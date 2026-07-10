@@ -146,6 +146,12 @@ config OLIMEX_STM32_H405
     depends on TCG && ARM
     select STM32F405_SOC
 
+config GNW_H7B0
+    bool
+    default y
+    depends on TCG && ARM
+    select GNW_H7B0_SOC
+
 config OMAP
     bool
     select FRAMEBUFFER
@@ -400,6 +406,10 @@ config STM32F405_SOC
     select STM32_RCC
     select STM32F4XX_SYSCFG
     select STM32F4XX_EXTI
+
+config GNW_H7B0_SOC
+    bool
+    select ARM_V7M
 
 config B_L475E_IOT01A
     bool

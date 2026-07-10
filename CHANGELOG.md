@@ -9,3 +9,8 @@
   the fork).
 - Initial documentation established: `CLAUDE.md`, `STATUS.md`,
   `CHANGELOG.md`, `docs/roadmap.md`.
+- Phase 0 complete: `gnw-h7b0` machine added (`hw/arm/gnw_h7b0.c`,
+  `hw/arm/gnw_h7b0_soc.c`) — bare Cortex-M7 + DTCM + AXI SRAM, no
+  peripherals. Verified booting a hand-built spin-loop ELF via gdb
+  (`-s -S`): reset SP/PC resolve correctly and PC advances on single-step.
+  Branch `gnw-h7b0` (based on tag `v9.2.4`) pushed to `origin`.
