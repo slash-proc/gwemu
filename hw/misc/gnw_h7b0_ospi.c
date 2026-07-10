@@ -62,13 +62,17 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
     switch (addr) {
     case GNW_H7B0_OSPI_CCR:
     case GNW_H7B0_OSPI_IR:
+    case GNW_H7B0_OSPI_AR:
         /*
          * Real hardware starts the transaction once the command is
-         * fully configured (CCR, or IR when an instruction phase is
-         * used, is the last register HAL writes before polling SR).
-         * No real transfer happens -- just instantly report it as
-         * complete (TCF set, BUSY clear) so HAL_OSPI_Command()'s
-         * post-config poll doesn't time out.
+         * fully configured -- CCR/IR for HAL_OSPI_Command()'s no-data
+         * path, or AR/IR (re-written by HAL_OSPI_Receive() itself,
+         * after HAL_OSPI_Command() already configured but didn't
+         * start the transfer) for the indirect-read data phase, per
+         * whichever of AR/IR corresponds to the command's address
+         * mode. No real transfer happens -- just instantly report it
+         * as complete (TCF set, BUSY clear) so either polling loop
+         * doesn't time out.
          */
         s->regs[addr >> 2] = value;
         s->regs[GNW_H7B0_OSPI_SR >> 2] |= OSPI_SR_TCF;

@@ -37,6 +37,7 @@ static void gnw_h7b0_rcc_reset(DeviceState *dev)
     GnwH7B0RccState *s = GNW_H7B0_RCC(dev);
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->regs[GNW_H7B0_RCC_RSR >> 2] = RCC_RSR_RESET_VALUE;
 }
 
 static uint64_t gnw_h7b0_rcc_read(void *opaque, hwaddr addr, unsigned int size)
@@ -127,6 +128,14 @@ static void gnw_h7b0_rcc_write(void *opaque, hwaddr addr,
             value &= ~RCC_BDCR_LSERDY;
         }
         s->regs[addr >> 2] = value;
+        return;
+    case GNW_H7B0_RCC_RSR:
+        /*
+         * Writing RMVF (bit16) clears the *RSTF cause flags on real
+         * hardware -- keep RMVF itself readable as written (firmware
+         * doesn't rely on it self-clearing here) but zero the rest.
+         */
+        s->regs[addr >> 2] = value & RCC_RSR_RMVF;
         return;
     default:
         qemu_log_mask(LOG_UNIMP,

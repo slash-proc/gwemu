@@ -42,6 +42,7 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     object_initialize_child(obj, "adc", &s->adc, TYPE_GNW_H7B0_ADC);
     object_initialize_child(obj, "ltdc", &s->ltdc, TYPE_GNW_H7B0_LTDC);
     object_initialize_child(obj, "spi2", &s->spi2, TYPE_GNW_H7B0_SPI);
+    object_initialize_child(obj, "spi1", &s->spi1, TYPE_GNW_H7B0_SPI);
 
     s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
 }
@@ -123,8 +124,15 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     /* OCTOSPI IO manager -- plain RAM placeholder (pin-mux only). */
     INIT_RAM_REGION(octospim, "GNW_H7B0.octospim", OCTOSPIM_BASE_ADDRESS,
                      OCTOSPIM_SIZE);
-    /* SPI2 (SD-card mod path) -- plain RAM placeholder. */
-    INIT_RAM_REGION(spi1, "GNW_H7B0.spi1", SPI1_BASE_ADDRESS, SPI1_SIZE);
+    /* EXTI + SYSCFG -- plain RAM placeholder. */
+    INIT_RAM_REGION(exti_syscfg, "GNW_H7B0.exti_syscfg",
+                     EXTI_SYSCFG_BASE_ADDRESS, EXTI_SYSCFG_SIZE);
+    /* DMA1 + DMA2 + DMAMUX1 -- plain RAM placeholder. */
+    INIT_RAM_REGION(dma, "GNW_H7B0.dma", DMA_BASE_ADDRESS, DMA_SIZE);
+    /* SAI1 -- plain RAM placeholder. */
+    INIT_RAM_REGION(sai1, "GNW_H7B0.sai1", SAI1_BASE_ADDRESS, SAI1_SIZE);
+    /* RTC -- plain RAM placeholder. */
+    INIT_RAM_REGION(rtc, "GNW_H7B0.rtc", RTC_BASE_ADDRESS, RTC_SIZE);
 #undef INIT_RAM_REGION
 
     armv7m = DEVICE(&s->armv7m);
@@ -190,6 +198,11 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->spi2), 0, SPI2_BASE_ADDRESS);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->spi1), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->spi1), 0, SPI1_BASE_ADDRESS);
 
     /*
      * Remaining peripherals (DMA2D, GPIO, USART, real flash/QSPI boot)

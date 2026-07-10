@@ -72,6 +72,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
 #define RCC_BDCR_LSEON      (1U << 0)
 #define RCC_BDCR_LSERDY     (1U << 1)
 
+/*
+ * RCC_RSR (reset status/cause flags) resets to 0x00E80000 on real
+ * hardware -- PORRSTF|PINRSTF|BORRSTF|CDRSTF all set together on a
+ * clean power-on (per STM32H7B0.svd, these are not mutually exclusive
+ * causes; a real power-on sets all four). A plain zeroed reset (this
+ * device's generic behavior otherwise) reads as "no reset cause at
+ * all", which real firmware doesn't expect -- found via a retro-go
+ * boot's reset-cause check falling through to an "Boot from
+ * brownout?" fallback path that isn't meant for a normal boot.
+ */
+#define GNW_H7B0_RCC_RSR        0x130
+#define RCC_RSR_RESET_VALUE     0x00E80000U
+#define RCC_RSR_RMVF            (1U << 16)
+
 struct GnwH7B0RccState {
     SysBusDevice parent_obj;
 

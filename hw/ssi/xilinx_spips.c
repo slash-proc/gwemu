@@ -619,11 +619,18 @@ static void xilinx_spips_flush_txfifo(XilinxSPIPS *s)
             return;
         } else if (s->snoop_state == SNOOP_STRIPING ||
                    s->snoop_state == SNOOP_NONE) {
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
             for (i = 0; i < num_effective_busses(s); ++i) {
                 if (!fifo8_is_empty(&s->tx_fifo)) {
                     tx_rx[i] = fifo8_pop(&s->tx_fifo);
                 }
             }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
             stripe8(tx_rx, num_effective_busses(s), false);
         } else if (s->snoop_state >= SNOOP_ADDR) {
             tx = fifo8_pop(&s->tx_fifo);

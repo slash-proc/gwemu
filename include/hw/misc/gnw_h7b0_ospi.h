@@ -7,13 +7,19 @@
  * docs/roadmap.md). Purpose: ST HAL's HAL_OSPI_Command() (used by
  * both the no-data and indirect-write paths in
  * sdk/stm32h7xx-hal-driver/Src/stm32h7xx_hal_ospi.c) writes the
- * command config registers (CCR/IR last) then polls SR's TCF bit,
- * and __HAL_OSPI_CLEAR_FLAG() writes FCR to W1C the corresponding SR
- * bit. Without both of those, HAL_OSPI_Command() times out and
- * returns HAL_ERROR/HAL_TIMEOUT, which real firmware treats as fatal
- * (found via a gnw-chainloader boot hitting its own "spin forever on
- * HAL error" trap in OSPI_WriteBytes). Every other register is a
- * plain read-what-was-written shadow with no side effects.
+ * command config registers (CCR/IR last) then polls SR's TCF bit, and
+ * __HAL_OSPI_CLEAR_FLAG() writes FCR to W1C the corresponding SR bit.
+ * HAL_OSPI_Receive() (the indirect-read path) triggers the actual
+ * transfer differently: it re-writes AR (if the command has an
+ * address phase, e.g. an SFDP read) or IR (if not) *after*
+ * HAL_OSPI_Command() has already configured -- but not started -- the
+ * transaction, then polls SR's FT|TC bits per byte. Without TCF also
+ * being set on an AR write, that second trigger path hangs forever
+ * (found via a gnw-chainloader boot hanging in OSPI_GetFlashSizeSfdp()
+ * -- a genuine silent infinite loop, not a BusFault, since AR is a
+ * real backed register and the read just never completes). Every
+ * other register is a plain read-what-was-written shadow with no side
+ * effects.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -64,6 +70,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
 
 #define GNW_H7B0_OSPI_CCR   0x100
 #define GNW_H7B0_OSPI_IR    0x110
+#define GNW_H7B0_OSPI_AR    0x48
 
 struct GnwH7B0OspiState {
     SysBusDevice parent_obj;

@@ -207,12 +207,48 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 #define SPI2_BASE_ADDRESS 0x40003800
 
 /*
- * SPI1, per STM32H7B0.svd baseAddress 0x40013000. Modeled as plain RAM
+ * SPI1, per STM32H7B0.svd baseAddress 0x40013000. This is the "Tim"
+ * SD-card mod's dedicated-pin bus, tried first by gnw-chainloader's
+ * sdcard_detect() -> spi1_init(). Modeled as a real minimal device
+ * (hw/misc/gnw_h7b0_spi.c, same as SPI2): found by a boot hang in
+ * spi1_init() spinning on SR.TXP/SR.EOT the same way SPI2's LCD path
+ * did, which a plain-RAM stub never sets.
+ */
+#define SPI1_BASE_ADDRESS 0x40013000
+
+/*
+ * EXTI + SYSCFG, per STM32H7B0.svd (contiguous 0x400-per-block,
+ * 0x58000000-0x580007FF). Modeled as plain RAM for now -- same
+ * rationale as the other not-yet-modeled peripherals above; covers
+ * both in one region since they're adjacent and both commonly touched
+ * during GPIO/interrupt pin-mux init.
+ */
+#define EXTI_SYSCFG_BASE_ADDRESS 0x58000000
+#define EXTI_SYSCFG_SIZE          0x800
+
+/*
+ * DMA1 + DMA2 + DMAMUX1, per STM32H7B0.svd (contiguous 0x400-per-block,
+ * 0x40020000-0x40020BFF). Modeled as plain RAM for now -- same
+ * rationale as the other not-yet-modeled peripherals above.
+ */
+#define DMA_BASE_ADDRESS 0x40020000
+#define DMA_SIZE          0xC00
+
+/*
+ * SAI1 (Serial Audio Interface), per STM32H7B0.svd baseAddress
+ * 0x40015800. Modeled as plain RAM for now -- same rationale as the
+ * other not-yet-modeled peripherals above.
+ */
+#define SAI1_BASE_ADDRESS 0x40015800
+#define SAI1_SIZE          0x400
+
+/*
+ * RTC, per STM32H7B0.svd baseAddress 0x58004000. Modeled as plain RAM
  * for now -- same rationale as the other not-yet-modeled peripherals
  * above.
  */
-#define SPI1_BASE_ADDRESS 0x40013000
-#define SPI1_SIZE          0x400
+#define RTC_BASE_ADDRESS 0x58004000
+#define RTC_SIZE          0x400
 
 /*
  * LTDC (LCD-TFT Display Controller), per STM32H7B0.svd baseAddress
@@ -235,6 +271,7 @@ struct GnwH7B0State {
     GnwH7B0AdcState adc;
     GnwH7B0LtdcState ltdc;
     GnwH7B0SpiState spi2;
+    GnwH7B0SpiState spi1;
 
     MemoryRegion itcm;
     MemoryRegion dtcm;
@@ -254,7 +291,10 @@ struct GnwH7B0State {
     MemoryRegion gpio;
     MemoryRegion crs;
     MemoryRegion octospim;
-    MemoryRegion spi1;
+    MemoryRegion exti_syscfg;
+    MemoryRegion dma;
+    MemoryRegion sai1;
+    MemoryRegion rtc;
 
     Clock *sysclk;
 };
