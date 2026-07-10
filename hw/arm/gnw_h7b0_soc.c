@@ -62,17 +62,6 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         memory_region_add_subregion(system_memory, base, &s->field); \
     } while (0)
 
-    /*
-     * ITCM sits at 0x0, the Cortex-M's hardwired reset vector-fetch
-     * address, and is genuinely RAM on real hardware (not a flash
-     * mirror/alias) -- so a kernel loaded here for bring-up testing is
-     * architecturally correct, not a hack, as long as it fits in 64K.
-     * OPEN QUESTION (see docs/roadmap.md Phase 1): real firmware bigger
-     * than 64K boots from flash bank 1 via BOOT_ADD option-byte
-     * selection, which is a real address-0 remap distinct from ITCM's
-     * own fixed mapping -- not yet modeled here. Revisit once real
-     * (not test-kernel) firmware boot is attempted.
-     */
     INIT_RAM_REGION(itcm, "GNW_H7B0.itcm", ITCM_BASE_ADDRESS, ITCM_SIZE);
     INIT_RAM_REGION(dtcm, "GNW_H7B0.dtcm", DTCM_BASE_ADDRESS, DTCM_SIZE);
     INIT_RAM_REGION(axisram1, "GNW_H7B0.axisram1", AXISRAM1_BASE_ADDRESS,
@@ -103,6 +92,22 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     qdev_prop_set_uint8(armv7m, "num-prio-bits", 4);
     qdev_prop_set_string(armv7m, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m7"));
     qdev_prop_set_bit(armv7m, "enable-bitband", true);
+    /*
+     * Real hardware boots from flash bank 1 at 0x08000000 via BOOT_ADD
+     * option-byte address-0 remap (cold boot) or a debug probe directly
+     * setting VTOR/SP/PC there (the gnwmanager dev-flow path retro-go's
+     * own linker script targets -- see STM32H7B0VBTx_FLASH.ld, whose
+     * .isr_vector lands at FLASH's origin, not ITCM's). QEMU's ARMv7M
+     * container exposes exactly this indirection via init-nsvtor: it's
+     * the initial value of VTOR, which is where cpu_reset() reads the
+     * initial SP/PC vector table from. (Cortex-M7 has no TrustZone-M,
+     * so it's the "ns" -- non-secure, i.e. only -- variant that applies;
+     * "init-svtor" is a no-op property on this core, silently ignored by
+     * armv7m.c's object_property_find guard -- do not use it here.)
+     * Pointing it at flash bank 1 models that remap without needing a
+     * fake alias memory region.
+     */
+    qdev_prop_set_uint32(armv7m, "init-nsvtor", FLASH_BANK1_BASE_ADDRESS);
     qdev_connect_clock_in(armv7m, "cpuclk", s->sysclk);
     qdev_connect_clock_in(armv7m, "refclk", s->sysclk);
     object_property_set_link(OBJECT(&s->armv7m), "memory",

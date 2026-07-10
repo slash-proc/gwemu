@@ -12,11 +12,8 @@ Cortex-M7 against the real STM32H7B0 SRAM/flash bank layout.
 
 ## Current phase
 
-**Phase 1 — Memory map + boot path** (see `docs/roadmap.md`): memory map
-done, RCC stub implemented and verified but NOT YET COMMITTED (see
-"Uncommitted work" below — a Claude Code session restart interrupted
-this; next session should commit it first thing after checking it still
-builds).
+**Phase 1 — Memory map + boot path** (see `docs/roadmap.md`): memory map,
+RCC stub, and boot path are all done and committed.
 - [x] Full real SRAM map added, sourced from RM0455 Table 6 (`rm0455.pdf`,
   repo root), cross-checked against `STM32H7B0.svd`'s RCC clock-enable bit
   names: ITCM (`0x0`, 64K), DTCM (`0x20000000`, 128K), AXI SRAM1/2/3
@@ -38,13 +35,24 @@ builds).
   Re-verified via gdb (`-s -S`, stepi): SP loads as `0x10000` (top of real
   64K ITCM), PC starts at the vector table's reset handler and advances on
   single-step.
-- [ ] **Open question, not yet resolved**: real firmware bigger than 64K
-  can't fit in ITCM the way this test kernel does. Real hardware boots
-  from flash bank 1 via BOOT_ADD option-byte selection, which is a real
-  address-0 remap distinct from ITCM's own fixed mapping — not yet
-  modeled. Needs solving before any real (non-toy) firmware image can
-  boot. See the comment in `hw/arm/gnw_h7b0_soc.c` above the ITCM region
-  init.
+- [x] **Boot-from-flash resolved**: the kernel now loads at flash bank 1
+  (`FLASH_BANK1_BASE_ADDRESS`, `0x08000000`) instead of ITCM, matching
+  where retro-go's own linker script (`STM32H7B0VBTx_FLASH.ld`) places
+  `.isr_vector` and where the real gnwmanager debug-probe dev flow starts
+  execution. The ARMv7M CPU's `init-nsvtor` property (the CPU's initial
+  VTOR, which `cpu_reset()` reads SP/PC from) is set to
+  `FLASH_BANK1_BASE_ADDRESS` in `gnw_h7b0_soc.c`, modeling real
+  hardware's BOOT_ADD address-0 remap without a fake alias memory
+  region. **Gotcha**: it's `init-nsvtor`, not `init-svtor` — Cortex-M7
+  has no TrustZone-M, so the secure-VTOR property is a silent no-op on
+  this core (found by first setting `init-svtor` and seeing PC/SP still
+  reset to 0/0 — QEMU doesn't error, it just ignores an unknown
+  property via `object_property_find`). Verified via a hand-built
+  flash-linked test kernel under gdb (`-s -S`, stepi): SP/PC load as
+  `0x20020000`/`0x0800000c` from the flash vector table, and a store
+  instruction lands correctly in AXI SRAM a few steps later. ITCM is
+  still modeled as real RAM at `0x0` (unchanged) — it's simply no longer
+  where the kernel is loaded or where the CPU looks for its boot vector.
 - [x] Minimal RCC stub implemented (`hw/misc/gnw_h7b0_rcc.{c,h}`, mapped
   at `0x58024400` per RM0455/CMSIS cross-check): mirrors RCC_CR's
   HSION/HSEON/PLL1-3ON bits into their matching RDY bits, and RCC_CFGR's
@@ -69,20 +77,15 @@ builds).
     "incomplete type" compile errors that looked unrelated to the actual
     typo.
 
-## Uncommitted work (as of this restart)
+## Next up
 
-The RCC device files are written, build clean, and are verified working
-(see above), but were NOT git-committed before this Claude Code session
-had to restart (repeated auto-mode classifier false-positives blocked
-`git add`/`git commit` calls — unrelated to the actual changes, which are
-a normal device-model addition). Files involved:
-- `hw/misc/gnw_h7b0_rcc.c`, `include/hw/misc/gnw_h7b0_rcc.h` (new)
-- `hw/arm/gnw_h7b0_soc.c`, `include/hw/arm/gnw_h7b0_soc.h` (wire up RCC)
-- `hw/arm/Kconfig`, `hw/misc/Kconfig`, `hw/misc/meson.build` (build reg)
-
-**Next session should**: `git status` to confirm these are still present
-and uncommitted, rebuild to confirm it still compiles, then commit before
-doing anything else.
+Phase 1 is functionally complete (memory map, RCC stub, boot path all
+done). Phase 2 (DMA2D device model, see `docs/roadmap.md`) hasn't been
+started. Before that: real (non-toy) retro-go firmware boot hasn't been
+attempted end-to-end yet against the new flash boot path — worth trying
+against a real `_intflash.bin` build to see what it faults on next
+(expected: RCC register reads/writes past this stub's current coverage,
+or GPIO/other peripherals not modeled yet).
 
 ## Known constraints
 

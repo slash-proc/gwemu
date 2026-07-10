@@ -2,6 +2,18 @@
 
 ## 2026-07-10
 
+- Phase 1 boot path resolved: the kernel now loads at flash bank 1
+  (`0x08000000`) instead of ITCM, with the ARMv7M CPU's `init-nsvtor`
+  property pointed there so reset reads the initial SP/PC from flash's
+  vector table — modeling real hardware's BOOT_ADD address-0 remap (or
+  the gnwmanager debug-probe dev-flow path) without a fake alias memory
+  region. Note: it's `init-nsvtor`, not `init-svtor` — Cortex-M7 has no
+  TrustZone-M, so the `-s-` (secure) variant is a silent no-op on this
+  core. Verified via a hand-built flash-linked test kernel under gdb
+  (`-s -S`): SP/PC load as `0x20020000`/`0x0800000c` from the flash
+  vector table, and a store instruction a few steps in lands correctly
+  in AXI SRAM.
+
 - Repo initialized as a fork of upstream QEMU. Remotes set: `origin` =
   `slash-proc/gwemu`, `upstream` = `qemu/qemu`. Fetched full upstream
   history/tags locally; pushed only the `v9.2.4` stable tag to `origin` as

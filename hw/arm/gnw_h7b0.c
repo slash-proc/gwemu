@@ -3,10 +3,11 @@
  *
  * Phase 1: instantiates gnw-h7b0-soc (real SRAM bank layout + internal/
  * external flash regions, no peripherals yet) and loads a kernel image
- * into ITCM (the CPU's real reset-vector-fetch address on real hardware)
- * for bring-up testing. See ../../docs/roadmap.md and
- * gnw_h7b0_soc.c's ITCM comment for the open question about how real,
- * >64K firmware images actually boot (flash-backed, not ITCM-backed).
+ * into flash bank 1 at 0x08000000, matching real hardware's boot path
+ * (BOOT_ADD option-byte remap on cold boot, or a debug probe's VTOR/SP/
+ * PC direct-set on the gnwmanager dev flow -- see gnw_h7b0_soc.c's
+ * init-svtor comment) and where retro-go's own linker script places
+ * .isr_vector. See ../../docs/roadmap.md.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -52,7 +53,7 @@ static void gnw_h7b0_init(MachineState *machine)
 
     armv7m_load_kernel(ARM_CPU(first_cpu),
                         machine->kernel_filename,
-                        ITCM_BASE_ADDRESS, ITCM_SIZE);
+                        FLASH_BANK1_BASE_ADDRESS, FLASH_BANK_SIZE);
 }
 
 static void gnw_h7b0_machine_init(MachineClass *mc)

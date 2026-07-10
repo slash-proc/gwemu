@@ -55,16 +55,17 @@ GPU behavior instead of a slow stand-in.
   flash size override vs RM0455.
 - **Done**: boots a test kernel via ITCM (genuinely RAM at address `0x0`
   on real hardware) instead of Phase 0's temporary alias hack.
-- **Open, unsolved**: real firmware bigger than 64K can't boot via ITCM
-  the way the test kernel does. Real hardware boots from flash bank 1 via
-  BOOT_ADD option-byte selection — a real address-0 remap distinct from
-  ITCM's fixed mapping — not yet modeled. Needed before any real (not toy)
-  firmware image can boot.
-- **Not started**: minimal RCC stub — enough register read/write behavior
-  that real firmware's clock-init code doesn't hang polling a
-  permanently-zero status bit. Not cycle-accurate at this stage.
-- Goal: a real STM32H7B0-target firmware image begins executing from flash
-  and gets through early clock/memory init without faulting.
+- **Done**: kernel now loads at flash bank 1 (`0x08000000`) with the
+  ARMv7M CPU's `init-nsvtor` property pointed there, so reset reads SP/PC
+  from flash's vector table — modeling real hardware's BOOT_ADD address-0
+  remap without a fake alias region. See `STATUS.md` for the
+  `init-nsvtor`-vs-`init-svtor` gotcha (Cortex-M7 has no TrustZone-M).
+- **Done**: minimal RCC stub — enough register read/write behavior that
+  real firmware's clock-init code doesn't hang polling a permanently-zero
+  status bit. Not cycle-accurate at this stage.
+- Goal (not yet attempted): a real STM32H7B0-target firmware image begins
+  executing from flash and gets through early clock/memory init without
+  faulting.
 
 ### Phase 2 — DMA2D device model
 - New device `hw/display/gnw-dma2d.c`: `MemoryRegionOps` for the register
