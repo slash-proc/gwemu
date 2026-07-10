@@ -24,6 +24,11 @@ phased plan.
 - `docs/` — design rationale, architecture notes, dated investigation
   writeups for anything gnarly (bug hunts, root-causes). Narrative and
   history belong here, not in STATUS.md.
+- **`docs/session-2026-07-10-state.md`** — a session got cut off
+  mid-investigation (chainloader's menu not drawing, a release-build
+  perf fix that introduced a worse 0%-CPU hang, retro-go's
+  Error_Handler crash, extflash not yet wired up). Read this first and
+  work from it before starting fresh investigation on any of those.
 
 ## Repo/remote conventions
 
