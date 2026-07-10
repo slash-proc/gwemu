@@ -84,6 +84,9 @@ config IMX
 config STM32_RCC
     bool
 
+config GNW_H7B0_RCC
+    bool
+
 config STM32F2XX_SYSCFG
     bool
 

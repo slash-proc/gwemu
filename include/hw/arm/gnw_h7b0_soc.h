@@ -30,6 +30,7 @@
 #define HW_ARM_GNW_H7B0_SOC_H
 
 #include "hw/arm/armv7m.h"
+#include "hw/misc/gnw_h7b0_rcc.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_SOC "gnw-h7b0-soc"
@@ -90,10 +91,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 #define EXTFLASH_BASE_ADDRESS 0x90000000
 #define EXTFLASH_SIZE         (64 * 1024 * 1024)
 
+/*
+ * RCC base address: computed as PERIPH_BASE + SRD_AHB4PERIPH_BASE offset
+ * + 0x4400 from sdk/cmsis-device-h7/Include/stm32h7b0xx.h, cross-checked
+ * against RM0455 Table 7's register boundary list (RCC:
+ * 0x58024400-0x580247FF) -- both agree.
+ */
+#define RCC_BASE_ADDRESS 0x58024400
+
 struct GnwH7B0State {
     SysBusDevice parent_obj;
 
     ARMv7MState armv7m;
+    GnwH7B0RccState rcc;
 
     MemoryRegion itcm;
     MemoryRegion dtcm;

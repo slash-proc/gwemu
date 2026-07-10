@@ -35,6 +35,7 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     GnwH7B0State *s = GNW_H7B0_SOC(obj);
 
     object_initialize_child(obj, "armv7m", &s->armv7m, TYPE_ARMV7M);
+    object_initialize_child(obj, "rcc", &s->rcc, TYPE_GNW_H7B0_RCC);
 
     s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
 }
@@ -110,9 +111,14 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
 
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->rcc), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->rcc), 0, RCC_BASE_ADDRESS);
+
     /*
-     * Peripherals (RCC, DMA2D, GPIO, USART, flash/QSPI boot) are added in
-     * later phases; see ../../docs/roadmap.md.
+     * Remaining peripherals (DMA2D, GPIO, USART, real flash/QSPI boot)
+     * are added in later phases; see ../../docs/roadmap.md.
      */
 }
 

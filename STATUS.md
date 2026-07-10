@@ -13,7 +13,10 @@ Cortex-M7 against the real STM32H7B0 SRAM/flash bank layout.
 ## Current phase
 
 **Phase 1 — Memory map + boot path** (see `docs/roadmap.md`): memory map
-done, RCC stub not started.
+done, RCC stub implemented and verified but NOT YET COMMITTED (see
+"Uncommitted work" below — a Claude Code session restart interrupted
+this; next session should commit it first thing after checking it still
+builds).
 - [x] Full real SRAM map added, sourced from RM0455 Table 6 (`rm0455.pdf`,
   repo root), cross-checked against `STM32H7B0.svd`'s RCC clock-enable bit
   names: ITCM (`0x0`, 64K), DTCM (`0x20000000`, 128K), AXI SRAM1/2/3
@@ -42,8 +45,44 @@ done, RCC stub not started.
   modeled. Needs solving before any real (non-toy) firmware image can
   boot. See the comment in `hw/arm/gnw_h7b0_soc.c` above the ITCM region
   init.
-- [ ] Minimal RCC stub: not started. Needed so real firmware's clock-init
-  polling loops don't hang forever on a permanently-zero status bit.
+- [x] Minimal RCC stub implemented (`hw/misc/gnw_h7b0_rcc.{c,h}`, mapped
+  at `0x58024400` per RM0455/CMSIS cross-check): mirrors RCC_CR's
+  HSION/HSEON/PLL1-3ON bits into their matching RDY bits, and RCC_CFGR's
+  SW field into SWS, both instantly (not cycle-accurate) so a real
+  clock-init polling loop won't hang. Everything else is a plain
+  read-what-was-written shadow register. **Verified working** via a
+  real CPU-executed test program (not gdb debug-writes, which turned out
+  to not reliably exercise MMIO access-size paths the same way real STR
+  instructions do): writing `HSION|HSEON|PLL1ON` reads back with
+  `HSIRDY|HSERDY|PLL1RDY` correctly OR'd in (`0x01010001` ->
+  `0x03030005`), and writing `CFGR.SW=2` reads back with `SWS` correctly
+  mirrored (`0x2` -> `0x12`). Deliberately NOT based on the existing
+  upstream `hw/misc/stm32_rcc.c`: that device is F4-family register
+  offsets and does not mirror ON->RDY bits at all, so reusing it would
+  leave real H7B0 clock-init hanging.
+  - Bug found and fixed along the way: initial version had
+    `.valid.min_access_size = 4`, which silently dropped narrower
+    (1-2 byte) writes — relaxed to `min_access_size = 1`.
+  - Bug found and fixed along the way: a stray `*/` inside a doc comment
+    in `gnw_h7b0_rcc.h` closed the comment block early, corrupting
+    everything after it including the struct definition, causing
+    "incomplete type" compile errors that looked unrelated to the actual
+    typo.
+
+## Uncommitted work (as of this restart)
+
+The RCC device files are written, build clean, and are verified working
+(see above), but were NOT git-committed before this Claude Code session
+had to restart (repeated auto-mode classifier false-positives blocked
+`git add`/`git commit` calls — unrelated to the actual changes, which are
+a normal device-model addition). Files involved:
+- `hw/misc/gnw_h7b0_rcc.c`, `include/hw/misc/gnw_h7b0_rcc.h` (new)
+- `hw/arm/gnw_h7b0_soc.c`, `include/hw/arm/gnw_h7b0_soc.h` (wire up RCC)
+- `hw/arm/Kconfig`, `hw/misc/Kconfig`, `hw/misc/meson.build` (build reg)
+
+**Next session should**: `git status` to confirm these are still present
+and uncommitted, rebuild to confirm it still compiles, then commit before
+doing anything else.
 
 ## Known constraints
 

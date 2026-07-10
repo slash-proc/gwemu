@@ -29,3 +29,14 @@
   Re-verified boot via gdb. Flagged an open question: real firmware >64K
   needs flash-backed boot via BOOT_ADD option-byte selection, not yet
   modeled.
+- Added `scripts/fetch-sdk.sh`, pulling the real STM32CubeH7 HAL driver +
+  device CMSIS source into gitignored `sdk/`, pinned to the same versions
+  `game-and-watch-retro-go-sd` builds real firmware against.
+- Implemented and verified a minimal RCC device stub
+  (`hw/misc/gnw_h7b0_rcc.{c,h}`) mirroring RCC_CR ON->RDY bits and
+  RCC_CFGR SW->SWS so real firmware's clock-init polling doesn't hang.
+  Verified via a real CPU-executed test program. **NOT YET COMMITTED**
+  as of this entry — see STATUS.md "Uncommitted work" section; a Claude
+  Code session restart interrupted the commit step (unrelated
+  auto-mode-classifier false positives blocking git commands, not a
+  problem with the code itself).
