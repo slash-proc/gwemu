@@ -51,35 +51,51 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
 
-    memory_region_init_ram(&s->dtcm, OBJECT(dev_soc), "GNW_H7B0.dtcm",
-                            DTCM_SIZE, &err);
-    if (err != NULL) {
-        error_propagate(errp, err);
-        return;
-    }
-    memory_region_add_subregion(system_memory, DTCM_BASE_ADDRESS, &s->dtcm);
-
-    memory_region_init_ram(&s->axisram, OBJECT(dev_soc), "GNW_H7B0.axisram",
-                            AXISRAM_SIZE, &err);
-    if (err != NULL) {
-        error_propagate(errp, err);
-        return;
-    }
-    memory_region_add_subregion(system_memory, AXISRAM_BASE_ADDRESS,
-                                 &s->axisram);
+#define INIT_RAM_REGION(field, name, base, size) \
+    do { \
+        memory_region_init_ram(&s->field, OBJECT(dev_soc), name, size, &err); \
+        if (err != NULL) { \
+            error_propagate(errp, err); \
+            return; \
+        } \
+        memory_region_add_subregion(system_memory, base, &s->field); \
+    } while (0)
 
     /*
-     * TEMPORARY (Phase 0 only): Cortex-M reset always reads initial
-     * SP/PC from address 0x0. Real hardware maps flash there via
-     * BOOT/OSPI XIP; until Phase 1 adds a real flash/QSPI model, alias
-     * AXI SRAM at 0x0 so a kernel image loaded into AXI SRAM is also
-     * reachable at the CPU's hardwired reset vector address. Remove once
-     * Phase 1's flash model provides a real address-0 mapping.
+     * ITCM sits at 0x0, the Cortex-M's hardwired reset vector-fetch
+     * address, and is genuinely RAM on real hardware (not a flash
+     * mirror/alias) -- so a kernel loaded here for bring-up testing is
+     * architecturally correct, not a hack, as long as it fits in 64K.
+     * OPEN QUESTION (see docs/roadmap.md Phase 1): real firmware bigger
+     * than 64K boots from flash bank 1 via BOOT_ADD option-byte
+     * selection, which is a real address-0 remap distinct from ITCM's
+     * own fixed mapping -- not yet modeled here. Revisit once real
+     * (not test-kernel) firmware boot is attempted.
      */
-    memory_region_init_alias(&s->axisram_alias, OBJECT(dev_soc),
-                              "GNW_H7B0.axisram.alias", &s->axisram, 0,
-                              AXISRAM_SIZE);
-    memory_region_add_subregion(system_memory, 0, &s->axisram_alias);
+    INIT_RAM_REGION(itcm, "GNW_H7B0.itcm", ITCM_BASE_ADDRESS, ITCM_SIZE);
+    INIT_RAM_REGION(dtcm, "GNW_H7B0.dtcm", DTCM_BASE_ADDRESS, DTCM_SIZE);
+    INIT_RAM_REGION(axisram1, "GNW_H7B0.axisram1", AXISRAM1_BASE_ADDRESS,
+                     AXISRAM1_SIZE);
+    INIT_RAM_REGION(axisram2, "GNW_H7B0.axisram2", AXISRAM2_BASE_ADDRESS,
+                     AXISRAM2_SIZE);
+    INIT_RAM_REGION(axisram3, "GNW_H7B0.axisram3", AXISRAM3_BASE_ADDRESS,
+                     AXISRAM3_SIZE);
+    INIT_RAM_REGION(ahbsram1, "GNW_H7B0.ahbsram1", AHBSRAM1_BASE_ADDRESS,
+                     AHBSRAM1_SIZE);
+    INIT_RAM_REGION(ahbsram2, "GNW_H7B0.ahbsram2", AHBSRAM2_BASE_ADDRESS,
+                     AHBSRAM2_SIZE);
+    INIT_RAM_REGION(srdsram, "GNW_H7B0.srdsram", SRDSRAM_BASE_ADDRESS,
+                     SRDSRAM_SIZE);
+    INIT_RAM_REGION(bkpsram, "GNW_H7B0.bkpsram", BKPSRAM_BASE_ADDRESS,
+                     BKPSRAM_SIZE);
+    INIT_RAM_REGION(flash_bank1, "GNW_H7B0.flash_bank1",
+                     FLASH_BANK1_BASE_ADDRESS, FLASH_BANK_SIZE);
+    INIT_RAM_REGION(flash_bank2, "GNW_H7B0.flash_bank2",
+                     FLASH_BANK2_BASE_ADDRESS, FLASH_BANK_SIZE);
+    INIT_RAM_REGION(extflash, "GNW_H7B0.extflash", EXTFLASH_BASE_ADDRESS,
+                     EXTFLASH_SIZE);
+
+#undef INIT_RAM_REGION
 
     armv7m = DEVICE(&s->armv7m);
     qdev_prop_set_uint32(armv7m, "num-irq", 96);

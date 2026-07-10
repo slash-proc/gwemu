@@ -1,5 +1,6 @@
 /GNUmakefile
 /build/
+/rm0455.pdf
 /.cache/
 /.vscode/
 *.pyc

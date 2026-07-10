@@ -5,38 +5,50 @@ Last updated: 2026-07-10
 ## Where things stand
 
 Repo is a fork of upstream QEMU (`qemu/qemu`), pinned to tag `v9.2.4`.
-Working branch `gnw-h7b0` (based on that tag) pushed to `origin`
-(`slash-proc/gwemu`). **Phase 0 complete**: a new `gnw-h7b0` machine boots
-a bare Cortex-M7 to a working spin loop.
+Working branch `gnw-h7b0` (based on that tag), pushed to `origin` as of
+Phase 0 (not re-pushed since; push only on explicit go-ahead). **Phase 0
+and the memory-map portion of Phase 1 are done**: `gnw-h7b0` boots a bare
+Cortex-M7 against the real STM32H7B0 SRAM/flash bank layout.
 
 ## Current phase
 
-**Phase 0 — Fork setup**: done.
-- [x] Working branch `gnw-h7b0` created from `v9.2.4`, pushed to origin.
-- [x] Baseline `arm-softmmu` build confirmed working unmodified.
-- [x] `hw/arm/gnw_h7b0_soc.c` + `include/hw/arm/gnw_h7b0_soc.h`: SoC
-      container with Cortex-M7, DTCM (`0x20000000`, 128K), AXI SRAM
-      (`0x24000000`, 1M) — no peripherals yet. `hw/arm/gnw_h7b0.c`: thin
-      machine-init wrapper, `-M gnw-h7b0`. Registered in
-      `hw/arm/{Kconfig,meson.build}`.
-  - Temporary Phase-0-only hack in the SoC realize function: AXI SRAM is
-    aliased at address `0x0` so a kernel loaded there is reachable at the
-    Cortex-M hardwired reset-vector address. Real hardware does this via
-    flash/XIP boot; this alias must be removed once Phase 1 adds a real
-    flash model — see the comment at its definition in
-    `hw/arm/gnw_h7b0_soc.c`.
-- [x] Verified via gdb (`-s -S`, stepi): reset SP loads as `0x24100000`
-  (top of AXI SRAM, matches a hand-built vector table), PC starts at the
-  vector table's reset handler and advances correctly on single-step —
-  confirms the boot/build/board-registration pipeline works end to end.
-
-**Next: Phase 1 — Memory map + boot path** (see `docs/roadmap.md`):
-ITCM/AHB SRAM/internal flash/QSPI regions, a minimal RCC stub, and
-removing the Phase-0 address-0 alias hack in favor of a real flash-at-0x0
-mapping.
+**Phase 1 — Memory map + boot path** (see `docs/roadmap.md`): memory map
+done, RCC stub not started.
+- [x] Full real SRAM map added, sourced from RM0455 Table 6 (`rm0455.pdf`,
+  repo root), cross-checked against `STM32H7B0.svd`'s RCC clock-enable bit
+  names: ITCM (`0x0`, 64K), DTCM (`0x20000000`, 128K), AXI SRAM1/2/3
+  (`0x24000000`/256K, `0x24040000`/384K, `0x240A0000`/384K), AHB SRAM1/2
+  (`0x30000000`/64K, `0x30010000`/64K), SRD SRAM (`0x38000000`/32K),
+  backup SRAM (`0x38800000`/4K).
+- [x] Internal flash: bank1 `0x08000000`, bank2 `0x08100000`, 256K each.
+  **Deliberately overrides RM0455**, which says H7B0 has only 128K
+  single-bank flash — that's wrong for real silicon per the project owner
+  (community-verified, undocumented by ST). See
+  `docs/h7b0-flash-discrepancy.md` before touching this.
+- [x] External OSPI flash reserved at `0x90000000`, 64M placeholder (real
+  size 1-256M). Not yet modeled as a real OCTOSPI device — plain RAM for
+  now. Target is dual-quad OCTOSPI1+OCTOSPI2 (the Tim Scheuerwegen SD-card
+  mod's SPI2/OSPI2 path), not yet implemented at the register level.
+- [x] Removed the Phase-0 "alias AXI SRAM at address 0" hack: ITCM is
+  genuinely RAM at address `0x0` on real hardware, so the test kernel now
+  loads there directly — architecturally correct, not a stand-in.
+  Re-verified via gdb (`-s -S`, stepi): SP loads as `0x10000` (top of real
+  64K ITCM), PC starts at the vector table's reset handler and advances on
+  single-step.
+- [ ] **Open question, not yet resolved**: real firmware bigger than 64K
+  can't fit in ITCM the way this test kernel does. Real hardware boots
+  from flash bank 1 via BOOT_ADD option-byte selection, which is a real
+  address-0 remap distinct from ITCM's own fixed mapping — not yet
+  modeled. Needs solving before any real (non-toy) firmware image can
+  boot. See the comment in `hw/arm/gnw_h7b0_soc.c` above the ITCM region
+  init.
+- [ ] Minimal RCC stub: not started. Needed so real firmware's clock-init
+  polling loops don't hang forever on a permanently-zero status bit.
 
 ## Known constraints
 
 - No STM32H7B0 machine exists upstream; everything here is new.
 - Keep `../minicraft-gnw`'s MPS2 fault-trap QEMU harness as the working
   regression baseline until this fork's model is proven equivalent.
+- RM0455 is known-wrong about internal flash size on real H7B0 — see
+  `docs/h7b0-flash-discrepancy.md` before trusting it on flash topics.

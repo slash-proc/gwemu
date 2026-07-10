@@ -47,12 +47,22 @@ GPU behavior instead of a slow stand-in.
   board-registration pipeline works before adding real complexity.
 
 ### Phase 1 — Memory map + boot path
-- Model real memory regions from the SVD: ITCM, DTCM, AXI SRAM, backup
-  SRAM, and QSPI/OSPI flash where G&W firmware actually lives (XIP boot,
-  not the RAM_EMU load-and-jump the current GWHB harness fakes).
-- Minimal RCC stub: enough register read/write behavior that real
-  firmware's clock-init code doesn't hang polling a permanently-zero status
-  bit. Not cycle-accurate at this stage.
+- **Done**: real memory regions modeled from RM0455 Table 6 (not just the
+  SVD, which doesn't cover plain RAM/flash regions): ITCM, DTCM, AXI
+  SRAM1/2/3, AHB SRAM1/2, SRD SRAM, backup SRAM, internal flash banks 1/2,
+  external OSPI flash placeholder. See `STATUS.md` for exact
+  addresses/sizes and `docs/h7b0-flash-discrepancy.md` for the internal
+  flash size override vs RM0455.
+- **Done**: boots a test kernel via ITCM (genuinely RAM at address `0x0`
+  on real hardware) instead of Phase 0's temporary alias hack.
+- **Open, unsolved**: real firmware bigger than 64K can't boot via ITCM
+  the way the test kernel does. Real hardware boots from flash bank 1 via
+  BOOT_ADD option-byte selection — a real address-0 remap distinct from
+  ITCM's fixed mapping — not yet modeled. Needed before any real (not toy)
+  firmware image can boot.
+- **Not started**: minimal RCC stub — enough register read/write behavior
+  that real firmware's clock-init code doesn't hang polling a
+  permanently-zero status bit. Not cycle-accurate at this stage.
 - Goal: a real STM32H7B0-target firmware image begins executing from flash
   and gets through early clock/memory init without faulting.
 

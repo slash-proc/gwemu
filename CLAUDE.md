@@ -41,6 +41,14 @@ phased plan.
 - `STM32H7B0.svd` at repo root is the authoritative register/address map.
   Use it for peripheral base addresses and register layouts instead of
   hand-transcribing from the reference manual.
+- `rm0455.pdf` at repo root (STM32H7A3/7B3/7B0 reference manual) is
+  expected to exist locally for memory-map/register lookups but is
+  gitignored (58MB, copyrighted ST document) — not tracked, won't survive
+  a fresh clone. Re-fetch it yourself if it's missing.
+- RM0455 is wrong about internal flash on real H7B0 silicon (says 128K
+  single-bank; real hardware is 2x256K dual-bank, community-verified, not
+  documented anywhere official). Trust the project owner over RM0455 here.
+  See `docs/h7b0-flash-discrepancy.md` before touching flash sizing.
 - Cross-check emulated behavior against real findings already documented in
   `../minicraft-gnw/docs/qemu-testing.md` and
   `../minicraft-gnw/docs/real-hardware-testing.md` (e.g. real hardware
