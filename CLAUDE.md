@@ -45,6 +45,17 @@ phased plan.
   expected to exist locally for memory-map/register lookups but is
   gitignored (58MB, copyrighted ST document) — not tracked, won't survive
   a fresh clone. Re-fetch it yourself if it's missing.
+- `sdk/` (gitignored, ~65MB, not a build dependency) is the real
+  STM32CubeH7 HAL driver + device-specific CMSIS source, pinned to the
+  same versions `../game-and-watch-retro-go-sd/Makefile.common` builds
+  real firmware against (so it reflects what real firmware actually
+  does). Run `scripts/fetch-sdk.sh` to populate it if missing. Use
+  `sdk/stm32h7xx-hal-driver/Src/stm32h7xx_hal_{rcc,dma2d,ospi}.c` and
+  `sdk/cmsis-device-h7/Include/stm32h7b0xx.h` as ground truth for
+  peripheral register behavior when writing device models — same role as
+  `STM32H7B0.svd`/`rm0455.pdf`, but showing actual driver logic (e.g.
+  which status bits a real init sequence polls for) rather than just
+  register layout.
 - RM0455 is wrong about internal flash on real H7B0 silicon (says 128K
   single-bank; real hardware is 2x256K dual-bank, community-verified, not
   documented anywhere official). Trust the project owner over RM0455 here.
