@@ -124,18 +124,35 @@ RCC stub, and boot path are all done and committed.
     `crash_log_capture`), not a QEMU crash. This made gap-finding fast:
     attach gdb, read PC, `addr2line`, done.
 
+- [x] New real device `hw/display/gnw_h7b0_ltdc.c` (LTDC, `0x50001000`):
+  Layer1-only, RGB565-only, no timing/IRQ modeling — a real graphics
+  console backed by `framebuffer_update_display`-style full-frame reads
+  from guest RAM (`CFBAR`/`CFBP` from `LxCFBLR`, `CFBLNR` for row
+  count), upscaled 2x nearest-neighbor into the host window
+  (`GNW_H7B0_LTDC_SCALE`). **Gotcha**: `LxCFBLR`'s `CFBLL` field
+  (`active_width*bpp+3`) is *not* the row pitch — use `CFBP` instead;
+  using `CFBLL` gave a 2-pixel-per-row skew, found by comparing live
+  register values (`CFBP=640` vs `(CFBLL-3)=644`) against the known
+  320-wide real framebuffer. `SPI2` upgraded from a plain-RAM stub to a
+  real device (`hw/misc/gnw_h7b0_spi.c`, `SR.TXP`/`SR.EOT` mirroring)
+  after the LCD-panel init-command path (`gw_lcd_spi_tx`, separate from
+  the LTDC pixel path) hung the same way OSPI/ADC did; new plain-RAM
+  stub for SPI1. **Boot now runs continuously** past all of Phase 1's
+  gaps — confirmed via a real SDL window showing the LCD console
+  (currently near-black, matching guest framebuffer content being
+  all-zero at this point in `gnw-chainloader`'s boot, before its UI
+  draws anything).
+
 ## Next up
 
-Boot now reaches real LTDC init (`0x50001000`) and stops there — a
-BusFault on an LTDC register read, caught cleanly by the firmware's own
-fault handler. **This is the next task**: LTDC is a real device model
-(timing registers, layer config, CLUT, framebuffer DMA, interrupts),
-not a quick RCC/PWR-style stub — roughly Phase 2/3 territory pulled
-forward, since the user wants video working next rather than continuing
-the whack-a-mole peripheral-gap approach indefinitely. Phase 2's DMA2D
-device model (see `docs/roadmap.md`) is closely related and should
-probably be tackled around the same time, since retro-go/chainloader
-firmware uses both together for rendering.
+Continue the whack-a-mole: run `gnw_chainloader.bin` further and fix
+whatever the next BusFault/hang is (same methodology as above — attach
+gdb, read PC, `addr2line`, find the register in the SVD/CMSIS headers).
+Phase 2's DMA2D device model (see `docs/roadmap.md`) is the next
+big-ticket item once LTDC's neighbors stop faulting, since retro-go/
+chainloader firmware uses DMA2D + LTDC together for real rendering (our
+LTDC stub can already display *something*, but nothing produces
+interesting pixel content without DMA2D).
 
 extflash (needed for retro-go, not for gnw-chainloader) still isn't
 populated — the user will provide a real image later for that test

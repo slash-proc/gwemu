@@ -96,6 +96,9 @@ config GNW_H7B0_OSPI
 config GNW_H7B0_ADC
     bool
 
+config GNW_H7B0_SPI
+    bool
+
 config STM32F2XX_SYSCFG
     bool
 

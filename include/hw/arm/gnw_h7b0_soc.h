@@ -34,6 +34,8 @@
 #include "hw/misc/gnw_h7b0_pwr.h"
 #include "hw/misc/gnw_h7b0_ospi.h"
 #include "hw/misc/gnw_h7b0_adc.h"
+#include "hw/display/gnw_h7b0_ltdc.h"
+#include "hw/misc/gnw_h7b0_spi.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_SOC "gnw-h7b0-soc"
@@ -192,14 +194,35 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 #define ADC_BASE_ADDRESS 0x40022000
 
 /*
- * SPI2, per STM32H7B0.svd baseAddress 0x40003800. This is the SD-card
- * mod's SPI path (Tim Scheuerwegen mod, per CLAUDE.md's repo
- * conventions -- SPI2/OSPI2, not the yota9 mod). Modeled as plain RAM
+ * SPI2, per STM32H7B0.svd baseAddress 0x40003800. This is also the
+ * LCD-panel init-command path (separate from the LTDC pixel-data
+ * path; see gnw-chainloader's gw_lcd_spi_tx()) as well as the Tim
+ * Scheuerwegen SD-card mod's SPI path (per CLAUDE.md's repo
+ * conventions -- SPI2/OSPI2, not the yota9 mod). Modeled as a real
+ * minimal device (hw/misc/gnw_h7b0_spi.c): found by a gnw-chainloader
+ * boot hang in gw_lcd_spi_tx() spinning on SR.TXP/SR.EOT, which a
+ * plain-RAM stub never sets. No real byte transfer happens yet (no
+ * LCD-panel or SD-card model attached).
+ */
+#define SPI2_BASE_ADDRESS 0x40003800
+
+/*
+ * SPI1, per STM32H7B0.svd baseAddress 0x40013000. Modeled as plain RAM
  * for now -- same rationale as the other not-yet-modeled peripherals
  * above.
  */
-#define SPI2_BASE_ADDRESS 0x40003800
-#define SPI2_SIZE          0x400
+#define SPI1_BASE_ADDRESS 0x40013000
+#define SPI1_SIZE          0x400
+
+/*
+ * LTDC (LCD-TFT Display Controller), per STM32H7B0.svd baseAddress
+ * 0x50001000. Modeled as a real minimal device
+ * (hw/display/gnw_h7b0_ltdc.c): Layer1-only, RGB565-only, no
+ * timing/IRQ modeling. Found by a gnw-chainloader boot reaching real
+ * LTDC init after all other Phase 1 boot-path gaps were closed -- see
+ * STATUS.md and gnw_h7b0_ltdc.h.
+ */
+#define LTDC_BASE_ADDRESS 0x50001000
 
 struct GnwH7B0State {
     SysBusDevice parent_obj;
@@ -210,6 +233,8 @@ struct GnwH7B0State {
     GnwH7B0OspiState octospi1;
     GnwH7B0OspiState octospi2;
     GnwH7B0AdcState adc;
+    GnwH7B0LtdcState ltdc;
+    GnwH7B0SpiState spi2;
 
     MemoryRegion itcm;
     MemoryRegion dtcm;
@@ -229,7 +254,7 @@ struct GnwH7B0State {
     MemoryRegion gpio;
     MemoryRegion crs;
     MemoryRegion octospim;
-    MemoryRegion spi2;
+    MemoryRegion spi1;
 
     Clock *sysclk;
 };

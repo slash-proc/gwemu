@@ -2,6 +2,16 @@
 
 ## 2026-07-10
 
+- Added a real LTDC device (`hw/display/gnw_h7b0_ltdc.c`): Layer1/
+  RGB565-only, reads the guest framebuffer each frame and blits it
+  (2x nearest-neighbor upscaled) into a real QEMU display window.
+  Fixed a row-pitch bug along the way (`LxCFBLR`'s `CFBLL` field isn't
+  the real stride, `CFBP` is). Also upgraded SPI2 from a plain-RAM stub
+  to a real device (`hw/misc/gnw_h7b0_spi.c`) after the LCD-panel
+  init-command path hung the same way OSPI/ADC previously did.
+  `gnw-chainloader` now boots and runs continuously with a real window
+  showing the LCD console output.
+
 - Booted a real `gnw-chainloader` firmware image end-to-end for the
   first time and fixed the resulting chain of boot-path gaps: RCC's
   `CSR`/`BDCR` LSI/LSE ready-bit mirroring; new real devices for PWR
