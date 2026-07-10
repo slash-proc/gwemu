@@ -87,6 +87,15 @@ config STM32_RCC
 config GNW_H7B0_RCC
     bool
 
+config GNW_H7B0_PWR
+    bool
+
+config GNW_H7B0_OSPI
+    bool
+
+config GNW_H7B0_ADC
+    bool
+
 config STM32F2XX_SYSCFG
     bool
 

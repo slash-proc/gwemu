@@ -77,15 +77,69 @@ RCC stub, and boot path are all done and committed.
     "incomplete type" compile errors that looked unrelated to the actual
     typo.
 
+- [x] Real firmware boot exercised end-to-end for the first time, using
+  a real `gnw-chainloader` build (`gnw_chainloader.bin`, not tracked in
+  this repo — see `../gnw-chainloader`) since it doesn't require an
+  extflash image to reach real init code, unlike retro-go. Found and
+  fixed a chain of boot-path gaps by iterating "run under gdb, find the
+  BusFault/hang, fix it, repeat" (methodology: same as roadmap Phase 4's
+  intended approach, just pulled earlier because it was the fastest way
+  to validate Phase 1's boot path against real firmware). In order
+  found:
+  - RCC extended: `RCC_CSR`'s LSION→LSIRDY and `RCC_BDCR`'s
+    LSEON→LSERDY mirroring (same instant-approximation pattern as
+    `RCC_CR`) — without these, `SystemClock_Config`'s LSI/LSE enable
+    spins forever (LSERDY has no timeout in this firmware's clock init,
+    a genuine infinite loop, not just a slow poll).
+  - New real device `hw/misc/gnw_h7b0_pwr.c` (PWR, `0x58024800`):
+    mirrors `PWR_CR3`/`PWR_SRDCR` writes into `PWR_CSR1.ACTVOSRDY` /
+    `PWR_SRDCR.VOSRDY` instantly. Without this, `SystemClock_Config`'s
+    supply-configuration step hangs forever polling a hardware-set-only
+    status bit a plain RAM stub can never set.
+  - New real device `hw/misc/gnw_h7b0_ospi.c` (OCTOSPI1/2,
+    `0x52005000`/`0x5200A000`): mirrors CCR/IR writes into `SR.TCF`
+    instantly (no real command/address/data-phase transfer yet — no
+    bytes actually move). Without this, ST HAL's `HAL_OSPI_Command()`
+    times out waiting for `SR.TCF` and returns an error, which real
+    firmware treats as fatal (its own "spin forever" trap in
+    `OSPI_WriteBytes`, not a QEMU crash).
+  - New real device `hw/misc/gnw_h7b0_adc.c` (ADC1/ADC2, `0x40022000`,
+    covers both instances + `ADC12_COMMON` in one 0x400 window):
+    mirrors `CR.ADEN`→`ISR.ADRDY` per-instance. Without this,
+    `board_adc_init()` hangs forever polling ADRDY. Reads always return
+    0 — no real conversion semantics.
+  - Plain-RAM placeholders added for peripherals that are read/written
+    during boot but don't have hardware-set status bits blocking
+    progress (so a dumb RAM shadow is enough): DBGMCU (`0x5C001000`),
+    flash controller regs / `FLASH_ACR` (`0x52002000`, distinct from
+    the memory-mapped flash content), FMC (`0x52004000`), GPIOA-K
+    (`0x58020000`-`0x58022FFF`, no button/LCD-line semantics yet), CRS
+    (`0x40008400`), the OCTOSPI IO manager (`0x5200B400`), and SPI2
+    (`0x40003800`, the Tim Scheuerwegen SD-card mod's SPI path).
+  - Confirmed real hardware fault-recovery behavior along the way:
+    `gnw-chainloader` installs real `HardFault`/`BusFault`/etc handlers
+    (`src/chainloader/system/crash_log.c`) that record fault context to
+    a fixed SRAM address and then halt — so a BusFault from a still-gap
+    peripheral is a clean, deliberate stop (PC parked in
+    `crash_log_capture`), not a QEMU crash. This made gap-finding fast:
+    attach gdb, read PC, `addr2line`, done.
+
 ## Next up
 
-Phase 1 is functionally complete (memory map, RCC stub, boot path all
-done). Phase 2 (DMA2D device model, see `docs/roadmap.md`) hasn't been
-started. Before that: real (non-toy) retro-go firmware boot hasn't been
-attempted end-to-end yet against the new flash boot path — worth trying
-against a real `_intflash.bin` build to see what it faults on next
-(expected: RCC register reads/writes past this stub's current coverage,
-or GPIO/other peripherals not modeled yet).
+Boot now reaches real LTDC init (`0x50001000`) and stops there — a
+BusFault on an LTDC register read, caught cleanly by the firmware's own
+fault handler. **This is the next task**: LTDC is a real device model
+(timing registers, layer config, CLUT, framebuffer DMA, interrupts),
+not a quick RCC/PWR-style stub — roughly Phase 2/3 territory pulled
+forward, since the user wants video working next rather than continuing
+the whack-a-mole peripheral-gap approach indefinitely. Phase 2's DMA2D
+device model (see `docs/roadmap.md`) is closely related and should
+probably be tackled around the same time, since retro-go/chainloader
+firmware uses both together for rendering.
+
+extflash (needed for retro-go, not for gnw-chainloader) still isn't
+populated — the user will provide a real image later for that test
+path specifically.
 
 ## Known constraints
 

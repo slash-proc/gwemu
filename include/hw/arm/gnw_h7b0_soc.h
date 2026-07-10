@@ -31,6 +31,9 @@
 
 #include "hw/arm/armv7m.h"
 #include "hw/misc/gnw_h7b0_rcc.h"
+#include "hw/misc/gnw_h7b0_pwr.h"
+#include "hw/misc/gnw_h7b0_ospi.h"
+#include "hw/misc/gnw_h7b0_adc.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_SOC "gnw-h7b0-soc"
@@ -99,11 +102,114 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  */
 #define RCC_BASE_ADDRESS 0x58024400
 
+/*
+ * DBGMCU (CoreSight debug unit), per RM0455 Table 7's register boundary
+ * list. Modeled as plain RAM for now -- see the comment above its
+ * INIT_RAM_REGION call in gnw_h7b0_soc.c realize().
+ */
+#define DBGMCU_BASE_ADDRESS 0x5C001000
+#define DBGMCU_SIZE          0x400
+
+/*
+ * Flash controller registers (FLASH_ACR etc. -- NOT the memory-mapped
+ * flash content itself, that's FLASH_BANK1/2_BASE_ADDRESS above), per
+ * RM0455/CMSIS FLASH_R_BASE = AHB3PERIPH_BASE + 0x2000. Modeled as plain
+ * RAM for now -- see the DBGMCU comment in gnw_h7b0_soc.c realize() for
+ * the same rationale (real firmware polls FLASH_ACR wait-state-ready
+ * bits during clock init; without backing memory here that BusFaults).
+ */
+#define FLASH_R_BASE_ADDRESS 0x52002000
+#define FLASH_R_SIZE          0x1000
+
+/*
+ * FMC (Flexible Memory Controller -- external SRAM/NAND/PSRAM/SDRAM
+ * interface), per RM0455/CMSIS FMC_R_BASE = AHB3PERIPH_BASE + 0x4000.
+ * Modeled as plain RAM for now -- same rationale as FLASH_R/DBGMCU
+ * above.
+ */
+#define FMC_BASE_ADDRESS 0x52004000
+#define FMC_SIZE          0x1000
+
+/*
+ * PWR (power control), per RM0455/SVD baseAddress 0x58024800, right
+ * after RCC. Modeled as a real minimal device (hw/misc/gnw_h7b0_pwr.c),
+ * RCC-style: found by a gnw-chainloader boot hang in SystemClock_Config
+ * spinning on PWR_CSR1's ACTVOSRDY bit, which a plain-RAM stub never
+ * sets (it's a hardware-set-only status bit, not something firmware
+ * writes). See gnw_h7b0_pwr.h.
+ */
+#define PWR_BASE_ADDRESS 0x58024800
+
+/*
+ * GPIOA-K, per STM32H7B0.svd (contiguous 0x400-per-port blocks,
+ * 0x58020000-0x58022FFF). Modeled as plain RAM for now -- real GPIO
+ * (buttons, LCD control lines) is Phase 4 territory (see
+ * docs/roadmap.md); this is only enough to let pin-init code that
+ * reads/writes MODER/OTYPER/etc. during early boot avoid BusFaulting.
+ * No button input or LCD control-line side effects yet -- do not treat
+ * this as a real GPIO model.
+ */
+#define GPIO_BASE_ADDRESS 0x58020000
+#define GPIO_SIZE         (11 * 0x400)
+
+/*
+ * CRS (Clock Recovery System, HSI48 auto-trim -- used by USB), per
+ * STM32H7B0.svd baseAddress 0x40008400. Modeled as plain RAM for now --
+ * same rationale as the other not-yet-modeled peripherals above.
+ */
+#define CRS_BASE_ADDRESS 0x40008400
+#define CRS_SIZE          0x400
+
+/*
+ * OCTOSPI1/2 controller registers (distinct from the memory-mapped XIP
+ * window at EXTFLASH_BASE_ADDRESS above), per STM32H7B0.svd. Modeled as
+ * a real minimal device (hw/misc/gnw_h7b0_ospi.c), RCC/PWR-style: found
+ * by a gnw-chainloader boot hitting its own "spin forever on HAL error"
+ * trap in OSPI_WriteBytes, because HAL_OSPI_Command()'s post-config
+ * poll of SR's TCF bit never completed against a plain-RAM stub. See
+ * gnw_h7b0_ospi.h -- still no real command/address/data-phase transfer
+ * semantics (no bytes actually move), just enough for HAL to see
+ * "command accepted, transfer complete" and not error out.
+ */
+#define OCTOSPI1_BASE_ADDRESS 0x52005000
+#define OCTOSPI2_BASE_ADDRESS 0x5200A000
+/*
+ * OCTOSPI IO manager -- plain RAM for now (pin-mux config only, no
+ * transfer semantics needed there).
+ */
+#define OCTOSPIM_BASE_ADDRESS 0x5200B400
+#define OCTOSPIM_SIZE          0x400
+
+/*
+ * ADC1/ADC2 (+ common registers), per STM32H7B0.svd (0x40022000/
+ * 0x40022100, 0x100 each, plus shared ADC_COMMON registers at +0x300).
+ * Modeled as a real minimal device (hw/misc/gnw_h7b0_adc.c), RCC/PWR-
+ * style: found by a gnw-chainloader boot hang in board_adc_init()
+ * spinning on ADC1's ISR.ADRDY bit after setting CR.ADEN, which a
+ * plain-RAM stub never sets. See gnw_h7b0_adc.h -- still no real
+ * conversion semantics (reads always return 0).
+ */
+#define ADC_BASE_ADDRESS 0x40022000
+
+/*
+ * SPI2, per STM32H7B0.svd baseAddress 0x40003800. This is the SD-card
+ * mod's SPI path (Tim Scheuerwegen mod, per CLAUDE.md's repo
+ * conventions -- SPI2/OSPI2, not the yota9 mod). Modeled as plain RAM
+ * for now -- same rationale as the other not-yet-modeled peripherals
+ * above.
+ */
+#define SPI2_BASE_ADDRESS 0x40003800
+#define SPI2_SIZE          0x400
+
 struct GnwH7B0State {
     SysBusDevice parent_obj;
 
     ARMv7MState armv7m;
     GnwH7B0RccState rcc;
+    GnwH7B0PwrState pwr;
+    GnwH7B0OspiState octospi1;
+    GnwH7B0OspiState octospi2;
+    GnwH7B0AdcState adc;
 
     MemoryRegion itcm;
     MemoryRegion dtcm;
@@ -117,6 +223,13 @@ struct GnwH7B0State {
     MemoryRegion flash_bank1;
     MemoryRegion flash_bank2;
     MemoryRegion extflash;
+    MemoryRegion dbgmcu;
+    MemoryRegion flash_r;
+    MemoryRegion fmc;
+    MemoryRegion gpio;
+    MemoryRegion crs;
+    MemoryRegion octospim;
+    MemoryRegion spi2;
 
     Clock *sysclk;
 };

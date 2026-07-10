@@ -22,3 +22,7 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# gnw: scratch firmware images for boot testing, not part of the repo
+/retro-go-temp/
+/gnw_chainloader.bin

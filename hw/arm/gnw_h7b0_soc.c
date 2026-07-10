@@ -36,6 +36,10 @@ static void gnw_h7b0_soc_initfn(Object *obj)
 
     object_initialize_child(obj, "armv7m", &s->armv7m, TYPE_ARMV7M);
     object_initialize_child(obj, "rcc", &s->rcc, TYPE_GNW_H7B0_RCC);
+    object_initialize_child(obj, "pwr", &s->pwr, TYPE_GNW_H7B0_PWR);
+    object_initialize_child(obj, "octospi1", &s->octospi1, TYPE_GNW_H7B0_OSPI);
+    object_initialize_child(obj, "octospi2", &s->octospi2, TYPE_GNW_H7B0_OSPI);
+    object_initialize_child(obj, "adc", &s->adc, TYPE_GNW_H7B0_ADC);
 
     s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
 }
@@ -84,7 +88,41 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
                      FLASH_BANK2_BASE_ADDRESS, FLASH_BANK_SIZE);
     INIT_RAM_REGION(extflash, "GNW_H7B0.extflash", EXTFLASH_BASE_ADDRESS,
                      EXTFLASH_SIZE);
-
+    /*
+     * DBGMCU (CoreSight debug unit): not modeled as a real device, same
+     * "plain RAM placeholder" treatment as extflash above. Real firmware
+     * (ST HAL's DBGMCU_CR sleep/stop/standby-debug-enable helpers) reads
+     * and read-modifies-writes this during early boot; without *some*
+     * backing memory here those accesses BusFault, and this SoC's fault
+     * handlers don't recover from that gracefully. A RAM stub is enough
+     * to let boot past that point -- real semantics (e.g. IDC's fixed
+     * chip-ID reset value) are future work if something depends on them.
+     */
+    INIT_RAM_REGION(dbgmcu, "GNW_H7B0.dbgmcu", DBGMCU_BASE_ADDRESS,
+                     DBGMCU_SIZE);
+    /*
+     * Flash controller registers (FLASH_ACR etc, distinct from the
+     * memory-mapped flash content above) -- same plain-RAM-placeholder
+     * rationale as DBGMCU just above: real firmware polls FLASH_ACR
+     * wait-state-ready bits during clock init and BusFaults without
+     * backing memory here.
+     */
+    INIT_RAM_REGION(flash_r, "GNW_H7B0.flash_r", FLASH_R_BASE_ADDRESS,
+                     FLASH_R_SIZE);
+    /* FMC (external memory controller) -- same plain-RAM rationale. */
+    INIT_RAM_REGION(fmc, "GNW_H7B0.fmc", FMC_BASE_ADDRESS, FMC_SIZE);
+    /*
+     * GPIOA-K -- plain RAM placeholder, not a real GPIO model yet
+     * (Phase 4). See the GPIO_SIZE comment in gnw_h7b0_soc.h.
+     */
+    INIT_RAM_REGION(gpio, "GNW_H7B0.gpio", GPIO_BASE_ADDRESS, GPIO_SIZE);
+    /* CRS (HSI48 clock recovery/auto-trim) -- plain RAM placeholder. */
+    INIT_RAM_REGION(crs, "GNW_H7B0.crs", CRS_BASE_ADDRESS, CRS_SIZE);
+    /* OCTOSPI IO manager -- plain RAM placeholder (pin-mux only). */
+    INIT_RAM_REGION(octospim, "GNW_H7B0.octospim", OCTOSPIM_BASE_ADDRESS,
+                     OCTOSPIM_SIZE);
+    /* SPI2 (SD-card mod path) -- plain RAM placeholder. */
+    INIT_RAM_REGION(spi2, "GNW_H7B0.spi2", SPI2_BASE_ADDRESS, SPI2_SIZE);
 #undef INIT_RAM_REGION
 
     armv7m = DEVICE(&s->armv7m);
@@ -120,6 +158,26 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->rcc), 0, RCC_BASE_ADDRESS);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->pwr), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->pwr), 0, PWR_BASE_ADDRESS);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->octospi1), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->octospi1), 0, OCTOSPI1_BASE_ADDRESS);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->octospi2), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->octospi2), 0, OCTOSPI2_BASE_ADDRESS);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->adc), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->adc), 0, ADC_BASE_ADDRESS);
 
     /*
      * Remaining peripherals (DMA2D, GPIO, USART, real flash/QSPI boot)

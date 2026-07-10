@@ -105,6 +105,29 @@ static void gnw_h7b0_rcc_write(void *opaque, hwaddr addr,
                  << RCC_CFGR_SWS_SHIFT);
         s->regs[addr >> 2] = value;
         return;
+    case GNW_H7B0_RCC_CSR:
+        /* Mirror LSION into LSIRDY, same instant-approximation as CR. */
+        if (value & RCC_CSR_LSION) {
+            value |= RCC_CSR_LSIRDY;
+        } else {
+            value &= ~RCC_CSR_LSIRDY;
+        }
+        s->regs[addr >> 2] = value;
+        return;
+    case GNW_H7B0_RCC_BDCR:
+        /*
+         * Mirror LSEON into LSERDY. Real G&W hardware may not even
+         * populate an LSE crystal, but firmware here spins
+         * unconditionally (no timeout) on LSERDY regardless, so this
+         * must always come ready to avoid a permanent hang.
+         */
+        if (value & RCC_BDCR_LSEON) {
+            value |= RCC_BDCR_LSERDY;
+        } else {
+            value &= ~RCC_BDCR_LSERDY;
+        }
+        s->regs[addr >> 2] = value;
+        return;
     default:
         qemu_log_mask(LOG_UNIMP,
                       "%s: offset 0x%"HWADDR_PRIx" is a plain read/write "

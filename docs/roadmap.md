@@ -63,9 +63,19 @@ GPU behavior instead of a slow stand-in.
 - **Done**: minimal RCC stub — enough register read/write behavior that
   real firmware's clock-init code doesn't hang polling a permanently-zero
   status bit. Not cycle-accurate at this stage.
-- Goal (not yet attempted): a real STM32H7B0-target firmware image begins
-  executing from flash and gets through early clock/memory init without
-  faulting.
+- **Done**: goal achieved and then some. A real `gnw-chainloader` firmware
+  image boots from flash, gets through clock/memory/power init, and
+  reaches real LTDC init before stopping on a (currently) unbacked LTDC
+  register access. See `STATUS.md` for the full list of gaps found and
+  fixed along the way (RCC LSI/LSE ready bits; new PWR, OCTOSPI1/2, ADC
+  devices; several plain-RAM peripheral placeholders).
+
+**Note**: LTDC (and likely DMA2D alongside it, since retro-go/
+chainloader firmware uses both together) got pulled forward from
+Phase 2/3 below sooner than planned, because that's where real boot
+now stops and it's the user's current priority over continuing
+Phase 4's peripheral-gap whack-a-mole. Treat the phase numbers below as
+soft ordering, not a strict gate.
 
 ### Phase 2 — DMA2D device model
 - New device `hw/display/gnw-dma2d.c`: `MemoryRegionOps` for the register

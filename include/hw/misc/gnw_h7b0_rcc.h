@@ -3,9 +3,11 @@
  *
  * Not cycle-accurate, not a full RCC model. Purpose: real firmware's
  * clock-init code writes an *ON bit then polls the matching *RDY bit in
- * RCC_CR (and SW then polls SWS in RCC_CFGR) and must not hang forever
- * doing so -- see docs/roadmap.md Phase 1. Every other register is a
- * plain read-what-was-written shadow with no side effects.
+ * RCC_CR (and SW then polls SWS in RCC_CFGR, LSION then polls LSIRDY
+ * in RCC_CSR, and LSEON then polls LSERDY in RCC_BDCR) and must not
+ * hang forever doing so -- see
+ * docs/roadmap.md Phase 1. Every other register is a plain
+ * read-what-was-written shadow with no side effects.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -61,6 +63,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
 #define RCC_CFGR_SW_MASK    (0x7U << RCC_CFGR_SW_SHIFT)
 #define RCC_CFGR_SWS_SHIFT  3
 #define RCC_CFGR_SWS_MASK   (0x7U << RCC_CFGR_SWS_SHIFT)
+
+#define GNW_H7B0_RCC_CSR    0x74
+#define RCC_CSR_LSION       (1U << 0)
+#define RCC_CSR_LSIRDY      (1U << 1)
+
+#define GNW_H7B0_RCC_BDCR   0x70
+#define RCC_BDCR_LSEON      (1U << 0)
+#define RCC_BDCR_LSERDY     (1U << 1)
 
 struct GnwH7B0RccState {
     SysBusDevice parent_obj;

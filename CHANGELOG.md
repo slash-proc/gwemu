@@ -2,6 +2,18 @@
 
 ## 2026-07-10
 
+- Booted a real `gnw-chainloader` firmware image end-to-end for the
+  first time and fixed the resulting chain of boot-path gaps: RCC's
+  `CSR`/`BDCR` LSI/LSE ready-bit mirroring; new real devices for PWR
+  (`hw/misc/gnw_h7b0_pwr.c`), OCTOSPI1/2 (`gnw_h7b0_ospi.c`), and
+  ADC1/2 (`gnw_h7b0_adc.c`), each mirroring a hardware-set status bit
+  real firmware polls after enabling the peripheral; plain-RAM
+  placeholders for DBGMCU, the flash controller register block, FMC,
+  GPIOA-K, CRS, the OCTOSPI IO manager, and SPI2. Boot now reaches real
+  LTDC init and stops cleanly there (BusFault caught by the firmware's
+  own crash handler) — see STATUS.md for the full gap-by-gap
+  breakdown and what's next (LTDC device model).
+
 - Phase 1 boot path resolved: the kernel now loads at flash bank 1
   (`0x08000000`) instead of ITCM, with the ARMv7M CPU's `init-nsvtor`
   property pointed there so reset reads the initial SP/PC from flash's

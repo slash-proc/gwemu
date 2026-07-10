@@ -411,6 +411,9 @@ config GNW_H7B0_SOC
     bool
     select ARM_V7M
     select GNW_H7B0_RCC
+    select GNW_H7B0_PWR
+    select GNW_H7B0_OSPI
+    select GNW_H7B0_ADC
 
 config B_L475E_IOT01A
     bool
