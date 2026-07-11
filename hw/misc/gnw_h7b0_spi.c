@@ -31,7 +31,7 @@
 #include "hw/misc/gnw_h7b0_regs_spi.h"
 #include "hw/misc/gnw_h7b0_stub_log.h"
 #include "hw/sd/sd.h"
-#include "sysemu/blockdev.h"
+#include "system/blockdev.h"
 
 /*
  * TXDR completion used to be deferred by a small QEMUTimer-paced delay
