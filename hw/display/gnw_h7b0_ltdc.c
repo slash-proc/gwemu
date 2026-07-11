@@ -162,11 +162,11 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
      * framebuffer-swap strategy during scrolling, not a generic capture-
      * timing change here.
      */
-    int rows = gnw_h7b0_ltdc_capture_setup(s);
-    if (rows > 0) {
-        gnw_h7b0_ltdc_capture_rows(s, 0, rows);
-        s->content_dirty = true;
-    }
+    /* We DO NOT capture here anymore.
+     * Capturing here while the CPU is still drawing (because emulated CPU is slower
+     * than 60Hz) captures partially drawn frames.
+     * We only capture on VBR write.
+     */
 
     /*
      * RRIF only belongs here when a VBR reload actually applies this
@@ -693,6 +693,17 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
         }
         if (value & LTDC_SRCR_VBR) {
             s->vbr_reload_pending = true;
+            
+            /* The guest has finished drawing the frame and requested a swap. 
+             * Capture it NOW to avoid capturing it mid-draw during the next frame. 
+             * Only capture if the UI thread has finished blitting the previous capture. */
+            if (!s->content_dirty) {
+                int rows = gnw_h7b0_ltdc_capture_setup(s);
+                if (rows > 0) {
+                    gnw_h7b0_ltdc_capture_rows(s, 0, rows);
+                    s->content_dirty = true;
+                }
+            }
         }
         s->regs[addr >> 2] = value & ~LTDC_SRCR_IMR;
         return;

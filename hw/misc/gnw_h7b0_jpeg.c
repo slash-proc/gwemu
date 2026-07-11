@@ -166,7 +166,30 @@ static uint64_t gnw_h7b0_jpeg_read(void *opaque, hwaddr addr, unsigned int size)
         if (s->dor_cursor < total) {
             s->dor_cursor += 4;
         }
-        if (s->dor_cursor >= total) {
+        /*
+         * Real hardware's output FIFO threshold (JPEG_FIFO_TH_SIZE = 8
+         * words = 32 bytes, stm32h7xx_hal_jpeg.c) lets firmware's polling
+         * loop drain 8 words per outer-loop iteration via OFTF instead of
+         * checking flags and reading DOR one word at a time via OFNEF.
+         * The total number of DOR reads is identical either way (real
+         * HAL's JPEG_StoreOutputData() still reads DOR in a plain word-at-
+         * a-time loop internally regardless of threshold) -- but never
+         * setting OFTF here forced every single decode into the ~8x-more-
+         * outer-loop-iterations OFNEF path, each iteration paying its own
+         * separate SR-flag-check MMIO round trip on top of the DOR read
+         * itself. Real cover-art-heavy screens (coverflow/menus) do this
+         * thousands of times per frame, so that per-iteration MMIO/BQL
+         * overhead was a genuine, measurable performance bug (perf showed
+         * >16% total CPU in QEMU's own MMIO dispatch/lock path during a
+         * menu scroll-loop) -- not just a cosmetic fidelity gap.
+         */
+        uint32_t remaining = (s->dor_cursor < total) ? (total - s->dor_cursor) : 0;
+        if (remaining >= 32) {
+            s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_OFTF;
+        } else {
+            s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &= ~JPEG_SR_OFTF;
+        }
+        if (remaining == 0) {
             s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &= ~JPEG_SR_OFNEF;
         }
         return v;
@@ -378,11 +401,22 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
                           JPEG_SR_IFTF | JPEG_SR_IFNFF);
                     /* Real output data is now available in y/cb/cr_plane
                      * (DOR-readable) -- set OFNEF ("output FIFO not empty")
-                     * so a real polling loop (JPEG_Process()) drains DOR.
-                     * The DOR read handler clears OFNEF again once the
-                     * cursor reaches the end of all three planes. */
+                     * so a real polling loop (JPEG_Process()) drains DOR,
+                     * and OFTF too (real hardware's output FIFO threshold)
+                     * whenever at least a full 8-word/32-byte chunk is
+                     * available, so firmware takes the bulk-drain path
+                     * instead of checking flags once per single word --
+                     * see the DOR read handler's comment for why this
+                     * matters for performance, not just fidelity. Both
+                     * flags are kept in sync as the DOR read handler
+                     * drains the cursor. */
                     if (s->y_plane) {
+                        uint32_t total0 = (uint32_t)s->plane_width * (uint32_t)s->plane_height +
+                                          2 * (uint32_t)s->chroma_width * (uint32_t)s->chroma_height;
                         s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_OFNEF;
+                        if (total0 >= 32) {
+                            s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_OFTF;
+                        }
                     }
                 }
             }

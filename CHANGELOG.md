@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-07-11 (part 3 — VBR-gated capture timing, JPEG OFTF perf fix)
+
+- **Gated LTDC framebuffer capture on firmware's `SRCR.VBR` write** instead
+  of an independent fixed vblank timer (`hw/display/gnw_h7b0_ltdc.c`,
+  developed in a separate concurrent session, reviewed and merged here).
+  The old unconditional per-tick capture could sample the framebuffer while
+  the emulated CPU was still mid-draw on a variable-cost frame (e.g. a
+  JPEG-heavy coverflow redraw), a plausible root cause for the "flip back
+  then snap" tearing symptom distinct from anything found earlier this
+  session. Capture is gated on `!s->content_dirty` so an unconsumed capture
+  isn't overwritten before the UI thread picks it up. **Not yet confirmed
+  live whether this resolves the flicker** — known gap: content that never
+  writes `SRCR.VBR` (single-buffered/IMR-only paths) no longer gets
+  captured at all.
+- **Fixed a real JPEG decode performance bug**: the model never set `OFTF`
+  (output FIFO threshold), so firmware's polling loop (`JPEG_Process`) was
+  always forced into the one-word-at-a-time `OFNEF` path instead of the
+  real 8-words-per-check bulk path, multiplying the number of separate
+  SR-flag-check MMIO round trips per decode by ~8x. `perf` showed this as
+  the dominant cost (>16% of total CPU) during a menu scroll-loop
+  workload; setting `OFTF` correctly (mirroring real hardware's FIFO
+  watermark) cut that specific overhead to ~11% with zero change to
+  decoded output (total DOR word-reads are identical either way — real
+  hardware's own `JPEG_StoreOutputData` still reads one word at a time
+  internally regardless of threshold, so this only reduces polling-loop
+  *iteration* overhead, not real data volume). Ruled out GPIO/input
+  reading as a contributor via the same profile — it doesn't appear in the
+  hot path at all.
+
 ## 2026-07-11 (part 2 — real DMA2D/JPEG YCbCr blend pipeline, flicker still open)
 
 Follow-on to the same-day LTDC/JPEG work below. Full writeup:

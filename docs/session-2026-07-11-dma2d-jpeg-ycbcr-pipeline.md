@@ -173,3 +173,39 @@ draw-loop code.
   marker parser now living in this codebase — worth reusing rather than
   re-deriving if any future work needs real per-image sampling-factor
   information again.
+
+## Session end-state (2026-07-11, later same day)
+
+Two more things landed after the pipeline work above:
+
+1. **A likely-real flicker fix from a concurrent session**:
+   `hw/display/gnw_h7b0_ltdc.c`'s vblank capture was changed to fire only
+   on firmware's `SRCR.VBR` write (gated on `!s->content_dirty`) instead of
+   an independent fixed-rate timer. This addresses a timing axis nothing
+   in this doc's investigation touched: the *old* unconditional per-tick
+   capture could sample the framebuffer mid-draw whenever the emulated
+   CPU's render time for a given frame varied (which JPEG/DMA2D-heavy
+   coverflow frames do, relative to fixed-cost gameplay blits) — a
+   plausible root cause for exactly the reported "flip back then snap"
+   symptom. **Not yet confirmed live as of this doc's writing** — see
+   `STATUS.md` for current confirmation status before assuming this is
+   settled. Known gap: content that never writes `SRCR.VBR` no longer gets
+   captured at all (an earlier draft, preserved in `test_patch.diff` in the
+   repo root at the time of writing, kept a fallback path for this case;
+   the version that landed dropped it).
+2. **A real JPEG decode performance bug, unrelated to the flicker
+   investigation**: `perf` during a menu scroll-loop showed >16% of total
+   CPU in QEMU's own MMIO-dispatch/BQL-lock machinery. Root cause: the
+   JPEG model never set `OFTF` (output FIFO threshold), forcing firmware's
+   polling loop into a one-word-at-a-time drain path instead of the real
+   8-words-per-check bulk path — ~8x more separate flag-check MMIO round
+   trips per decode for zero reason (real hardware's own
+   `JPEG_StoreOutputData` still reads DOR one word at a time internally
+   regardless of threshold, so this only affects polling-*loop* overhead,
+   not real data volume). Fixing it cut that overhead to ~11%. GPIO/input
+   reading was checked and ruled out as a contributor via the same
+   profile — it doesn't appear in the hot path.
+
+Next session should start by confirming (1) live, then decide whether to
+keep chasing the flicker or move on, per `STATUS.md`'s "Next objective"
+(stock/official firmware bring-up is the next planned pivot regardless).
