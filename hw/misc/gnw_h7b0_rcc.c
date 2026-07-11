@@ -129,16 +129,17 @@ static void gnw_h7b0_rcc_write(void *opaque, hwaddr addr,
         return;
     case GNW_H7B0_RCC_BDCR:
         /*
-         * Mirror LSEON into LSERDY. Real G&W hardware may not even
-         * populate an LSE crystal, but firmware here spins
-         * unconditionally (no timeout) on LSERDY regardless, so this
-         * must always come ready to avoid a permanent hang.
+         * Real G&W hardware may not even populate an LSE crystal, but
+         * firmware spins on LSERDY regardless (sometimes with a timeout,
+         * sometimes without -- confirmed both in retro-go and in a stock
+         * firmware's HAL_RCCEx_PeriphCLKConfig RTCSEL-select path, which
+         * clears LSEON to 0 via a BDRST pulse while reprogramming RTCSEL
+         * and then waits on LSERDY in that same call), so this must
+         * always come ready to avoid a permanent hang -- unconditionally,
+         * not just mirroring LSEON, since real firmware's own BDRST
+         * pulse legitimately clears LSEON right before this wait.
          */
-        if (value & RCC_BDCR_LSEON) {
-            value |= RCC_BDCR_LSERDY;
-        } else {
-            value &= ~RCC_BDCR_LSERDY;
-        }
+        value |= RCC_BDCR_LSERDY;
         s->regs[addr >> 2] = value;
         return;
     case GNW_H7B0_RCC_RSR:

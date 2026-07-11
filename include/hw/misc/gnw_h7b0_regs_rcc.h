@@ -149,6 +149,10 @@
 #define GNW_H7B0_RCC_CKGAENR_WMASK  0xe003ffff
 
 #define GNW_H7B0_RCC_RSR_OFFSET 0x130
+/* NOTE: this reset value is dead -- gnw_h7b0_rcc_reset() unconditionally
+ * overrides RSR with RCC_RSR_RESET_VALUE (gnw_h7b0_rcc.h) right after the
+ * generic reset loop that uses this constant. See that definition for the
+ * real, authoritative reset value and rationale. */
 #define GNW_H7B0_RCC_RSR_RESET  0x00e80000
 #define GNW_H7B0_RCC_RSR_WMASK  0x00010000
 

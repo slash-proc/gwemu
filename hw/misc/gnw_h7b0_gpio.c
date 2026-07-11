@@ -192,6 +192,39 @@ static void gnw_h7b0_gpio_reset(DeviceState *dev)
         hwaddr idr = port * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET;
         s->regs[idr >> 2] = 0xFFFFU;
     }
+    /*
+     * PC8 (port index 2, bit 8) is polled active-low by stock firmware
+     * during early boot (briefly reconfigured as output, read back, then
+     * restored to input) before its boot state machine will advance past
+     * state 6 -- with every input defaulting high like every other pin
+     * here, that wait never succeeds and boot hangs forever. Not in
+     * retro-go's known board.c pinout, so its real function (hinge/lid
+     * switch, a boot-mode strap, some other sense pin) isn't confirmed --
+     * defaulting it low is a guess to unblock stock-firmware boot, not a
+     * verified real-hardware fact. Revisit if a real pinout turns up.
+     *
+     * PA0 (port index 0, bit 0) and PC13 (port index 2, bit 13) are gated
+     * the same active-low way, by a distinct function further down the
+     * same boot path (FUN_08006224 in a Ghidra decompile of this stock
+     * image) that also requires FUN_0800644c() != 1 and GPIOD bits
+     * 5/9/11/14/15 all high (already true with our all-high IDR default)
+     * before a charger/PMIC-status retry counter is allowed to progress
+     * at all -- without these two also reading low, that counter can
+     * never advance past 0 and the boot's main loop spins forever. Same
+     * caveat as PC8: real identity (charger STAT/nIRQ lines are the
+     * likely guess, given the paired charger-status byte this same path
+     * reads is stuck at an unhandled enum value) isn't confirmed.
+     */
+    s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 8);
+    s->regs[(0 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 0);
+    s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 13);
+    /*
+     * PD0 (port index 3, bit 0): the same retry-counter path only
+     * treats a poll as "real progress" (vs. an immediate reset back to
+     * 0) when GPIOD's raw IDR value is even -- i.e. bit 0 clear. Same
+     * unconfirmed-guess caveat as the pins above.
+     */
+    s->regs[(3 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 0);
 }
 
 static uint64_t gnw_h7b0_gpio_read(void *opaque, hwaddr addr,

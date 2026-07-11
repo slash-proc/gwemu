@@ -99,8 +99,20 @@ static void gnw_h7b0_rtc_reset(DeviceState *dev)
     /* Calendar reads as already-initialized/synchronized from reset,
      * same rationale as RCC_RSR's non-zero reset value: a plain-zero
      * reset reads as "never initialized", which is not what real
-     * firmware expects to see on any boot after the very first. */
-    s->regs[GNW_H7B0_RTC_ICSR >> 2] = RTC_ICSR_RSF | RTC_ICSR_INITS;
+     * firmware expects to see on any boot after the very first.
+     *
+     * WUTWF/ALRBWF/ALRAWF also need to be set here, not just on an
+     * explicit ICSR write (see the ICSR case below): CR is disabled
+     * (WUTE/ALRAE/ALRBE all 0) at reset, and real hardware reports the
+     * corresponding write-allowed flag as 1 whenever the timer/alarm is
+     * disabled. A stock-firmware boot was found hanging in
+     * HAL_RTCEx_DeactivateWakeUpTimer(), which clears CR.WUTE then
+     * polls ICSR.WUTWF directly -- without ever writing ICSR first -- so
+     * leaving these bits zeroed at reset made that wait spin until its
+     * timeout, and the caller retried the whole RTC bring-up forever. */
+    s->regs[GNW_H7B0_RTC_ICSR >> 2] = RTC_ICSR_RSF | RTC_ICSR_INITS
+                                       | RTC_ICSR_WUTWF | RTC_ICSR_ALRBWF
+                                       | RTC_ICSR_ALRAWF;
 
     s->rtc_base_epoch = time(NULL);
     s->rtc_base_vclock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -187,6 +199,21 @@ static void gnw_h7b0_rtc_write(void *opaque, hwaddr addr,
             (sr & RTC_SR_ALRAF & ((value & RTC_CR_ALRAIE) ? ~0u : 0))
           | (sr & RTC_SR_ALRBF & ((value & RTC_CR_ALRBIE) ? ~0u : 0))
           | (sr & RTC_SR_WUTF  & ((value & RTC_CR_WUTIE)  ? ~0u : 0));
+
+        /* Keep ICSR's write-allowed flags in sync with CR here too, not
+         * just on an explicit ICSR write -- HAL_RTCEx_DeactivateWakeUpTimer()
+         * clears WUTE then polls WUTWF straight from CR without an
+         * intervening ICSR write (see reset's comment above). */
+        {
+            uint32_t icsr = s->regs[GNW_H7B0_RTC_ICSR >> 2];
+            icsr = (value & RTC_CR_WUTE) ? (icsr & ~RTC_ICSR_WUTWF)
+                                          : (icsr | RTC_ICSR_WUTWF);
+            icsr = (value & RTC_CR_ALRAE) ? (icsr & ~RTC_ICSR_ALRAWF)
+                                           : (icsr | RTC_ICSR_ALRAWF);
+            icsr = (value & RTC_CR_ALRBE) ? (icsr & ~RTC_ICSR_ALRBWF)
+                                           : (icsr | RTC_ICSR_ALRBWF);
+            s->regs[GNW_H7B0_RTC_ICSR >> 2] = icsr;
+        }
         return;
     }
     case GNW_H7B0_RTC_SCR:

@@ -74,12 +74,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
 #define RCC_BDCR_LSERDY     (1U << 1)
 
 /*
- * RCC_RSR (reset status/cause flags) resets to 0x00680000 here --
- * PINRSTF|BORRSTF|CDRSTF set, PORRSTF deliberately left clear. A real
- * power-on sets all four together (0x00E80000, per STM32H7B0.svd/CMSIS,
- * these are not mutually exclusive causes) and a plain zeroed reset
- * (this device's generic behavior otherwise) reads as "no reset cause
- * at all", which real firmware doesn't expect -- found via a retro-go
+ * RCC_RSR (reset status/cause flags) resets to 0x01680000 here --
+ * SFTRSTF|PINRSTF|BORRSTF|CDRSTF set, PORRSTF deliberately left clear. A real
+ * power-on sets PINRSTF|BORRSTF|CDRSTF|PORRSTF together (0x00E80000, per
+ * STM32H7B0.svd/CMSIS, these are not mutually exclusive causes) and a plain
+ * zeroed reset (this device's generic behavior otherwise) reads as "no reset
+ * cause at all", which real firmware doesn't expect -- found via a retro-go
  * boot's reset-cause check falling through to an "Boot from
  * brownout?" fallback path that isn't meant for a normal boot.
  * PORRSTF specifically must stay clear: gnw-chainloader's stub_main()
@@ -91,9 +91,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
  * every emulated boot into that permanent standby trap. PINRSTF (pin
  * reset) is a more accurate stand-in for "board was just reset/
  * relaunched", which is what every QEMU boot actually is.
+ *
+ * SFTRSTF (software-reset flag, bit 24) added on top of the above: a stock
+ * firmware image was found gating its entire LTDC/graphics init path on
+ * `RCC_RSR & (SFTRSTF|WWDGRSTF)` being nonzero (real disassembly: `tst
+ * RCC_RSR, #0x11000000; beq <skip-ltdc-init>`). Real G&W hardware boots
+ * through a stage-0 bootloader (see ../../../game-and-watch-stage0) that
+ * jumps into application firmware via a software reset; stock firmware
+ * expects to see SFTRSTF set as a signal that stage0 already ran and did
+ * its own init. We load application firmware directly via -kernel, skipping
+ * stage0 entirely, so without SFTRSTF here the image permanently takes the
+ * branch meant to run only after that handoff and never initializes LTDC.
+ * Setting SFTRSTF unconditionally simulates "this looks like a stage0
+ * handoff" without actually chainloading a stage0 image.
  */
 #define GNW_H7B0_RCC_RSR        0x130
-#define RCC_RSR_RESET_VALUE     0x00680000U
+#define RCC_RSR_RESET_VALUE     0x01680000U
 #define RCC_RSR_RMVF            (1U << 16)
 
 /*
