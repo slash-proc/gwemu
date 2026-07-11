@@ -18,16 +18,97 @@
 
 static GnwH7B0JpegState *global_jpeg_state = NULL;
 
-uint8_t *gnw_h7b0_jpeg_get_hack_buffer(int *width, int *height)
+void gnw_h7b0_jpeg_get_last_decoded_size(uint32_t *width, uint32_t *height)
 {
-    if (global_jpeg_state && global_jpeg_state->rgb_buffer) {
-        *width = global_jpeg_state->rgb_width;
-        *height = global_jpeg_state->rgb_height;
-        return global_jpeg_state->rgb_buffer;
+    if (global_jpeg_state && global_jpeg_state->y_plane) {
+        *width = (uint32_t)global_jpeg_state->plane_width;
+        *height = (uint32_t)global_jpeg_state->plane_height;
+        return;
     }
     *width = 0;
     *height = 0;
-    return NULL;
+}
+
+void gnw_h7b0_jpeg_get_last_chroma_size(uint32_t *width, uint32_t *height)
+{
+    if (global_jpeg_state && global_jpeg_state->y_plane) {
+        *width = (uint32_t)global_jpeg_state->chroma_width;
+        *height = (uint32_t)global_jpeg_state->chroma_height;
+        return;
+    }
+    *width = 0;
+    *height = 0;
+}
+
+/* Clamp a fixed-point-converted sample to a valid byte. */
+static inline uint8_t gnw_h7b0_jpeg_clamp_u8(int v)
+{
+    if (v < 0) {
+        return 0;
+    }
+    if (v > 255) {
+        return 255;
+    }
+    return (uint8_t)v;
+}
+
+/*
+ * Hand-parse the SOF0 marker (FF C0) out of the buffered input JPEG bytes
+ * to recover each component's real H/V sampling-factor nibble. stb_image's
+ * public API doesn't expose these, but real hardware's CONFRN1's VSF/HSF
+ * fields need them for register-read fidelity (see plan doc). Returns true
+ * and fills h_out/v_out with component 1's (luma) sampling factors if a
+ * SOF0 marker was found and looked well-formed; false otherwise (caller
+ * should fall back to its previous approximation).
+ */
+static bool gnw_h7b0_jpeg_parse_sof0_luma_sampling(const uint8_t *buf, size_t len,
+                                                    int *h_out, int *v_out)
+{
+    size_t i = 0;
+
+    while (i + 4 <= len) {
+        if (buf[i] != 0xFF) {
+            i++;
+            continue;
+        }
+        uint8_t marker = buf[i + 1];
+        /* Skip fill bytes / standalone markers with no length field. */
+        if (marker == 0xFF) {
+            i++;
+            continue;
+        }
+        if (marker == 0xD8 || marker == 0xD9 ||
+            (marker >= 0xD0 && marker <= 0xD7) || marker == 0x01) {
+            i += 2;
+            continue;
+        }
+        if (i + 4 > len) {
+            break;
+        }
+        uint32_t seg_len = ((uint32_t)buf[i + 2] << 8) | buf[i + 3];
+        if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2) {
+            /* SOF0/1/2: marker(2)+len(2)+precision(1)+height(2)+width(2)+
+             * num_components(1)+per-component(id,samp,qt)*3. */
+            size_t sof_off = i + 4;
+            if (sof_off + 6 > len) {
+                return false;
+            }
+            uint8_t num_comp = buf[sof_off + 5];
+            size_t comp0_off = sof_off + 6;
+            if (num_comp < 1 || comp0_off + 3 > len) {
+                return false;
+            }
+            uint8_t samp = buf[comp0_off + 1];
+            *h_out = (samp >> 4) & 0xF;
+            *v_out = samp & 0xF;
+            return true;
+        }
+        if (seg_len < 2 || i + 2 + seg_len > len) {
+            break;
+        }
+        i += 2 + seg_len;
+    }
+    return false;
 }
 
 static void gnw_h7b0_jpeg_reset(DeviceState *dev)
@@ -39,6 +120,13 @@ static void gnw_h7b0_jpeg_reset(DeviceState *dev)
     if (s->inbuf) {
         g_byte_array_set_size(s->inbuf, 0);
     }
+    g_free(s->y_plane);
+    g_free(s->cb_plane);
+    g_free(s->cr_plane);
+    s->y_plane = s->cb_plane = s->cr_plane = NULL;
+    s->plane_width = s->plane_height = 0;
+    s->chroma_width = s->chroma_height = 0;
+    s->dor_cursor = 0;
 }
 
 static uint64_t gnw_h7b0_jpeg_read(void *opaque, hwaddr addr, unsigned int size)
@@ -47,6 +135,41 @@ static uint64_t gnw_h7b0_jpeg_read(void *opaque, hwaddr addr, unsigned int size)
     if (addr >= GNW_H7B0_JPEG_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%"HWADDR_PRIx"\n", __func__, addr);
         return 0;
+    }
+    if (addr == GNW_H7B0_JPEG_DOR_OFFSET) {
+        /* Real DOR: pop the next 4 bytes from a flat cursor over
+         * y_plane||cb_plane||cr_plane, little-endian-packed like the
+         * existing DIR write path. Entirely synchronous, no timers --
+         * mirrors the DIR register's own instant-completion style. */
+        uint32_t y_size = (uint32_t)s->plane_width * (uint32_t)s->plane_height;
+        uint32_t c_size = (uint32_t)s->chroma_width * (uint32_t)s->chroma_height;
+        uint32_t total = y_size + 2 * c_size;
+        uint32_t v = 0;
+
+        if (total == 0 || !s->y_plane) {
+            return 0;
+        }
+        for (int i = 0; i < 4; i++) {
+            uint32_t pos = s->dor_cursor + i;
+            uint8_t byte = 0;
+            if (pos < total) {
+                if (pos < y_size) {
+                    byte = s->y_plane[pos];
+                } else if (pos < y_size + c_size) {
+                    byte = s->cb_plane[pos - y_size];
+                } else {
+                    byte = s->cr_plane[pos - y_size - c_size];
+                }
+            }
+            v |= ((uint32_t)byte) << (8 * i);
+        }
+        if (s->dor_cursor < total) {
+            s->dor_cursor += 4;
+        }
+        if (s->dor_cursor >= total) {
+            s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &= ~JPEG_SR_OFNEF;
+        }
+        return v;
     }
     return s->regs[addr >> 2];
 }
@@ -105,6 +228,13 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
         }
         s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &= ~JPEG_SR_EOCF;
         s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= (JPEG_SR_IFTF | JPEG_SR_IFNFF);
+    } else if (addr == GNW_H7B0_JPEG_CR_OFFSET) {
+        /* IFF/OFF (input/output FIFO flush) are real pulse bits -- the SVD
+         * documents them as "always read as 0". Mirror the self-clearing
+         * pattern used elsewhere in this codebase (e.g. gnw_h7b0_crc.c's
+         * RESET bit) by immediately clearing them back out of the shadow
+         * register right after the generic masked write above latches them. */
+        s->regs[GNW_H7B0_JPEG_CR_OFFSET >> 2] &= ~(uint32_t)JPEG_CR_FLUSH_PULSE_MASK;
     } else if (addr == GNW_H7B0_JPEG_CFR_OFFSET) {
         /* CFR is a real write-1-to-clear pulse register (its bit positions
          * mirror SR's exactly): clear the matching SR bits, then reset CFR
@@ -121,11 +251,44 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
                 int w, h, comp;
                 if (stbi_info_from_memory(s->inbuf->data, s->inbuf->len, &w, &h, &comp)) {
                     s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= (1U << 6); /* HPDF */
+
+                    /* NF = number of color components - 1 (CONFR1 field
+                     * semantics per the SVD), derived from the real decoded
+                     * component count instead of a hardcoded "always 3
+                     * components" placeholder. JPEG components are 1
+                     * (grayscale) or 3 (YCbCr) in the overwhelming common
+                     * case; clamp defensively for the rare/invalid case. */
+                    uint32_t nf = (comp >= 1 && comp <= 4) ? (uint32_t)(comp - 1) : 2;
                     uint32_t c1 = s->regs[GNW_H7B0_JPEG_CONFR1_OFFSET >> 2];
-                    s->regs[GNW_H7B0_JPEG_CONFR1_OFFSET >> 2] = (c1 & ~0xFFFF0003U) | (h << 16) | 2;
+                    s->regs[GNW_H7B0_JPEG_CONFR1_OFFSET >> 2] =
+                        (c1 & ~(JPEG_CONFR1_YSIZE_MASK | JPEG_CONFR1_NF_MASK)) |
+                        ((uint32_t)h << JPEG_CONFR1_YSIZE_SHIFT) | nf;
+
                     uint32_t c3 = s->regs[GNW_H7B0_JPEG_CONFR3_OFFSET >> 2];
-                    s->regs[GNW_H7B0_JPEG_CONFR3_OFFSET >> 2] = (c3 & ~0xFFFF0000U) | (w << 16);
-                    s->regs[GNW_H7B0_JPEG_CONFRN1_OFFSET >> 2] = (3 << 4);
+                    s->regs[GNW_H7B0_JPEG_CONFR3_OFFSET >> 2] =
+                        (c3 & ~JPEG_CONFR3_XSIZE_MASK) | ((uint32_t)w << JPEG_CONFR3_XSIZE_SHIFT);
+
+                    /* CONFRN1 (component 1 / luma) NB/HSF/VSF fields: real
+                     * per-image sampling factors, hand-parsed from the SOF0
+                     * marker (stbi_info_from_memory() doesn't expose these).
+                     * NB (data units - 1 per MCU) = H*V - 1 for luma. Falls
+                     * back to the previous approximation (comp==1: no
+                     * subsampling; comp==3: assume common 4:2:0 => NB=3) if
+                     * SOF0 parsing fails for any reason. */
+                    int sof_h = 0, sof_v = 0;
+                    uint32_t confrn1;
+                    if (gnw_h7b0_jpeg_parse_sof0_luma_sampling(s->inbuf->data,
+                                                                s->inbuf->len,
+                                                                &sof_h, &sof_v) &&
+                        sof_h >= 1 && sof_h <= 4 && sof_v >= 1 && sof_v <= 4) {
+                        uint32_t nb = (uint32_t)(sof_h * sof_v - 1);
+                        confrn1 = (nb << JPEG_CONFRN_NB_SHIFT) |
+                                  ((uint32_t)sof_v << JPEG_CONFRN_VSF_SHIFT) |
+                                  ((uint32_t)sof_h << JPEG_CONFRN_HSF_SHIFT);
+                    } else {
+                        confrn1 = (comp == 1) ? 0 : (3U << JPEG_CONFRN_NB_SHIFT);
+                    }
+                    s->regs[GNW_H7B0_JPEG_CONFRN1_OFFSET >> 2] = confrn1;
                 }
             }
 
@@ -142,25 +305,85 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
                     int w, h, comp;
                     stbi_uc *rgb = stbi_load_from_memory(s->inbuf->data, s->inbuf->len, &w, &h, &comp, 3);
                     if (rgb) {
-                        if (s->rgb_buffer) {
-                            g_free(s->rgb_buffer);
+                        /*
+                         * Real hardware/firmware expects chroma-subsampled
+                         * output sized per the image's real SOF0 H/V
+                         * sampling factors (e.g. 4:2:0 => 1.5*w*h total, not
+                         * 3*w*h) -- serving full-resolution chroma made our
+                         * DOR output ~2x the size firmware's own destination
+                         * buffer expects, so firmware's polling loop only
+                         * drained part of it, leaving the buffer's tail
+                         * stale (visible as banded corruption). Derive the
+                         * real H/V factors here (same parse used for
+                         * CONFRN1 above) and subsample Cb/Cr to match.
+                         */
+                        int sof_h2 = 0, sof_v2 = 0;
+                        if (!gnw_h7b0_jpeg_parse_sof0_luma_sampling(
+                                s->inbuf->data, s->inbuf->len, &sof_h2, &sof_v2) ||
+                            sof_h2 < 1 || sof_h2 > 4 || sof_v2 < 1 || sof_v2 > 4) {
+                            sof_h2 = 1;
+                            sof_v2 = 1;
                         }
-                        s->rgb_buffer = g_malloc(w * h * 2);
-                        s->rgb_width = w;
-                        s->rgb_height = h;
+                        if (comp == 1) {
+                            sof_h2 = 1;
+                            sof_v2 = 1;
+                        }
+                        int chroma_w = (w + sof_h2 - 1) / sof_h2;
+                        int chroma_h = (h + sof_v2 - 1) / sof_v2;
+
+                        g_free(s->y_plane);
+                        g_free(s->cb_plane);
+                        g_free(s->cr_plane);
+                        s->y_plane = g_malloc(w * h);
+                        s->cb_plane = g_malloc(chroma_w * chroma_h);
+                        s->cr_plane = g_malloc(chroma_w * chroma_h);
+                        s->plane_width = w;
+                        s->plane_height = h;
+                        s->chroma_width = chroma_w;
+                        s->chroma_height = chroma_h;
+                        s->dor_cursor = 0;
+
                         for (int i = 0; i < w * h; i++) {
-                            uint16_t r5 = rgb[i * 3 + 0] >> 3;
-                            uint16_t g6 = rgb[i * 3 + 1] >> 2;
-                            uint16_t b5 = rgb[i * 3 + 2] >> 3;
-                            uint16_t rgb565 = (r5 << 11) | (g6 << 5) | b5;
-                            stw_le_p(s->rgb_buffer + i * 2, rgb565);
+                            int r = rgb[i * 3 + 0];
+                            int g = rgb[i * 3 + 1];
+                            int b = rgb[i * 3 + 2];
+                            /* BT.601 RGB->YCbCr, fixed-point (Q16)
+                             * approximation of the standard coefficients. */
+                            int y = (299 * r + 587 * g + 114 * b) / 1000;
+                            s->y_plane[i] = gnw_h7b0_jpeg_clamp_u8(y);
+                        }
+                        for (int cy = 0; cy < chroma_h; cy++) {
+                            for (int cx = 0; cx < chroma_w; cx++) {
+                                /* Nearest-sample the source pixel at this
+                                 * chroma cell's top-left corner. */
+                                int sx = cx * sof_h2;
+                                int sy = cy * sof_v2;
+                                if (sx >= w) sx = w - 1;
+                                if (sy >= h) sy = h - 1;
+                                int idx = sy * w + sx;
+                                int r = rgb[idx * 3 + 0];
+                                int g = rgb[idx * 3 + 1];
+                                int b = rgb[idx * 3 + 2];
+                                int cb = (-168736 * r - 331264 * g + 500000 * b) / 1000000 + 128;
+                                int cr = (500000 * r - 418688 * g - 81312 * b) / 1000000 + 128;
+                                s->cb_plane[cy * chroma_w + cx] = gnw_h7b0_jpeg_clamp_u8(cb);
+                                s->cr_plane[cy * chroma_w + cx] = gnw_h7b0_jpeg_clamp_u8(cr);
+                            }
                         }
                         stbi_image_free(rgb);
                     }
                     s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_EOCF;
                     s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &=
-                        ~(JPEG_SR_OFNEF | JPEG_SR_OFTF | JPEG_SR_COF |
+                        ~(JPEG_SR_OFTF | JPEG_SR_COF |
                           JPEG_SR_IFTF | JPEG_SR_IFNFF);
+                    /* Real output data is now available in y/cb/cr_plane
+                     * (DOR-readable) -- set OFNEF ("output FIFO not empty")
+                     * so a real polling loop (JPEG_Process()) drains DOR.
+                     * The DOR read handler clears OFNEF again once the
+                     * cursor reaches the end of all three planes. */
+                    if (s->y_plane) {
+                        s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_OFNEF;
+                    }
                 }
             }
         }

@@ -279,6 +279,42 @@ uint32_t gnw_h7b0_rcc_get_pll1p_hz(GnwH7B0RccState *s)
 }
 
 /*
+ * PLL3R output frequency (pll3_r_ck) -- LTDC's pixel clock, hardwired to
+ * this PLL output with no clock-source mux (unlike SAI1/ADC). Same VCO/
+ * output formula and same N-raw-field handling as gnw_h7b0_rcc_get_pll1p_hz()/
+ * gnw_h7b0_rcc_get_pll2p_hz() (see the latter's comment for why N gets no
+ * extra +1 beyond the one already folded into the VCO term); R's own "+1"
+ * is applied explicitly at the division step below, same as P for PLL1/
+ * PLL2. Used by gnw_h7b0_ltdc.c to derive the real vblank rate instead of
+ * assuming a fixed 60Hz.
+ */
+uint32_t gnw_h7b0_rcc_get_pll3r_hz(GnwH7B0RccState *s)
+{
+    uint32_t sel = s->regs[GNW_H7B0_RCC_PLLCKSELR_OFFSET >> 2];
+    uint32_t cfgr = s->regs[GNW_H7B0_RCC_PLLCFGR_OFFSET >> 2];
+    uint32_t divr = s->regs[GNW_H7B0_RCC_PLL3DIVR_OFFSET >> 2];
+    uint32_t fracr = s->regs[GNW_H7B0_RCC_PLL3FRACR_OFFSET >> 2];
+
+    uint32_t divm3 = (sel & RCC_PLLCKSELR_DIVM3_MASK) >> RCC_PLLCKSELR_DIVM3_SHIFT;
+    uint32_t n3_raw = (divr & RCC_PLL3DIVR_N3_MASK) >> RCC_PLL3DIVR_N3_SHIFT;
+    uint32_t r3_raw = (divr & RCC_PLL3DIVR_R3_MASK) >> RCC_PLL3DIVR_R3_SHIFT;
+    uint32_t fracn3 = (cfgr & RCC_PLLCFGR_PLL3FRACEN) ?
+        ((fracr & RCC_PLL3FRACR_FRACN3_MASK) >> RCC_PLL3FRACR_FRACN3_SHIFT) : 0;
+    uint32_t osc_hz = gnw_h7b0_rcc_get_osc_hz(s);
+
+    if (divm3 == 0) {
+        return 0;
+    }
+
+    uint64_t numerator = (uint64_t)osc_hz *
+                          (n3_raw * 8192ULL + fracn3 + 8192ULL);
+    uint64_t denominator = (uint64_t)divm3 * 8192ULL;
+    uint64_t vco = numerator / denominator;
+
+    return (uint32_t)(vco / (r3_raw + 1));
+}
+
+/*
  * Effective SYSCLK, respecting CFGR.SWS -- real firmware's overclock
  * sequence briefly drops SW to HSI before reprogramming PLL1, then
  * switches back (see gnw_h7b0_rcc.h's plan-doc reference); RCC already

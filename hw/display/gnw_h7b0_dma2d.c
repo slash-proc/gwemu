@@ -50,6 +50,7 @@ static bool gnw_h7b0_dma2d_format_bpp(uint32_t cm, int *bpp)
         *bpp = 2;
         return true;
     case DMA2D_INPUT_L8:
+    case DMA2D_INPUT_A8:
         *bpp = 1;
         return true;
     default:
@@ -57,8 +58,14 @@ static bool gnw_h7b0_dma2d_format_bpp(uint32_t cm, int *bpp)
     }
 }
 
+/*
+ * fixed_colr is only consulted for A8 (real hardware pairs an A8 alpha
+ * mask with that layer's FGCOLR/BGCOLR fixed 24-bit RGB register --
+ * previously dead/unread registers in this file, now wired in for real).
+ */
 static uint32_t gnw_h7b0_dma2d_read_argb8888(uint32_t cm, hwaddr addr,
-                                              hwaddr clut_addr)
+                                              hwaddr clut_addr,
+                                              uint32_t fixed_colr)
 {
     switch (cm) {
     case DMA2D_INPUT_ARGB8888: {
@@ -126,9 +133,76 @@ static uint32_t gnw_h7b0_dma2d_read_argb8888(uint32_t cm, hwaddr addr,
             return ldl_le_p(buf);
         }
     }
+    case DMA2D_INPUT_A8: {
+        uint8_t alpha;
+
+        cpu_physical_memory_read(addr, &alpha, 1);
+        return ((uint32_t)alpha << 24) | (fixed_colr & 0x00FFFFFFU);
+    }
     default:
         return 0xFF000000U;
     }
+}
+
+/*
+ * Real fetch for the JPEG device's YCbCr planes (replaces the old
+ * "raw pointer hack" -- see docs/plan for the real-DOR-register JPEG
+ * change this pairs with). Firmware's own polling loop
+ * (HAL_JPEG_Decode()/JPEG_Process()) drains JPEG's DOR register into a
+ * guest-RAM buffer at a firmware-controlled address, laid out as
+ * y_plane || cb_plane || cr_plane (each plane_w*plane_h bytes) -- that
+ * guest address is FGMAR here, exactly like every other input format.
+ * Converts via standard BT.601 YCbCr->RGB (inverse of the JPEG device's
+ * RGB->YCbCr conversion).
+ */
+static uint32_t gnw_h7b0_dma2d_read_ycbcr(hwaddr fg_mar, uint32_t plane_w,
+                                          uint32_t plane_h, uint32_t chroma_w,
+                                          uint32_t chroma_h, uint32_t x, uint32_t y)
+{
+    /*
+     * The guest buffer is tightly packed: a full-resolution Y plane
+     * (plane_w*plane_h bytes) followed by Cb/Cr planes subsampled to
+     * chroma_w*chroma_h bytes each (per the image's real SOF0 H/V
+     * sampling factors -- matching real hardware/firmware's expected
+     * output size; serving unsubsampled chroma made our DOR output much
+     * larger than firmware's destination buffer, which then only
+     * partially drained it, leaving stale bytes in the tail -- visible
+     * as banded corruption). Reading past the real width/height (the
+     * DMA2D transfer's own NLR geometry can exceed the actual decoded
+     * image, e.g. a smaller placeholder "no cover" image) would walk
+     * into the next row's bytes (no row padding to skip) -- treat
+     * out-of-bounds columns/rows as fully transparent instead.
+     */
+    if (x >= plane_w || y >= plane_h || chroma_w == 0 || chroma_h == 0) {
+        return 0x00000000U;
+    }
+
+    uint32_t y_size = plane_w * plane_h;
+    uint32_t c_size = chroma_w * chroma_h;
+    uint32_t y_off = y * plane_w + x;
+    uint32_t cx = x * chroma_w / plane_w;
+    uint32_t cy = y * chroma_h / plane_h;
+    if (cx >= chroma_w) cx = chroma_w - 1;
+    if (cy >= chroma_h) cy = chroma_h - 1;
+    uint32_t c_off = cy * chroma_w + cx;
+    uint8_t yv, cb, cr;
+
+    cpu_physical_memory_read(fg_mar + y_off, &yv, 1);
+    cpu_physical_memory_read(fg_mar + y_size + c_off, &cb, 1);
+    cpu_physical_memory_read(fg_mar + (hwaddr)y_size + c_size + c_off, &cr, 1);
+
+    int yi = yv;
+    int cbi = (int)cb - 128;
+    int cri = (int)cr - 128;
+    int r = yi + (int)(1.402 * cri);
+    int g = yi - (int)(0.344136 * cbi) - (int)(0.714136 * cri);
+    int b = yi + (int)(1.772 * cbi);
+
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+
+    return 0xFF000000U | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
 static void gnw_h7b0_dma2d_write_output(uint32_t cm, hwaddr addr,
@@ -218,6 +292,28 @@ static unsigned int gnw_h7b0_dma2d_apply_alpha_mode(uint32_t pfccr,
     }
 }
 
+/*
+ * Shared "over" compositing helper, generalized out of the M2M_BLEND
+ * branch so M2M_BLEND/M2M_BLEND_FG/M2M_BLEND_BG can all call the same
+ * math instead of duplicating it. fg/bg are ARGB8888 with alpha already
+ * resolved via gnw_h7b0_dma2d_apply_alpha_mode(); fa/ba are those
+ * resolved alpha values (0-255).
+ */
+static uint32_t gnw_h7b0_dma2d_blend_over(uint32_t fg, unsigned int fa,
+                                           uint32_t bg, unsigned int ba)
+{
+    unsigned int fr = (fg >> 16) & 0xFF, fgg = (fg >> 8) & 0xFF,
+                 fb = fg & 0xFF;
+    unsigned int br = (bg >> 16) & 0xFF, bgg = (bg >> 8) & 0xFF,
+                 bb = bg & 0xFF;
+    unsigned int r = (fr * fa + br * (255 - fa)) / 255U;
+    unsigned int g = (fgg * fa + bgg * (255 - fa)) / 255U;
+    unsigned int b = (fb * fa + bb * (255 - fa)) / 255U;
+    unsigned int a = fa + (ba * (255 - fa)) / 255U;
+
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
 static void gnw_h7b0_dma2d_update_irq(GnwH7B0Dma2dState *s)
 {
     bool pending = ((s->regs[GNW_H7B0_DMA2D_ISR >> 2] & DMA2D_ISR_TCIF) &&
@@ -279,20 +375,22 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
     hwaddr fg_mar = s->regs[GNW_H7B0_DMA2D_FGMAR >> 2];
     uint32_t fg_or = s->regs[GNW_H7B0_DMA2D_FGOR >> 2];
     hwaddr fg_clut = s->regs[GNW_H7B0_DMA2D_FGCMAR >> 2];
+    uint32_t fg_colr = s->regs[GNW_H7B0_DMA2D_FGCOLR >> 2];
     int fg_bpp = 0;
 
-    bool is_jpeg_hack = false;
-    uint8_t *hack_rgb_buf = NULL;
-    int hack_w = 0, hack_h = 0;
+    bool is_jpeg_ycbcr = false;
+    uint32_t jpeg_w = 0, jpeg_h = 0;
+    uint32_t jpeg_cw = 0, jpeg_ch = 0;
 
     if (fg_cm == 0xB) { /* DMA2D_INPUT_YCBCR */
-        hack_rgb_buf = gnw_h7b0_jpeg_get_hack_buffer(&hack_w, &hack_h);
-        if (hack_rgb_buf) {
-            is_jpeg_hack = true;
-            fg_bpp = 2; /* Treat as RGB565 */
+        gnw_h7b0_jpeg_get_last_decoded_size(&jpeg_w, &jpeg_h);
+        gnw_h7b0_jpeg_get_last_chroma_size(&jpeg_cw, &jpeg_ch);
+        if (jpeg_w > 0 && jpeg_h > 0) {
+            is_jpeg_ycbcr = true;
+            fg_bpp = 1; /* One byte per plane per pixel; planes read separately. */
         } else {
             qemu_log_mask(LOG_UNIMP,
-                          "gnw_h7b0_dma2d: YCbCr foreground requested but no JPEG hack buffer available\n");
+                          "gnw_h7b0_dma2d: YCbCr foreground requested but no decoded JPEG image available\n");
             return;
         }
     } else {
@@ -325,7 +423,7 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
         return;
     }
 
-    hwaddr fg_stride = is_jpeg_hack ? (hwaddr)hack_w * 2 : (hwaddr)(pixels_per_line + fg_or) * fg_bpp;
+    hwaddr fg_stride = (hwaddr)(pixels_per_line + fg_or) * fg_bpp;
     hwaddr out_stride = (hwaddr)(pixels_per_line + oor) * out_bpp;
 
     if (mode == DMA2D_MODE_M2M_PFC) {
@@ -335,18 +433,11 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
 
             for (uint32_t x = 0; x < pixels_per_line; x++) {
                 uint32_t argb;
-                if (is_jpeg_hack) {
-                    uint16_t px565 = lduw_le_p(hack_rgb_buf + y * fg_stride + x * 2);
-                    unsigned int r5 = (px565 >> 11) & 0x1F;
-                    unsigned int g6 = (px565 >> 5) & 0x3F;
-                    unsigned int b5 = px565 & 0x1F;
-                    unsigned int r8 = (r5 << 3) | (r5 >> 2);
-                    unsigned int g8 = (g6 << 2) | (g6 >> 4);
-                    unsigned int b8 = (b5 << 3) | (b5 >> 2);
-                    argb = 0xFF000000U | (r8 << 16) | (g8 << 8) | b8;
+                if (is_jpeg_ycbcr) {
+                    argb = gnw_h7b0_dma2d_read_ycbcr(fg_mar, jpeg_w, jpeg_h, jpeg_cw, jpeg_ch, x, y);
                 } else {
                     argb = gnw_h7b0_dma2d_read_argb8888(
-                        fg_cm, fg_row + (hwaddr)x * fg_bpp, fg_clut);
+                        fg_cm, fg_row + (hwaddr)x * fg_bpp, fg_clut, fg_colr);
                 }
                 unsigned int a = gnw_h7b0_dma2d_apply_alpha_mode(
                     fg_pfccr, (argb >> 24) & 0xFF);
@@ -359,60 +450,66 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
         return;
     }
 
-    if (mode == DMA2D_MODE_M2M_BLEND) {
+    /*
+     * M2M_BLEND blends two real fetched buffers (FG+BG). M2M_BLEND_FG and
+     * M2M_BLEND_BG are H7-specific "blend with fixed color" modes (see
+     * sdk/.../stm32h7xx_hal_dma2d.h: "DMA2D memory to memory with blending
+     * transfer mode and fixed color FG/BG") -- one side is a CONSTANT
+     * 24-bit color from FGCOLR/BGCOLR, not a fetched buffer at all. Real
+     * firmware (hw_jpeg_decoder.c's cover-art blend) uses BLEND_BG with
+     * only FGPFCCR/FGMAR configured for the real YCbCr buffer; BGMAR is
+     * never a valid pixel buffer in this mode on real hardware, so it must
+     * not be read as one here -- doing so was reading uninitialized/stale
+     * guest memory as the background on every transfer, producing garbage
+     * pixels and severe flicker.
+     */
+    if (mode == DMA2D_MODE_M2M_BLEND || mode == DMA2D_MODE_M2M_BLEND_FG ||
+        mode == DMA2D_MODE_M2M_BLEND_BG) {
         uint32_t bg_pfccr = s->regs[GNW_H7B0_DMA2D_BGPFCCR >> 2];
         uint32_t bg_cm = bg_pfccr & DMA2D_PFCCR_CM_MASK;
         hwaddr bg_mar = s->regs[GNW_H7B0_DMA2D_BGMAR >> 2];
         uint32_t bg_or = s->regs[GNW_H7B0_DMA2D_BGOR >> 2];
         hwaddr bg_clut = s->regs[GNW_H7B0_DMA2D_BGCMAR >> 2];
-        int bg_bpp;
+        uint32_t bg_colr = s->regs[GNW_H7B0_DMA2D_BGCOLR >> 2];
+        uint32_t fg_colr_fixed = s->regs[GNW_H7B0_DMA2D_FGCOLR >> 2];
+        bool fg_is_fixed = (mode == DMA2D_MODE_M2M_BLEND_FG);
+        bool bg_is_fixed = (mode == DMA2D_MODE_M2M_BLEND_BG);
+        int bg_bpp = 0;
 
-        if (!gnw_h7b0_dma2d_format_bpp(bg_cm, &bg_bpp)) {
+        if (!bg_is_fixed && !gnw_h7b0_dma2d_format_bpp(bg_cm, &bg_bpp)) {
             qemu_log_mask(LOG_UNIMP,
                           "gnw_h7b0_dma2d: unsupported background color "
                           "mode %u, not transferring\n", bg_cm);
             return;
         }
 
-        hwaddr bg_stride = (hwaddr)(pixels_per_line + bg_or) * bg_bpp;
+        hwaddr bg_stride = bg_is_fixed ? 0
+            : (hwaddr)(pixels_per_line + bg_or) * bg_bpp;
 
         for (uint32_t y = 0; y < lines; y++) {
             hwaddr fg_row = fg_mar + (hwaddr)y * fg_stride;
-            hwaddr bg_row = bg_mar + (hwaddr)y * bg_stride;
+            hwaddr bg_row = bg_is_fixed ? 0 : bg_mar + (hwaddr)y * bg_stride;
             hwaddr out_row = omar + (hwaddr)y * out_stride;
 
             for (uint32_t x = 0; x < pixels_per_line; x++) {
                 uint32_t fg;
-                if (is_jpeg_hack) {
-                    uint16_t px565 = lduw_le_p(hack_rgb_buf + y * fg_stride + x * 2);
-                    unsigned int r5 = (px565 >> 11) & 0x1F;
-                    unsigned int g6 = (px565 >> 5) & 0x3F;
-                    unsigned int b5 = px565 & 0x1F;
-                    unsigned int r8 = (r5 << 3) | (r5 >> 2);
-                    unsigned int g8 = (g6 << 2) | (g6 >> 4);
-                    unsigned int b8 = (b5 << 3) | (b5 >> 2);
-                    fg = 0xFF000000U | (r8 << 16) | (g8 << 8) | b8;
+                if (fg_is_fixed) {
+                    fg = 0xFF000000U | (fg_colr_fixed & 0x00FFFFFFU);
+                } else if (is_jpeg_ycbcr) {
+                    fg = gnw_h7b0_dma2d_read_ycbcr(fg_mar, jpeg_w, jpeg_h, jpeg_cw, jpeg_ch, x, y);
                 } else {
                     fg = gnw_h7b0_dma2d_read_argb8888(
-                        fg_cm, fg_row + (hwaddr)x * fg_bpp, fg_clut);
+                        fg_cm, fg_row + (hwaddr)x * fg_bpp, fg_clut, fg_colr);
                 }
-                uint32_t bg = gnw_h7b0_dma2d_read_argb8888(
-                    bg_cm, bg_row + (hwaddr)x * bg_bpp, bg_clut);
+                uint32_t bg = bg_is_fixed
+                    ? (0xFF000000U | (bg_colr & 0x00FFFFFFU))
+                    : gnw_h7b0_dma2d_read_argb8888(
+                          bg_cm, bg_row + (hwaddr)x * bg_bpp, bg_clut, bg_colr);
                 unsigned int fa = gnw_h7b0_dma2d_apply_alpha_mode(
                     fg_pfccr, (fg >> 24) & 0xFF);
                 unsigned int ba = gnw_h7b0_dma2d_apply_alpha_mode(
                     bg_pfccr, (bg >> 24) & 0xFF);
-                unsigned int fr = (fg >> 16) & 0xFF, fg_g = (fg >> 8) & 0xFF,
-                             fb = fg & 0xFF;
-                unsigned int br = (bg >> 16) & 0xFF, bg_g = (bg >> 8) & 0xFF,
-                             bb = bg & 0xFF;
-                /* Standard "over" compositing: out = fg*fa + bg*(1-fa),
-                 * out_a = fa + ba*(1-fa). */
-                unsigned int r = (fr * fa + br * (255 - fa)) / 255U;
-                unsigned int g = (fg_g * fa + bg_g * (255 - fa)) / 255U;
-                unsigned int b = (fb * fa + bb * (255 - fa)) / 255U;
-                unsigned int a = fa + (ba * (255 - fa)) / 255U;
-                uint32_t argb = (a << 24) | (r << 16) | (g << 8) | b;
+                uint32_t argb = gnw_h7b0_dma2d_blend_over(fg, fa, bg, ba);
 
                 gnw_h7b0_dma2d_write_output(
                     out_cm, out_row + (hwaddr)x * out_bpp, argb);

@@ -10,8 +10,14 @@
  * nothing). QEMU's own display-refresh timer drives redraws, not a
  * modeled per-pixel/per-line VSYNC scan.
  *
- * Line interrupt IS modeled, though, via a plain ~60Hz QEMU timer (not
- * derived from any real pixel-clock/AWCR/TWCR timing): both
+ * Line interrupt IS modeled, though, via a QEMU timer now paced by the
+ * live PLL3R pixel clock and TWCR panel timing (see
+ * gnw_h7b0_ltdc_recalc_timers()) rather than a plain fixed ~60Hz -- LTDC's
+ * pixel clock is hardwired to pll3_r_ck (no clock-source mux like SAI1/
+ * ADC have), and real firmware's PLL3 config computes to ~66.7Hz against
+ * the real 392x255 panel timing, not 60Hz. GNW_H7B0_LTDC_VBLANK_HZ is now
+ * only the defensive fallback for when RCC isn't wired or the computed
+ * rate is nonsensical. Both
  * gnw-chainloader's gui_refresh() and retro-go-sd's
  * lcd_wait_for_vblank() (Core/Src/gw_lcd.c) __WFI()-busy-wait on a
  * frame counter that only HAL_LTDC_LineEventCallback() (the real LI
@@ -70,6 +76,7 @@
 #include "exec/memory.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "hw/misc/gnw_h7b0_rcc.h"
 
 #define TYPE_GNW_H7B0_LTDC "gnw-h7b0-ltdc"
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0LtdcState, GNW_H7B0_LTDC)
@@ -84,6 +91,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0LtdcState, GNW_H7B0_LTDC)
 
 #define GNW_H7B0_LTDC_GCR    0x18
 #define LTDC_GCR_LTDCEN      (1U << 0)
+/* DEN (dither enable): confirmed via STM32H7B0.svd this session, not
+ * previously defined in this codebase. */
+#define LTDC_GCR_DEN         (1U << 16)
 
 #define GNW_H7B0_LTDC_SRCR   0x24
 #define LTDC_SRCR_IMR        (1U << 0)
@@ -91,15 +101,48 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0LtdcState, GNW_H7B0_LTDC)
 
 #define GNW_H7B0_LTDC_TWCR      0x14
 
+#define GNW_H7B0_LTDC_BPCR      0xC
+/* AVBP: bits[10:0], AHBP: bits[27:16] -- accumulated back porch, needed to
+ * convert a shadow-buffer row/col index into an absolute panel coordinate
+ * for window-clip checks against WHPCR/WVPCR (which are themselves
+ * absolute-panel-coordinate registers, per real HAL_LTDC_Init()). */
+#define LTDC_BPCR_AVBP_MASK     0x7FFU
+#define LTDC_BPCR_AHBP_SHIFT    16
+#define LTDC_BPCR_AHBP_MASK     0xFFFU
+
+#define GNW_H7B0_LTDC_BCCR      0x2C
+
 /* Layer1 registers, offsets relative to the LTDC base (0x84 + sub-offset). */
 #define GNW_H7B0_LTDC_L1CR      0x84
 #define LTDC_LxCR_LEN           (1U << 0)
+/* COLKEN (color-key enable): confirmed via STM32H7B0.svd this session, not
+ * previously defined in this codebase. */
+#define LTDC_LxCR_COLKEN        (1U << 1)
 #define GNW_H7B0_LTDC_L1WHPCR   0x88
 #define GNW_H7B0_LTDC_L1WVPCR   0x8C
+/* WHPCR: WHSTPOS bits[11:0], WHSPPOS bits[27:16]. WVPCR: WVSTPOS
+ * bits[10:0], WVSPPOS bits[26:16]. Both absolute panel coordinates. */
+#define LTDC_LxWHPCR_WHSTPOS_MASK  0xFFFU
+#define LTDC_LxWHPCR_WHSPPOS_SHIFT 16
+#define LTDC_LxWHPCR_WHSPPOS_MASK  0xFFFU
+#define LTDC_LxWVPCR_WVSTPOS_MASK  0x7FFU
+#define LTDC_LxWVPCR_WVSPPOS_SHIFT 16
+#define LTDC_LxWVPCR_WVSPPOS_MASK  0x7FFU
+#define GNW_H7B0_LTDC_L1CKCR    0x90
 #define GNW_H7B0_LTDC_L1PFCR    0x94
 #define LTDC_LxPFCR_PF_MASK     0x7U
 #define LTDC_PF_RGB565          2U
 #define LTDC_PF_L8              5U
+#define GNW_H7B0_LTDC_L1CACR    0x98
+#define GNW_H7B0_LTDC_L1DCCR    0x9C
+#define GNW_H7B0_LTDC_L1BFCR    0xA0
+/* BF1: bits[10:8], BF2: bits[2:0]. Values 0x4/0x5 select constant-alpha
+ * only (that layer's CACR); 0x6/0x7 select pixel-alpha x constant-alpha --
+ * see gnw_h7b0_ltdc_blend_over()'s comment for the full formula. */
+#define LTDC_LxBFCR_BF1_SHIFT   8
+#define LTDC_LxBFCR_BF1_MASK    0x7U
+#define LTDC_LxBFCR_BF2_MASK    0x7U
+#define LTDC_LxBFCR_MODE_PA     (1U << 1) /* set in both BF1/BF2 PAxCA values */
 #define GNW_H7B0_LTDC_L1CLUTWR  0xC4
 #define GNW_H7B0_LTDC_L1CFBAR   0xAC
 #define GNW_H7B0_LTDC_L1CFBLR   0xB0
@@ -110,11 +153,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0LtdcState, GNW_H7B0_LTDC)
 
 /* Layer2 registers */
 #define GNW_H7B0_LTDC_L2CR      0x104
+#define GNW_H7B0_LTDC_L2WHPCR   0x108
+#define GNW_H7B0_LTDC_L2WVPCR   0x10C
+#define GNW_H7B0_LTDC_L2CKCR    0x110
 #define GNW_H7B0_LTDC_L2PFCR    0x114
 #define GNW_H7B0_LTDC_L2CACR    0x118
+#define GNW_H7B0_LTDC_L2DCCR    0x11C
+#define GNW_H7B0_LTDC_L2BFCR    0x120
 #define GNW_H7B0_LTDC_L2CFBAR   0x12C
 #define GNW_H7B0_LTDC_L2CFBLR   0x130
 #define GNW_H7B0_LTDC_L2CFBLNR  0x134
+#define GNW_H7B0_LTDC_L2CLUTWR  0x144
 
 #define GNW_H7B0_LTDC_IER    0x34
 #define LTDC_IER_LIE         (1U << 0)
@@ -133,7 +182,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0LtdcState, GNW_H7B0_LTDC)
 
 #define GNW_H7B0_LTDC_LIPCR  0x40
 
-/* Plain fixed-rate vblank approximation -- see the file-header comment. */
+/*
+ * Fallback vblank rate, used only when RCC isn't wired (gnw_h7b0_ltdc_set_rcc()
+ * never called) or the live PLL3R-derived rate computes to something
+ * nonsensical -- see gnw_h7b0_ltdc_recalc_timers() in gnw_h7b0_ltdc.c. Real
+ * firmware's PLL3 config (M=4,N=9,R=24) against the real 392x255 panel
+ * timing computes to ~66.7Hz, not this; kept only as a defensive default,
+ * not a claim about the real refresh rate.
+ */
 #define GNW_H7B0_LTDC_VBLANK_HZ 60
 
 struct GnwH7B0LtdcState {
@@ -148,6 +204,15 @@ struct GnwH7B0LtdcState {
     bool pf_warned;
 
     uint32_t regs[GNW_H7B0_LTDC_SIZE / 4];
+
+    /* Set via gnw_h7b0_ltdc_set_rcc(), same realize-order-independence
+     * rationale as gnw_h7b0_sai1.h's rcc field. Lets
+     * gnw_h7b0_ltdc_recalc_timers() derive the real vblank rate from
+     * PLL3R (LTDC's pixel clock is hardwired to pll3_r_ck, no mux) plus
+     * live TWCR timing instead of the fixed GNW_H7B0_LTDC_VBLANK_HZ
+     * fallback. May be NULL (e.g. standalone instantiation) -- callers
+     * must check before use. */
+    GnwH7B0RccState *rcc;
 
     /*
      * Real "active" copies of the Layer1 and Layer2 registers that actually
@@ -171,6 +236,28 @@ struct GnwH7B0LtdcState {
     uint32_t active_l2pfcr;
     uint32_t active_l2cacr;
     bool vbr_reload_pending;
+
+    /*
+     * Additional active-set snapshots for the generalized per-layer
+     * compositing pipeline (color key, window-clip/default-color,
+     * generalized blend factors, dithering) -- same shadow->active
+     * reload semantics as the fields above, just for registers that
+     * previously weren't read at all.
+     */
+    uint32_t active_l1ckcr;
+    uint32_t active_l2ckcr;
+    uint32_t active_l1dccr;
+    uint32_t active_l2dccr;
+    uint32_t active_bccr;
+    uint32_t active_l1cacr;
+    uint32_t active_l1bfcr;
+    uint32_t active_l2bfcr;
+    uint32_t active_l1whpcr;
+    uint32_t active_l1wvpcr;
+    uint32_t active_l2whpcr;
+    uint32_t active_l2wvpcr;
+    uint32_t active_gcr;
+    uint32_t active_bpcr;
 
     /*
      * Shadow buffer to decouple QEMU's asynchronous UI refresh from the
@@ -198,6 +285,14 @@ struct GnwH7B0LtdcState {
     uint32_t clut[256];
 
     /*
+     * Layer2's own hardware CLUT (L2CLUTWR) -- real hardware has fully
+     * independent per-layer CLUTs, so a single shared array (as used to
+     * be the case here) is only correct as long as Layer2 never uses L8,
+     * which real firmware doesn't guarantee.
+     */
+    uint32_t clut2[256];
+
+    /*
      * Set whenever gnw_h7b0_ltdc_vblank_tick() captures a fresh frame
      * into shadow_buffer; cleared once gnw_h7b0_ltdc_update_display()
      * actually redraws from it. QEMU's own UI refresh timer
@@ -212,5 +307,7 @@ struct GnwH7B0LtdcState {
      * the same single QEMU main thread. */
     bool content_dirty;
 };
+
+void gnw_h7b0_ltdc_set_rcc(GnwH7B0LtdcState *s, GnwH7B0RccState *rcc);
 
 #endif

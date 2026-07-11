@@ -64,19 +64,61 @@ static void gnw_h7b0_ltdc_reload_active(GnwH7B0LtdcState *s)
     s->active_l2cfblnr = s->regs[GNW_H7B0_LTDC_L2CFBLNR >> 2];
     s->active_l2pfcr = s->regs[GNW_H7B0_LTDC_L2PFCR >> 2];
     s->active_l2cacr = s->regs[GNW_H7B0_LTDC_L2CACR >> 2];
+
+    s->active_l1ckcr = s->regs[GNW_H7B0_LTDC_L1CKCR >> 2];
+    s->active_l2ckcr = s->regs[GNW_H7B0_LTDC_L2CKCR >> 2];
+    s->active_l1dccr = s->regs[GNW_H7B0_LTDC_L1DCCR >> 2];
+    s->active_l2dccr = s->regs[GNW_H7B0_LTDC_L2DCCR >> 2];
+    s->active_bccr = s->regs[GNW_H7B0_LTDC_BCCR >> 2];
+    s->active_l1cacr = s->regs[GNW_H7B0_LTDC_L1CACR >> 2];
+    s->active_l1bfcr = s->regs[GNW_H7B0_LTDC_L1BFCR >> 2];
+    s->active_l2bfcr = s->regs[GNW_H7B0_LTDC_L2BFCR >> 2];
+    s->active_l1whpcr = s->regs[GNW_H7B0_LTDC_L1WHPCR >> 2];
+    s->active_l1wvpcr = s->regs[GNW_H7B0_LTDC_L1WVPCR >> 2];
+    s->active_l2whpcr = s->regs[GNW_H7B0_LTDC_L2WHPCR >> 2];
+    s->active_l2wvpcr = s->regs[GNW_H7B0_LTDC_L2WVPCR >> 2];
+    s->active_gcr = s->regs[GNW_H7B0_LTDC_GCR >> 2];
+    s->active_bpcr = s->regs[GNW_H7B0_LTDC_BPCR >> 2];
 }
 
 static void gnw_h7b0_ltdc_recalc_timers(GnwH7B0LtdcState *s, int64_t now)
 {
     uint32_t twcr = s->regs[GNW_H7B0_LTDC_TWCR >> 2];
+    /* TWCR packs both fields: TOTALH bits[10:0], TOTALW bits[27:16] --
+     * see STM32H7B0.svd. */
     uint32_t totalh = (twcr & 0x7FF) + 1;
+    uint32_t totalw = ((twcr >> 16) & 0xFFF) + 1;
     uint32_t lipcr = s->regs[GNW_H7B0_LTDC_LIPCR >> 2] & 0x7FF;
 
     if (totalh <= 1) {
         totalh = 240;
     }
 
-    int64_t frame_ns = NANOSECONDS_PER_SECOND / GNW_H7B0_LTDC_VBLANK_HZ;
+    /*
+     * Derive the real vblank rate from the live PLL3R frequency (LTDC's
+     * pixel clock is hardwired to pll3_r_ck, no clock-source mux) and the
+     * real panel timing, instead of assuming the fixed
+     * GNW_H7B0_LTDC_VBLANK_HZ -- real firmware's PLL3 config (M=4,N=9,R=24)
+     * against the real 392x255 panel timing computes to ~66.7Hz, not 60Hz,
+     * and that ~10% mismatch against a fixed 60Hz tick was a suspected
+     * cause of coverflow-menu flicker/scroll roughness (see the plan doc
+     * for the full derivation). Falls back to the fixed constant if RCC
+     * isn't wired or the computed rate is nonsensical -- same defensive
+     * clamping philosophy used for TIM2/DMA/SPI timing elsewhere in this
+     * device family.
+     */
+    uint32_t vblank_hz = GNW_H7B0_LTDC_VBLANK_HZ;
+    if (s->rcc && totalw > 0 && totalh > 0) {
+        uint32_t pll3r_hz = gnw_h7b0_rcc_get_pll3r_hz(s->rcc);
+        uint64_t pixels = (uint64_t)totalw * totalh;
+        uint32_t real_hz = pixels > 0 ? (uint32_t)(pll3r_hz / pixels) : 0;
+
+        if (real_hz >= 1 && real_hz <= 1000) {
+            vblank_hz = real_hz;
+        }
+    }
+
+    int64_t frame_ns = NANOSECONDS_PER_SECOND / vblank_hz;
     int64_t line_ns = frame_ns / totalh;
 
     timer_mod(s->vblank_timer, now + frame_ns);
@@ -86,6 +128,11 @@ static void gnw_h7b0_ltdc_recalc_timers(GnwH7B0LtdcState *s, int64_t now)
     } else {
         timer_del(s->line_timer);
     }
+}
+
+void gnw_h7b0_ltdc_set_rcc(GnwH7B0LtdcState *s, GnwH7B0RccState *rcc)
+{
+    s->rcc = rcc;
 }
 
 static int gnw_h7b0_ltdc_capture_setup(GnwH7B0LtdcState *s);
@@ -121,13 +168,21 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
         s->content_dirty = true;
     }
 
-    s->regs[GNW_H7B0_LTDC_ISR >> 2] |= LTDC_ISR_RRIF;
-    gnw_h7b0_ltdc_update_irq(s);
-
+    /*
+     * RRIF only belongs here when a VBR reload actually applies this
+     * tick -- real hardware sets it on a genuine reload event, not on
+     * every vblank. Setting it unconditionally (the previous behavior)
+     * made firmware's HAL_LTDC_ReloadEventCallback() (which re-stages
+     * CFBAR for double buffering) fire on every single vblank instead
+     * of only when a swap was actually requested, since retro-go leaves
+     * LTDC_IT_RR permanently enabled.
+     */
     if (s->vbr_reload_pending) {
         gnw_h7b0_ltdc_reload_active(s);
         s->vbr_reload_pending = false;
         s->regs[GNW_H7B0_LTDC_SRCR >> 2] &= ~LTDC_SRCR_VBR;
+        s->regs[GNW_H7B0_LTDC_ISR >> 2] |= LTDC_ISR_RRIF;
+        gnw_h7b0_ltdc_update_irq(s);
     }
 
     gnw_h7b0_ltdc_recalc_timers(s, now);
@@ -158,6 +213,7 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
     s->shadow_width = 0;
     s->shadow_height = 0;
     memset(s->clut, 0, sizeof(s->clut));
+    memset(s->clut2, 0, sizeof(s->clut2));
 
     gnw_h7b0_ltdc_reload_active(s);
     gnw_h7b0_ltdc_recalc_timers(s, now);
@@ -285,6 +341,116 @@ static int gnw_h7b0_ltdc_capture_setup(GnwH7B0LtdcState *s)
     return rows;
 }
 
+/*
+ * Generalized STM32H7 LTDC blend: applies LxBFCR's BF1/BF2 fields
+ * literally rather than assuming a fixed PAxCA-with-complement formula.
+ * BF1 (this layer's own weight) is either the layer's constant alpha
+ * (CACR) alone (register value 0x4/0x5, LTDC_LxBFCR_MODE_PA clear) or
+ * pixel-alpha x constant-alpha (0x6/0x7, MODE_PA set). BF2 is the
+ * complement of that same computation applied to what's already
+ * composited below -- real hardware's default reset value for both
+ * fields is the PAxCA pair (BFCR=0x607), which is exactly the classic
+ * "over" operator this produces: factor1 = pa*ca/255, factor2 =
+ * 255-factor1. For the common case (CACR=255, pa=255, i.e. an opaque
+ * RGB565/L8 source with default blend factors) factor1=255/factor2=0,
+ * so the result is the foreground pixel unmodified -- matching the
+ * previous hardcoded behavior exactly.
+ */
+static uint32_t gnw_h7b0_ltdc_blend_over(uint32_t fg, unsigned int fg_a,
+                                          uint32_t bfcr, unsigned int ca,
+                                          uint32_t bg)
+{
+    unsigned int bf1 = (bfcr >> LTDC_LxBFCR_BF1_SHIFT) & LTDC_LxBFCR_BF1_MASK;
+    unsigned int bf2 = bfcr & LTDC_LxBFCR_BF2_MASK;
+    unsigned int factor1 = (bf1 & LTDC_LxBFCR_MODE_PA) ? (fg_a * ca) / 255U : ca;
+    unsigned int factor2_base = (bf2 & LTDC_LxBFCR_MODE_PA) ? (fg_a * ca) / 255U : ca;
+    unsigned int factor2 = 255U - factor2_base;
+
+    unsigned int fg_r = (fg >> 16) & 0xFF, fg_g = (fg >> 8) & 0xFF, fg_b = fg & 0xFF;
+    unsigned int bg_r = (bg >> 16) & 0xFF, bg_g = (bg >> 8) & 0xFF, bg_b = bg & 0xFF;
+
+    unsigned int r = MIN(255U, (fg_r * factor1 + bg_r * factor2) / 255U);
+    unsigned int g = MIN(255U, (fg_g * factor1 + bg_g * factor2) / 255U);
+    unsigned int b = MIN(255U, (fg_b * factor1 + bg_b * factor2) / 255U);
+
+    return 0xFF000000U | (r << 16) | (g << 8) | b;
+}
+
+/*
+ * Resolve one layer's raw fetched pixel (already-converted ARGB, native
+ * alpha for ARGB formats or 255 for opaque RGB565/L8) against that
+ * layer's window-clip and color-key configuration, returning the
+ * effective ARGB pixel to hand to gnw_h7b0_ltdc_blend_over() -- outside
+ * the layer's window it's DCCR's default color+alpha instead of
+ * framebuffer content (DCCR's bit layout, alpha[31:24]/RGB[23:16:8:0],
+ * is already a valid ARGB32 value); a color-key match forces alpha to 0
+ * so the pixel is fully transparent (falls through to what's below),
+ * independent of that layer's blend-factor mode.
+ */
+static uint32_t gnw_h7b0_ltdc_resolve_layer(uint32_t raw_px, bool in_window,
+                                             uint32_t dccr, bool colken,
+                                             uint32_t ckcr,
+                                             unsigned int *out_alpha)
+{
+    uint32_t px;
+    unsigned int alpha;
+
+    if (!in_window) {
+        px = dccr;
+        alpha = (dccr >> 24) & 0xFF;
+    } else if (colken && (raw_px & 0xFFFFFFU) == (ckcr & 0xFFFFFFU)) {
+        px = raw_px;
+        alpha = 0;
+    } else {
+        px = raw_px;
+        alpha = (raw_px >> 24) & 0xFF;
+    }
+
+    *out_alpha = alpha;
+    return px;
+}
+
+static const int gnw_h7b0_ltdc_bayer4x4[4][4] = {
+    { 0,  8,  2, 10 },
+    {12,  4, 14,  6 },
+    { 3, 11,  1,  9 },
+    {15,  7, 13,  5 },
+};
+
+/*
+ * Standard 4x4 Bayer ordered dither, gated on GCR.DEN. Confirmed a true
+ * no-op for this model today: shadow_buffer and the host display surface
+ * are both full 32bpp/8-bit-per-channel, so nothing downstream ever
+ * quantizes bit depth (unlike a real TFT panel, which this hardware
+ * feature targets). Implemented anyway for fidelity/future-proofing (per
+ * explicit request), using the same truncate-then-replicate-low-bits
+ * re-expansion pattern as gnw_h7b0_ltdc_rgb565_to_pixel32().
+ */
+static inline uint8_t gnw_h7b0_ltdc_dither_channel(uint8_t value, int px, int py)
+{
+    const int n = 6; /* assumed panel bit depth (e.g. RGB666) */
+    const int step = 1 << (8 - n);
+    int d = gnw_h7b0_ltdc_bayer4x4[py & 3][px & 3];
+    int adjusted = (int)value + (d * step) / 16 - step / 2;
+    unsigned int truncated;
+    unsigned int nbit;
+
+    adjusted = MAX(0, MIN(255, adjusted));
+    truncated = ((unsigned int)adjusted) & ~(unsigned int)(step - 1);
+    nbit = truncated >> (8 - n);
+
+    return (uint8_t)((nbit << (8 - n)) | (nbit >> (2 * n - 8)));
+}
+
+static inline uint32_t gnw_h7b0_ltdc_dither_pixel(uint32_t px, int x, int y)
+{
+    unsigned int r = gnw_h7b0_ltdc_dither_channel((px >> 16) & 0xFF, x, y);
+    unsigned int g = gnw_h7b0_ltdc_dither_channel((px >> 8) & 0xFF, x, y);
+    unsigned int b = gnw_h7b0_ltdc_dither_channel(px & 0xFF, x, y);
+
+    return (px & 0xFF000000U) | (r << 16) | (g << 8) | b;
+}
+
 static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
                                         int row_end)
 {
@@ -295,9 +461,22 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
     int src_width = cols * (l1_l8 ? 1 : 2);
     g_autofree uint8_t *linebuf = g_malloc(src_width);
 
+    bool l1_colken = s->active_l1cr & LTDC_LxCR_COLKEN;
+    uint32_t l1_ckcr = s->active_l1ckcr;
+    uint32_t l1_dccr = s->active_l1dccr;
+    uint32_t l1_bfcr = s->active_l1bfcr;
+    uint32_t l1_cacr = s->active_l1cacr & 0xFF;
+    int l1_whstpos = s->active_l1whpcr & LTDC_LxWHPCR_WHSTPOS_MASK;
+    int l1_whsppos = (s->active_l1whpcr >> LTDC_LxWHPCR_WHSPPOS_SHIFT) &
+                      LTDC_LxWHPCR_WHSPPOS_MASK;
+    int l1_wvstpos = s->active_l1wvpcr & LTDC_LxWVPCR_WVSTPOS_MASK;
+    int l1_wvsppos = (s->active_l1wvpcr >> LTDC_LxWVPCR_WVSPPOS_SHIFT) &
+                      LTDC_LxWVPCR_WVSPPOS_MASK;
+
     bool l2_en = s->active_l2cr & LTDC_LxCR_LEN;
     uint32_t l2_cfbar = s->active_l2cfbar;
     uint32_t l2_pfcr = s->active_l2pfcr & LTDC_LxPFCR_PF_MASK;
+    bool l2_l8 = (l2_pfcr == LTDC_PF_L8);
     uint32_t l2_cfblr = s->active_l2cfblr;
     int l2_src_width = (int)((l2_cfblr >> LTDC_LxCFBLR_CFBP_SHIFT) &
                               LTDC_LxCFBLR_CFBP_MASK);
@@ -306,39 +485,82 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
         switch (l2_pfcr) {
         case 0: l2_bpp = 4; break;
         case 2: case 3: case 4: l2_bpp = 2; break;
+        case 5: l2_bpp = 1; break; /* L8 */
         default: l2_bpp = 0; break;
         }
     }
     uint32_t l2_cacr = s->active_l2cacr & 0xFF;
+    bool l2_colken = s->active_l2cr & LTDC_LxCR_COLKEN;
+    uint32_t l2_ckcr = s->active_l2ckcr;
+    uint32_t l2_dccr = s->active_l2dccr;
+    uint32_t l2_bfcr = s->active_l2bfcr;
+    int l2_whstpos = s->active_l2whpcr & LTDC_LxWHPCR_WHSTPOS_MASK;
+    int l2_whsppos = (s->active_l2whpcr >> LTDC_LxWHPCR_WHSPPOS_SHIFT) &
+                      LTDC_LxWHPCR_WHSPPOS_MASK;
+    int l2_wvstpos = s->active_l2wvpcr & LTDC_LxWVPCR_WVSTPOS_MASK;
+    int l2_wvsppos = (s->active_l2wvpcr >> LTDC_LxWVPCR_WVSPPOS_SHIFT) &
+                      LTDC_LxWVPCR_WVSPPOS_MASK;
+
+    uint32_t bccr = 0xFF000000U | (s->active_bccr & 0xFFFFFFU);
+    bool dither_en = s->active_gcr & LTDC_GCR_DEN;
+
+    int ahbp = (s->active_bpcr >> LTDC_BPCR_AHBP_SHIFT) & LTDC_BPCR_AHBP_MASK;
+    int avbp = s->active_bpcr & LTDC_BPCR_AVBP_MASK;
 
     for (int y = row_start; y < row_end; y++) {
+        int abs_y = avbp + y + 1;
+        bool l1_row_in = abs_y >= l1_wvstpos && abs_y <= l1_wvsppos;
+        bool l2_row_in = abs_y >= l2_wvstpos && abs_y <= l2_wvsppos;
+
         cpu_physical_memory_read(cfbar + (hwaddr)y * src_width, linebuf,
                                  src_width);
 
         for (int x = 0; x < cols; x++) {
-            uint32_t px = l1_l8 ? s->clut[linebuf[x]]
-                                 : gnw_h7b0_ltdc_rgb565_to_pixel32(
-                                       lduw_le_p(linebuf + x * 2));
+            int abs_x = ahbp + x + 1;
+            bool l1_in = l1_row_in && abs_x >= l1_whstpos && abs_x <= l1_whsppos;
+            uint32_t l1_raw = l1_l8 ? s->clut[linebuf[x]]
+                                    : gnw_h7b0_ltdc_rgb565_to_pixel32(
+                                          lduw_le_p(linebuf + x * 2));
+
+            /* Layer2 first/bottom, composited over the opaque background
+             * color (BCCR); Layer1 second/top, composited over that
+             * result. */
+            uint32_t below = bccr;
 
             if (l2_en && l2_bpp > 0) {
-                uint32_t fg_px = gnw_h7b0_ltdc_read_pixel(
-                    l2_cfbar + (hwaddr)y * l2_src_width + (hwaddr)x * l2_bpp,
-                    l2_pfcr);
-                unsigned int fg_a = (fg_px >> 24) & 0xFF;
-                fg_a = (fg_a * l2_cacr) / 255U;
-                if (fg_a > 0) {
-                    unsigned int bg_r = (px >> 16) & 0xFF;
-                    unsigned int bg_g = (px >> 8) & 0xFF;
-                    unsigned int bg_b = px & 0xFF;
-                    unsigned int fg_r = (fg_px >> 16) & 0xFF;
-                    unsigned int fg_g = (fg_px >> 8) & 0xFF;
-                    unsigned int fg_b = fg_px & 0xFF;
+                bool l2_in = l2_row_in && abs_x >= l2_whstpos &&
+                             abs_x <= l2_whsppos;
+                uint32_t l2_raw;
+                unsigned int l2_alpha;
+                uint32_t l2_resolved;
 
-                    unsigned int r = (fg_r * fg_a + bg_r * (255 - fg_a)) / 255U;
-                    unsigned int g = (fg_g * fg_a + bg_g * (255 - fg_a)) / 255U;
-                    unsigned int b = (fg_b * fg_a + bg_b * (255 - fg_a)) / 255U;
-                    px = 0xFF000000U | (r << 16) | (g << 8) | b;
+                if (l2_l8) {
+                    uint8_t idx;
+                    cpu_physical_memory_read(
+                        l2_cfbar + (hwaddr)y * l2_src_width + (hwaddr)x,
+                        &idx, 1);
+                    l2_raw = s->clut2[idx];
+                } else {
+                    l2_raw = gnw_h7b0_ltdc_read_pixel(
+                        l2_cfbar + (hwaddr)y * l2_src_width +
+                            (hwaddr)x * l2_bpp,
+                        l2_pfcr);
                 }
+
+                l2_resolved = gnw_h7b0_ltdc_resolve_layer(
+                    l2_raw, l2_in, l2_dccr, l2_colken, l2_ckcr, &l2_alpha);
+                below = gnw_h7b0_ltdc_blend_over(l2_resolved, l2_alpha,
+                                                  l2_bfcr, l2_cacr, bccr);
+            }
+
+            unsigned int l1_alpha;
+            uint32_t l1_resolved = gnw_h7b0_ltdc_resolve_layer(
+                l1_raw, l1_in, l1_dccr, l1_colken, l1_ckcr, &l1_alpha);
+            uint32_t px = gnw_h7b0_ltdc_blend_over(l1_resolved, l1_alpha,
+                                                    l1_bfcr, l1_cacr, below);
+
+            if (dither_en) {
+                px = gnw_h7b0_ltdc_dither_pixel(px, abs_x, abs_y);
             }
 
             s->shadow_buffer[y * cols + x] = px;
@@ -457,9 +679,17 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
          * lcd_wait_for_vblank(), very likely also the "runs too fast"
          * bug. IMR keeps clearing instantly (real immediate reload
          * really is instant on real hardware too).
+         *
+         * RRIF must be raised here too: real hardware sets it for any
+         * reload that actually takes effect, immediate or deferred, and
+         * an immediate reload here is exactly that -- it was previously
+         * only ever set (unconditionally, wrongly) from the vblank tick,
+         * so IMR reloads never raised it at all.
          */
         if (value & LTDC_SRCR_IMR) {
             gnw_h7b0_ltdc_reload_active(s);
+            s->regs[GNW_H7B0_LTDC_ISR >> 2] |= LTDC_ISR_RRIF;
+            gnw_h7b0_ltdc_update_irq(s);
         }
         if (value & LTDC_SRCR_VBR) {
             s->vbr_reload_pending = true;
@@ -495,6 +725,17 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
         unsigned int g = (value >> 8) & 0xFF;
         unsigned int b = value & 0xFF;
         s->clut[idx] = 0xFF000000U | (r << 16) | (g << 8) | b;
+        return;
+    }
+    case GNW_H7B0_LTDC_L2CLUTWR:
+    {
+        /* Mirrors L1CLUTWR above, but into Layer2's own independent
+         * CLUT -- real hardware has separate CLUTs per layer. */
+        unsigned int idx = (value >> 24) & 0xFF;
+        unsigned int r = (value >> 16) & 0xFF;
+        unsigned int g = (value >> 8) & 0xFF;
+        unsigned int b = value & 0xFF;
+        s->clut2[idx] = 0xFF000000U | (r << 16) | (g << 8) | b;
         return;
     }
     default:

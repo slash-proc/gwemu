@@ -48,6 +48,20 @@ phased plan.
   patched Zelda firmware image still hangs past ADC config) and two
   known-but-not-root-caused issues (LTDC flicker, game logic running too
   fast) flagged as the next session's starting point.
+- `docs/session-2026-07-11-ltdc-flicker-investigation.md` /
+  `-dma2d-jpeg-ycbcr-pipeline.md` — the LTDC/JPEG/DMA2D coverflow-flicker
+  investigation: RRIF fix and LTDC per-layer compositing generalization
+  (color key/window-clip/blend/dither/L2 fixes) landed but didn't fix the
+  flicker; a real DMA2D `BLEND_BG`/`BLEND_FG` ("fixed color") mode
+  implementation and a real JPEG `DOR`-register/guest-RAM output pipeline
+  (replacing an RGB565 "hack buffer" pointer handoff) fixed two real
+  corruption bugs (a stale-`BGMAR` read, a chroma-subsampling size
+  mismatch) but still didn't fix the underlying flicker. Read the second
+  doc's "Workflow/tooling notes" section before debugging LTDC/DMA2D/JPEG
+  timing further — it has a real gotcha about misreading shared
+  scratch-buffer reuse as instability, plus current gdb/monitor/launch
+  workflow notes. Flicker root cause is still open; next steps are listed
+  there.
 
 ## Repo/remote conventions
 

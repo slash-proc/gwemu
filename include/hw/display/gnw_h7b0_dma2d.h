@@ -68,11 +68,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0Dma2dState, GNW_H7B0_DMA2D)
 #define DMA2D_CR_TEIE          (1U << 8)
 #define DMA2D_CR_TCIE          (1U << 9)
 #define DMA2D_CR_MODE_SHIFT    16
-#define DMA2D_CR_MODE_MASK     (0x3U << DMA2D_CR_MODE_SHIFT)
+/* Real hardware's MODE field in CR is 3 bits wide (confirmed against
+ * sdk/stm32h7xx-hal-driver/Src/stm32h7xx_hal_dma2d.h) -- a 2-bit mask here
+ * silently truncated real firmware's MODE=5 (M2M_BLEND_BG) down to 1
+ * (M2M_PFC), which is why the real cover-art blend path never actually ran
+ * in emulation. */
+#define DMA2D_CR_MODE_MASK     (0x7U << DMA2D_CR_MODE_SHIFT)
 #define DMA2D_MODE_M2M         0U
 #define DMA2D_MODE_M2M_PFC     1U
 #define DMA2D_MODE_M2M_BLEND   2U
 #define DMA2D_MODE_R2M         3U
+#define DMA2D_MODE_M2M_BLEND_FG 4U
+#define DMA2D_MODE_M2M_BLEND_BG 5U
 
 #define GNW_H7B0_DMA2D_ISR     0x04
 #define DMA2D_ISR_TEIF         (1U << 0)

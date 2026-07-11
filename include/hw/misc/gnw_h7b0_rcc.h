@@ -114,6 +114,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
 #define RCC_PLLCKSELR_DIVM1_MASK    (0x3fU << RCC_PLLCKSELR_DIVM1_SHIFT)
 #define RCC_PLLCKSELR_DIVM2_SHIFT   12
 #define RCC_PLLCKSELR_DIVM2_MASK    (0x3fU << RCC_PLLCKSELR_DIVM2_SHIFT)
+#define RCC_PLLCKSELR_DIVM3_SHIFT   20
+#define RCC_PLLCKSELR_DIVM3_MASK    (0x3fU << RCC_PLLCKSELR_DIVM3_SHIFT)
 #define RCC_PLLCKSELR_PLLSRC_SHIFT  0
 #define RCC_PLLCKSELR_PLLSRC_MASK   (0x3U << RCC_PLLCKSELR_PLLSRC_SHIFT)
 #define RCC_PLLCKSELR_PLLSRC_HSI    0
@@ -122,6 +124,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
 
 #define RCC_PLLCFGR_PLL1FRACEN      (1U << 0)
 #define RCC_PLLCFGR_PLL2FRACEN      (1U << 4)
+#define RCC_PLLCFGR_PLL3FRACEN      (1U << 8)
 
 #define RCC_PLL1DIVR_N1_SHIFT       0
 #define RCC_PLL1DIVR_N1_MASK        (0x1ffU << RCC_PLL1DIVR_N1_SHIFT)
@@ -138,6 +141,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
 
 #define RCC_PLL2FRACR_FRACN2_SHIFT  3
 #define RCC_PLL2FRACR_FRACN2_MASK   (0x1fffU << RCC_PLL2FRACR_FRACN2_SHIFT)
+
+/*
+ * PLL3 -- same fractional-N family as PLL1/PLL2 (see
+ * gnw_h7b0_rcc_get_pll2p_hz()'s comment for the shared formula/raw-field
+ * rationale), added so gnw_h7b0_ltdc.c can derive the LTDC pixel clock
+ * (pll3_r_ck -- LTDC has no clock-source mux, it's hardwired to PLL3R
+ * unlike SAI1/ADC) instead of assuming a fixed vblank rate. Needs R, not
+ * P: PLL3DIVR's R3 field sits at a different bit offset than P1/P2 (wider
+ * field, higher offset), since LTDC needs the third PLL output, the first
+ * of the three actually decoded by this device.
+ */
+#define RCC_PLL3DIVR_N3_SHIFT       0
+#define RCC_PLL3DIVR_N3_MASK        (0x1ffU << RCC_PLL3DIVR_N3_SHIFT)
+#define RCC_PLL3DIVR_R3_SHIFT       24
+#define RCC_PLL3DIVR_R3_MASK        (0x7fU << RCC_PLL3DIVR_R3_SHIFT)
+
+#define RCC_PLL3FRACR_FRACN3_SHIFT  3
+#define RCC_PLL3FRACR_FRACN3_MASK   (0x1fffU << RCC_PLL3FRACR_FRACN3_SHIFT)
 
 /* CFGR.SWS (bits[6:3]) selected clock, decoded by
  * gnw_h7b0_rcc_get_sysclk_hz() -- see gnw_h7b0_rcc.c. */
@@ -196,6 +217,7 @@ struct GnwH7B0RccState {
 
 uint32_t gnw_h7b0_rcc_get_pll2p_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_pll1p_hz(GnwH7B0RccState *s);
+uint32_t gnw_h7b0_rcc_get_pll3r_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_sysclk_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_hclk_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_sai1_kernel_hz(GnwH7B0RccState *s);

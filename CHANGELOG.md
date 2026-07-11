@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026-07-11 (part 2 — real DMA2D/JPEG YCbCr blend pipeline, flicker still open)
+
+Follow-on to the same-day LTDC/JPEG work below. Full writeup:
+`docs/session-2026-07-11-dma2d-jpeg-ycbcr-pipeline.md` (and its predecessor
+`docs/session-2026-07-11-ltdc-flicker-investigation.md`).
+
+- **Fixed LTDC `RRIF` unconditional-assert bug** and **generalized LTDC's
+  per-layer compositing** (color key, window-clip/default-color, generalized
+  `BF1`/`BF2` blend formula, Bayer dithering, Layer2 CLUT/window-clip gaps) —
+  both real, both tested, **neither fixed the reported coverflow flicker**.
+- **Replaced the JPEG "hack buffer"** (a raw RGB565 QEMU-heap pointer handed
+  directly to DMA2D, superseding this file's earlier 2026-07-11 JPEG entry
+  below, which turned out to bypass `FGMAR`/`FGOR`/chroma-subsampling
+  entirely) **with a real polled `DOR` register** that firmware's own
+  `HAL_JPEG_Decode`/`JPEG_Process` polling loop drains into guest RAM,
+  exactly like real polling-mode JPEG decode (no DMA involved) — decode
+  stays fully synchronous, only the delivery mechanism changed.
+- **Fixed `DMA2D_CR_MODE_MASK`** from 2 bits to the real 3-bit width —
+  firmware's real cover-art blend mode (`M2M_BLEND_BG` = 5) was silently
+  truncating to `M2M_PFC` (1), meaning the real blend firmware performs
+  never actually happened in emulation before this.
+- **Implemented real `BLEND_BG`/`BLEND_FG` "fixed color" semantics** (one
+  side is a constant `FGCOLR`/`BGCOLR`, not a fetched buffer — confirmed via
+  the real HAL header) and added a real `A8` input-format fetch. An initial
+  pass that treated `BLEND_BG` like a two-buffer blend (fetching a nonexistent
+  `BGMAR` buffer) was a real regression, caught via live testing, fixed same
+  session.
+- **Fixed a chroma-subsampling storage-size mismatch**: serving full-
+  resolution (non-subsampled) Cb/Cr made our JPEG `DOR` output ~2x the size
+  firmware's own destination buffer expects for real (subsampled) hardware
+  output, so firmware's polling loop only partially drained it — visible as
+  banded/static corruption on cover art. Fixed by subsampling Cb/Cr per the
+  image's real hand-parsed SOF0 sampling factors.
+- **Fixed an out-of-bounds row-wrap** in the new YCbCr fetch (reading past a
+  decoded image's real width using the DMA2D transfer's larger configured
+  geometry wrapped into the next row's bytes).
+- Both corruption fixes are confirmed live-fixed by the user. **The original
+  coverflow/menu flicker itself is still unresolved** — decode, compositing,
+  and the final CPU blit into the LCD framebuffer are all now confirmed
+  deterministic, ruling out this pipeline as the remaining cause. Next
+  suspect: LTDC scanout/vblank timing relative to firmware's real swap
+  cadence, not yet live-traced.
+
 ## 2026-07-11
 
 - **Fixed the pause/options-overlay flicker (screen tearing)**: The root cause was QEMU's asynchronous UI refresh timer occasionally reading the active frontbuffer mid-draw. The guest uses DMA2D to draw overlays directly into the frontbuffer immediately after a `VBR` buffer flip. Fixed by introducing an internal `shadow_buffer` in the LTDC module that captures the fully composited guest frame at the very end of the 16ms window (the instant before the next `VBLANK`), decoupling QEMU's UI thread from the guest rendering entirely.

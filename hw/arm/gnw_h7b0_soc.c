@@ -260,6 +260,7 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->ltdc), 0, LTDC_BASE_ADDRESS);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->ltdc), 0,
                         qdev_get_gpio_in(armv7m, LTDC_IRQn));
+    gnw_h7b0_ltdc_set_rcc(&s->ltdc, &s->rcc);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dma2d), errp)) {
         return;
