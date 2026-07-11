@@ -26,7 +26,7 @@
 #include "qemu/log.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/gnw_h7b0_spi.h"
 #include "hw/misc/gnw_h7b0_regs_spi.h"
 #include "hw/misc/gnw_h7b0_stub_log.h"
@@ -211,12 +211,11 @@ static const VMStateDescription vmstate_gnw_h7b0_spi = {
     }
 };
 
-static Property gnw_h7b0_spi_properties[] = {
+static const Property gnw_h7b0_spi_properties[] = {
     DEFINE_PROP_BOOL("sd-card", GnwH7B0SpiState, sd_card, false),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void gnw_h7b0_spi_class_init(ObjectClass *klass, void *data)
+static void gnw_h7b0_spi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

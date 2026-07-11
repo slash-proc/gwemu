@@ -25,7 +25,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "migration/vmstate.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/misc/gnw_h7b0_adc.h"
 
 static void gnw_h7b0_adc_reset(DeviceState *dev)
@@ -139,7 +139,7 @@ static const VMStateDescription vmstate_gnw_h7b0_adc = {
     }
 };
 
-static void gnw_h7b0_adc_class_init(ObjectClass *klass, void *data)
+static void gnw_h7b0_adc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

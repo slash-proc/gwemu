@@ -31,8 +31,8 @@
 #ifndef HW_MISC_GNW_H7B0_RCC_H
 #define HW_MISC_GNW_H7B0_RCC_H
 
-#include "hw/sysbus.h"
-#include "hw/clock.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/clock.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_RCC "gnw-h7b0-rcc"

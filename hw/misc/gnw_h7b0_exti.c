@@ -59,7 +59,7 @@ static const VMStateDescription vmstate_gnw_h7b0_exti = {
     }
 };
 
-static void gnw_h7b0_exti_class_init(ObjectClass *klass, void *data)
+static void gnw_h7b0_exti_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->vmsd = &vmstate_gnw_h7b0_exti;

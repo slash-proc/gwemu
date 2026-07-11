@@ -8,7 +8,7 @@
 #ifndef HW_MISC_GNW_H7B0_TIM2_H
 #define HW_MISC_GNW_H7B0_TIM2_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "qom/object.h"
 #include "qemu/timer.h"
 #include "hw/misc/gnw_h7b0_rcc.h"

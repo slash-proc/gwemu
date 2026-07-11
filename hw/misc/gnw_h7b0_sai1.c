@@ -21,9 +21,10 @@
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/gnw_h7b0_sai1.h"
 #include "hw/misc/gnw_h7b0_regs_sai1.h"
+#include "exec/cpu-common.h"
 
 #define SAI_xCR1_SAIEN  (1U << 16)
 #define SAI_xCR1_DMAEN  (1U << 17)
@@ -181,7 +182,7 @@ static void gnw_h7b0_sai1_voice_cb(void *opaque, int avail)
          */
         uint32_t max = MIN((uint32_t)avail, fifo8_num_used(&s->fifo));
         const uint8_t *ptr = fifo8_pop_bufptr(&s->fifo, max, &chunk);
-        int n = AUD_write(s->voice, (void *)ptr, chunk);
+        int n = audio_be_write(s->audio_be, s->voice, (void *)ptr, chunk);
 
         if (n <= 0) {
             break;
@@ -209,13 +210,13 @@ static void gnw_h7b0_sai1_update_voice(GnwH7B0Sai1State *s)
             .freq = gnw_h7b0_sai1_get_rate_hz(s),
             .nchannels = GNW_H7B0_SAI1_CHANNELS,
             .fmt = AUDIO_FORMAT_S16,
-            .endianness = AUDIO_HOST_ENDIANNESS,
+            .big_endian = false,
         };
 
-        s->voice = AUD_open_out(&s->card, s->voice, "gnw-h7b0-sai1", s,
-                                 gnw_h7b0_sai1_voice_cb, &as);
+        s->voice = audio_be_open_out(s->audio_be, s->voice, "gnw-h7b0-sai1",
+                                      s, gnw_h7b0_sai1_voice_cb, &as);
         if (s->voice) {
-            AUD_set_active_out(s->voice, 1);
+            audio_be_set_active_out(s->audio_be, s->voice, true);
             s->voice_open = true;
             if (s->dma) {
                 gnw_h7b0_dma_set_stream_notifier(s->dma,
@@ -225,7 +226,7 @@ static void gnw_h7b0_sai1_update_voice(GnwH7B0Sai1State *s)
             }
         }
     } else if (!want_enabled && s->voice_open) {
-        AUD_set_active_out(s->voice, 0);
+        audio_be_set_active_out(s->audio_be, s->voice, false);
         s->voice_open = false;
         fifo8_reset(&s->fifo);
         if (s->dma) {
@@ -260,7 +261,7 @@ static void gnw_h7b0_sai1_reset(DeviceState *dev)
         s->regs[i] = get_sai1_reset_value(i * 4);
     }
     if (s->voice_open) {
-        AUD_set_active_out(s->voice, 0);
+        audio_be_set_active_out(s->audio_be, s->voice, false);
         s->voice_open = false;
         fifo8_reset(&s->fifo);
         if (s->dma) {
@@ -338,7 +339,7 @@ static void gnw_h7b0_sai1_realize(DeviceState *dev, Error **errp)
 {
     GnwH7B0Sai1State *s = GNW_H7B0_SAI1(dev);
 
-    if (!AUD_register_card(TYPE_GNW_H7B0_SAI1, &s->card, errp)) {
+    if (!audio_be_check(&s->audio_be, errp)) {
         return;
     }
     fifo8_create(&s->fifo, GNW_H7B0_SAI1_FIFO_CAPACITY);
@@ -355,12 +356,11 @@ static const VMStateDescription vmstate_gnw_h7b0_sai1 = {
     }
 };
 
-static Property gnw_h7b0_sai1_properties[] = {
-    DEFINE_AUDIO_PROPERTIES(GnwH7B0Sai1State, card),
-    DEFINE_PROP_END_OF_LIST(),
+static const Property gnw_h7b0_sai1_properties[] = {
+    DEFINE_AUDIO_PROPERTIES(GnwH7B0Sai1State, audio_be),
 };
 
-static void gnw_h7b0_sai1_class_init(ObjectClass *klass, void *data)
+static void gnw_h7b0_sai1_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->vmsd = &vmstate_gnw_h7b0_sai1;

@@ -186,7 +186,7 @@ static const VMStateDescription vmstate_gnw_h7b0_crc = {
     }
 };
 
-static void gnw_h7b0_crc_class_init(ObjectClass *klass, void *data)
+static void gnw_h7b0_crc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

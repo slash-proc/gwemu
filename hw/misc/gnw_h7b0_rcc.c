@@ -30,7 +30,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "migration/vmstate.h"
-#include "hw/clock.h"
+#include "hw/core/clock.h"
 #include "hw/misc/gnw_h7b0_rcc.h"
 #include "hw/misc/gnw_h7b0_regs_rcc.h"
 
@@ -420,7 +420,7 @@ static const VMStateDescription vmstate_gnw_h7b0_rcc = {
     }
 };
 
-static void gnw_h7b0_rcc_class_init(ObjectClass *klass, void *data)
+static void gnw_h7b0_rcc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

@@ -2,7 +2,7 @@
 #ifndef HW_MISC_GNW_H7B0_FLASH_R_H
 #define HW_MISC_GNW_H7B0_FLASH_R_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_FLASH_R "gnw-h7b0-flash_r"

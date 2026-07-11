@@ -71,9 +71,9 @@
 #ifndef HW_DISPLAY_GNW_H7B0_LTDC_H
 #define HW_DISPLAY_GNW_H7B0_LTDC_H
 
-#include "hw/sysbus.h"
-#include "hw/irq.h"
-#include "exec/memory.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
+#include "system/memory.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "hw/misc/gnw_h7b0_rcc.h"

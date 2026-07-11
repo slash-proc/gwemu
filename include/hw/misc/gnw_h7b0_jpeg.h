@@ -2,7 +2,7 @@
 #ifndef HW_MISC_GNW_H7B0_JPEG_H
 #define HW_MISC_GNW_H7B0_JPEG_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_JPEG "gnw-h7b0-jpeg"

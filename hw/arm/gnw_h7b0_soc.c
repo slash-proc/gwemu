@@ -25,10 +25,10 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "exec/address-spaces.h"
+#include "system/address-spaces.h"
 #include "hw/arm/gnw_h7b0_soc.h"
-#include "hw/qdev-clock.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 
 static void gnw_h7b0_soc_initfn(Object *obj)
 {
@@ -408,7 +408,7 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      */
 }
 
-static void gnw_h7b0_soc_class_init(ObjectClass *klass, void *data)
+static void gnw_h7b0_soc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

@@ -10,7 +10,7 @@
 #ifndef HW_MISC_GNW_H7B0_DMA_H
 #define HW_MISC_GNW_H7B0_DMA_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "qom/object.h"
 #include "qemu/timer.h"
 

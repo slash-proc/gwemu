@@ -24,7 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "hw/misc/gnw_h7b0_ospi.h"
 #include "hw/misc/gnw_h7b0_regs_ospi.h"
@@ -418,13 +418,12 @@ static const VMStateDescription vmstate_gnw_h7b0_ospi = {
     }
 };
 
-static Property gnw_h7b0_ospi_properties[] = {
+static const Property gnw_h7b0_ospi_properties[] = {
     DEFINE_PROP_UINT64("flash-size", GnwH7B0OspiState, flash_size,
                         OSPI_FLASH_DEFAULT_SIZE),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void gnw_h7b0_ospi_class_init(ObjectClass *klass, void *data)
+static void gnw_h7b0_ospi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

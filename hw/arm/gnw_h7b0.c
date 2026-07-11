@@ -30,11 +30,12 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "hw/boards.h"
-#include "hw/qdev-clock.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/boards.h"
+#include "hw/core/qdev-clock.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/arm/gnw_h7b0_soc.h"
 #include "hw/arm/boot.h"
+#include "hw/arm/machines-qom.h"
 
 /*
  * Was 280MHz (the datasheet's stated max) as a placeholder guess -- but
@@ -119,4 +120,4 @@ static void gnw_h7b0_machine_init(MachineClass *mc)
     machine_add_audiodev_property(mc);
 }
 
-DEFINE_MACHINE("gnw-h7b0", gnw_h7b0_machine_init)
+DEFINE_MACHINE_ARM("gnw-h7b0", gnw_h7b0_machine_init)

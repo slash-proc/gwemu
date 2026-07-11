@@ -19,9 +19,9 @@
 #ifndef HW_MISC_GNW_H7B0_SAI1_H
 #define HW_MISC_GNW_H7B0_SAI1_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "qom/object.h"
-#include "audio/audio.h"
+#include "qemu/audio.h"
 #include "qemu/fifo8.h"
 #include "hw/misc/gnw_h7b0_dma.h"
 #include "hw/misc/gnw_h7b0_rcc.h"
@@ -49,7 +49,7 @@ struct GnwH7B0Sai1State {
     MemoryRegion mmio;
     uint32_t regs[GNW_H7B0_SAI1_SIZE / 4];
 
-    QEMUSoundCard card;
+    AudioBackend *audio_be;
     SWVoiceOut *voice;
     bool voice_open;
 

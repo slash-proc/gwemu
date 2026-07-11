@@ -48,9 +48,9 @@
 #ifndef HW_DISPLAY_GNW_H7B0_DMA2D_H
 #define HW_DISPLAY_GNW_H7B0_DMA2D_H
 
-#include "hw/sysbus.h"
-#include "hw/irq.h"
-#include "exec/memory.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
+#include "system/memory.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_DMA2D "gnw-h7b0-dma2d"
