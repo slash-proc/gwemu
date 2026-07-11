@@ -415,7 +415,28 @@ config GNW_H7B0_SOC
     select GNW_H7B0_OSPI
     select GNW_H7B0_ADC
     select GNW_H7B0_LTDC
+    select GNW_H7B0_DMA2D
     select GNW_H7B0_SPI
+    select GNW_H7B0_RTC
+    select GNW_H7B0_CRC
+    select GNW_H7B0_GPIO
+    select SSI_SD
+    select GNW_H7B0_DBGMCU
+    select GNW_H7B0_DWT
+    select GNW_H7B0_FLASH_R
+    select GNW_H7B0_FMC
+    select GNW_H7B0_CRS
+    select GNW_H7B0_OCTOSPIM
+    select GNW_H7B0_EXTI
+    select GNW_H7B0_SYSCFG
+    select GNW_H7B0_DMA
+    select GNW_H7B0_SAI1
+    select GNW_H7B0_DAC
+    select GNW_H7B0_TIM1
+    select GNW_H7B0_JPEG
+    select GNW_H7B0_TAMP
+    select GNW_H7B0_WWDG
+    select GNW_H7B0_TIM2
 
 config B_L475E_IOT01A
     bool

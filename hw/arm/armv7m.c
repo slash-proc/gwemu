@@ -428,6 +428,27 @@ static void armv7m_realize(DeviceState *dev, Error **errp)
                           "nvic-default", 0x100000);
     memory_region_add_subregion_overlap(&s->container, 0xe0000000,
                                         &s->defaultmem, -1);
+    /*
+     * Optional board-provided DWT (Data Watchpoint and Trace unit,
+     * 0xe0001000) device, same pattern as NVIC/systick just below:
+     * added directly into the container (not via board_memory/the
+     * generic system bus) at a priority that wins over defaultmem's
+     * RAZ/WI catch-all, only when a board actually links one in via
+     * the "dwt-mr" property. Boards that don't set it are completely
+     * unaffected -- defaultmem's existing RAZ/WI behavior is
+     * untouched. See gnw_h7b0_soc.c for why a real one matters: real
+     * firmware timing/frame-pacing logic on at least one board reads
+     * DWT_CYCCNT as a free-running cycle counter, and permanently
+     * RAZ/WI (always reading 0, i.e. "no time ever elapses") corrupts
+     * that pacing in ways that are otherwise very hard to diagnose.
+     */
+    fprintf(stderr, "[armv7m-dwt-debug] s->dwt_mr=%p\n", s->dwt_mr);
+    if (s->dwt_mr) {
+        memory_region_add_subregion_overlap(&s->container, 0xe0001000,
+                                            s->dwt_mr, 1);
+        fprintf(stderr, "[armv7m-dwt-debug] added dwt_mr overlap, size=%"
+                PRIu64 "\n", memory_region_size(s->dwt_mr));
+    }
 
     /* Wire the NVIC up to the CPU */
     sbd = SYS_BUS_DEVICE(&s->nvic);
@@ -541,6 +562,8 @@ static void armv7m_realize(DeviceState *dev, Error **errp)
 static Property armv7m_properties[] = {
     DEFINE_PROP_STRING("cpu-type", ARMv7MState, cpu_type),
     DEFINE_PROP_LINK("memory", ARMv7MState, board_memory, TYPE_MEMORY_REGION,
+                     MemoryRegion *),
+    DEFINE_PROP_LINK("dwt-mr", ARMv7MState, dwt_mr, TYPE_MEMORY_REGION,
                      MemoryRegion *),
     DEFINE_PROP_LINK("idau", ARMv7MState, idau, TYPE_IDAU_INTERFACE, Object *),
     DEFINE_PROP_UINT32("init-svtor", ARMv7MState, init_svtor, 0),

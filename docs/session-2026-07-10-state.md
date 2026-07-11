@@ -32,6 +32,41 @@ Everything through commit `5482a047e9` on branch `gnw-h7b0`:
   pipeline (boot → clock/power/OSPI/ADC/SPI init → LTDC → text
   rendering) works end to end.
 
+## Fixed: chainloader was permanently stuck in a POR-standby trap before even reaching the app
+
+Found while resuming this session: `gnw_chainloader.bin` (current
+build, may be a newer firmware revision than whichever one produced
+the "STATE_COMPLETE" observation above — `../gnw-chainloader`'s source
+isn't version-pinned here) was **not** progressing at all — PC parked
+permanently at `0x08000e6c` in `stub.elf`, confirmed identical across
+multiple gdb checks 6+ seconds apart (real hang, not slow).
+
+Root cause: `src/chainloader/stub_main.c:64`'s
+`if (RCC->RSR & RCC_RSR_PORRSTF)` branch. On real hardware this only
+fires on a genuine cold power-on and deliberately parks the CPU in
+`SCB_SCR.SLEEPDEEP` + `WFI` forever, waiting for a physical WKUP1
+button press, specifically to prevent auto-boot when the device is
+just plugged into USB. `RCC_RSR_RESET_VALUE` (`gnw_h7b0_rcc.h`) had
+`PORRSTF` set as part of a realistic all-four-flags-on power-on value
+(`0x00E80000`) — correct for real hardware's *first ever* power-on,
+but since QEMU resets to this same value on *every* launch, every
+single emulated boot looked like a fresh POR and hit this permanent
+standby trap. We don't model the WKUP1 pin, so there was no way out.
+
+**Fixed** by clearing just the `PORRSTF` bit
+(`RCC_RSR_RESET_VALUE` now `0x00680000`, keeping
+`CDRSTF|BORRSTF|PINRSTF`) — `PINRSTF` (pin reset) is a more accurate
+stand-in for "the board was just reset/relaunched", which is what
+every QEMU boot actually is. Confirmed fix: PC now advances into the
+decompressed app in AXI SRAM (`0x2400xxxx` range, was never reached
+before), and `g_scan.state` progresses through real states
+(`STATE_PROBE_SD` observed ~8s in) instead of never leaving the flash
+stub. Live SDL window now also shows a plain dark-grey background
+instead of the LTDC's uninitialized-black default, indicating the app
+is now driving the display — screen still has no menu text, which is
+Open problem 1 below, now able to be investigated for real since the
+firmware actually runs.
+
 ## Open problem 1: chainloader's menu never draws
 
 `gnw-chainloader` runs with no faults, but the screen stays a solid
@@ -185,33 +220,53 @@ source to trace further (retro-go's `main.c`/`Error_Handler`
 implementation isn't in this repo's tree — only `gw_retro_go_bank1.elf`
 and friends under `retro-go-temp/`, gitignored, user-provided).
 
-**Next step**: get retro-go source (or at least `main.c` /
-`Error_Handler` / the RTC init path) to trace this properly, the same
-way `gnw-chainloader`'s source let us diagnose everything else this
-session. Without source, further progress here means blind
-disassembly, which is much slower per finding than it was for
-chainloader.
+**UPDATE — still crashes, extflash did NOT fix this.** Initial
+same-session gdb spot-checks (at ~10s and ~110s of real wall-clock
+time, under the debug build's ~20-25x slowdown) caught the CPU still
+legitimately executing GPIO/button-polling code
+(`buttons_get`/`HAL_GPIO_ReadPin`) with `uwTick` climbing, which looked
+like the crash was avoided. It wasn't — a longer unattended run (no
+gdbserver attached, full speed, ~62 real seconds) reached the LTDC
+framebuffer and displayed the exact same crash screen text,
+`PC=0x00000000 LR=0x08005915`, confirmed visually by the user. So
+extflash content only delayed reaching `Error_Handler` (through more
+real boot work happening first), it didn't prevent it. See the
+extflash section below for what's confirmed vs. not, and go back to
+"**Next step**" above (get retro-go source) for this specific crash.
 
-## extflash
+## extflash — wiring confirmed working; did NOT fix the Open-problem-3 crash
 
-User added `example-extflash-backup.bin` (64MB, exact match for
-`EXTFLASH_SIZE`) at the repo root — gitignored, not tracked, **not yet
-wired up or tested**. `EXTFLASH_BASE_ADDRESS` (`0x90000000`) is
-currently backed by a zero-initialized plain-RAM region
-(`gnw_h7b0_soc.c`'s `INIT_RAM_REGION(extflash, ...)`); the simplest way
-to actually load this file's content into it is QEMU's generic loader
-device, no code changes needed:
+Tested the loader-device approach:
 
 ```
 -device loader,file=/home/doug/Nerd/git/qemu-gnw/example-extflash-backup.bin,addr=0x90000000
 ```
 
-(untested — do this next, it's cheap to try). This should let
-retro-go's OSPI reads return real content instead of all-zero, which
-may also change/fix the `Error_Handler` crash above if it's
-content-dependent (e.g. reading a real, valid-looking asset instead of
-all-zero garbage that some code path mishandles) — worth trying
-*before* diving into retro-go source, since it's a 30-second test.
+**The loader mechanism itself works, no code changes needed** — this
+is a good, reusable way to populate `EXTFLASH_BASE_ADDRESS`
+(`0x90000000`, otherwise a zero-initialized plain-RAM region per
+`gnw_h7b0_soc.c`'s `INIT_RAM_REGION(extflash, ...)`) for any future
+retro-go/chainloader testing that needs real flash content.
+
+**But it does not fix Open problem 3.** With real extflash content
+present, retro-go still eventually hits the identical
+`Error_Handler` crash (`PC=0x00000000`, `LR=0x08005915`) — confirmed
+via the live SDL window after ~62 real seconds of unattended running.
+Early gdb spot-checks (at ~10s/~110s real time) had caught it mid-flight
+still legitimately executing GPIO/button-polling code with `uwTick`
+climbing, which was a false-positive "looks fixed" signal — it just
+hadn't reached the crash point yet at those check-in times. `logbuf`
+content (the three boot lines) was identical in both the crashed and
+not-yet-crashed states either way, consistent with those being
+unconditional diagnostics unrelated to the crash, as suspected before.
+
+**Net effect**: extflash loading is now a proven, ready-to-use tool,
+but Open problem 3 (retro-go's `Error_Handler` crash) is unresolved
+and still needs retro-go source to trace further — see "**Next step**"
+in Open problem 3 above.
+
+Origin note: user added `example-extflash-backup.bin` (64MB, exact
+match for `EXTFLASH_SIZE`) at the repo root — gitignored, not tracked.
 
 ## gdb gotchas learned this session (save yourself the time)
 

@@ -99,6 +99,11 @@ struct ARMv7MState {
     char *cpu_type;
     /* MemoryRegion the board provides to us (with its devices, RAM, etc) */
     MemoryRegion *board_memory;
+    /* Optional board-provided DWT (0xe0001000) MemoryRegion -- see
+     * armv7m.c's realize for why/how this overrides defaultmem's
+     * RAZ/WI there. NULL (the default) leaves existing RAZ/WI
+     * behavior completely unchanged. */
+    MemoryRegion *dwt_mr;
     Object *idau;
     uint32_t init_svtor;
     uint32_t init_nsvtor;

@@ -35,7 +35,27 @@
 #include "hw/misc/gnw_h7b0_ospi.h"
 #include "hw/misc/gnw_h7b0_adc.h"
 #include "hw/display/gnw_h7b0_ltdc.h"
+#include "hw/display/gnw_h7b0_dma2d.h"
 #include "hw/misc/gnw_h7b0_spi.h"
+#include "hw/misc/gnw_h7b0_rtc.h"
+#include "hw/misc/gnw_h7b0_crc.h"
+#include "hw/misc/gnw_h7b0_gpio.h"
+#include "hw/misc/gnw_h7b0_dbgmcu.h"
+#include "hw/misc/gnw_h7b0_dwt.h"
+#include "hw/misc/gnw_h7b0_flash_r.h"
+#include "hw/misc/gnw_h7b0_fmc.h"
+#include "hw/misc/gnw_h7b0_crs.h"
+#include "hw/misc/gnw_h7b0_octospim.h"
+#include "hw/misc/gnw_h7b0_exti.h"
+#include "hw/misc/gnw_h7b0_syscfg.h"
+#include "hw/misc/gnw_h7b0_dma.h"
+#include "hw/misc/gnw_h7b0_sai1.h"
+#include "hw/misc/gnw_h7b0_dac.h"
+#include "hw/misc/gnw_h7b0_tim1.h"
+#include "hw/misc/gnw_h7b0_jpeg.h"
+#include "hw/misc/gnw_h7b0_tamp.h"
+#include "hw/misc/gnw_h7b0_wwdg.h"
+#include "hw/misc/gnw_h7b0_tim2.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_SOC "gnw-h7b0-soc"
@@ -85,6 +105,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 #define FLASH_BANK_SIZE           (256 * 1024)
 
 /*
+ * Factory-programmed 96-bit unique device ID (STM32H7xx_HAL_Driver's
+ * HAL_GetUIDw0/1/2(), stm32h7b0xx.h's UID_BASE) -- real hardware has
+ * this burned into a fixed system-memory address well past either
+ * flash bank, not backed by any RAM/flash region we model elsewhere.
+ * retro-go's extflash file-cache journal (Core/Src/gw_flash_alloc.c's
+ * get_cpu_unique_id(), used whenever a ROM is too big for the RAM
+ * cache and gets cached to extflash instead) reads this at runtime;
+ * without backing memory here that read BusFaults. A small RAM page
+ * seeded with a fixed synthetic UID (gnw_h7b0_soc.c) is enough --
+ * nothing depends on this matching real silicon's actual per-chip ID.
+ */
+#define UID_BASE_ADDRESS 0x08FFF800
+#define UID_SIZE          4096
+
+/*
  * External OSPI flash (real G&W firmware lives here, XIP). Dual-quad
  * OCTOSPI1+OCTOSPI2 via the IO manager, since we're targeting the Tim
  * Scheuerwegen SD-card mod (SPI2/OSPI2 path), not the yota9 mod. Not yet
@@ -110,6 +145,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  * INIT_RAM_REGION call in gnw_h7b0_soc.c realize().
  */
 #define DBGMCU_BASE_ADDRESS 0x5C001000
+
+/*
+ * ARMv7-M DWT unit -- architecturally fixed for every Cortex-M
+ * implementation, not SoC-specific (see gnw_h7b0_dwt.h).
+ */
+#define DWT_BASE_ADDRESS 0xE0001000
 #define DBGMCU_SIZE          0x400
 
 /*
@@ -144,15 +185,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 
 /*
  * GPIOA-K, per STM32H7B0.svd (contiguous 0x400-per-port blocks,
- * 0x58020000-0x58022FFF). Modeled as plain RAM for now -- real GPIO
- * (buttons, LCD control lines) is Phase 4 territory (see
- * docs/roadmap.md); this is only enough to let pin-init code that
- * reads/writes MODER/OTYPER/etc. during early boot avoid BusFaulting.
- * No button input or LCD control-line side effects yet -- do not treat
- * this as a real GPIO model.
+ * 0x58020000-0x58022FFF). Modeled as a real minimal device
+ * (hw/misc/gnw_h7b0_gpio.c) -- real GPIO (pin-mux-driven input/output,
+ * LCD control lines) is still Phase 4 territory (see docs/roadmap.md),
+ * but a zero-initialized plain-RAM IDR made every active-low button
+ * (external pull-ups, real hardware convention) read as permanently
+ * pressed, silently forcing gnw-chainloader's "God Mode" boot-time
+ * button-override path on every launch. See gnw_h7b0_gpio.h.
  */
 #define GPIO_BASE_ADDRESS 0x58020000
-#define GPIO_SIZE         (11 * 0x400)
 
 /*
  * CRS (Clock Recovery System, HSI48 auto-trim -- used by USB), per
@@ -183,15 +224,76 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 #define OCTOSPIM_SIZE          0x400
 
 /*
+ * TAMP (tamper/backup registers), per STM32H7B0.svd baseAddress
+ * 0x58004400 -- adjacent to but distinct from RTC (RTC_BASE_ADDRESS
+ * above only covers 0x58004000-0x580043FF; TAMP is a separate
+ * peripheral immediately after it, not merged into our RTC device).
+ * Modeled as plain RAM for now -- same rationale as the other
+ * not-yet-modeled peripherals above; found the same way CRC was, one
+ * gap further into gnw-chainloader's boot once OSPI/CRC stopped
+ * blocking it.
+ */
+#define TAMP_BASE_ADDRESS 0x58004400
+#define TAMP_SIZE          0x400
+
+/*
+ * WWDG (window watchdog), per STM32H7B0.svd baseAddress 0x50003000.
+ * Modeled as plain RAM for now -- same rationale as the other
+ * not-yet-modeled peripherals above; found the same way DAC1/DAC2/
+ * TIM1 were, entirely unmapped rather than even a RAM placeholder.
+ * `MX_WWDG1_Init()` (retro-go) and the OEM firmware's own watchdog
+ * init both touch this during boot. No real countdown/refresh
+ * semantics modeled -- if something ever blocks waiting for a
+ * hardware-set WWDG status bit, a dumb RAM stub won't be enough (same
+ * caveat as RTC/OSPI/ADC/PWR before they got real devices).
+ */
+#define WWDG_BASE_ADDRESS 0x50003000
+#define WWDG_SIZE          0x400
+
+/*
+ * TIM2/3/4/5 (general purpose) + TIM6/7 (basic) + TIM12/13/14 (general
+ * purpose), per STM32H7B0.svd (contiguous 0x400-per-timer blocks,
+ * 0x40000000-0x400027FF, right up to LPTIM1 at 0x40002400... wait,
+ * LPTIM1 is 0x40002400-0x400027FF so this region stops there).
+ * Modeled as plain RAM for now -- same rationale as the other
+ * not-yet-modeled peripherals above; found via patched-zelda-bank1.bin
+ * (real OEM firmware) touching TIM5 (0x40000C00) during boot, entirely
+ * unmapped like TIM1 was. Covering the whole contiguous block up front
+ * (TIM1's own gap was found and fixed one timer at a time, single
+ * instance, before this) since real OEM firmware's timer usage
+ * (piezo speaker PWM, backlight, etc.) is likely to touch more than
+ * one of these.
+ */
+#define TIM2_BLOCK_BASE_ADDRESS 0x40000000
+#define TIM2_BLOCK_SIZE          0x2800
+
+/*
+ * CRC (hardware CRC-32 unit), per STM32H7B0.svd baseAddress
+ * 0x40023000. Modeled as a real device (hw/misc/gnw_h7b0_crc.c) --
+ * found once gnw-chainloader's OSPI_Init() stopped hanging (see
+ * gnw_h7b0_ospi.h) and boot reached ofw_crc32()
+ * (src/chainloader/system/ofw_verify.c), which first BusFaulted
+ * (entirely unmapped) and, once given only a plain-RAM stub, made
+ * every flash-content verification fail (DR always read back 0). A
+ * real bit-serial CRC engine was needed, not just enough register
+ * plumbing to avoid a fault -- see gnw_h7b0_crc.h.
+ */
+#define CRC_BASE_ADDRESS 0x40023000
+
+/*
  * ADC1/ADC2 (+ common registers), per STM32H7B0.svd (0x40022000/
  * 0x40022100, 0x100 each, plus shared ADC_COMMON registers at +0x300).
  * Modeled as a real minimal device (hw/misc/gnw_h7b0_adc.c), RCC/PWR-
  * style: found by a gnw-chainloader boot hang in board_adc_init()
  * spinning on ADC1's ISR.ADRDY bit after setting CR.ADEN, which a
- * plain-RAM stub never sets. See gnw_h7b0_adc.h -- still no real
- * conversion semantics (reads always return 0).
+ * plain-RAM stub never sets. See gnw_h7b0_adc.h -- regular conversions
+ * return a fixed full-battery reading; every other register is a plain
+ * shadow.
  */
 #define ADC_BASE_ADDRESS 0x40022000
+/* Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type: ADC_IRQn = 18
+ * (shared by ADC1/ADC2). */
+#define ADC_IRQn 18
 
 /*
  * SPI2, per STM32H7B0.svd baseAddress 0x40003800. This is also the
@@ -243,6 +345,58 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 #define SAI1_SIZE          0x400
 
 /*
+ * DAC1, per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's DAC1_BASE
+ * (0x40007400) -- audio output (piezo speaker), untouched by
+ * gnw-chainloader (no audio) but touched by retro-go's audio init.
+ * Was previously not mapped AT ALL (not even a RAM placeholder,
+ * unlike every other not-yet-modeled peripheral here) -- a genuine
+ * bus fault, found because it cascaded into an unrecoverable "Lockup:
+ * can't escalate" QEMU abort (a second fault inside the first fault's
+ * handler that couldn't be taken at the current priority) rather than
+ * a clean, debuggable single fault. Modeled as plain RAM for now --
+ * same rationale as the other not-yet-modeled peripherals above.
+ */
+#define DAC1_BASE_ADDRESS 0x40007400
+#define DAC1_SIZE          0x400
+
+/*
+ * DAC2, per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's DAC2_BASE
+ * (0x58003400, SRD domain -- a separate instance from DAC1, not a
+ * mirror). Same "was entirely unmapped, found via the same DAC1
+ * lockup" story -- see DAC1_BASE_ADDRESS above.
+ */
+#define DAC2_BASE_ADDRESS 0x58003400
+#define DAC2_SIZE          0x400
+
+/*
+ * TIM1, per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's TIM1_BASE
+ * (0x40010000) -- an entire peripheral class (all timers) was
+ * previously unmapped; retro-go's MX_TIM1_Init() (Core/Src/main.c,
+ * likely piezo-speaker PWM) is the only timer it initializes, found
+ * via the same real-BSOD-crash-screen trail as DAC1/DAC2. Modeled as
+ * plain RAM for now -- same rationale as the other not-yet-modeled
+ * peripherals above.
+ */
+#define TIM1_BASE_ADDRESS 0x40010000
+#define TIM1_SIZE          0x400
+
+/*
+ * JPEG, per STM32H7B0.svd baseAddress 0x52003000 -- hardware JPEG
+ * decode, used by retro-go's menu UI for game cover art/thumbnails.
+ * Was entirely unmapped (not even a RAM placeholder), found via a real
+ * BSOD (`Invalid read at addr 0x52003030 ... reason: rejected` in the
+ * guest-error log) while booting retro-go-real-bank1.bin. SVD's
+ * documented addressBlock is only 0x400, but retro-go reads as far as
+ * offset 0x42C (past that into the reserved gap before FMC at
+ * 0x52004000) -- sized to cover the whole gap up to FMC rather than
+ * just the documented register block, since this is only a RAM
+ * placeholder anyway. Modeled as plain RAM for now -- same rationale
+ * as the other not-yet-modeled peripherals above.
+ */
+#define JPEG_BASE_ADDRESS 0x52003000
+#define JPEG_SIZE          0x1000
+
+/*
  * RTC, per STM32H7B0.svd baseAddress 0x58004000. Modeled as plain RAM
  * for now -- same rationale as the other not-yet-modeled peripherals
  * above.
@@ -253,12 +407,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 /*
  * LTDC (LCD-TFT Display Controller), per STM32H7B0.svd baseAddress
  * 0x50001000. Modeled as a real minimal device
- * (hw/display/gnw_h7b0_ltdc.c): Layer1-only, RGB565-only, no
- * timing/IRQ modeling. Found by a gnw-chainloader boot reaching real
- * LTDC init after all other Phase 1 boot-path gaps were closed -- see
+ * (hw/display/gnw_h7b0_ltdc.c): Layer1-only, RGB565-only, plain
+ * fixed-rate vblank/line-interrupt approximation (not real per-line
+ * timing). Found by a gnw-chainloader boot reaching real LTDC init
+ * after all other Phase 1 boot-path gaps were closed -- see
  * STATUS.md and gnw_h7b0_ltdc.h.
  */
 #define LTDC_BASE_ADDRESS 0x50001000
+/* Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type: LTDC_IRQn = 88. */
+#define LTDC_IRQn 88
+
+/*
+ * DMA2D (Chrom-ART Accelerator), per STM32H7B0.svd baseAddress
+ * 0x52001000. Modeled as a real minimal device (hw/display/gnw_h7b0_dma2d.c):
+ * R2M/M2M/M2M_PFC/M2M_BLEND modes, ARGB8888/RGB565/ARGB1555/ARGB4444/L8
+ * pixel formats. Added to fix a real BusFault crash in retro-go
+ * firmware's HAL_DMA2D_Init() -- DMA2D was previously completely
+ * unmapped.
+ */
+#define DMA2D_BASE_ADDRESS 0x52001000
+/* Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type: DMA2D_IRQn = 90. */
+#define DMA2D_IRQn 90
 
 struct GnwH7B0State {
     SysBusDevice parent_obj;
@@ -270,8 +439,29 @@ struct GnwH7B0State {
     GnwH7B0OspiState octospi2;
     GnwH7B0AdcState adc;
     GnwH7B0LtdcState ltdc;
+    GnwH7B0Dma2dState dma2d;
     GnwH7B0SpiState spi2;
     GnwH7B0SpiState spi1;
+    GnwH7B0RtcState rtc;
+    GnwH7B0CrcState crc;
+    GnwH7B0GpioState gpio;
+    GnwH7B0DbgmcuState dbgmcu;
+    GnwH7B0DwtState dwt;
+    GnwH7B0FlashRState flash_r;
+    GnwH7B0FmcState fmc;
+    GnwH7B0CrsState crs;
+    GnwH7B0OctospimState octospim;
+    GnwH7B0ExtiState exti;
+    GnwH7B0SyscfgState syscfg;
+    GnwH7B0DmaState dma;
+    GnwH7B0Sai1State sai1;
+    GnwH7B0DacState dac1;
+    GnwH7B0DacState dac2;
+    GnwH7B0Tim1State tim1;
+    GnwH7B0JpegState jpeg;
+    GnwH7B0TampState tamp;
+    GnwH7B0WwdgState wwdg;
+    GnwH7B0Tim2State tim2;
 
     MemoryRegion itcm;
     MemoryRegion dtcm;
@@ -285,16 +475,7 @@ struct GnwH7B0State {
     MemoryRegion flash_bank1;
     MemoryRegion flash_bank2;
     MemoryRegion extflash;
-    MemoryRegion dbgmcu;
-    MemoryRegion flash_r;
-    MemoryRegion fmc;
-    MemoryRegion gpio;
-    MemoryRegion crs;
-    MemoryRegion octospim;
-    MemoryRegion exti_syscfg;
-    MemoryRegion dma;
-    MemoryRegion sai1;
-    MemoryRegion rtc;
+    MemoryRegion uid;
 
     Clock *sysclk;
 };

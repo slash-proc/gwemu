@@ -24,11 +24,30 @@ phased plan.
 - `docs/` — design rationale, architecture notes, dated investigation
   writeups for anything gnarly (bug hunts, root-causes). Narrative and
   history belong here, not in STATUS.md.
-- **`docs/session-2026-07-10-state.md`** — a session got cut off
-  mid-investigation (chainloader's menu not drawing, a release-build
-  perf fix that introduced a worse 0%-CPU hang, retro-go's
-  Error_Handler crash, extflash not yet wired up). Read this first and
-  work from it before starting fresh investigation on any of those.
+- `docs/session-2026-07-10-state.md` / `-part2-state.md` — historical
+  investigation writeups from an earlier cut-off session. All four
+  open problems they tracked (chainloader's menu not drawing,
+  retro-go's `Error_Handler` crash, extflash not wired up, a
+  release-build perf hang) are now resolved — see CHANGELOG.md's
+  2026-07-10 entries (LTDC vblank/IRQ, RTC device, SPI `TXP` fix, real
+  OSPI/CRC command decoding) for what actually fixed them. Kept for
+  gdb-workflow notes and DMA2D/LTDC history, not as a live TODO list.
+- `docs/h7b0-clock-tree-findings.md` — hard-won HSI-vs-HSE, PLL2 VCO/
+  fractional-N formula, SAI1SEL mux, and TIM2/HCLK clock-tree facts
+  confirmed via live gdb tracing against real firmware; consult before
+  adding real-clock-dependent behavior to any new peripheral (ADC timing,
+  timer-driven devices, SPI/OSPI baud-rate fidelity) instead of
+  re-deriving or re-guessing a frequency.
+- `docs/session-2026-07-10-part3-gamepad-sd-debugging.md` — real xpad
+  gamepad support, a real physical SD card testing session, and a real
+  DMA2D device model. Documents the disassembly-only (no debug symbols)
+  gdb technique used to find most of that session's bugs, and the
+  "firmware polls a status flag our stub never sets" pattern that
+  accounted for most of them (SPI1 RXP, ssi-sd.c CMD58, JPEG EOCF/IFTF/
+  IFNFF, TIM2-block UIF, RTC ICSR write-flags). Has an open problem (a
+  patched Zelda firmware image still hangs past ADC config) and two
+  known-but-not-root-caused issues (LTDC flicker, game logic running too
+  fast) flagged as the next session's starting point.
 
 ## Repo/remote conventions
 

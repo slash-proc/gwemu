@@ -28,3 +28,9 @@ GTAGS
 /gnw_chainloader.bin
 /example-extflash-backup.bin
 /build-release/
+/sdcard.img
+/*.bin
+/perf.data
+/backup/
+/GEMINI.md
+*.mp3

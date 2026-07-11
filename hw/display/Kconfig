@@ -29,6 +29,9 @@ config GNW_H7B0_LTDC
     bool
     select FRAMEBUFFER
 
+config GNW_H7B0_DMA2D
+    bool
+
 config SII9022
     bool
     depends on I2C

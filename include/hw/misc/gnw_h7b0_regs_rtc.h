@@ -1,0 +1,189 @@
+/* Auto-generated from STM32H7B0.svd for RTC */
+#ifndef GNW_H7B0_REGS_RTC_H
+#define GNW_H7B0_REGS_RTC_H
+
+#include <stdint.h>
+
+#define GNW_H7B0_RTC_TR_OFFSET 0x0
+#define GNW_H7B0_RTC_TR_RESET  0x00000000
+#define GNW_H7B0_RTC_TR_WMASK  0x007f7f7f
+
+#define GNW_H7B0_RTC_DR_OFFSET 0x4
+#define GNW_H7B0_RTC_DR_RESET  0x00002101
+#define GNW_H7B0_RTC_DR_WMASK  0x00ffff3f
+
+#define GNW_H7B0_RTC_SSR_OFFSET 0x8
+#define GNW_H7B0_RTC_SSR_RESET  0x00000000
+#define GNW_H7B0_RTC_SSR_WMASK  0x00000000
+
+#define GNW_H7B0_RTC_ICSR_OFFSET 0xc
+#define GNW_H7B0_RTC_ICSR_RESET  0x00000007
+#define GNW_H7B0_RTC_ICSR_WMASK  0x000000a0
+
+#define GNW_H7B0_RTC_PRER_OFFSET 0x10
+#define GNW_H7B0_RTC_PRER_RESET  0x007f00ff
+#define GNW_H7B0_RTC_PRER_WMASK  0x007f7fff
+
+#define GNW_H7B0_RTC_WUTR_OFFSET 0x14
+#define GNW_H7B0_RTC_WUTR_RESET  0x0000ffff
+#define GNW_H7B0_RTC_WUTR_WMASK  0x0000ffff
+
+#define GNW_H7B0_RTC_CR_OFFSET 0x18
+#define GNW_H7B0_RTC_CR_RESET  0x00000000
+#define GNW_H7B0_RTC_CR_WMASK  0xe7ffff7f
+
+#define GNW_H7B0_RTC_WPR_OFFSET 0x24
+#define GNW_H7B0_RTC_WPR_RESET  0x00000000
+#define GNW_H7B0_RTC_WPR_WMASK  0x000000ff
+
+#define GNW_H7B0_RTC_CALR_OFFSET 0x28
+#define GNW_H7B0_RTC_CALR_RESET  0x00000000
+#define GNW_H7B0_RTC_CALR_WMASK  0x0000e1ff
+
+#define GNW_H7B0_RTC_SHIFTR_OFFSET 0x2c
+#define GNW_H7B0_RTC_SHIFTR_RESET  0x00000000
+#define GNW_H7B0_RTC_SHIFTR_WMASK  0x80007fff
+
+#define GNW_H7B0_RTC_TSTR_OFFSET 0x30
+#define GNW_H7B0_RTC_TSTR_RESET  0x00000000
+#define GNW_H7B0_RTC_TSTR_WMASK  0x00000000
+
+#define GNW_H7B0_RTC_TSDR_OFFSET 0x34
+#define GNW_H7B0_RTC_TSDR_RESET  0x00000000
+#define GNW_H7B0_RTC_TSDR_WMASK  0x00000000
+
+#define GNW_H7B0_RTC_TSSSR_OFFSET 0x38
+#define GNW_H7B0_RTC_TSSSR_RESET  0x00000000
+#define GNW_H7B0_RTC_TSSSR_WMASK  0x00000000
+
+#define GNW_H7B0_RTC_ALRMAR_OFFSET 0x40
+#define GNW_H7B0_RTC_ALRMAR_RESET  0x00000000
+#define GNW_H7B0_RTC_ALRMAR_WMASK  0xffffffff
+
+#define GNW_H7B0_RTC_ALRMASSR_OFFSET 0x44
+#define GNW_H7B0_RTC_ALRMASSR_RESET  0x00000000
+#define GNW_H7B0_RTC_ALRMASSR_WMASK  0x0f007fff
+
+#define GNW_H7B0_RTC_ALRMBR_OFFSET 0x48
+#define GNW_H7B0_RTC_ALRMBR_RESET  0x00000000
+#define GNW_H7B0_RTC_ALRMBR_WMASK  0xffffffff
+
+#define GNW_H7B0_RTC_ALRMBSSR_OFFSET 0x4c
+#define GNW_H7B0_RTC_ALRMBSSR_RESET  0x00000000
+#define GNW_H7B0_RTC_ALRMBSSR_WMASK  0x0f007fff
+
+#define GNW_H7B0_RTC_SR_OFFSET 0x50
+#define GNW_H7B0_RTC_SR_RESET  0x00000000
+#define GNW_H7B0_RTC_SR_WMASK  0x00000000
+
+#define GNW_H7B0_RTC_MISR_OFFSET 0x54
+#define GNW_H7B0_RTC_MISR_RESET  0x00000000
+#define GNW_H7B0_RTC_MISR_WMASK  0x00000000
+
+#define GNW_H7B0_RTC_SCR_OFFSET 0x5c
+#define GNW_H7B0_RTC_SCR_RESET  0x00000000
+#define GNW_H7B0_RTC_SCR_WMASK  0x0000003f
+
+#define GNW_H7B0_RTC_CFGR_OFFSET 0x60
+#define GNW_H7B0_RTC_CFGR_RESET  0x00000000
+#define GNW_H7B0_RTC_CFGR_WMASK  0x00000001
+
+static inline uint32_t get_rtc_write_mask(uint32_t offset) {
+    switch (offset) {
+        case GNW_H7B0_RTC_TR_OFFSET:
+            return GNW_H7B0_RTC_TR_WMASK;
+        case GNW_H7B0_RTC_DR_OFFSET:
+            return GNW_H7B0_RTC_DR_WMASK;
+        case GNW_H7B0_RTC_SSR_OFFSET:
+            return GNW_H7B0_RTC_SSR_WMASK;
+        case GNW_H7B0_RTC_ICSR_OFFSET:
+            return GNW_H7B0_RTC_ICSR_WMASK;
+        case GNW_H7B0_RTC_PRER_OFFSET:
+            return GNW_H7B0_RTC_PRER_WMASK;
+        case GNW_H7B0_RTC_WUTR_OFFSET:
+            return GNW_H7B0_RTC_WUTR_WMASK;
+        case GNW_H7B0_RTC_CR_OFFSET:
+            return GNW_H7B0_RTC_CR_WMASK;
+        case GNW_H7B0_RTC_WPR_OFFSET:
+            return GNW_H7B0_RTC_WPR_WMASK;
+        case GNW_H7B0_RTC_CALR_OFFSET:
+            return GNW_H7B0_RTC_CALR_WMASK;
+        case GNW_H7B0_RTC_SHIFTR_OFFSET:
+            return GNW_H7B0_RTC_SHIFTR_WMASK;
+        case GNW_H7B0_RTC_TSTR_OFFSET:
+            return GNW_H7B0_RTC_TSTR_WMASK;
+        case GNW_H7B0_RTC_TSDR_OFFSET:
+            return GNW_H7B0_RTC_TSDR_WMASK;
+        case GNW_H7B0_RTC_TSSSR_OFFSET:
+            return GNW_H7B0_RTC_TSSSR_WMASK;
+        case GNW_H7B0_RTC_ALRMAR_OFFSET:
+            return GNW_H7B0_RTC_ALRMAR_WMASK;
+        case GNW_H7B0_RTC_ALRMASSR_OFFSET:
+            return GNW_H7B0_RTC_ALRMASSR_WMASK;
+        case GNW_H7B0_RTC_ALRMBR_OFFSET:
+            return GNW_H7B0_RTC_ALRMBR_WMASK;
+        case GNW_H7B0_RTC_ALRMBSSR_OFFSET:
+            return GNW_H7B0_RTC_ALRMBSSR_WMASK;
+        case GNW_H7B0_RTC_SR_OFFSET:
+            return GNW_H7B0_RTC_SR_WMASK;
+        case GNW_H7B0_RTC_MISR_OFFSET:
+            return GNW_H7B0_RTC_MISR_WMASK;
+        case GNW_H7B0_RTC_SCR_OFFSET:
+            return GNW_H7B0_RTC_SCR_WMASK;
+        case GNW_H7B0_RTC_CFGR_OFFSET:
+            return GNW_H7B0_RTC_CFGR_WMASK;
+        default:
+            return 0x00000000; /* Read-only or unmapped by default */
+    }
+}
+
+static inline uint32_t get_rtc_reset_value(uint32_t offset) {
+    switch (offset) {
+        case GNW_H7B0_RTC_TR_OFFSET:
+            return GNW_H7B0_RTC_TR_RESET;
+        case GNW_H7B0_RTC_DR_OFFSET:
+            return GNW_H7B0_RTC_DR_RESET;
+        case GNW_H7B0_RTC_SSR_OFFSET:
+            return GNW_H7B0_RTC_SSR_RESET;
+        case GNW_H7B0_RTC_ICSR_OFFSET:
+            return GNW_H7B0_RTC_ICSR_RESET;
+        case GNW_H7B0_RTC_PRER_OFFSET:
+            return GNW_H7B0_RTC_PRER_RESET;
+        case GNW_H7B0_RTC_WUTR_OFFSET:
+            return GNW_H7B0_RTC_WUTR_RESET;
+        case GNW_H7B0_RTC_CR_OFFSET:
+            return GNW_H7B0_RTC_CR_RESET;
+        case GNW_H7B0_RTC_WPR_OFFSET:
+            return GNW_H7B0_RTC_WPR_RESET;
+        case GNW_H7B0_RTC_CALR_OFFSET:
+            return GNW_H7B0_RTC_CALR_RESET;
+        case GNW_H7B0_RTC_SHIFTR_OFFSET:
+            return GNW_H7B0_RTC_SHIFTR_RESET;
+        case GNW_H7B0_RTC_TSTR_OFFSET:
+            return GNW_H7B0_RTC_TSTR_RESET;
+        case GNW_H7B0_RTC_TSDR_OFFSET:
+            return GNW_H7B0_RTC_TSDR_RESET;
+        case GNW_H7B0_RTC_TSSSR_OFFSET:
+            return GNW_H7B0_RTC_TSSSR_RESET;
+        case GNW_H7B0_RTC_ALRMAR_OFFSET:
+            return GNW_H7B0_RTC_ALRMAR_RESET;
+        case GNW_H7B0_RTC_ALRMASSR_OFFSET:
+            return GNW_H7B0_RTC_ALRMASSR_RESET;
+        case GNW_H7B0_RTC_ALRMBR_OFFSET:
+            return GNW_H7B0_RTC_ALRMBR_RESET;
+        case GNW_H7B0_RTC_ALRMBSSR_OFFSET:
+            return GNW_H7B0_RTC_ALRMBSSR_RESET;
+        case GNW_H7B0_RTC_SR_OFFSET:
+            return GNW_H7B0_RTC_SR_RESET;
+        case GNW_H7B0_RTC_MISR_OFFSET:
+            return GNW_H7B0_RTC_MISR_RESET;
+        case GNW_H7B0_RTC_SCR_OFFSET:
+            return GNW_H7B0_RTC_SCR_RESET;
+        case GNW_H7B0_RTC_CFGR_OFFSET:
+            return GNW_H7B0_RTC_CFGR_RESET;
+        default:
+            return 0x00000000;
+    }
+}
+
+#endif /* GNW_H7B0_REGS_RTC_H */

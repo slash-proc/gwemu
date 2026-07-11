@@ -1,0 +1,69 @@
+/* Auto-generated from STM32H7B0.svd for DBGMCU */
+#ifndef GNW_H7B0_REGS_DBGMCU_H
+#define GNW_H7B0_REGS_DBGMCU_H
+
+#include <stdint.h>
+
+#define GNW_H7B0_DBGMCU_IDC_OFFSET 0x0
+#define GNW_H7B0_DBGMCU_IDC_RESET  0x10006480
+#define GNW_H7B0_DBGMCU_IDC_WMASK  0x00000000
+
+#define GNW_H7B0_DBGMCU_CR_OFFSET 0x4
+#define GNW_H7B0_DBGMCU_CR_RESET  0x00000000
+#define GNW_H7B0_DBGMCU_CR_WMASK  0x10700187
+
+#define GNW_H7B0_DBGMCU_APB3FZ1_OFFSET 0x34
+#define GNW_H7B0_DBGMCU_APB3FZ1_RESET  0x00000000
+#define GNW_H7B0_DBGMCU_APB3FZ1_WMASK  0x00000040
+
+#define GNW_H7B0_DBGMCU_APB1LFZ1_OFFSET 0x3c
+#define GNW_H7B0_DBGMCU_APB1LFZ1_RESET  0x00000000
+#define GNW_H7B0_DBGMCU_APB1LFZ1_WMASK  0x00e003ff
+
+#define GNW_H7B0_DBGMCU_APB2FZ1_OFFSET 0x4c
+#define GNW_H7B0_DBGMCU_APB2FZ1_RESET  0x00000000
+#define GNW_H7B0_DBGMCU_APB2FZ1_WMASK  0x00070003
+
+#define GNW_H7B0_DBGMCU_APB4FZ1_OFFSET 0x54
+#define GNW_H7B0_DBGMCU_APB4FZ1_RESET  0x00000000
+#define GNW_H7B0_DBGMCU_APB4FZ1_WMASK  0x00050680
+
+static inline uint32_t get_dbgmcu_write_mask(uint32_t offset) {
+    switch (offset) {
+        case GNW_H7B0_DBGMCU_IDC_OFFSET:
+            return GNW_H7B0_DBGMCU_IDC_WMASK;
+        case GNW_H7B0_DBGMCU_CR_OFFSET:
+            return GNW_H7B0_DBGMCU_CR_WMASK;
+        case GNW_H7B0_DBGMCU_APB3FZ1_OFFSET:
+            return GNW_H7B0_DBGMCU_APB3FZ1_WMASK;
+        case GNW_H7B0_DBGMCU_APB1LFZ1_OFFSET:
+            return GNW_H7B0_DBGMCU_APB1LFZ1_WMASK;
+        case GNW_H7B0_DBGMCU_APB2FZ1_OFFSET:
+            return GNW_H7B0_DBGMCU_APB2FZ1_WMASK;
+        case GNW_H7B0_DBGMCU_APB4FZ1_OFFSET:
+            return GNW_H7B0_DBGMCU_APB4FZ1_WMASK;
+        default:
+            return 0x00000000; /* Read-only or unmapped by default */
+    }
+}
+
+static inline uint32_t get_dbgmcu_reset_value(uint32_t offset) {
+    switch (offset) {
+        case GNW_H7B0_DBGMCU_IDC_OFFSET:
+            return GNW_H7B0_DBGMCU_IDC_RESET;
+        case GNW_H7B0_DBGMCU_CR_OFFSET:
+            return GNW_H7B0_DBGMCU_CR_RESET;
+        case GNW_H7B0_DBGMCU_APB3FZ1_OFFSET:
+            return GNW_H7B0_DBGMCU_APB3FZ1_RESET;
+        case GNW_H7B0_DBGMCU_APB1LFZ1_OFFSET:
+            return GNW_H7B0_DBGMCU_APB1LFZ1_RESET;
+        case GNW_H7B0_DBGMCU_APB2FZ1_OFFSET:
+            return GNW_H7B0_DBGMCU_APB2FZ1_RESET;
+        case GNW_H7B0_DBGMCU_APB4FZ1_OFFSET:
+            return GNW_H7B0_DBGMCU_APB4FZ1_RESET;
+        default:
+            return 0x00000000;
+    }
+}
+
+#endif /* GNW_H7B0_REGS_DBGMCU_H */

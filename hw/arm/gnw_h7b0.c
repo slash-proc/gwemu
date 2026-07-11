@@ -32,11 +32,37 @@
 #include "qapi/error.h"
 #include "hw/boards.h"
 #include "hw/qdev-clock.h"
+#include "hw/qdev-properties.h"
 #include "hw/arm/gnw_h7b0_soc.h"
 #include "hw/arm/boot.h"
 
-/* Real STM32H7B0 SYSCLK is configurable up to 280MHz; use max for now. */
-#define SYSCLK_FRQ 280000000ULL
+/*
+ * Was 280MHz (the datasheet's stated max) as a placeholder guess -- but
+ * retro-go's actual PLL1 configuration (RCC->PLLCKSELR/PLLCFGR/
+ * PLL1DIVR, decoded by HAL_RCC_GetSysClockFreq()) computes to
+ * 340512000 Hz exactly, confirmed by reading SystemCoreClock live
+ * out of guest RAM after boot. Since our RCC model is a plain
+ * register shadow (no real PLL lock/frequency modeling -- see
+ * gnw_h7b0_rcc.c), firmware's own clock-derived timing (SysTick reload,
+ * frame-pacing math in Core/Src/porting/common.c's
+ * frame_integrator/get_elapsed_time()) only comes out correct if this
+ * Clock's rate actually matches what firmware computed it configured
+ * PLL1 to. Using 280MHz here made every SysTick/HAL_GetTick()-based
+ * measurement run at 280/340.5 =~ 82% of the real elapsed-time rate,
+ * which made retro-go's frame_integrator perpetually think less time
+ * had passed than really had, believing (from ITS perspective, based
+ * on this now-provably-wrong clock) that emulation was running faster
+ * than intended -- permanently latching common_emu_state.pause_frames
+ * at 1. That's what was producing "runs too fast/stuttery" gameplay
+ * and, audibly, corrupted retro-go audio: pause_frames=1 makes
+ * common_emu_sound_sync() wait for two DMA half-transfer ticks per
+ * call instead of one, while the per-core sound_submit() (e.g.
+ * gwenesis_sound_submit()) still only refills whichever ONE audio
+ * buffer half is active when it finally runs, permanently starving
+ * the other -- audible as pitch/rate distortion and stuck-tone
+ * "ripping" artifacts smeared into otherwise-normal audio.
+ */
+#define SYSCLK_FRQ 340512000ULL
 
 static void gnw_h7b0_init(MachineState *machine)
 {
@@ -44,11 +70,35 @@ static void gnw_h7b0_init(MachineState *machine)
     Clock *sysclk;
 
     sysclk = clock_new(OBJECT(machine), "SYSCLK");
-    clock_set_hz(sysclk, SYSCLK_FRQ);
+    /*
+     * Real silicon's actual post-reset state is HSI @ 64MHz -- PLL1 isn't
+     * even running yet at this point, let alone reprogrammed to one of
+     * retro-go's three OC levels (see SYSCLK_FRQ's comment above for
+     * those). gnw_h7b0_rcc.c now decodes PLL1/CFGR.SWS live and pushes a
+     * clock_update_hz() through this same Clock the moment firmware's
+     * SystemClock_Config() runs early in boot (gnw_h7b0_soc_realize()
+     * wires RCC to this Clock via gnw_h7b0_rcc_set_sysclk()), so this
+     * bootstrap value only matters for the brief pre-SystemClock_Config
+     * window -- 64000000 literal rather than including gnw_h7b0_rcc.h's
+     * GNW_H7B0_RCC_HSI_HZ here, to avoid pulling a hw/misc/ header into
+     * the board file for one constant.
+     */
+    clock_set_hz(sysclk, 64000000ULL);
 
     dev = qdev_new(TYPE_GNW_H7B0_SOC);
     object_property_add_child(OBJECT(machine), "soc", OBJECT(dev));
     qdev_connect_clock_in(dev, "sysclk", sysclk);
+
+    /* SAI1 (gnw_h7b0_sai1.c) opens an AUD_* voice and needs to know
+     * which -audiodev to use; machine->audiodev is QEMU's usual
+     * "the one -audiodev the user passed" plumbing (see e.g.
+     * hw/arm/versatilepb.c's pl041 wiring). Must be set before the
+     * SoC (and thus SAI1) realizes. */
+    if (machine->audiodev) {
+        qdev_prop_set_string(DEVICE(&GNW_H7B0_SOC(dev)->sai1), "audiodev",
+                              machine->audiodev);
+    }
+
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
 
     armv7m_load_kernel(ARM_CPU(first_cpu),
@@ -66,6 +116,7 @@ static void gnw_h7b0_machine_init(MachineClass *mc)
     mc->desc = "Nintendo Game & Watch (STM32H7B0, Cortex-M7)";
     mc->init = gnw_h7b0_init;
     mc->valid_cpu_types = valid_cpu_types;
+    machine_add_audiodev_property(mc);
 }
 
 DEFINE_MACHINE("gnw-h7b0", gnw_h7b0_machine_init)

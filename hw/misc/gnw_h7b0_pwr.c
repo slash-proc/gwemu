@@ -26,12 +26,15 @@
 #include "qemu/log.h"
 #include "migration/vmstate.h"
 #include "hw/misc/gnw_h7b0_pwr.h"
+#include "hw/misc/gnw_h7b0_regs_pwr.h"
 
 static void gnw_h7b0_pwr_reset(DeviceState *dev)
 {
     GnwH7B0PwrState *s = GNW_H7B0_PWR(dev);
 
-    memset(s->regs, 0, sizeof(s->regs));
+    for (int i = 0; i < (GNW_H7B0_PWR_SIZE / 4); i++) {
+        s->regs[i] = get_pwr_reset_value(i * 4);
+    }
 }
 
 static uint64_t gnw_h7b0_pwr_read(void *opaque, hwaddr addr, unsigned int size)
@@ -57,6 +60,9 @@ static void gnw_h7b0_pwr_write(void *opaque, hwaddr addr,
                       __func__, addr);
         return;
     }
+
+    uint32_t mask = get_pwr_write_mask(addr);
+    value = (s->regs[addr >> 2] & ~mask) | (value & mask);
 
     switch (addr) {
     case GNW_H7B0_PWR_CR3:

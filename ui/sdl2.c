@@ -29,6 +29,7 @@
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/sdl2.h"
+#include "ui/sdl2-gamepad.h"
 #include "sysemu/runstate.h"
 #include "sysemu/runstate-action.h"
 #include "sysemu/sysemu.h"
@@ -690,6 +691,13 @@ void sdl2_poll_events(struct sdl2_console *scon)
         case SDL_WINDOWEVENT:
             handle_windowevent(ev);
             break;
+        case SDL_CONTROLLERDEVICEADDED:
+        case SDL_CONTROLLERDEVICEREMOVED:
+        case SDL_CONTROLLERBUTTONDOWN:
+        case SDL_CONTROLLERBUTTONUP:
+            idle = 0;
+            sdl2_gamepad_handle_event(ev);
+            break;
         default:
             break;
         }
@@ -772,6 +780,7 @@ static void sdl_cleanup(void)
         SDL_FreeCursor(guest_sprite);
     }
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    sdl2_gamepad_fini();
 }
 
 static const DisplayChangeListenerOps dcl_2d_ops = {
@@ -937,6 +946,8 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     if (gui_fullscreen) {
         sdl_grab_start(&sdl2_console[0]);
     }
+
+    sdl2_gamepad_init();
 
     atexit(sdl_cleanup);
 }

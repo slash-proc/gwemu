@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "migration/vmstate.h"
+#include "hw/irq.h"
 #include "hw/misc/gnw_h7b0_adc.h"
 
 static void gnw_h7b0_adc_reset(DeviceState *dev)
@@ -68,11 +69,31 @@ static void gnw_h7b0_adc_write(void *opaque, hwaddr addr,
          * hardware takes a stabilization delay). Good enough to unblock
          * the polling loop that always follows ADC enable.
          */
-        s->regs[addr >> 2] = value;
+        s->regs[addr >> 2] = value & ~ADC_CR_ADCAL;
         if (value & ADC_CR_ADEN) {
             s->regs[(instance_base + GNW_H7B0_ADC_ISR) >> 2] |= ADC_ISR_ADRDY;
         } else {
             s->regs[(instance_base + GNW_H7B0_ADC_ISR) >> 2] &= ~ADC_ISR_ADRDY;
+        }
+
+        /*
+         * A regular conversion (ADSTART) always "reads" a fixed full-battery
+         * value into DR and completes instantly. See gnw_h7b0_adc.h for why
+         * this specific value/path: gnw-chainloader's board_get_battery_raw()
+         * busy-polls EOC right after this write, and retro-go-sd's
+         * bq24072_poll() expects an EOC interrupt (via HAL_ADC_Start_IT) to
+         * eventually call HAL_ADC_ConvCpltCallback().
+         */
+        if (value & ADC_CR_ADSTART) {
+            s->regs[(instance_base + GNW_H7B0_ADC_DR) >> 2] =
+                GNW_H7B0_ADC_FULL_BATTERY_RAW;
+            s->regs[(instance_base + GNW_H7B0_ADC_ISR) >> 2] |= ADC_ISR_EOC;
+            s->regs[addr >> 2] &= ~ADC_CR_ADSTART;
+
+            if (s->regs[(instance_base + GNW_H7B0_ADC_IER) >> 2] &
+                ADC_IER_EOCIE) {
+                qemu_irq_pulse(s->irq);
+            }
         }
         return;
     }
@@ -105,6 +126,7 @@ static void gnw_h7b0_adc_init(Object *obj)
     memory_region_init_io(&s->mmio, obj, &gnw_h7b0_adc_ops, s,
                            TYPE_GNW_H7B0_ADC, GNW_H7B0_ADC_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
 static const VMStateDescription vmstate_gnw_h7b0_adc = {

@@ -180,7 +180,30 @@ static uint32_t ssi_sd_transfer(SSIPeripheral *dev, uint32_t val)
                 /* CMD8/CMD58 returns R3/R7 response */
                 DPRINTF("Returned R3/R7\n");
                 s->arglen = 5;
-                s->response[0] = 1;
+                /*
+                 * response[0] is R1: bit0 is the idle-state flag. CMD8 is
+                 * always sent before ACMD41, so the card is genuinely
+                 * still idle and hardcoding 1 there is correct. CMD58
+                 * (READ_OCR) is typically sent *after* ACMD41 succeeds to
+                 * confirm CCS, by which point the card has left idle
+                 * state -- hardcoding 1 here made every SDv2 card
+                 * permanently fail voltage-window negotiation from the
+                 * guest's point of view (idle bit never seen clear),
+                 * found via gnw-chainloader's spi1_init() -- its
+                 * one-shot `spi1_send_cmd(CMD58, 0) == 0` check never
+                 * passes with idle stuck at 1, so the SD card type is
+                 * never set and sdcard_detect() always reports "no card"
+                 * even with a real, working card image attached. Same
+                 * idle heuristic as the CMD13-style status response
+                 * below.
+                 */
+                if (s->cmd == 58) {
+                    uint32_t r3_cardstatus = ldl_be_p(longresp);
+                    s->response[0] =
+                        (((r3_cardstatus >> 9) & 0xf) < 4) ? 1 : 0;
+                } else {
+                    s->response[0] = 1;
+                }
                 memcpy(&s->response[1], longresp, 4);
             } else if (s->arglen != 4) {
                 BADF("Unexpected response to cmd %d\n", s->cmd);

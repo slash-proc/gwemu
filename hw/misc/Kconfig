@@ -99,6 +99,15 @@ config GNW_H7B0_ADC
 config GNW_H7B0_SPI
     bool
 
+config GNW_H7B0_RTC
+    bool
+
+config GNW_H7B0_CRC
+    bool
+
+config GNW_H7B0_GPIO
+    bool
+
 config STM32F2XX_SYSCFG
     bool
 
@@ -231,3 +240,51 @@ config XLNX_VERSAL_TRNG
     bool
 
 source macio/Kconfig
+
+config GNW_H7B0_DBGMCU
+    bool
+
+config GNW_H7B0_DWT
+    bool
+
+config GNW_H7B0_FLASH_R
+    bool
+
+config GNW_H7B0_FMC
+    bool
+
+config GNW_H7B0_CRS
+    bool
+
+config GNW_H7B0_OCTOSPIM
+    bool
+
+config GNW_H7B0_EXTI
+    bool
+
+config GNW_H7B0_SYSCFG
+    bool
+
+config GNW_H7B0_DMA
+    bool
+
+config GNW_H7B0_SAI1
+    bool
+
+config GNW_H7B0_DAC
+    bool
+
+config GNW_H7B0_TIM1
+    bool
+
+config GNW_H7B0_JPEG
+    bool
+
+config GNW_H7B0_TAMP
+    bool
+
+config GNW_H7B0_WWDG
+    bool
+
+config GNW_H7B0_TIM2
+    bool
