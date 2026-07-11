@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-07-11 (part 4 — bump pinned base v9.2.4 -> v11.0.2)
+
+- **Merged upstream `v11.0.2`** (previously pinned to `v9.2.4`), via
+  `git merge` rather than rebase to preserve existing history. Nearly all
+  conflicts were upstream refactors in files this fork never touches
+  (target/arm, migration, etc.) and were taken wholesale from upstream;
+  the only real conflicts were in the 4 files we'd actually modified
+  (`hw/arm/Kconfig`, `hw/arm/meson.build`, `hw/sd/ssi-sd.c`, `ui/sdl2.c`).
+  Notably, upstream's SPI-mode response refactor in `hw/sd/sd.c`
+  (idle-state bit now derived from real SD card state) superseded our
+  earlier CMD58 idle-bit heuristic patch in `ssi-sd.c`, which was
+  dropped in favor of the upstream fix.
+- Ported all `gnw_h7b0_*` device models to v11.0.2's internal API churn:
+  several `hw/*.h` headers moved under `hw/core/`, `exec/memory.h` ->
+  `system/memory.h`, `ObjectClass.class_init`'s `data` param is now
+  `const void *`, `DEFINE_PROP_END_OF_LIST()` sentinel removed from
+  `Property` arrays, and the audio backend API was rewritten
+  (`QEMUSoundCard`/`AUD_*` -> `AudioBackend *`/`audio_be_*` in
+  `gnw_h7b0_sai1.c`). Also had to switch `gnw_h7b0.c`'s machine
+  registration from `DEFINE_MACHINE()` to `DEFINE_MACHINE_ARM()` since
+  `hw/arm/meson.build` moved most boards (including ours) into a new
+  shared `arm_common_ss` source set that requires the ARM target-info
+  interface to actually show up in `-M help`.
+- Verified `qemu-system-arm` builds clean and boots
+  `gw_retro_go_bank1.elf` normally under gdb (PC and `uwTick`
+  progressing steadily across repeated samples, not just process-alive).
+
 ## 2026-07-11 (part 3 — VBR-gated capture timing, JPEG OFTF perf fix)
 
 - **Gated LTDC framebuffer capture on firmware's `SRCR.VBR` write** instead

@@ -67,7 +67,7 @@ phased plan.
 
 - `origin` = `slash-proc/gwemu` (this fork, push target).
 - `upstream` = `qemu/qemu` (read-only, fetch only, never push).
-- Pinned base: tag `v9.2.4`. Don't casually rebase onto upstream `master`;
+- Pinned base: tag `v11.0.2`. Don't casually rebase onto upstream `master`;
   bump the pin deliberately and note it in CHANGELOG.md when we do.
 - All game-and-watch-specific additions live in-tree (like xemu's
   `hw/xbox/`), primarily under `hw/arm/` (SoC/board) and `hw/display/`
