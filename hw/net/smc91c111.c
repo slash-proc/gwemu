@@ -8,13 +8,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/net/smc91c111.h"
-#include "hw/registerfields.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/registerfields.h"
+#include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -30,6 +30,12 @@
  * LAN91C111 datasheet).
  */
 #define MAX_PACKET_SIZE 2048
+/*
+ * Size of the non-data fields in a data frame: status word,
+ * byte count, control byte, and last data byte; this defines
+ * the smallest value the byte count in the frame can validly be.
+ */
+#define MIN_PACKET_SIZE 6
 
 #define TYPE_SMC91C111 "smc91c111"
 OBJECT_DECLARE_SIMPLE_TYPE(smc91c111_state, SMC91C111)
@@ -59,7 +65,7 @@ struct smc91c111_state {
     int tx_fifo_done_len;
     int tx_fifo_done[NUM_PACKETS];
     /* Packet buffer memory.  */
-    uint8_t data[NUM_PACKETS][2048];
+    uint8_t data[NUM_PACKETS][MAX_PACKET_SIZE];
     uint8_t int_level;
     uint8_t int_mask;
     MemoryRegion mmio;
@@ -87,7 +93,8 @@ static const VMStateDescription vmstate_smc91c111 = {
         VMSTATE_INT32_ARRAY(rx_fifo, smc91c111_state, NUM_PACKETS),
         VMSTATE_INT32(tx_fifo_done_len, smc91c111_state),
         VMSTATE_INT32_ARRAY(tx_fifo_done, smc91c111_state, NUM_PACKETS),
-        VMSTATE_BUFFER_UNSAFE(data, smc91c111_state, 0, NUM_PACKETS * 2048),
+        VMSTATE_BUFFER_UNSAFE(data, smc91c111_state, 0,
+                              NUM_PACKETS * MAX_PACKET_SIZE),
         VMSTATE_UINT8(int_level, smc91c111_state),
         VMSTATE_UINT8(int_mask, smc91c111_state),
         VMSTATE_END_OF_LIST()
@@ -288,7 +295,7 @@ static void smc91c111_do_tx(smc91c111_state *s)
         *(p++) = 0x40;
         len = *(p++);
         len |= ((int)*(p++)) << 8;
-        if (len > MAX_PACKET_SIZE) {
+        if (len < MIN_PACKET_SIZE || len > MAX_PACKET_SIZE) {
             /*
              * Datasheet doesn't say what to do here, and there is no
              * relevant tx error condition listed. Log, and drop the packet.
@@ -299,7 +306,13 @@ static void smc91c111_do_tx(smc91c111_state *s)
             smc91c111_complete_tx_packet(s, packetnum);
             continue;
         }
-        len -= 6;
+        /*
+         * Convert from size of the data frame to number of bytes of
+         * actual packet data. Whether the "last data byte" field is
+         * included in the packet depends on the ODD bit in the control
+         * byte at the end of the frame.
+         */
+        len -= MIN_PACKET_SIZE;
         control = p[len + 1];
         if (control & 0x20)
             len++;
@@ -814,8 +827,9 @@ static ssize_t smc91c111_receive(NetClientState *nc, const uint8_t *buf, size_t 
     if (crc)
         packetsize += 4;
     /* TODO: Flag overrun and receive errors.  */
-    if (packetsize > 2048)
+    if (packetsize > MAX_PACKET_SIZE) {
         return -1;
+    }
     packetnum = smc91c111_allocate_packet(s);
     if (packetnum == 0x80)
         return -1;
@@ -907,12 +921,11 @@ static void smc91c111_realize(DeviceState *dev, Error **errp)
     /* ??? Save/restore.  */
 }
 
-static Property smc91c111_properties[] = {
+static const Property smc91c111_properties[] = {
     DEFINE_NIC_PROPERTIES(smc91c111_state, conf),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void smc91c111_class_init(ObjectClass *klass, void *data)
+static void smc91c111_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
