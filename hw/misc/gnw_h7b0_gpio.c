@@ -226,33 +226,27 @@ static void gnw_h7b0_gpio_reset(DeviceState *dev)
      * else -- not yet identified -- still needs at least one of them
      * low, independent of the charger-retry-counter path).
      *
-     * PA0 itself is still forced low here (needed for that same
-     * early-storm reason). Real disassembly of this stock image's
-     * EXTI0_IRQHandler (0x08017aba, tail-jumps to a real, non-trivial
-     * handler body at 0x08009ce6) shows it's what actually arms the
-     * SysTick watchdog above -- the watchdog does nothing at all until
-     * EXTI0 has fired at least once (a flag byte the handler sets), so a
-     * plain permanent-low GPIO default (no real EXTI, no interrupt ever
-     * firing) couldn't have been triggering that watchdog after all;
-     * that theory was wrong. Built real EXTI0-9 edge-triggered interrupt
-     * delivery (gnw_h7b0_exti.c, NVIC-wired in gnw_h7b0_soc.c) to test
-     * releasing PA0 with a real rising-edge interrupt instead of a
-     * silent register flip -- that made things *worse* too (same
-     * RCC/PWR/RTC re-init storm as the earlier no-EXTI attempt), and a
-     * breakpoint at EXTI0_IRQHandler's real body never even fired within
-     * a 10s window, meaning firmware hadn't armed RTSR1/CPUIMR1 for line
-     * 0 by then either -- so the storm on release isn't (yet confirmed
-     * to be) caused by this specific interrupt actually running; it's
-     * unexplained. Left permanently low for now. gnw_h7b0_gpio_pa0_release()
-     * and the timer that would call it are kept in the source (unarmed --
-     * see gnw_h7b0_gpio_init()) as a documented, ready-to-resume attempt
-     * for whoever picks this up next, not because releasing PA0 is known
-     * to work. The EXTI/NVIC wiring itself is real, correct, general-
-     * purpose infrastructure independent of whether it turns out to be
-     * the answer here.
+     * PA0 was previously *also* forced low here for that same early-storm
+     * reason (see prior history in git blame / CHANGELOG.md), but that
+     * predates the RCC_RSR.SFTRSTF fix (gnw_h7b0_rcc.h) and current
+     * understanding of the LTDC IRQ88 NVIC-enable gap -- both of which
+     * were still missing when the "releasing PA0 causes a storm" finding
+     * was made. With those in place, live-releasing PA0 (both at reset
+     * and mid-boot, tested against both Mario and Zelda) produces real
+     * forward progress instead: firmware's "state-6" handler (confirmed
+     * via gnwmanager's mario.py/zelda.py "warm-boot power-off fix" patch
+     * comments -- Mario 0x08005EF4, Zelda 0x0800EA8C, both labeled
+     * "state-6 standby") gates its real work behind this exact bit, and
+     * with PA0 high, that handler runs and produces genuine SPI2 LCD
+     * panel bring-up traffic (real TXDR command bytes matching the known
+     * panel-init byte sequence) instead of silently no-op'ing every pass.
+     * PA0/WKUP1 defaults HIGH here now to match "power button not held"
+     * -- gnwmanager's own patch comments describe this as "normally-high,
+     * whose *held* (low) state is meant to trigger... shutdown," i.e. the
+     * pin's un-pressed resting state is high, not low. No longer forced
+     * low at reset.
      */
     s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 8);
-    s->regs[(0 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 0);
     s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 13);
     s->regs[(3 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 0);
 }
