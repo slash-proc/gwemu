@@ -1,15 +1,23 @@
 # Status
 
-Last updated: 2026-07-11
+Last updated: 2026-07-12
 
 ## Where things stand
 
-Repo is a fork of upstream QEMU (`qemu/qemu`), pinned to tag `v9.2.4`.
+Repo is a fork of upstream QEMU (`qemu/qemu`), pinned to tag `v11.0.2`.
 Working branch `gnw-h7b0`. Phase 0/1 (boot path, memory map) and Phase 2/3
 (DMA2D, LTDC display) are done. retro-go (homebrew) firmware boots
 end-to-end through the SD-backed build, with working audio, gamepad input,
 JPEG-decoded cover art, and menu/gameplay rendering. Not push-worthy yet —
 local commits only, push only on explicit go-ahead.
+
+**Actively in progress:** getting stock (official Nintendo) firmware
+(Mario, Zelda) booting to visible display output — not yet reached. See
+`docs/session-2026-07-12-stock-firmware-boot-investigation.md` for the
+full narrative. Two real fixes landed so far (`RCC_RSR.SFTRSTF`, PA0/WKUP1
+GPIO reset default); current blocker is a main-superloop timeout counter
+that never arms because its enable field is never written — not yet
+root-caused to a specific missing register/condition.
 
 ## What works
 
@@ -72,7 +80,18 @@ local commits only, push only on explicit go-ahead.
 ## Next objective
 
 **Get the stock (official Nintendo) Game & Watch firmware booting and
-running**, as opposed to the homebrew retro-go build tested so far. Not yet
-started — expect new peripheral gaps and boot-path differences relative to
-retro-go/gnw-chainloader, since neither of those are the real stock
-firmware.
+running**, as opposed to the homebrew retro-go build tested so far.
+In progress — see `docs/session-2026-07-12-stock-firmware-boot-investigation.md`.
+Stock firmware has no bootloader (linear execution from bank 1); the
+process is: boot → sample PC/registers at the stuck point (verify with a
+`stepi` burst before trusting it's really stuck — MMIO-instruction
+monitor-sampling bias is real) → decompile via `gnw-mario-decomp`/
+`gnw-zelda-decomp`'s Ghidra tooling → cross-reference `STM32H7B0.svd`,
+`rm0455.pdf`, `sdk/`, and `gnwmanager`'s `mario.py`/`zelda.py` (real,
+hash-verified patch offsets with comments on real firmware behavior) →
+implement the fix directly in the relevant device model → rebuild →
+repeat. Live gdb pokes and binary patches are diagnostic aids only, never
+the fix. Two real fixes landed so far: `RCC_RSR.SFTRSTF` reset value, and
+PA0/WKUP1 no longer forced low at GPIO reset. Current blocker: a
+main-superloop timeout counter (both games) never arms because its enable
+field is never written by anything — not yet root-caused.

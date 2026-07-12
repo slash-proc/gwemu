@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-07-12 — stock firmware boot investigation, PA0/WKUP1 fix
+
+Full narrative: `docs/session-2026-07-12-stock-firmware-boot-investigation.md`.
+
+- **Fixed `hw/misc/gnw_h7b0_gpio.c`**: stopped forcing PA0/WKUP1 low at
+  GPIO reset. It was previously forced low to work around an unrelated
+  early-boot write-storm hang from before `RCC_RSR.SFTRSTF` was fixed.
+  Real disassembly, cross-checked against `gnwmanager`'s
+  `gnwmanager/cli/gnw_patch/{mario,zelda}.py` (real, SHA1-hash-verified
+  stock-firmware patch offsets, not a theory), shows this pin gates a
+  "state-6 standby" handler (both patch files literally label it that,
+  as part of a "warm-boot power-off fix": Mario `0x08005EF4`, Zelda
+  `0x0800EA8C`) that firmware expects to read high (button not held) to
+  do its real display-init work. With `RCC_RSR.SFTRSTF` already fixed,
+  releasing PA0 no longer triggers the old storm — confirmed real forward
+  progress on both Mario and Zelda with zero live pokes (genuine
+  `SPI2->TXDR` traffic matching the known LCD panel bring-up command
+  sequence).
+- New sibling decompilation projects: `~/Nerd/git/gnw-mario-decomp` and
+  `~/Nerd/git/gnw-zelda-decomp`, same Ghidra script toolkit in both.
+- Found but not yet fixed: both games' main superloop only exits a
+  timeout-gated wait once a counter (Zelda: `FUN_0800edfc`, threshold 39)
+  crosses a threshold, but the counter never starts because its enable
+  field (`[r4+0x60]`) is never written by anything — confirmed via a live
+  hardware watchpoint over ~12s of real execution. Next session should
+  pick up from here.
+- Workflow: confirmed QEMU's SD model only requires power-of-2 sizing for
+  cards ≤2GiB; above that (the user's real ~7.4GiB `sdcard.img`) only
+  512K alignment is required — no qcow2 overlay needed, plain
+  `-drive if=sd,format=raw,file=sdcard.img` works directly.
+
 ## 2026-07-11 (part 4 — bump pinned base v9.2.4 -> v11.0.2)
 
 - **Merged upstream `v11.0.2`** (previously pinned to `v9.2.4`), via
