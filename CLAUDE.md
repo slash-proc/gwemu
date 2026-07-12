@@ -112,6 +112,38 @@ phased plan.
 - Keep `../minicraft-gnw`'s existing MPS2 fault-trap harness working and
   untouched throughout this project — it's the regression baseline until
   the real machine model is proven equivalent.
+- Stock (official Nintendo) firmware ships with no debug symbols, so
+  tracing what it's actually waiting on requires Ghidra decompilation.
+  `../gnw-mario-decomp` and `../gnw-zelda-decomp` are sibling repos (one
+  per game) holding that work: a Ghidra project per game
+  (`ghidra-proj/{Mario,Zelda}Proj`, imported from
+  `backup/internal_flash_backup_{mario,zelda}.bin` at base `0x08000000`,
+  `ARM:LE:32:Cortex`) plus a shared headless-scripting toolkit in each
+  repo's `scripts/` (`DecompAt.java` decompiles a given address,
+  `FindCallers2.java`/`FindXrefs3.java` find callers/references,
+  `FindMovtScalar.java` finds MOVW/MOVT-split 32-bit immediate loads that
+  raw literal-pool byte search misses, `CreateFunctions2.java` forces a
+  function boundary Ghidra's auto-analysis didn't create). Run via
+  `$GHIDRA_HOME/support/analyzeHeadless <repo>/ghidra-proj <ProjName>
+  -process internal_flash_backup_<game>.bin -noanalysis -scriptPath
+  <repo>/scripts -postScript <Script>.java <args>` (`-noanalysis` reuses
+  the project's already-computed auto-analysis). Each repo's own
+  `README.md` has more detail; `docs/session-2026-07-12-stock-firmware-boot-investigation.md`
+  has the current findings.
+- `gnwmanager` (separate local repo,
+  `gnwmanager/gnwmanager/cli/gnw_patch/{mario,zelda}.py`) is a real,
+  SHA1-hash-verified firmware patcher for these same stock images —
+  its inline comments describe what specific patched addresses actually
+  do on real hardware (e.g. the "warm-boot power-off fix" / "state-6
+  standby" comments that led directly to a real `gnw_h7b0_gpio.c` fix).
+  Treat it as ground truth, not a theory, and check it periodically when
+  stuck on a boot-path address — it covers more of stock firmware's
+  behavior than has been traced here so far. Its *data*-modification
+  patcher steps (erasing save regions, disabling save encryption,
+  removing games to save space) are for producing gnwmanager's own
+  custom-firmware builds and should not be replicated when testing stock
+  boot in qemu-gnw — always boot the user's supplied
+  `backup/flash_backup_{mario,zelda}.bin` unmodified.
 
 ## Build
 

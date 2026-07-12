@@ -64,12 +64,49 @@ external flash at `0x90000000`.
 
 ## Tooling / workflow notes
 
-- **`gnw-mario-decomp` and `gnw-zelda-decomp`** (sibling repos to this
-  one, at `~/Nerd/git/`) hold per-game Ghidra analysis. Same script
-  toolkit in both (`scripts/DecompAt.java`, `FindCallers2.java`,
-  `FindXrefs3.java`, `FindMovtScalar.java` for MOVW/MOVT-split
-  immediates that raw byte search misses, `CreateFunctions2.java` for
-  forcing a function boundary Ghidra's auto-analysis missed).
+- **`gnw-mario-decomp` and `gnw-zelda-decomp`** (new this session, sibling
+  repos at `~/Nerd/git/`, one per game) hold per-game Ghidra analysis.
+  Each has the same layout: `ghidra-proj/{Mario,Zelda}Proj` (imported from
+  `backup/internal_flash_backup_{mario,zelda}.bin`, base `0x08000000`,
+  `ARM:LE:32:Cortex`, no symbols — everything is `FUN_08xxxxxx`/
+  `DAT_08xxxxxx` auto-generated Ghidra labels), `scripts/` (shared
+  toolkit, copied verbatim between the two repos), `decompiled/` (saved
+  output), and its own `README.md`. Useful scripts:
+  - `DecompAt.java <hex addr>` — decompile the function containing an
+    address. Auto-creates the function first if Ghidra's auto-analysis
+    didn't (interleaved literal pools in this binary make that common —
+    check for a "NO FUNCTION at ..." message and rerun with
+    `CreateFunctions2.java <addr>` first if so).
+  - `FindCallers2.java <hex addr>` — list direct-call (`bl`) callers of an
+    address. Returns nothing for functions only reached via a computed
+    jump table or function-pointer table (common for state-machine
+    dispatchers here) — those need manual disassembly of the jump table
+    itself instead.
+  - `FindXrefs3.java <hex addr>` — list all references (read/write/call).
+  - `FindMovtScalar.java <hex halfword>` — scan every instruction for an
+    operand scalar matching a given 16-bit value, to find MOVW/MOVT-split
+    32-bit immediate loads that a raw literal-pool byte search
+    (`data.find(target_bytes)`) misses entirely. Needed because this
+    binary mixes both addressing styles.
+  - `CreateFunctions2.java <hex addr>` — force a function boundary at an
+    address Ghidra didn't auto-detect, so `DecompAt.java` has something to
+    decompile.
+
+  Invoke any of them via (`GHIDRA_HOME` = wherever Ghidra is installed
+  locally):
+  ```
+  $GHIDRA_HOME/support/analyzeHeadless <repo>/ghidra-proj <ProjName> \
+    -process internal_flash_backup_<game>.bin \
+    -noanalysis \
+    -scriptPath <repo>/scripts \
+    -postScript <Script>.java <args>
+  ```
+  (`-noanalysis` reuses the project's already-computed auto-analysis from
+  import time — needed every invocation after the first, otherwise it
+  re-analyzes the whole binary each time.) Multiple `-postScript` flags
+  can be chained in one invocation (e.g. `CreateFunctions2.java <addr>`
+  then `DecompAt.java <addr>` back-to-back) to save the ~1s Ghidra
+  startup cost per call.
 - **`gnwmanager/gnwmanager/cli/gnw_patch/mario.py` and `zelda.py`** (a
   separate local repo) are real, SHA1-hash-verified stock-firmware patch
   offsets with inline comments describing what each patched address does
