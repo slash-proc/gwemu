@@ -203,27 +203,45 @@ static void gnw_h7b0_gpio_reset(DeviceState *dev)
      * defaulting it low is a guess to unblock stock-firmware boot, not a
      * verified real-hardware fact. Revisit if a real pinout turns up.
      *
-     * PA0 (port index 0, bit 0) and PC13 (port index 2, bit 13) are gated
-     * the same active-low way, by a distinct function further down the
-     * same boot path (FUN_08006224 in a Ghidra decompile of this stock
-     * image) that also requires FUN_0800644c() != 1 and GPIOD bits
-     * 5/9/11/14/15 all high (already true with our all-high IDR default)
-     * before a charger/PMIC-status retry counter is allowed to progress
-     * at all -- without these two also reading low, that counter can
-     * never advance past 0 and the boot's main loop spins forever. Same
-     * caveat as PC8: real identity (charger STAT/nIRQ lines are the
-     * likely guess, given the paired charger-status byte this same path
-     * reads is stuck at an unhandled enum value) isn't confirmed.
+     * PA0 (port index 0, bit 0), PC13 (port index 2, bit 13), and PD0
+     * (port index 3, bit 0) were previously also forced low here, to
+     * unblock a charger/PMIC-status retry counter (FUN_08006224 in a
+     * Ghidra decompile of this stock image) gated behind those three
+     * pins plus GPIOD bits 5/9/11/14/15. That turned out to be the wrong
+     * fix: with RCC_RSR.SFTRSTF now set (see gnw_h7b0_rcc.h), boot takes
+     * a different top-level branch that reaches LTDC/graphics init
+     * without ever needing that retry counter, so it isn't required.
+     * Worse, forcing PA0 low permanently satisfies a *different*,
+     * unrelated SysTick-driven watchdog's decrement condition (real
+     * disassembly at 0x08009cfa: counts down 5000 ticks while
+     * GPIOA_IDR bit 0 reads low, then calls the same standby-entry trap
+     * documented in gnwmanager's mario.py patch comments) -- PA0 is far
+     * more likely the WKUP1 power button, normally-high, whose *held*
+     * (low) state is meant to trigger exactly that shutdown after ~5s.
+     * Forcing it low unconditionally caused boot to auto-trigger standby
+     * a few seconds in, which looked identical to "still hung" from the
+     * outside. PC13/PD0 restored below since removing all three together
+     * reintroduced the original massive-write-storm hang (something
+     * else -- not yet identified -- still needs at least one of them
+     * low, independent of the charger-retry-counter path).
+     *
+     * PA0 itself is still forced low here (needed for that same
+     * early-storm reason). Tried releasing it back high a few seconds
+     * later via a one-shot QEMUTimer, to dodge the SysTick watchdog
+     * while still satisfying the early-storm requirement, matching a
+     * real momentary button press -- that made things worse (the
+     * release edge itself appears to retrigger a full RCC/PWR/RTC
+     * re-init storm, plausibly a real "woken by button" firmware path
+     * we don't otherwise support), so it's left permanently low for now
+     * and the SysTick standby-trap tradeoff is accepted: boot reaches
+     * real LTDC configuration within the first few seconds before that
+     * trap parks the CPU. Revisit alongside real EXTI/NVIC wiring
+     * (currently a no-op stub, see gnw_h7b0_exti.c) if that standby trap
+     * needs to be avoided for longer test runs.
      */
     s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 8);
     s->regs[(0 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 0);
     s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 13);
-    /*
-     * PD0 (port index 3, bit 0): the same retry-counter path only
-     * treats a poll as "real progress" (vs. an immediate reset back to
-     * 0) when GPIOD's raw IDR value is even -- i.e. bit 0 clear. Same
-     * unconfirmed-guess caveat as the pins above.
-     */
     s->regs[(3 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 0);
 }
 
