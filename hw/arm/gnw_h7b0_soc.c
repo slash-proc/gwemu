@@ -335,6 +335,26 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->exti), 0, EXTI_SYSCFG_BASE_ADDRESS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->exti), 0,
+                        qdev_get_gpio_in(armv7m, EXTI0_IRQn));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->exti), 1,
+                        qdev_get_gpio_in(armv7m, EXTI1_IRQn));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->exti), 2,
+                        qdev_get_gpio_in(armv7m, EXTI2_IRQn));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->exti), 3,
+                        qdev_get_gpio_in(armv7m, EXTI3_IRQn));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->exti), 4,
+                        qdev_get_gpio_in(armv7m, EXTI4_IRQn));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->exti), 5,
+                        qdev_get_gpio_in(armv7m, EXTI9_5_IRQn));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->exti), 6,
+                        qdev_get_gpio_in(armv7m, EXTI15_10_IRQn));
+    /* GPIO's PA0-release logic needs to notify EXTI of a real edge -- see
+     * gnw_h7b0_gpio.c. Both devices already exist and are realized by
+     * this point; this just wires the pointer, not a QOM property, since
+     * GPIO -> EXTI isn't a real hardware bus relationship worth modeling
+     * more formally for one internal notification. */
+    s->gpio.exti = &s->exti;
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->syscfg), errp)) {
         return;

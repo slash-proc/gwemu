@@ -31,6 +31,7 @@
 #include "ui/input.h"
 #include "hw/misc/gnw_h7b0_gpio.h"
 #include "hw/misc/gnw_h7b0_regs_gpio.h"
+#include "hw/misc/gnw_h7b0_exti.h"
 
 /*
  * Button -> port/pin table, transcribed from gnw-chainloader's own
@@ -226,18 +227,29 @@ static void gnw_h7b0_gpio_reset(DeviceState *dev)
      * low, independent of the charger-retry-counter path).
      *
      * PA0 itself is still forced low here (needed for that same
-     * early-storm reason). Tried releasing it back high a few seconds
-     * later via a one-shot QEMUTimer, to dodge the SysTick watchdog
-     * while still satisfying the early-storm requirement, matching a
-     * real momentary button press -- that made things worse (the
-     * release edge itself appears to retrigger a full RCC/PWR/RTC
-     * re-init storm, plausibly a real "woken by button" firmware path
-     * we don't otherwise support), so it's left permanently low for now
-     * and the SysTick standby-trap tradeoff is accepted: boot reaches
-     * real LTDC configuration within the first few seconds before that
-     * trap parks the CPU. Revisit alongside real EXTI/NVIC wiring
-     * (currently a no-op stub, see gnw_h7b0_exti.c) if that standby trap
-     * needs to be avoided for longer test runs.
+     * early-storm reason). Real disassembly of this stock image's
+     * EXTI0_IRQHandler (0x08017aba, tail-jumps to a real, non-trivial
+     * handler body at 0x08009ce6) shows it's what actually arms the
+     * SysTick watchdog above -- the watchdog does nothing at all until
+     * EXTI0 has fired at least once (a flag byte the handler sets), so a
+     * plain permanent-low GPIO default (no real EXTI, no interrupt ever
+     * firing) couldn't have been triggering that watchdog after all;
+     * that theory was wrong. Built real EXTI0-9 edge-triggered interrupt
+     * delivery (gnw_h7b0_exti.c, NVIC-wired in gnw_h7b0_soc.c) to test
+     * releasing PA0 with a real rising-edge interrupt instead of a
+     * silent register flip -- that made things *worse* too (same
+     * RCC/PWR/RTC re-init storm as the earlier no-EXTI attempt), and a
+     * breakpoint at EXTI0_IRQHandler's real body never even fired within
+     * a 10s window, meaning firmware hadn't armed RTSR1/CPUIMR1 for line
+     * 0 by then either -- so the storm on release isn't (yet confirmed
+     * to be) caused by this specific interrupt actually running; it's
+     * unexplained. Left permanently low for now. gnw_h7b0_gpio_pa0_release()
+     * and the timer that would call it are kept in the source (unarmed --
+     * see gnw_h7b0_gpio_init()) as a documented, ready-to-resume attempt
+     * for whoever picks this up next, not because releasing PA0 is known
+     * to work. The EXTI/NVIC wiring itself is real, correct, general-
+     * purpose infrastructure independent of whether it turns out to be
+     * the answer here.
      */
     s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 8);
     s->regs[(0 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 0);
@@ -288,6 +300,21 @@ static const MemoryRegionOps gnw_h7b0_gpio_ops = {
     },
 };
 
+/* See PA0's comment in gnw_h7b0_gpio_reset() -- releases PA0 (WKUP1/power
+ * button, best guess) back to its normal-high idle level a short while
+ * after reset, generating a real EXTI0 rising-edge interrupt in the
+ * process (if firmware has configured EXTI0 for a rising trigger by
+ * then; a no-op otherwise, same as real hardware). */
+static void gnw_h7b0_gpio_pa0_release(void *opaque)
+{
+    GnwH7B0GpioState *s = GNW_H7B0_GPIO(opaque);
+
+    s->regs[(0 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] |= (1u << 0);
+    if (s->exti) {
+        gnw_h7b0_exti_set_line(s->exti, 0, true);
+    }
+}
+
 static void gnw_h7b0_gpio_init(Object *obj)
 {
     GnwH7B0GpioState *s = GNW_H7B0_GPIO(obj);
@@ -295,6 +322,8 @@ static void gnw_h7b0_gpio_init(Object *obj)
     memory_region_init_io(&s->mmio, obj, &gnw_h7b0_gpio_ops, s,
                            TYPE_GNW_H7B0_GPIO, GNW_H7B0_GPIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+    s->pa0_release_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                         gnw_h7b0_gpio_pa0_release, s);
 }
 
 static void gnw_h7b0_gpio_realize(DeviceState *dev, Error **errp)

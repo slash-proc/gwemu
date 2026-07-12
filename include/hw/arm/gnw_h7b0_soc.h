@@ -295,6 +295,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  * (shared by ADC1/ADC2). */
 #define ADC_IRQn 18
 
+/* Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type. EXTI lines
+ * 0-4 each get a dedicated IRQ; 5-9 and 10-15 share one IRQ each. */
+#define EXTI0_IRQn 6
+#define EXTI1_IRQn 7
+#define EXTI2_IRQn 8
+#define EXTI3_IRQn 9
+#define EXTI4_IRQn 10
+#define EXTI9_5_IRQn 23
+#define EXTI15_10_IRQn 40
+
 /*
  * SPI2, per STM32H7B0.svd baseAddress 0x40003800. This is also the
  * LCD-panel init-command path (separate from the LTDC pixel-data

@@ -57,6 +57,7 @@
 #define HW_MISC_GNW_H7B0_GPIO_H
 
 #include "hw/core/sysbus.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_GPIO "gnw-h7b0-gpio"
@@ -69,11 +70,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0GpioState, GNW_H7B0_GPIO)
 
 #define GNW_H7B0_GPIO_IDR_OFFSET  0x10
 
+typedef struct GnwH7B0ExtiState GnwH7B0ExtiState;
+
 struct GnwH7B0GpioState {
     SysBusDevice parent_obj;
 
     MemoryRegion mmio;
     uint32_t regs[GNW_H7B0_GPIO_SIZE / 4];
+    /* Set by the SoC after both devices exist (see gnw_h7b0_soc.c). Used
+     * only to notify EXTI of the PA0 (WKUP1, best guess) release edge --
+     * see gnw_h7b0_gpio_pa0_release() in gnw_h7b0_gpio.c. */
+    GnwH7B0ExtiState *exti;
+    QEMUTimer *pa0_release_timer;
 };
 
 #endif
