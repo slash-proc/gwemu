@@ -29,6 +29,7 @@
 #include "hw/arm/gnw_h7b0_soc.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/misc/unimp.h"
 
 static void gnw_h7b0_soc_initfn(Object *obj)
 {
@@ -117,6 +118,87 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     INIT_RAM_REGION(extflash, "GNW_H7B0.extflash", EXTFLASH_BASE_ADDRESS,
                      EXTFLASH_SIZE);
     INIT_RAM_REGION(uid, "GNW_H7B0.uid", UID_BASE_ADDRESS, UID_SIZE);
+
+    /*
+     * Unimplemented devices to prevent BusFaults on gnwmanager payload,
+     * a not-yet-modeled peripheral read/write, or a reset-register
+     * snapshot tool (scripts/snapshot_registers.py) walking every
+     * STM32H7B0.svd peripheral. Every SVD peripheral base address not
+     * already covered by a real device model below is stubbed here so
+     * accesses log instead of faulting.
+     */
+    create_unimplemented_device("IWDG1", 0x58004800, 0x400);
+    create_unimplemented_device("HASH", 0x48021400, 0x400);
+    create_unimplemented_device("SPI3", 0x40003c00, 0x400);
+    create_unimplemented_device("SPDIFRX", 0x40004000, 0x400);
+    create_unimplemented_device("USART2", 0x40004400, 0x400);
+    create_unimplemented_device("USART3", 0x40004800, 0x400);
+    create_unimplemented_device("UART4", 0x40004c00, 0x400);
+    create_unimplemented_device("UART5", 0x40005000, 0x400);
+    create_unimplemented_device("I2C1", 0x40005400, 0x400);
+    create_unimplemented_device("I2C2", 0x40005800, 0x400);
+    create_unimplemented_device("I2C3", 0x40005c00, 0x400);
+    create_unimplemented_device("CEC", 0x40006c00, 0x400);
+    create_unimplemented_device("UART7", 0x40007800, 0x400);
+    create_unimplemented_device("UART8", 0x40007c00, 0x400);
+    create_unimplemented_device("SWPMI", 0x40008800, 0x400);
+    create_unimplemented_device("OPAMP", 0x40009000, 0x400);
+    create_unimplemented_device("MDIOS", 0x40009400, 0x400);
+    create_unimplemented_device("TT_FDCAN", 0x4000a000, 0x400);
+    create_unimplemented_device("FDCAN", 0x4000a400, 0x400);
+    create_unimplemented_device("CAN_CCU", 0x4000a800, 0x400);
+    create_unimplemented_device("TIM8", 0x40010400, 0x400);
+    create_unimplemented_device("USART1", 0x40011000, 0x400);
+    create_unimplemented_device("USART6", 0x40011400, 0x400);
+    create_unimplemented_device("USART9", 0x40011800, 0x400);
+    create_unimplemented_device("USART10", 0x40011c00, 0x400);
+    create_unimplemented_device("SPI4", 0x40013400, 0x400);
+    create_unimplemented_device("TIM15", 0x40014000, 0x400);
+    create_unimplemented_device("TIM16", 0x40014400, 0x400);
+    create_unimplemented_device("TIM17", 0x40014800, 0x400);
+    create_unimplemented_device("SPI5", 0x40015000, 0x400);
+    create_unimplemented_device("SAI2", 0x40015c00, 0x400);
+    create_unimplemented_device("HRTIM_Master", 0x40017400, 0x80);
+    create_unimplemented_device("HRTIM_TIMA", 0x40017480, 0x80);
+    create_unimplemented_device("HRTIM_TIMB", 0x40017500, 0x80);
+    create_unimplemented_device("HRTIM_TIMC", 0x40017580, 0x80);
+    create_unimplemented_device("HRTIM_TIMD", 0x40017600, 0x80);
+    create_unimplemented_device("HRTIM_TIME", 0x40017680, 0x80);
+    create_unimplemented_device("HRTIM_Common", 0x40017780, 0x80);
+    create_unimplemented_device("DFSDM1", 0x40017800, 0x4bc);
+    create_unimplemented_device("DMAMUX1", 0x40020800, 0x400);
+    create_unimplemented_device("OTG1_HS_GLOBAL", 0x40040000, 0x400);
+    create_unimplemented_device("OTG1_HS_HOST", 0x40040400, 0x400);
+    create_unimplemented_device("OTG1_HS_DEVICE", 0x40040800, 0x400);
+    create_unimplemented_device("OTG1_HS_PWRCLK", 0x40040e00, 0x3f200);
+    create_unimplemented_device("DCMI", 0x48020000, 0x400);
+    create_unimplemented_device("PSSI", 0x48020400, 0x6b);
+    create_unimplemented_device("HSEM", 0x48020800, 0x400);
+    create_unimplemented_device("CRYP", 0x48021000, 0x400);
+    create_unimplemented_device("RNG", 0x48021800, 0x400);
+    create_unimplemented_device("SDMMC2", 0x48022400, 0x400);
+    create_unimplemented_device("DELAY_Block_SDMMC2", 0x48022800, 0x400);
+    create_unimplemented_device("BDMA1", 0x48022c00, 0x400);
+    create_unimplemented_device("AXI", 0x51000000, 0x100000);
+    create_unimplemented_device("MDMA", 0x52000000, 0x1000);
+    create_unimplemented_device("Delay_Block_OCTOSPI1", 0x52006000, 0x400);
+    create_unimplemented_device("SDMMC1", 0x52007000, 0x3fd);
+    create_unimplemented_device("DELAY_Block_SDMMC1", 0x52008000, 0x400);
+    create_unimplemented_device("RAMECC", 0x52009000, 0x400);
+    create_unimplemented_device("Delay_Block_OCTOSPI2", 0x5200b000, 0x400);
+    create_unimplemented_device("OTFDEC1", 0x5200b800, 0x400);
+    create_unimplemented_device("OTFDEC2", 0x5200bc00, 0x400);
+    create_unimplemented_device("LPUART1", 0x58000c00, 0x400);
+    create_unimplemented_device("SPI6", 0x58001400, 0x400);
+    create_unimplemented_device("I2C4", 0x58001c00, 0x400);
+    create_unimplemented_device("LPTIM2", 0x58002400, 0x400);
+    create_unimplemented_device("LPTIM3", 0x58002800, 0x400);
+    create_unimplemented_device("COMP1", 0x58003800, 0x400);
+    create_unimplemented_device("VREFBUF", 0x58003c00, 0x400);
+    create_unimplemented_device("DFSDM2", 0x58006c00, 0x400);
+    create_unimplemented_device("BDMA2", 0x58025400, 0x400);
+    create_unimplemented_device("DMAMUX2", 0x58025800, 0x400);
+
     {
         /*
          * Seed a fixed synthetic 96-bit UID (HAL_GetUIDw0/1/2() read

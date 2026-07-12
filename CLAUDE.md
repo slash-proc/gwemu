@@ -62,6 +62,41 @@ phased plan.
   scratch-buffer reuse as instability, plus current gdb/monitor/launch
   workflow notes. Flicker root cause is still open; next steps are listed
   there.
+- `docs/session-2026-07-12-register-snapshot-diffing.md` — a real-hardware
+  -vs-QEMU register snapshot/diff workflow (`scripts/snapshot_registers.py`
+  + `diff_snapshots.py`/`triage_diffs.py`/`halt_at_entry.py`), built on
+  `gnwmanager`'s `--qemu` gdbstub support. Found/fixed 3 real reset-value
+  bugs (`GPIOx_BSRR`, `RTC_WPR`, `TIM1_EGR` — all a write-only "pulse"
+  register class). Also documents why RCC's apparent reset-default
+  anomalies (mirrored `ENR`/`LPENR` block, non-zero trim/backup-domain
+  registers) are real hardware behavior, not bugs — read before spending
+  more time on RCC specifically. Has real workflow guidance on which halt
+  strategy (`--gnwmanager-active` vs `--halt-at-entry` vs plain
+  `reset_and_halt()`) to use for future register-audit passes.
+- `docs/session-2026-07-12-breakpoint-lockstep-tracing.md` — breakpoint-
+  based (never single-step — too slow over real hardware's SWD link)
+  live QEMU-vs-real-hardware execution comparison workflow
+  (`scripts/checkpoint.py`/`step_init_calls.py`/`watch_loop_flag.py`/
+  `watch_write.py`/`lockstep_compare.py`), cross-referenced against
+  Ghidra decompilation. Confirmed QEMU tracks real hardware bit-for-bit
+  identically from the entry point through the main superloop's first 20
+  passes, reproducing the `[r4+9]`/`[r4+0x60]` blocker exactly. Has a
+  detailed list of real tooling bugs found this session (missing
+  breakpoint step-over before `continue`, an off-by-one on which side of
+  a breakpoint's instruction registers reflect, a Python socket-timeout
+  wedge, stdout buffering hiding live progress) that will recur in any
+  future scripting against `gnwmanager`'s `GDBBackend`/`OpenOCDBackend`
+  — read before writing new scripts in this style. Also root-caused
+  real-hardware SWD dropping into standby mid-trace to stock Zelda
+  firmware's own state-6 standby handler (not a tooling bug) and
+  recorded the decision to use a patched-out-standby blob for future
+  interactive hardware tracing sessions specifically.
+- **Never edit the `gnwmanager` package** to add capabilities needed for
+  a tracing/debugging script in this repo — write pure-consumer scripts
+  against its existing public `OCDBackend`/`GDBBackend`/`GnW` API
+  instead. It has independent development happening outside this repo
+  (confirmed mid-session: its `GDBBackend` changed under us from
+  someone else's concurrent work) and is not this repo's to modify.
 
 ## Repo/remote conventions
 

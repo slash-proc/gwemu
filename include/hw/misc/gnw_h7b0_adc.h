@@ -75,10 +75,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0AdcState, GNW_H7B0_ADC)
  * Fixed regular-conversion result returned on every ADSTART, standing in for
  * board_get_battery_raw()'s PC4/channel-4 battery-voltage read (see
  * gnw-chainloader's board.c and retro-go-sd's bq24072.c). Both firmwares
- * treat raw >= 13000 as BQ24072_BATTERY_FULL (100%); 13500 sits safely above
- * that threshold.
+ * treat raw >= 13000 as BQ24072_BATTERY_FULL (100%).
+ *
+ * Was 13500 -- calibrated only against that retro-go-sd/gnw-chainloader
+ * threshold, never checked against stock firmware. Confirmed wrong via
+ * 2026-07-12 breakpoint-lockstep-tracing: stock Zelda's own battery-level
+ * lookup (FUN_0800320e in a Ghidra decompile) uses up to 4 different
+ * threshold tables depending on a charging-state flag/GPIOE-bit combo,
+ * and one of those tables' max threshold is ~41974 -- far above 13500 --
+ * causing stock firmware to read battery level 0 on QEMU (vs a real
+ * nonzero level on real hardware, which has an actual battery), silently
+ * skipping an entire boot-progress branch (confirmed: this is the root
+ * cause of stock Zelda's display/LTDC-init path never being reached in
+ * QEMU, traced through ~6 layers of intermediate function calls -- see
+ * docs/session-2026-07-12-breakpoint-lockstep-tracing.md part 4).
+ * 0xFFFF (max a 16-bit DR register can hold) clears every threshold table
+ * in both firmware families and is the semantically correct "full
+ * battery" reading regardless of which table gets selected.
  */
-#define GNW_H7B0_ADC_FULL_BATTERY_RAW 13500
+#define GNW_H7B0_ADC_FULL_BATTERY_RAW 0xFFFF
 
 /* ADC1/ADC2 sub-block stride and count within the combined register file. */
 #define GNW_H7B0_ADC_INSTANCE_STRIDE 0x100

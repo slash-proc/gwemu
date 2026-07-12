@@ -33,6 +33,8 @@
 #include "hw/display/gnw_h7b0_ltdc.h"
 #include "hw/display/gnw_h7b0_regs_ltdc.h"
 
+static bool gnw_h7b0_ltdc_enabled(GnwH7B0LtdcState *s);
+
 /*
  * Integer nearest-neighbor upscale factor for the host window. The G&W
  * LCD is a tiny 320x240 panel; displayed 1:1 that's uncomfortably small
@@ -183,6 +185,15 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
         s->regs[GNW_H7B0_LTDC_SRCR >> 2] &= ~LTDC_SRCR_VBR;
         s->regs[GNW_H7B0_LTDC_ISR >> 2] |= LTDC_ISR_RRIF;
         gnw_h7b0_ltdc_update_irq(s);
+    } else {
+        /* Auto-capture for firmware (like gnwmanager) that doesn't use VBR */
+        if (!s->content_dirty && gnw_h7b0_ltdc_enabled(s)) {
+            int rows = gnw_h7b0_ltdc_capture_setup(s);
+            if (rows > 0) {
+                gnw_h7b0_ltdc_capture_rows(s, 0, rows);
+                s->content_dirty = true;
+            }
+        }
     }
 
     gnw_h7b0_ltdc_recalc_timers(s, now);

@@ -178,6 +178,10 @@ static void gnw_h7b0_rtc_write(void *opaque, hwaddr addr,
                               | RTC_ICSR_WUTWF | RTC_ICSR_ALRBWF
                               | RTC_ICSR_ALRAWF;
         return;
+    case GNW_H7B0_RTC_WPR_OFFSET:
+        /* WPR is write-only; real hardware/SVD always read it back as 0. */
+        s->regs[addr >> 2] = 0;
+        return;
     case GNW_H7B0_RTC_CR:
     {
         uint32_t old_cr = s->regs[addr >> 2];

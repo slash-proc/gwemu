@@ -1,5 +1,118 @@
 # Changelog
 
+## 2026-07-12 (later session, part 5) — real ADC battery-threshold bug found and fixed via lockstep tracing
+
+Full narrative: `docs/session-2026-07-12-breakpoint-lockstep-tracing.md`
+("Follow-up session (same day, part 5)" section, which also documents
+the efficient checkpoint-bisection playbook used to find this).
+
+- **Real fix**: `GNW_H7B0_ADC_FULL_BATTERY_RAW` (`include/hw/misc/gnw_h7b0_adc.h`)
+  bumped `13500` -> `0xFFFF`. The old value only cleared one of stock
+  Zelda's own 4 battery-level threshold tables (`FUN_0800320e` in a
+  Ghidra decompile, thresholds up to ~41974) -- QEMU read battery level
+  0 where real hardware reads a real nonzero level, silently skipping an
+  entire boot-progress branch. Checkpoint-confirmed: `FUN_0800ec7a` now
+  takes the same internal branch as real hardware, and the per-pass
+  event-queue dispatch now fires identically on both targets, neither of
+  which matched before this fix.
+- Also fixed same day (part 4, folded in here since it's the same
+  investigation thread): `hw/misc/gnw_h7b0_gpio.c` no longer forces
+  GPIOC bit 8/13 or GPIOD bit 0 low at reset -- confirmed via direct
+  real-hardware register reads that all read `0xFFFFFFFF`. This
+  unblocked QEMU reaching the LTDC display-init entry point and a
+  layer-window register write, matching real hardware at both, which it
+  never did before.
+- `scripts/boot_qemu.sh` gained `-audiodev pa,id=snd0` +
+  `-global gnw-h7b0-sai1.audiodev=snd0` (QEMU had no audio backend
+  configured at all) and a `--patched` flag to boot the
+  standby-patched bank1 image for a fair comparison against patched real
+  hardware.
+- New `scripts/make_zelda_patched_bank1.py` (reproduces gnwmanager's
+  standby-skip patch bytes locally) and `scripts/watch_state_byte.py`.
+- Still open: real hardware's route to the LTDC HAL init (`0x08013704`)
+  isn't the event-queue path just fixed -- a different, not-yet-found
+  call to `FUN_0800eb90(3)` is the actual trigger. No display/audio on
+  QEMU yet.
+
+## 2026-07-12 (later session, part 2) — breakpoint-based lockstep tracing
+
+Full narrative: `docs/session-2026-07-12-breakpoint-lockstep-tracing.md`.
+
+- New `scripts/checkpoint.py`, `step_init_calls.py`, `watch_loop_flag.py`,
+  `watch_write.py`, `lockstep_compare.py`: breakpoint-based (not
+  single-step-based -- too slow over real hardware's SWD link)
+  QEMU-vs-real-hardware live execution comparison at chosen checkpoints,
+  cross-referenced against Ghidra decompilation.
+- Confirmed QEMU tracks real hardware **bit-for-bit identically** from
+  the real reset entry point through the constructor/init-array
+  dispatcher, MPU/cache setup, ~20 subsystem inits, and into the main
+  superloop's first 20 passes -- the previously-documented "counter
+  never arms" blocker (`[r4+9]` exit flag, `[r4+0x60]` enable field both
+  stay 0) is reproduced exactly on QEMU with this new scripted,
+  repeatable checkpoint. Real-hardware confirmation at the same exact
+  point is the next session's first task.
+- Root-caused repeated real-hardware SWD disconnects
+  ("OpenOCD lost contact ... CPU likely entered low-power/standby") to
+  stock Zelda firmware's own state-6 standby handler triggering during
+  the repeated resets this kind of tracing requires -- not a tooling
+  bug. Decision: use `gnwmanager`'s patched-out-standby Zelda blob for
+  future interactive real-hardware breakpoint-tracing sessions
+  specifically (boot-behavior-accuracy work still uses the real stock
+  dump). QEMU has no standby/low-power mode modeled yet -- flagged as
+  necessary future work, not yet started.
+- Found and fixed several real bugs in this session's *own tooling*
+  (not firmware bugs): a missing breakpoint step-over before `continue`
+  that made QEMU look completely stuck re-executing the same call
+  forever (a pure tooling artifact -- see the doc's "Real, load-bearing
+  bugs found and fixed in this session's own tooling" section for the
+  full list, including a breakpoints-halt-before-not-after off-by-one,
+  a Python socket timeout wedge, and stdout buffering hiding live
+  progress).
+- Reinforced: do not edit the `gnwmanager` package to add capabilities
+  (reverted an earlier attempt this session) -- it has independent
+  concurrent development happening outside this repo; write pure-
+  consumer scripts against its existing public API instead.
+
+## 2026-07-12 (later session) — register snapshot/diff tooling, 3 real reset-default fixes
+
+Full narrative: `docs/session-2026-07-12-register-snapshot-diffing.md`.
+
+- New `scripts/snapshot_registers.py` + `diff_snapshots.py` +
+  `triage_diffs.py`: dump every SVD peripheral's register block from
+  QEMU or real hardware (via `gnwmanager`'s backend abstraction,
+  including its new `--qemu` gdbstub support) and diff/auto-classify
+  against the SVD's own documented reset values.
+- New `scripts/halt_at_entry.py`: deterministic reset-and-halt-at-the-
+  real-entry-point via a real breakpoint (gdb-remote `Z1` for QEMU,
+  OpenOCD `bp`/`wait_halt` for real hardware), replacing the racy plain
+  `reset_and_halt()`/`reset halt` for cases needing true pre-firmware POR
+  state. Built entirely on `gnwmanager`'s existing public backend API, no
+  changes to the `gnwmanager` package.
+- **Fixed 3 real reset-value bugs**, all the same class (a write-only
+  "pulse" register whose write handler had no special case, so the
+  generic mask-and-store path leaked the last-written value into
+  readback instead of the real always-reads-0 behavior):
+  `hw/misc/gnw_h7b0_gpio.c` (`GPIOx_BSRR`), `hw/misc/gnw_h7b0_rtc.c`
+  (`RTC_WPR`), `hw/misc/gnw_h7b0_tim1.c` (`TIM1_EGR`).
+- `hw/arm/gnw_h7b0_soc.c`: extended `create_unimplemented_device`
+  coverage from 2 to 69 peripherals (every SVD peripheral not covered by
+  a real device model), so a full-address-space register sweep (or any
+  future gnwmanager/firmware probe) logs instead of BusFaulting.
+- New `scripts/make_boot_images.py` + `boot_qemu.sh`: standardized,
+  correctly-sized (0xFF-padded to real `FLASH_BANK_SIZE`/`EXTFLASH_SIZE`)
+  bank1/bank2/extflash boot images and the one launch command going
+  forward, replacing ad hoc partial-dump QEMU invocations. Deliberately
+  omits `-d guest_errors,unimp`/other unbounded logging flags — that
+  combination filled `/tmp` and destabilized the host multiple times
+  this session.
+- Confirmed (not a bug): RCC's apparent reset-default "anomalies"
+  (mirrored `ENR`/`LPENR` register block at a constant `-0x60` offset,
+  non-zero trim/backup-domain registers) are real hardware behavior —
+  factory calibration trim loaded by hardware itself, backup-domain state
+  that legitimately persists across a warm reset by design, and an
+  undocumented address-decode aliasing quirk present even at a guaranteed
+  pre-firmware halt. None are fixable or worth modeling.
+
 ## 2026-07-12 — stock firmware boot investigation, PA0/WKUP1 fix
 
 Full narrative: `docs/session-2026-07-12-stock-firmware-boot-investigation.md`.

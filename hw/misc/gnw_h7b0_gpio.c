@@ -194,61 +194,23 @@ static void gnw_h7b0_gpio_reset(DeviceState *dev)
         s->regs[idr >> 2] = 0xFFFFU;
     }
     /*
-     * PC8 (port index 2, bit 8) is polled active-low by stock firmware
-     * during early boot (briefly reconfigured as output, read back, then
-     * restored to input) before its boot state machine will advance past
-     * state 6 -- with every input defaulting high like every other pin
-     * here, that wait never succeeds and boot hangs forever. Not in
-     * retro-go's known board.c pinout, so its real function (hinge/lid
-     * switch, a boot-mode strap, some other sense pin) isn't confirmed --
-     * defaulting it low is a guess to unblock stock-firmware boot, not a
-     * verified real-hardware fact. Revisit if a real pinout turns up.
-     *
-     * PA0 (port index 0, bit 0), PC13 (port index 2, bit 13), and PD0
-     * (port index 3, bit 0) were previously also forced low here, to
-     * unblock a charger/PMIC-status retry counter (FUN_08006224 in a
-     * Ghidra decompile of this stock image) gated behind those three
-     * pins plus GPIOD bits 5/9/11/14/15. That turned out to be the wrong
-     * fix: with RCC_RSR.SFTRSTF now set (see gnw_h7b0_rcc.h), boot takes
-     * a different top-level branch that reaches LTDC/graphics init
-     * without ever needing that retry counter, so it isn't required.
-     * Worse, forcing PA0 low permanently satisfies a *different*,
-     * unrelated SysTick-driven watchdog's decrement condition (real
-     * disassembly at 0x08009cfa: counts down 5000 ticks while
-     * GPIOA_IDR bit 0 reads low, then calls the same standby-entry trap
-     * documented in gnwmanager's mario.py patch comments) -- PA0 is far
-     * more likely the WKUP1 power button, normally-high, whose *held*
-     * (low) state is meant to trigger exactly that shutdown after ~5s.
-     * Forcing it low unconditionally caused boot to auto-trigger standby
-     * a few seconds in, which looked identical to "still hung" from the
-     * outside. PC13/PD0 restored below since removing all three together
-     * reintroduced the original massive-write-storm hang (something
-     * else -- not yet identified -- still needs at least one of them
-     * low, independent of the charger-retry-counter path).
-     *
-     * PA0 was previously *also* forced low here for that same early-storm
-     * reason (see prior history in git blame / CHANGELOG.md), but that
-     * predates the RCC_RSR.SFTRSTF fix (gnw_h7b0_rcc.h) and current
-     * understanding of the LTDC IRQ88 NVIC-enable gap -- both of which
-     * were still missing when the "releasing PA0 causes a storm" finding
-     * was made. With those in place, live-releasing PA0 (both at reset
-     * and mid-boot, tested against both Mario and Zelda) produces real
-     * forward progress instead: firmware's "state-6" handler (confirmed
-     * via gnwmanager's mario.py/zelda.py "warm-boot power-off fix" patch
-     * comments -- Mario 0x08005EF4, Zelda 0x0800EA8C, both labeled
-     * "state-6 standby") gates its real work behind this exact bit, and
-     * with PA0 high, that handler runs and produces genuine SPI2 LCD
-     * panel bring-up traffic (real TXDR command bytes matching the known
-     * panel-init byte sequence) instead of silently no-op'ing every pass.
-     * PA0/WKUP1 defaults HIGH here now to match "power button not held"
-     * -- gnwmanager's own patch comments describe this as "normally-high,
-     * whose *held* (low) state is meant to trigger... shutdown," i.e. the
-     * pin's un-pressed resting state is high, not low. No longer forced
-     * low at reset.
+     * PC8, PC13, and PD0 were previously forced low here as unverified
+     * guesses to unblock various boot-hang hypotheses (see CHANGELOG.md /
+     * git blame for the full charger-retry-counter and write-storm
+     * history). Confirmed wrong by direct real-hardware register reads
+     * during the 2026-07-12 breakpoint-lockstep-tracing session:
+     * GPIOC_IDR and GPIOD_IDR both read 0xFFFFFFFF on real hardware at
+     * reset, i.e. every pin including these three is genuinely high, not
+     * low. Real hardware's own stock-firmware boot state machine
+     * (FUN_0800ec7a's `(*GPIOC_IDR bit13) && ...` gate, checkpoint-traced
+     * this session) depends on PC13 reading high to proceed past state 6
+     * into LTDC/graphics init -- forcing it low was actively blocking the
+     * exact boot progress this project needs. No longer forced low at
+     * reset. If removing these reintroduces the previously-seen
+     * "massive-write-storm hang", that is a separate, real bug to find
+     * and fix on its own terms, not a reason to reintroduce readings that
+     * contradict measured real hardware.
      */
-    s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 8);
-    s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 13);
-    s->regs[(3 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 0);
 }
 
 static uint64_t gnw_h7b0_gpio_read(void *opaque, hwaddr addr,
@@ -278,6 +240,10 @@ static void gnw_h7b0_gpio_write(void *opaque, hwaddr addr,
     uint32_t port_offset = addr % GNW_H7B0_GPIO_PORT_SIZE;
     uint32_t mask = get_gpio_write_mask(port_offset);
     s->regs[addr >> 2] = (s->regs[addr >> 2] & ~mask) | (val64 & mask);
+    if (port_offset == GNW_H7B0_GPIO_BSRR_OFFSET) {
+        /* BSRR is write-only; real hardware/SVD always read it back as 0. */
+        s->regs[addr >> 2] = 0;
+    }
 }
 
 static const MemoryRegionOps gnw_h7b0_gpio_ops = {

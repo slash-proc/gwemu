@@ -32,6 +32,9 @@ static void gnw_h7b0_tim1_write(void *opaque, hwaddr addr, uint64_t val64, unsig
     }
     uint32_t mask = get_tim1_write_mask(addr);
     s->regs[addr >> 2] = (s->regs[addr >> 2] & ~mask) | ((uint32_t)val64 & mask);
+    if (addr == GNW_H7B0_TIM1_EGR_OFFSET) {
+        s->regs[addr >> 2] = 0; /* EGR is write-only; real hardware/SVD always read it back as 0 */
+    }
 }
 
 static const MemoryRegionOps gnw_h7b0_tim1_ops = {
