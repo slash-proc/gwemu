@@ -33,7 +33,36 @@
 #include "hw/display/gnw_h7b0_ltdc.h"
 #include "hw/display/gnw_h7b0_regs_ltdc.h"
 
-static bool gnw_h7b0_ltdc_enabled(GnwH7B0LtdcState *s);
+static int gnw_h7b0_ltdc_capture_setup(GnwH7B0LtdcState *s);
+static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
+                                        int row_end);
+
+static bool gnw_h7b0_ltdc_enabled(GnwH7B0LtdcState *s)
+{
+    return (s->active_gcr & LTDC_GCR_LTDCEN) &&
+           ((s->active_l1cr & LTDC_LxCR_LEN) ||
+            (s->active_l2cr & LTDC_LxCR_LEN));
+}
+
+/* Return true when a full frame was captured into shadow_buffer. */
+static bool gnw_h7b0_ltdc_capture_if_enabled(GnwH7B0LtdcState *s)
+{
+    int rows;
+
+    if (!gnw_h7b0_ltdc_enabled(s)) {
+        return false;
+    }
+
+    rows = gnw_h7b0_ltdc_capture_setup(s);
+    if (rows <= 0) {
+        return false;
+    }
+
+    gnw_h7b0_ltdc_capture_rows(s, 0, rows);
+    s->content_dirty = true;
+    s->invalidate = 1;
+    return true;
+}
 
 /*
  * Integer nearest-neighbor upscale factor for the host window. The G&W
@@ -123,6 +152,16 @@ static void gnw_h7b0_ltdc_recalc_timers(GnwH7B0LtdcState *s, int64_t now)
     int64_t frame_ns = NANOSECONDS_PER_SECOND / vblank_hz;
     int64_t line_ns = frame_ns / totalh;
 
+    {
+        static uint32_t last_hz_logged;
+        if (vblank_hz != last_hz_logged) {
+            fprintf(stderr, "[ltdc-debug] vblank_hz=%u (pll3r=%u totalw=%u totalh=%u)\n",
+                    vblank_hz, s->rcc ? gnw_h7b0_rcc_get_pll3r_hz(s->rcc) : 0,
+                    totalw, totalh);
+            last_hz_logged = vblank_hz;
+        }
+    }
+
     timer_mod(s->vblank_timer, now + frame_ns);
 
     if (lipcr < totalh) {
@@ -136,10 +175,6 @@ void gnw_h7b0_ltdc_set_rcc(GnwH7B0LtdcState *s, GnwH7B0RccState *rcc)
 {
     s->rcc = rcc;
 }
-
-static int gnw_h7b0_ltdc_capture_setup(GnwH7B0LtdcState *s);
-static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
-                                        int row_end);
 
 static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
 {
@@ -185,14 +220,14 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
         s->regs[GNW_H7B0_LTDC_SRCR >> 2] &= ~LTDC_SRCR_VBR;
         s->regs[GNW_H7B0_LTDC_ISR >> 2] |= LTDC_ISR_RRIF;
         gnw_h7b0_ltdc_update_irq(s);
+        if (s->vbr_deferred_capture) {
+            gnw_h7b0_ltdc_capture_if_enabled(s);
+            s->vbr_deferred_capture = false;
+        }
     } else {
         /* Auto-capture for firmware (like gnwmanager) that doesn't use VBR */
         if (!s->content_dirty && gnw_h7b0_ltdc_enabled(s)) {
-            int rows = gnw_h7b0_ltdc_capture_setup(s);
-            if (rows > 0) {
-                gnw_h7b0_ltdc_capture_rows(s, 0, rows);
-                s->content_dirty = true;
-            }
+            gnw_h7b0_ltdc_capture_if_enabled(s);
         }
     }
 
@@ -218,6 +253,7 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
     s->invalidate = 1;
     s->pf_warned = false;
     s->vbr_reload_pending = false;
+    s->vbr_deferred_capture = false;
 
     g_free(s->shadow_buffer);
     s->shadow_buffer = NULL;
@@ -230,11 +266,16 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
     gnw_h7b0_ltdc_recalc_timers(s, now);
 }
 
-static bool gnw_h7b0_ltdc_enabled(GnwH7B0LtdcState *s)
+static int gnw_h7b0_ltdc_layer_stride_bytes(uint32_t cfblr)
 {
-    return (s->regs[GNW_H7B0_LTDC_GCR >> 2] & LTDC_GCR_LTDCEN) &&
-           ((s->regs[GNW_H7B0_LTDC_L1CR >> 2] & LTDC_LxCR_LEN) ||
-            (s->regs[GNW_H7B0_LTDC_L2CR >> 2] & LTDC_LxCR_LEN));
+    int stride = (int)((cfblr >> LTDC_LxCFBLR_CFBP_SHIFT) &
+                        LTDC_LxCFBLR_CFBP_MASK);
+    int line_bytes = (int)(cfblr & LTDC_LxCFBLR_CFBLL_MASK);
+
+    if (stride <= 0) {
+        stride = line_bytes;
+    }
+    return stride;
 }
 
 static inline uint32_t gnw_h7b0_ltdc_rgb565_to_pixel32(uint16_t px)
@@ -333,8 +374,7 @@ static int gnw_h7b0_ltdc_capture_setup(GnwH7B0LtdcState *s)
     cfblr = s->active_l1cfblr;
     cfblnr = s->active_l1cfblnr & 0x7FFU;
 
-    src_width = (int)((cfblr >> LTDC_LxCFBLR_CFBP_SHIFT) &
-                       LTDC_LxCFBLR_CFBP_MASK);
+    src_width = gnw_h7b0_ltdc_layer_stride_bytes(cfblr);
     cols = src_width / (pfcr == LTDC_PF_L8 ? 1 : 2);
     rows = (int)cfblnr;
 
@@ -488,15 +528,16 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
     uint32_t l2_cfbar = s->active_l2cfbar;
     uint32_t l2_pfcr = s->active_l2pfcr & LTDC_LxPFCR_PF_MASK;
     bool l2_l8 = (l2_pfcr == LTDC_PF_L8);
+    bool l2_al44 = (l2_pfcr == LTDC_PF_AL44);
     uint32_t l2_cfblr = s->active_l2cfblr;
-    int l2_src_width = (int)((l2_cfblr >> LTDC_LxCFBLR_CFBP_SHIFT) &
-                              LTDC_LxCFBLR_CFBP_MASK);
+    int l2_src_width = gnw_h7b0_ltdc_layer_stride_bytes(l2_cfblr);
     int l2_bpp = 0;
     if (l2_en) {
         switch (l2_pfcr) {
         case 0: l2_bpp = 4; break;
         case 2: case 3: case 4: l2_bpp = 2; break;
         case 5: l2_bpp = 1; break; /* L8 */
+        case 6: l2_bpp = 1; break; /* AL44 -- 4-bit alpha + 4-bit luminance */
         default: l2_bpp = 0; break;
         }
     }
@@ -533,10 +574,25 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
                                     : gnw_h7b0_ltdc_rgb565_to_pixel32(
                                           lduw_le_p(linebuf + x * 2));
 
-            /* Layer2 first/bottom, composited over the opaque background
-             * color (BCCR); Layer1 second/top, composited over that
-             * result. */
-            uint32_t below = bccr;
+            /*
+             * Layer1 first/bottom, composited over the opaque background
+             * color (BCCR); Layer2 second/top (foreground), composited
+             * over that result -- real STM32 LTDC hardware always
+             * displays Layer2 above/in front of Layer1 (RM0455's LTDC
+             * overview: "Layer 2 is displayed in the foreground of
+             * Layer 1"). Had this backwards until 2026-07-13: Layer1
+             * (RGB565, no alpha channel -> every pixel fully opaque)
+             * was being drawn *over* Layer2, so Layer2's content
+             * (confirmed via pixel-level tracing to be real, correctly
+             * decoded AL44 overlay text -- Mario's GAME/PAUSE menu) was
+             * always fully obscured by Layer1's opaque clock-face
+             * pixels, even after the AL44 decode itself was fixed.
+             */
+            unsigned int l1_alpha;
+            uint32_t l1_resolved = gnw_h7b0_ltdc_resolve_layer(
+                l1_raw, l1_in, l1_dccr, l1_colken, l1_ckcr, &l1_alpha);
+            uint32_t below = gnw_h7b0_ltdc_blend_over(l1_resolved, l1_alpha,
+                                                       l1_bfcr, l1_cacr, bccr);
 
             if (l2_en && l2_bpp > 0) {
                 bool l2_in = l2_row_in && abs_x >= l2_whstpos &&
@@ -551,6 +607,39 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
                         l2_cfbar + (hwaddr)y * l2_src_width + (hwaddr)x,
                         &idx, 1);
                     l2_raw = s->clut2[idx];
+                } else if (l2_al44) {
+                    /*
+                     * AL44 (A4L4): raw byte packs a 4-bit alpha (upper
+                     * nibble) and a 4-bit luminance (lower nibble).
+                     * Confirmed via live 2026-07-13 tracing that this is
+                     * NOT a flat 256-entry CLUT-indexed format (an
+                     * earlier attempt at this fix treated it that way,
+                     * matching HAL_LTDC_ConfigCLUT()'s generic CLUT-load
+                     * API surface for AL44 -- but firmware only ever
+                     * writes L2CLUTWR for the 16 "diagonal" indices
+                     * 0,17,34,...255 = luminance*17, e.g. observed
+                     * writes at idx=0 and idx=255 but never idx=240/241/
+                     * 242/244, which are real luminance values (0,1,2,4)
+                     * combined with a nonzero alpha nibble -- i.e. only
+                     * a 16-entry grayscale-ish sub-palette gets loaded,
+                     * keyed by luminance*17, with alpha supplied
+                     * directly by the pixel's own alpha nibble rather
+                     * than through the CLUT at all). Look up the CLUT
+                     * using the luminance nibble replicated to a full
+                     * byte (matching ConfigCLUT's own idx encoding) for
+                     * RGB, and apply the pixel's own alpha nibble
+                     * (replicated to 8 bits) directly, overriding
+                     * whatever alpha the CLUT entry itself carries.
+                     */
+                    uint8_t raw;
+                    cpu_physical_memory_read(
+                        l2_cfbar + (hwaddr)y * l2_src_width + (hwaddr)x,
+                        &raw, 1);
+                    unsigned int a4 = (raw >> 4) & 0xF;
+                    unsigned int l4 = raw & 0xF;
+                    unsigned int a8 = a4 * 0x11U;
+                    uint32_t clut_rgb = s->clut2[l4 * 0x11U] & 0x00FFFFFFU;
+                    l2_raw = (a8 << 24) | clut_rgb;
                 } else {
                     l2_raw = gnw_h7b0_ltdc_read_pixel(
                         l2_cfbar + (hwaddr)y * l2_src_width +
@@ -561,14 +650,10 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
                 l2_resolved = gnw_h7b0_ltdc_resolve_layer(
                     l2_raw, l2_in, l2_dccr, l2_colken, l2_ckcr, &l2_alpha);
                 below = gnw_h7b0_ltdc_blend_over(l2_resolved, l2_alpha,
-                                                  l2_bfcr, l2_cacr, bccr);
+                                                  l2_bfcr, l2_cacr, below);
             }
 
-            unsigned int l1_alpha;
-            uint32_t l1_resolved = gnw_h7b0_ltdc_resolve_layer(
-                l1_raw, l1_in, l1_dccr, l1_colken, l1_ckcr, &l1_alpha);
-            uint32_t px = gnw_h7b0_ltdc_blend_over(l1_resolved, l1_alpha,
-                                                    l1_bfcr, l1_cacr, below);
+            uint32_t px = below;
 
             if (dither_en) {
                 px = gnw_h7b0_ltdc_dither_pixel(px, abs_x, abs_y);
@@ -585,10 +670,12 @@ static void gnw_h7b0_ltdc_update_display(void *opaque)
     DisplaySurface *surface = qemu_console_surface(s->con);
 
     if (!s->shadow_buffer || s->shadow_width <= 0 || s->shadow_height <= 0) {
+        s->content_dirty = false;
         return;
     }
 
     if (surface_bits_per_pixel(surface) != 32) {
+        s->content_dirty = false;
         return;
     }
 
@@ -701,22 +788,44 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
             gnw_h7b0_ltdc_reload_active(s);
             s->regs[GNW_H7B0_LTDC_ISR >> 2] |= LTDC_ISR_RRIF;
             gnw_h7b0_ltdc_update_irq(s);
+            /*
+             * HAL_LTDC_SetPixelFormat() and friends use IMR reloads for
+             * on-the-fly format/geometry changes. Unlike VBR (which
+             * captures the outgoing frame *before* the reload for double
+             * buffering), IMR takes effect instantly -- capture right away
+             * with the new active configuration or the host display never
+             * picks up the new framebuffer layout (lcd_setup_framebuffers()
+             * calls SetPixelFormat/SetAddress then a separate VBR reload,
+             * but intermediate IMR reloads from the HAL must still refresh).
+             */
+            gnw_h7b0_ltdc_capture_if_enabled(s);
         }
         if (value & LTDC_SRCR_VBR) {
             s->vbr_reload_pending = true;
-            
-            /* The guest has finished drawing the frame and requested a swap. 
-             * Capture it NOW to avoid capturing it mid-draw during the next frame. 
-             * Only capture if the UI thread has finished blitting the previous capture. */
+
+            /* The guest has finished drawing the frame and requested a swap.
+             * Capture it NOW to avoid capturing it mid-draw during the next
+             * frame. Only capture if the UI thread has finished blitting the
+             * previous capture. */
             if (!s->content_dirty) {
-                int rows = gnw_h7b0_ltdc_capture_setup(s);
-                if (rows > 0) {
-                    gnw_h7b0_ltdc_capture_rows(s, 0, rows);
-                    s->content_dirty = true;
-                }
+                gnw_h7b0_ltdc_capture_if_enabled(s);
+                s->vbr_deferred_capture = false;
+            } else {
+                s->vbr_deferred_capture = true;
             }
         }
         s->regs[addr >> 2] = value & ~LTDC_SRCR_IMR;
+        /*
+         * Re-derive the vblank/line timer rate on every reload request:
+         * the timers otherwise only re-arm at tick time, so a single
+         * recalculation made against a transient (mid-PLL3-programming)
+         * clock config can arm a pathologically long period that wedges
+         * the whole frame-tick chain (stock's main loop is paced by the
+         * reload-interrupt -> frame-flag path) until it finally fires.
+         * Firmware writes SRCR once per frame, making this the natural
+         * self-healing point.
+         */
+        gnw_h7b0_ltdc_recalc_timers(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         return;
     case GNW_H7B0_LTDC_IER:
         s->regs[addr >> 2] = value;

@@ -93,6 +93,31 @@ static void gnw_h7b0_rcc_write(void *opaque, hwaddr addr,
         } else {
             value &= ~RCC_CR_HSERDY;
         }
+        /*
+         * CSION -> CSIRDY, same instant-approximation as every other
+         * oscillator here. Found missing entirely 2026-07-13 while
+         * investigating Mario CFW running at ~half real-hardware
+         * speed: firmware's SystemClock_Config() requests CSI ON
+         * (confirmed live) as part of the same HAL_RCC_OscConfig()-
+         * style call that also configures PLL1, and PLL1 never
+         * reported ready in QEMU across several boot traces --
+         * confirmed live that CSION was set (bit 7) while CSIRDY
+         * (bit 8) stayed permanently clear, unlike every other
+         * oscillator's RDY bit, which all mirror correctly. If
+         * firmware's oscillator-enable loop waits on CSIRDY before
+         * or interleaved with the PLL1 configuration steps, a CSI
+         * readiness wait that can never succeed would plausibly
+         * explain the run-to-run-inconsistent PLL1 failure observed
+         * this session (sometimes never reaching the PLL1DIVR write,
+         * sometimes reaching it with what looked like a corrupted
+         * value) -- not yet confirmed as the complete fix, but a
+         * real, concrete gap either way.
+         */
+        if (value & RCC_CR_CSION) {
+            value |= RCC_CR_CSIRDY;
+        } else {
+            value &= ~RCC_CR_CSIRDY;
+        }
         if (value & RCC_CR_PLL1ON) {
             value |= RCC_CR_PLL1RDY;
         } else {

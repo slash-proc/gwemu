@@ -180,6 +180,8 @@ system_ss.add(when: 'CONFIG_GNW_H7B0_FLASH_R', if_true: files('gnw_h7b0_flash_r.
 system_ss.add(when: 'CONFIG_GNW_H7B0_FMC', if_true: files('gnw_h7b0_fmc.c'))
 system_ss.add(when: 'CONFIG_GNW_H7B0_CRS', if_true: files('gnw_h7b0_crs.c'))
 system_ss.add(when: 'CONFIG_GNW_H7B0_OCTOSPIM', if_true: files('gnw_h7b0_octospim.c'))
+system_ss.add(when: 'CONFIG_GNW_H7B0_OTFDEC', if_true: files('gnw_h7b0_otfdec.c'))
+system_ss.add(when: 'CONFIG_GNW_H7B0_CRYP', if_true: files('gnw_h7b0_cryp.c'))
 system_ss.add(when: 'CONFIG_GNW_H7B0_EXTI', if_true: files('gnw_h7b0_exti.c'))
 system_ss.add(when: 'CONFIG_GNW_H7B0_SYSCFG', if_true: files('gnw_h7b0_syscfg.c'))
 system_ss.add(when: 'CONFIG_GNW_H7B0_DMA', if_true: files('gnw_h7b0_dma.c'))

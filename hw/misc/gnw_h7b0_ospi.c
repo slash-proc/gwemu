@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "hw/misc/gnw_h7b0_ospi.h"
 #include "hw/misc/gnw_h7b0_regs_ospi.h"
@@ -42,6 +43,7 @@ static void gnw_h7b0_ospi_reset(DeviceState *dev)
     s->pending_addr = 0;
     s->dr_pos = 0;
     s->wel = false;
+    qemu_irq_lower(s->irq);
 }
 
 /*
@@ -204,6 +206,66 @@ static void ospi_cmd_triggered(GnwH7B0OspiState *s)
     }
 }
 
+/*
+ * Automatic status-polling mode (CR.FMODE == 2): real hardware
+ * repeatedly issues the configured read command and compares the
+ * received status against PSMAR under the PSMKR mask (AND or OR
+ * per CR.PMM), setting SR.SMF on match. Our synthetic flash's status
+ * responses are immediate and constant for a given command, so a
+ * single evaluation at trigger time is exact: if the generated status
+ * matches, SMF sets "instantly" (as it would on real idle flash); if
+ * it doesn't, no amount of re-polling of this model would change the
+ * answer, and leaving SMF clear until firmware reconfigures is also
+ * the honest behavior. Found via 2026-07-12 lockstep tracing: stock
+ * Zelda's OSPI reset sequence auto-polls RDSR after RSTEN/RST and
+ * waits on SMF (HAL_OSPI_AutoPolling), trapping at its own
+ * "HAL error" spin when SMF never set.
+ */
+static void ospi_autopoll_evaluate(GnwH7B0OspiState *s)
+{
+    uint32_t dlr = s->regs[GNW_H7B0_OSPI_DLR >> 2];
+    uint32_t nbytes = (dlr >= 3) ? 4 : dlr + 1;
+    uint32_t mask = s->regs[GNW_H7B0_OSPI_PSMKR >> 2];
+    uint32_t match = s->regs[GNW_H7B0_OSPI_PSMAR >> 2];
+    uint32_t status = 0;
+    bool matched;
+
+    for (uint32_t i = 0; i < nbytes; i++) {
+        status |= (uint32_t)ospi_gen_read_byte(s, i) << (8 * i);
+    }
+
+    if (s->regs[GNW_H7B0_OSPI_CR >> 2] & OSPI_CR_PMM) {
+        /* OR mode: any unmasked bit equal to its match bit. */
+        matched = (~(status ^ match) & mask) != 0;
+    } else {
+        /* AND mode: all unmasked bits equal to their match bits. */
+        matched = ((status ^ match) & mask) == 0;
+    }
+
+    if (matched) {
+        s->regs[GNW_H7B0_OSPI_SR >> 2] |= OSPI_SR_SMF;
+    }
+}
+
+/*
+ * Level-sensitive IRQ re-evaluation: real hardware asserts the line
+ * whenever any SR flag is both set and unmasked by the matching CR
+ * xIE bit, and deasserts it the moment none are -- so this must be
+ * called after every write that can change either SR or CR's IE bits.
+ */
+static void ospi_update_irq(GnwH7B0OspiState *s)
+{
+    uint32_t sr = s->regs[GNW_H7B0_OSPI_SR >> 2];
+    uint32_t cr = s->regs[GNW_H7B0_OSPI_CR >> 2];
+    bool pending = ((sr & OSPI_SR_TEF) && (cr & OSPI_CR_TEIE)) ||
+                   ((sr & OSPI_SR_TCF) && (cr & OSPI_CR_TCIE)) ||
+                   ((sr & OSPI_SR_FTF) && (cr & OSPI_CR_FTIE)) ||
+                   ((sr & OSPI_SR_SMF) && (cr & OSPI_CR_SMIE)) ||
+                   ((sr & OSPI_SR_TOF) && (cr & OSPI_CR_TOIE));
+
+    qemu_set_irq(s->irq, pending);
+}
+
 static uint64_t gnw_h7b0_ospi_read(void *opaque, hwaddr addr,
                                     unsigned int size)
 {
@@ -339,6 +401,11 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
         ospi_cmd_triggered(s);
         s->regs[GNW_H7B0_OSPI_SR >> 2] |= OSPI_SR_TCF | OSPI_SR_FTF;
         s->regs[GNW_H7B0_OSPI_SR >> 2] &= ~OSPI_SR_BUSY;
+        if (((s->regs[GNW_H7B0_OSPI_CR >> 2] & OSPI_CR_FMODE_MASK)
+              >> OSPI_CR_FMODE_SHIFT) == OSPI_FMODE_AUTOPOLL) {
+            ospi_autopoll_evaluate(s);
+        }
+        ospi_update_irq(s);
         return;
     case GNW_H7B0_OSPI_DR:
         /*
@@ -364,6 +431,11 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
     case GNW_H7B0_OSPI_FCR:
         /* Write-1-to-clear: FCR bit positions mirror SR's exactly. */
         s->regs[GNW_H7B0_OSPI_SR >> 2] &= ~value;
+        ospi_update_irq(s);
+        return;
+    case GNW_H7B0_OSPI_CR:
+        s->regs[addr >> 2] = value;
+        ospi_update_irq(s);
         return;
     case GNW_H7B0_OSPI_SR:
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -402,6 +474,7 @@ static void gnw_h7b0_ospi_init(Object *obj)
     memory_region_init_io(&s->mmio, obj, &gnw_h7b0_ospi_ops, s,
                            TYPE_GNW_H7B0_OSPI, GNW_H7B0_OSPI_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
 static const VMStateDescription vmstate_gnw_h7b0_ospi = {

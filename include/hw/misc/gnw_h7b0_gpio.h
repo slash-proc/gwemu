@@ -71,6 +71,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0GpioState, GNW_H7B0_GPIO)
 #define GNW_H7B0_GPIO_IDR_OFFSET  0x10
 
 typedef struct GnwH7B0ExtiState GnwH7B0ExtiState;
+typedef struct GnwH7B0SyscfgState GnwH7B0SyscfgState;
 
 struct GnwH7B0GpioState {
     SysBusDevice parent_obj;
@@ -81,7 +82,24 @@ struct GnwH7B0GpioState {
      * only to notify EXTI of the PA0 (WKUP1, best guess) release edge --
      * see gnw_h7b0_gpio_pa0_release() in gnw_h7b0_gpio.c. */
     GnwH7B0ExtiState *exti;
+    /* Set by the SoC alongside exti. Needed to consult SYSCFG_EXTICRx
+     * (the per-line port mux) so a button press only raises its EXTI
+     * line when firmware actually routed that line to the button's
+     * port -- several buttons share a line number across ports
+     * (PA0/PD0 both line 0, PC5/PD5 line 5, PC11/PD11 line 11). */
+    GnwH7B0SyscfgState *syscfg;
     QEMUTimer *pa0_release_timer;
+    /*
+     * Optional keyboard-remap property ("keymap"): comma-separated
+     * button=key pairs, e.g. "a=z,b=x,start=spc". Button names:
+     * pause game time a b left down right up pwr start select.
+     * Key names are QEMU QKeyCode names (the same names `-k help`-era
+     * keymaps and qemu monitor sendkey use: ret, spc, shift_r, kp_0,
+     * ...). Unlisted buttons keep their built-in defaults. Parsed at
+     * realize into key_map[].
+     */
+    char *keymap;
+    int key_map[16];
 };
 
 #endif

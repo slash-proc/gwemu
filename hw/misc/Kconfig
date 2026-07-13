@@ -306,6 +306,12 @@ config GNW_H7B0_CRS
 config GNW_H7B0_OCTOSPIM
     bool
 
+config GNW_H7B0_OTFDEC
+    bool
+
+config GNW_H7B0_CRYP
+    bool
+
 config GNW_H7B0_EXTI
     bool
 

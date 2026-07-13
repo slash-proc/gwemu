@@ -34,3 +34,5 @@ GTAGS
 /backup/
 /GEMINI.md
 *.mp3
+*.qcow2
+*.7z

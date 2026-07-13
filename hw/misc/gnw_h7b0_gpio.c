@@ -26,12 +26,16 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
+#include "qapi/util.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "hw/misc/gnw_h7b0_gpio.h"
 #include "hw/misc/gnw_h7b0_regs_gpio.h"
 #include "hw/misc/gnw_h7b0_exti.h"
+#include "hw/misc/gnw_h7b0_syscfg.h"
+#include "hw/misc/gnw_h7b0_regs_syscfg.h"
 
 /*
  * Button -> port/pin table, transcribed from gnw-chainloader's own
@@ -55,15 +59,25 @@ enum {
     GNW_BTN__COUNT,
 };
 
+/*
+ * A button can be wired to up to two pins: TIME is physically on both
+ * PC5 and PA2 (WKUP2) -- stock Zelda's read_buttons (FUN_08016808)
+ * reads TIME from PA2 in its default/clock mode and only from PC5 when
+ * a mode byte is set, so pressing TIME must drive both low or stock
+ * firmware never sees it. (PWR on PA0/WKUP1 is the same wakeup-capable
+ * pattern, single-wired.) pin2 == 0 means "no second wiring".
+ */
 typedef struct GnwButtonPin {
     int port;
     uint32_t pin;
+    int port2;
+    uint32_t pin2;
 } GnwButtonPin;
 
 static const GnwButtonPin gnw_h7b0_button_pins[GNW_BTN__COUNT] = {
     [GNW_BTN_PAUSE]  = { 2, 1U << 13 },
     [GNW_BTN_GAME]   = { 2, 1U << 1  },
-    [GNW_BTN_TIME]   = { 2, 1U << 5  },
+    [GNW_BTN_TIME]   = { 2, 1U << 5, 0, 1U << 2 },
     [GNW_BTN_A]      = { 3, 1U << 9  },
     [GNW_BTN_B]      = { 3, 1U << 5  },
     [GNW_BTN_LEFT]   = { 3, 1U << 11 },
@@ -100,43 +114,60 @@ static const int gnw_h7b0_key_map[GNW_BTN__COUNT] = {
 };
 
 /*
- * Pointer-button mapping. This project's pinned QEMU base (v9.2, see
- * CLAUDE.md) has no SDL2 game-controller/joystick backend -- InputButton
- * in this tree (qapi/ui.json) is a mouse-button enum (left, middle,
- * right, wheel directions, side, extra, touch), not a real gamepad
- * face-button enum. There
- * is no in-tree code path today by which an xpad-style controller's
- * face buttons reach a QEMU device, so this is a best-effort mapping of
- * the mouse-shaped events QEMU's input core can actually deliver, kept
- * here (rather than skipped) so the INPUT_EVENT_MASK_BTN path is wired
- * correctly for whenever this base gets a real joystick backend. left/
- * right double as the two main face buttons (A/B), middle/side/extra as
- * Start/Select/Pause, and the wheel directions as the d-pad.
+ * Deliberately no pointer/mouse-button mapping. An earlier best-effort
+ * mapping (left/middle/wheel -> A/START/d-pad, intended as a
+ * placeholder for a real joystick backend this QEMU base doesn't have)
+ * turned out to be actively harmful with the SDL display: ordinary
+ * window interaction silently pressed game buttons (clicking to focus
+ * = A, wheel = d-pad), and a click whose release was swallowed by a
+ * focus change left a button latched pressed forever -- observed live
+ * as START stuck low (game word 0x10) making the OFW menu ignore all
+ * further input. Keyboard (INPUT_EVENT_MASK_KEY) is the only input
+ * source; real gamepads need host-side key translation.
  */
-static const int gnw_h7b0_btn_map[INPUT_BUTTON__MAX] = {
-    [0 ... INPUT_BUTTON__MAX - 1] = -1,
-    [INPUT_BUTTON_LEFT]        = GNW_BTN_A,
-    [INPUT_BUTTON_RIGHT]       = GNW_BTN_B,
-    [INPUT_BUTTON_MIDDLE]      = GNW_BTN_START,
-    [INPUT_BUTTON_SIDE]        = GNW_BTN_SELECT,
-    [INPUT_BUTTON_EXTRA]       = GNW_BTN_PAUSE,
-    [INPUT_BUTTON_WHEEL_UP]    = GNW_BTN_UP,
-    [INPUT_BUTTON_WHEEL_DOWN]  = GNW_BTN_DOWN,
-    [INPUT_BUTTON_WHEEL_LEFT]  = GNW_BTN_LEFT,
-    [INPUT_BUTTON_WHEEL_RIGHT] = GNW_BTN_RIGHT,
-};
+static void gnw_h7b0_gpio_set_pin(GnwH7B0GpioState *s, int port,
+                                   uint32_t pin, bool pressed)
+{
+    hwaddr idr = port * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET;
+
+    /* Active-low: pressed clears the bit, released sets it back. */
+    if (pressed) {
+        s->regs[idr >> 2] &= ~pin;
+    } else {
+        s->regs[idr >> 2] |= pin;
+    }
+
+    /*
+     * Real hardware feeds every GPIO pin's level into its EXTI line
+     * (line N = pin N), gated by SYSCFG_EXTICRx's per-line port mux.
+     * Stock/CFW firmware waits for button presses via EXTI interrupts
+     * (e.g. the boot screen's "press POWER" wait), not just IDR polling,
+     * so the level change must be forwarded or interrupt-driven button
+     * waits never wake. Only forward when EXTICR actually routes this
+     * line to this button's port, since several buttons share a line
+     * number across ports.
+     */
+    if (s->exti && s->syscfg) {
+        int line = ctz32(pin);
+        uint32_t exticr = s->syscfg->regs[(GNW_H7B0_SYSCFG_EXTICR1_OFFSET
+                                            + (line / 4) * 4) >> 2];
+        int port_sel = (exticr >> ((line % 4) * 4)) & 0xF;
+
+        if (port_sel == port) {
+            /* EXTI line level follows the (active-low) pin level. */
+            gnw_h7b0_exti_set_line(s->exti, line, !pressed);
+        }
+    }
+}
 
 static void gnw_h7b0_gpio_set_button(GnwH7B0GpioState *s, int button,
                                       bool pressed)
 {
     const GnwButtonPin *bp = &gnw_h7b0_button_pins[button];
-    hwaddr idr = bp->port * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET;
 
-    /* Active-low: pressed clears the bit, released sets it back. */
-    if (pressed) {
-        s->regs[idr >> 2] &= ~bp->pin;
-    } else {
-        s->regs[idr >> 2] |= bp->pin;
+    gnw_h7b0_gpio_set_pin(s, bp->port, bp->pin, pressed);
+    if (bp->pin2) {
+        gnw_h7b0_gpio_set_pin(s, bp->port2, bp->pin2, pressed);
     }
 }
 
@@ -151,22 +182,12 @@ static void gnw_h7b0_gpio_input_event(DeviceState *dev, QemuConsole *src,
         int qcode = qemu_input_key_value_to_qcode(key->key);
 
         for (int i = 0; i < GNW_BTN__COUNT; i++) {
-            if (gnw_h7b0_key_map[i] == qcode) {
+            if (s->key_map[i] == qcode) {
                 fprintf(stderr, "[gpio-debug] t=%"PRId64" btn=%d down=%d\n",
                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), i, key->down);
                 gnw_h7b0_gpio_set_button(s, i, key->down);
                 break;
             }
-        }
-        break;
-    }
-    case INPUT_EVENT_KIND_BTN: {
-        InputBtnEvent *btn = evt->u.btn.data;
-
-        if (btn->button < INPUT_BUTTON__MAX &&
-            gnw_h7b0_btn_map[btn->button] != -1) {
-            gnw_h7b0_gpio_set_button(s, gnw_h7b0_btn_map[btn->button],
-                                      btn->down);
         }
         break;
     }
@@ -177,7 +198,7 @@ static void gnw_h7b0_gpio_input_event(DeviceState *dev, QemuConsole *src,
 
 static const QemuInputHandler gnw_h7b0_gpio_input_handler = {
     .name = "gnw-h7b0 buttons",
-    .mask = INPUT_EVENT_MASK_KEY | INPUT_EVENT_MASK_BTN,
+    .mask = INPUT_EVENT_MASK_KEY,
     .event = gnw_h7b0_gpio_input_event,
 };
 
@@ -286,8 +307,63 @@ static void gnw_h7b0_gpio_init(Object *obj)
                                          gnw_h7b0_gpio_pa0_release, s);
 }
 
+/* Button names for the "keymap" property, indexed by GNW_BTN_*. */
+static const char *const gnw_h7b0_button_names[GNW_BTN__COUNT] = {
+    [GNW_BTN_PAUSE]  = "pause",
+    [GNW_BTN_GAME]   = "game",
+    [GNW_BTN_TIME]   = "time",
+    [GNW_BTN_A]      = "a",
+    [GNW_BTN_B]      = "b",
+    [GNW_BTN_LEFT]   = "left",
+    [GNW_BTN_DOWN]   = "down",
+    [GNW_BTN_RIGHT]  = "right",
+    [GNW_BTN_UP]     = "up",
+    [GNW_BTN_PWR]    = "pwr",
+    [GNW_BTN_START]  = "start",
+    [GNW_BTN_SELECT] = "select",
+};
+
 static void gnw_h7b0_gpio_realize(DeviceState *dev, Error **errp)
 {
+    GnwH7B0GpioState *s = GNW_H7B0_GPIO(dev);
+
+    for (int i = 0; i < GNW_BTN__COUNT; i++) {
+        s->key_map[i] = gnw_h7b0_key_map[i];
+    }
+
+    if (s->keymap) {
+        g_auto(GStrv) pairs = g_strsplit(s->keymap, ",", -1);
+
+        for (char **p = pairs; *p; p++) {
+            g_auto(GStrv) kv = g_strsplit(g_strstrip(*p), "=", 2);
+            int btn = -1, qcode;
+
+            if (!kv[0] || !kv[1]) {
+                error_setg(errp, "keymap: bad entry '%s' "
+                           "(want button=key)", *p);
+                return;
+            }
+            for (int i = 0; i < GNW_BTN__COUNT; i++) {
+                if (!g_ascii_strcasecmp(kv[0], gnw_h7b0_button_names[i])) {
+                    btn = i;
+                    break;
+                }
+            }
+            if (btn < 0) {
+                error_setg(errp, "keymap: unknown button '%s'", kv[0]);
+                return;
+            }
+            qcode = qapi_enum_parse(&QKeyCode_lookup, kv[1], -1, NULL);
+            if (qcode < 0) {
+                error_setg(errp, "keymap: unknown key '%s' "
+                           "(use QKeyCode names, e.g. ret, spc, shift_r)",
+                           kv[1]);
+                return;
+            }
+            s->key_map[btn] = qcode;
+        }
+    }
+
     qemu_input_handler_register(dev, &gnw_h7b0_gpio_input_handler);
 }
 
@@ -301,12 +377,17 @@ static const VMStateDescription vmstate_gnw_h7b0_gpio = {
     }
 };
 
+static const Property gnw_h7b0_gpio_properties[] = {
+    DEFINE_PROP_STRING("keymap", GnwH7B0GpioState, keymap),
+};
+
 static void gnw_h7b0_gpio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->vmsd = &vmstate_gnw_h7b0_gpio;
     dc->realize = gnw_h7b0_gpio_realize;
+    device_class_set_props(dc, gnw_h7b0_gpio_properties);
     device_class_set_legacy_reset(dc, gnw_h7b0_gpio_reset);
 }
 

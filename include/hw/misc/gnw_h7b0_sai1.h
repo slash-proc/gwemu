@@ -31,6 +31,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0Sai1State, GNW_H7B0_SAI1)
 
 #define GNW_H7B0_SAI1_SIZE 0x400
 
+/* DMAMUX1 DMAREQ_ID for SAI1 Block A Tx (sai1_a_dma) -- see RM0455's
+ * DMAMUX1 request table. The actual stream is resolved at runtime from
+ * firmware's DMAMUX routing (retro-go: DMA1 Stream0; stock Zelda: DMA2
+ * Stream6), see gnw_h7b0_dma_set_request_notifier(). */
+#define GNW_H7B0_SAI1_DMA_REQUEST 87
+
 /* Real wiring is fixed in hardware (not modeled via DMAMUX routing
  * here) -- see file comment above. */
 #define GNW_H7B0_SAI1_DMA_STREAM 0

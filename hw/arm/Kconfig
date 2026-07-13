@@ -421,6 +421,8 @@ config GNW_H7B0_SOC
     select GNW_H7B0_FMC
     select GNW_H7B0_CRS
     select GNW_H7B0_OCTOSPIM
+    select GNW_H7B0_OTFDEC
+    select GNW_H7B0_CRYP
     select GNW_H7B0_EXTI
     select GNW_H7B0_SYSCFG
     select GNW_H7B0_DMA

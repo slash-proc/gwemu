@@ -44,6 +44,18 @@
  * register other than SR/FCR/DR/CCR/IR/AR is a plain read-what-was-
  * written shadow with no side effects.
  *
+ * Real IRQ line (OCTOSPI1_IRQn/OCTOSPI2_IRQn), gated by CR's TEIE/
+ * TCIE/FTIE/SMIE/TOIE bits against SR -- found via 2026-07-12
+ * breakpoint-lockstep tracing: stock Zelda firmware (unlike retro-go's
+ * always-polling gw_flash.c driver) uses HAL_OSPI's interrupt-mode
+ * completion path for at least one OSPI1 command during boot, busy-
+ * waiting on a software completion flag an ISR is expected to set;
+ * with no IRQ ever firing, that wait never completes and firmware
+ * hits its own "spin forever on HAL error" trap. The line is
+ * re-evaluated (raised or lowered) on every SR-affecting write (IR/AR
+ * trigger, FCR clear) and on any CR write that changes which SR bits
+ * are unmasked, matching real hardware's level-sensitive semantics.
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
@@ -90,6 +102,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
 
 #define GNW_H7B0_OSPI_FCR   0x24
 /* FCR bit positions mirror SR's TEF/TCF/FTF/SMF/TOF exactly. */
+
+#define GNW_H7B0_OSPI_CR    0x00
+#define OSPI_CR_TEIE        (1U << 16)
+#define OSPI_CR_TCIE        (1U << 17)
+#define OSPI_CR_FTIE        (1U << 18)
+#define OSPI_CR_SMIE        (1U << 19)
+#define OSPI_CR_TOIE        (1U << 20)
+#define OSPI_CR_PMM         (1U << 23) /* polling match mode: 0=AND, 1=OR */
+#define OSPI_CR_FMODE_SHIFT 28
+#define OSPI_CR_FMODE_MASK  (0x3U << OSPI_CR_FMODE_SHIFT)
+#define OSPI_FMODE_AUTOPOLL 2U
+
+/* Automatic status-polling registers (RM0455 OCTOSPI_PSMKR/PSMAR). */
+#define GNW_H7B0_OSPI_PSMKR 0x80
+#define GNW_H7B0_OSPI_PSMAR 0x88
 
 #define GNW_H7B0_OSPI_DLR   0x40
 #define GNW_H7B0_OSPI_AR    0x48
@@ -167,6 +194,7 @@ struct GnwH7B0OspiState {
     SysBusDevice parent_obj;
 
     MemoryRegion mmio;
+    qemu_irq irq;
     uint32_t regs[GNW_H7B0_OSPI_SIZE / 4];
     /* See gnw_h7b0_stub_log.h -- one-shot LOG_UNIMP per plain-shadow offset. */
     bool logged_unimp[GNW_H7B0_OSPI_SIZE / 4];

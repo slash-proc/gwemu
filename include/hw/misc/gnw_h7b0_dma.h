@@ -79,6 +79,23 @@ struct GnwH7B0DmaState {
 
     GnwH7B0DmaStreamRateFn stream_rate_fn[GNW_H7B0_DMA_STREAM_COUNT];
     void *stream_rate_fn_opaque[GNW_H7B0_DMA_STREAM_COUNT];
+
+    /*
+     * Request-ID-based registration (see
+     * gnw_h7b0_dma_set_request_notifier()): which DMAMUX1 request ID the
+     * registered peripheral owns, and where its callbacks are currently
+     * bound. Different firmware routes the same peripheral to different
+     * streams (retro-go: SAI1_A on DMA1 Stream0/DMAMUX ch0; stock
+     * Zelda: DMA2 Stream6/DMAMUX ch14), so the binding is re-resolved
+     * from the DMAMUX1 CxCR shadow registers on every CxCR write
+     * instead of being a compile-time stream number.
+     */
+    int req_id;
+    GnwH7B0DmaStreamNotifier req_notifier;
+    void *req_notifier_opaque;
+    GnwH7B0DmaStreamRateFn req_rate_fn;
+    void *req_rate_opaque;
+    int req_bound_stream; /* -1 = unbound */
 };
 
 void gnw_h7b0_dma_set_stream_notifier(GnwH7B0DmaState *s, int stream,
@@ -87,5 +104,19 @@ void gnw_h7b0_dma_set_stream_notifier(GnwH7B0DmaState *s, int stream,
 void gnw_h7b0_dma_set_stream_rate_fn(GnwH7B0DmaState *s, int stream,
                                       GnwH7B0DmaStreamRateFn fn,
                                       void *opaque);
+
+/*
+ * Register (or clear, with cb == NULL) a transfer notifier + rate fn for
+ * whichever stream firmware's DMAMUX1 routing assigns to `request`
+ * (DMAMUX1 DMAREQ_ID, e.g. 87 = sai1_a_dma). DMAMUX channels 0-7 feed
+ * DMA1 streams 0-7 (global stream index 0-7), channels 8-15 feed DMA2
+ * streams 0-7 (global 8-15). The binding follows later CxCR rewrites
+ * automatically.
+ */
+void gnw_h7b0_dma_set_request_notifier(GnwH7B0DmaState *s, int request,
+                                        GnwH7B0DmaStreamNotifier cb,
+                                        void *cb_opaque,
+                                        GnwH7B0DmaStreamRateFn rate_fn,
+                                        void *rate_opaque);
 
 #endif

@@ -1,12 +1,19 @@
 /*
  * STM32H7B0 LTDC minimal stub (Nintendo Game & Watch)
  *
- * Real device, not a full LTDC model: composites Layer1 only (Layer2,
- * blending, color-keying, CLUT are not modeled -- real G&W firmware
- * uses a single RGB565 layer at the LCD's native 320x240, per
- * gnw-chainloader's src/chainloader/gui.c), and only the RGB565 and L8
- * (CLUT-indexed, used by retro-go's RAM-saving framebuffer mode) pixel
- * formats are drawn (other LxPFCR values log unimplemented and draw
+ * Real device, not a full LTDC model, but composites both layers:
+ * Layer1 (bottom/background) and Layer2 (top/foreground -- real STM32
+ * LTDC hardware always shows Layer2 above Layer1; had this backwards
+ * until 2026-07-13, which combined with the AL44 gap below to make
+ * Mario/Zelda's GAME/PAUSE overlay menus fully invisible even once
+ * their pixel data was being decoded correctly), with blending,
+ * color-keying, and independent per-layer CLUTs all modeled (see
+ * gnw_h7b0_ltdc_capture_rows()). RGB565, ARGB8888/1555/4444, L8
+ * (flat 256-entry CLUT-indexed), and AL44 (4-bit alpha applied
+ * directly + 4-bit luminance indexing a 16-entry CLUT sub-palette at
+ * n*17 -- NOT flat-256-indexed like L8; used by Mario/Zelda's stock
+ * firmware for anti-aliased overlay text, e.g. the GAME/PAUSE menus)
+ * are all drawn (other LxPFCR values log unimplemented and draw
  * nothing). QEMU's own display-refresh timer drives redraws, not a
  * modeled per-pixel/per-line VSYNC scan.
  *
@@ -133,6 +140,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0LtdcState, GNW_H7B0_LTDC)
 #define LTDC_LxPFCR_PF_MASK     0x7U
 #define LTDC_PF_RGB565          2U
 #define LTDC_PF_L8              5U
+#define LTDC_PF_AL44            6U
 #define GNW_H7B0_LTDC_L1CACR    0x98
 #define GNW_H7B0_LTDC_L1DCCR    0x9C
 #define GNW_H7B0_LTDC_L1BFCR    0xA0
@@ -236,6 +244,16 @@ struct GnwH7B0LtdcState {
     uint32_t active_l2pfcr;
     uint32_t active_l2cacr;
     bool vbr_reload_pending;
+    /*
+     * Set when a SRCR.VBR write could not capture the outgoing frame
+     * because content_dirty was still true (the UI thread had not yet
+     * blitted the previous capture). The deferred capture is then taken
+     * immediately after the vblank reload applies the new shadow
+     * registers -- essential for lcd_setup_framebuffers()'s format/geometry
+     * changes, which otherwise leave the shadow buffer sized/configured for
+     * the old mode and the display appears frozen.
+     */
+    bool vbr_deferred_capture;
 
     /*
      * Additional active-set snapshots for the generalized per-layer

@@ -1,5 +1,237 @@
 # Changelog
 
+## 2026-07-13 (later same day) — Fixed: RCC_CR never mirrored CSION into CSIRDY, blocking Mario CFW's PLL1 overclock
+
+- User reported Mario CFW running at roughly half real-hardware speed;
+  confirmed via direct real-hardware register comparison (`gnwmanager`'s
+  `OpenOCDBackend`) that QEMU's CPU was permanently stuck on HSI (64MHz)
+  while real hardware runs the identical CFW image on PLL1. Root cause:
+  `hw/misc/gnw_h7b0_rcc.c`'s `RCC_CR` write handler mirrored every other
+  oscillator's `*ON` bit into its `*RDY` bit (HSI, HSE, PLL1/2/3, and
+  `RCC_CSR`'s LSI) but had no case for CSI at all —
+  `RCC_CR_CSION`/`RCC_CR_CSIRDY` weren't even defined. Firmware's
+  `SystemClock_Config()` requests CSI ON as part of the same
+  `HAL_RCC_OscConfig()`-style call that also configures PLL1; with
+  `CSIRDY` never reachable, the oscillator-config sequence never
+  reliably completed, and PLL1 never locked. Added the missing bit
+  definitions (`include/hw/misc/gnw_h7b0_rcc.h`) and mirror logic
+  (`hw/misc/gnw_h7b0_rcc.c`), matching the existing pattern for every
+  other oscillator. User-confirmed real effect: every clock register
+  (`PLLCKSELR`, `PLL1DIVR`, `CDCFGR1`, `CR`, `CFGR`) now matches real
+  hardware bit-for-bit after boot, where before QEMU was permanently
+  stuck on HSI. **A residual ~2x-slow tick rate remains despite every
+  register now matching** — narrowed to QEMU's own internal clock-
+  propagation/timing code (not firmware- or register-visible), not yet
+  found. See `docs/session-2026-07-12-breakpoint-lockstep-tracing.md`
+  part 20 for the full investigation and next-session starting point.
+
+## 2026-07-13 — Fixed: two real LTDC bugs (AL44 unimplemented + Layer2/Layer1 compositing order backwards), resolving GAME/PAUSE menu invisibility
+
+- Root cause of the Mario (and likely Zelda) GAME/PAUSE submenu bug
+  from 2026-07-12 part 15, fully resolved and user-confirmed live.
+  Button input, the menu's internal state machine, and the render
+  dispatch were all working correctly the whole time (extensively
+  re-verified this session) — the actual gap was entirely in QEMU's
+  LTDC compositor, `hw/display/gnw_h7b0_ltdc.c`, and turned out to be
+  two separate bugs stacked on top of each other:
+  1. LTDC pixel format `6` (AL44 — 4-bit alpha + 4-bit luminance, used
+     for anti-aliased overlay text) had no case in
+     `gnw_h7b0_ltdc_capture_rows()`'s Layer2 bpp switch, so it fell
+     through to `l2_bpp = 0` and silently skipped Layer2 compositing
+     entirely even though the layer was enabled and had real content.
+     Fixed with real AL44 decoding: alpha nibble applied directly,
+     luminance nibble indexes a 16-entry CLUT sub-palette at `n*17`
+     (confirmed against `sdk/stm32h7xx-hal-driver`'s
+     `HAL_LTDC_ConfigCLUT()` AL44 branch and live-observed `L2CLUTWR`
+     write patterns — firmware only ever loads the 16 diagonal
+     entries, never a flat 256-entry table, ruling out an earlier
+     attempt that treated AL44 like L8).
+  2. Layer compositing order was backwards: Layer2 was composited
+     first/bottom, Layer1 second/top — but real STM32 LTDC hardware
+     always shows Layer2 *above* Layer1. Layer1 (RGB565, no alpha
+     channel, always fully opaque) was therefore completely hiding
+     Layer2's overlay content even after AL44 decoding was fixed
+     correctly (confirmed via pixel-level tracing that Layer2 was
+     computing real, correct values the whole time). Fixed by
+     compositing Layer1 onto the background first, Layer2 onto that
+     result second.
+  Added `LTDC_PF_AL44` to `include/hw/display/gnw_h7b0_ltdc.h`. See
+  `docs/session-2026-07-12-breakpoint-lockstep-tracing.md` part 19 for
+  the full investigation, including two real tooling lessons from this
+  session (QEMU's gdbstub halts input-event delivery, not just the
+  vCPU -- reading peripheral state while halted can show stale
+  pre-input values; and a full, non-`-noanalysis` Ghidra pass is
+  needed for reliable RAM-address xref tracing).
+
+## 2026-07-12 (later session, part 15) — Mario GAME/PAUSE submenu bug investigated, not yet fixed
+
+- User-reported: on Mario CFW, GAME/PAUSE do nothing from the clock
+  face's main loop (POWER wake and TIME both work fine; GAME *does*
+  correctly wake the device from its screensaver, confirming the raw
+  input path is fine). Extensive investigation ruled out: the GPIO/
+  EXTI/`read_buttons()` chain (confirmed correct), the GAME+LEFT
+  retro-go-jump combo (correctly declines given our placeholder,
+  content-free `mario-bank2.bin`), the per-frame dispatch gate at
+  `FUN_0801056c` (`[ctx+0x770]`/`[ctx+0x772]` already satisfied on
+  QEMU), and LTDC Layer 2 being undrawn (it's actively populated with
+  real content on QEMU). Root cause not yet found — full findings and
+  concrete next steps in session doc part 15. No code changes this
+  part; also documented a recurring stale-GDBBackend-connection
+  tooling gotcha that produced one false-negative capture this
+  session.
+
+## 2026-07-12 (later session, part 14) — real CRYP (AES-GCM) device model; Mario boots
+
+- New device model `hw/misc/gnw_h7b0_cryp.c` + header: real AES-128/
+  192/256 (own key schedule + cipher, no external crypto lib) and a
+  spec-correct AES-GCM engine (GHASH, CTR keystream, INIT/HEADER/
+  PAYLOAD/FINAL phase state machine) matching the real hardware
+  register protocol, wired to CRYP_IRQn=79 at 0x48021000. Also
+  implements ECB/CBC/CTR (ready for future use, not yet exercised by
+  any traced boot path). Root cause: Mario's CFW boot performs a real
+  AES-GCM decrypt (integrity-checked blob) from CRYP's own ISR and
+  sleeps until it completes; CRYP was `create_unimplemented_device`
+  (silent stub, never interrupts), so the ISR never ran and boot hung
+  forever. User-confirmed: Mario now boots past this point.
+- Found via the systematic stuck-PC -> caller -> divergence method
+  (see session doc part 14) after a longer, less disciplined detour
+  earlier in the session — noted there as a process lesson.
+
+## 2026-07-12 (later session, part 14) — LTDC display frozen after dynamic framebuffer reconfiguration
+
+- Fixed hw/display/gnw_h7b0_ltdc.c: dynamic LTDC framebuffer/format
+  changes (e.g. retro-go's lcd_setup_framebuffers() RGB565↔LUT8 switch
+  via HAL_LTDC_SetPixelFormat() + HAL_LTDC_Reload(VBR)) no longer leave
+  the host display stuck on the last pre-change frame. Three
+  interacting gaps: (1) SRCR.IMR reloads updated the active register
+  set but never triggered a host capture (only VBR-write-time capture
+  existed); (2) when a SRCR.VBR write was skipped because content_dirty
+  was still true, the deferred vblank reload applied the new shadow
+  registers but also never captured, permanently blocking further
+  captures via the !content_dirty gate; (3) gnw_h7b0_ltdc_enabled()
+  consulted shadow regs[] instead of the active set actually used for
+  scanout. Fix: capture immediately after IMR reload, add
+  vbr_deferred_capture to capture right after the vblank reload when
+  the VBR-write capture was skipped, use active_* for enable checks,
+  and clear content_dirty on gfx_update() early-return paths so the
+  capture pipeline cannot wedge.
+
+## 2026-07-12 (later session, part 13) — OFW input + audio + display transitions working in QEMU
+
+- Buttons now raise real EXTI interrupts (SYSCFG EXTICR-muxed); TIME
+  dual-wired PC5+PA2 (stock reads PA2/WKUP2 in default mode); keyboard
+  map now configurable via `-global gnw-h7b0-gpio.keymap=...`.
+- SAI1's DMA binding resolved at runtime from DMAMUX request 87 (was
+  hardcoded to retro-go's DMA1 Stream0; stock uses DMA2 Stream6).
+- DMA double-buffer mode (SxCR.DBM) modeled (CT toggle, EN stays set) —
+  stock's audio engine streams via DBM; was killed after one buffer.
+- DMA2D IRQ line now honors all six ISR flags (CTCIF etc.) — stock's
+  palette-fade transitions sleep on CLUT-transfer-complete.
+- SD SPI-mode fix (colleague report): ACMD41 now → transfer state once
+  powered up; CMD17/CMD55 no longer rejected without a prior CSD read.
+- SAI NODIV=1 rate decoding fixed (stock: PLL2P 12.288MHz / MCKDIV 4 /
+  64-slot frames = 48kHz; was decoded as 12kHz through the NODIV=0
+  formula, running audio AND all audio-paced firmware at 1/4 speed —
+  also the real cause of "buttons don't react").
+- Removed the vestigial mouse-button input mapping (clicks/wheel were
+  silently pressing A/START/d-pad; a swallowed release latched START
+  low forever, freezing OFW menu input — the "stops responding after
+  the menu" bug).
+- Result: interactive OFW fully working in QEMU — POWER wake, TIME
+  transitions, correct-pitch audio, responsive input (user-confirmed).
+
+## 2026-07-12 (later session, parts 11-12) — ZELDA BOOTS TO VISIBLE DISPLAY in QEMU
+
+- The physical device's exact image pair (repo-root `zelda-patched.7z`:
+  gnwmanager-CFW bank1 + patched 4MB extflash) is now what
+  `boot_qemu.sh --patched` boots — bank1 verified byte-for-byte
+  identical to live device flash over SWD. The pivot to the full CFW
+  was an intentional project decision that had been lost across
+  session summaries; QEMU had been booting a stock+2-byte-patch image
+  with the wrong (stock, 64MB) extflash. All tracing scripts'
+  entry-point source repointed to the patched bank1 (CFW replaces the
+  reset vector).
+- With the correct image pair plus this session's OSPI-auto-polling
+  and OTFDEC fixes, **QEMU boots Zelda CFW to visible display output**
+  (user-confirmed on screen; `LTDC_GCR.LTDCEN=1`, steady-state PC
+  matches real hardware's). Remaining follow-ups (real OTFDEC AES-CTR
+  for genuinely-stock encrypted extflash, true-stock boot's WFI wait,
+  audio/input/gameplay verification) recorded in the session doc's
+  part 12.
+
+## 2026-07-12 (later session, parts 7-10) — RSTEN trap root-caused and fixed (OSPI auto-polling), OTFDEC device model added, two big methodology corrections
+
+Full narrative: `docs/session-2026-07-12-breakpoint-lockstep-tracing.md`
+(parts 7 through 10).
+
+- **Real fix (root cause of the part-6 self-trap)**: OSPI automatic
+  status-polling (CR.FMODE==2) was completely unmodeled, so `SR.SMF`
+  never set and stock Zelda's `HAL_OSPI_AutoPolling()` wait timed out
+  into firmware's own `b .` error trap at `0x080164b8`. Implemented in
+  `hw/misc/gnw_h7b0_ospi.c`/`.h` (`ospi_autopoll_evaluate()`: PSMKR/
+  PSMAR match, AND/OR per CR.PMM, evaluated at command trigger).
+- **Real fix (the next trap after that)**: new minimal OTFDEC device
+  model (`hw/misc/gnw_h7b0_otfdec.c` + header, both instances wired at
+  `0x5200b800`/`0x5200bc00`), implementing the key-CRC readback
+  (`CONFIGR.KEYCRC`, exact `HAL_OTFDEC_KeyCRCComputation()` algorithm)
+  that `HAL_OTFDEC_RegionSetKey()` verifies. Actual AES-CTR decryption
+  of memory-mapped reads is NOT yet modeled — stock extflash is
+  encrypted, so data (not control flow) read through OTFDEC regions is
+  still wrong on QEMU; flagged as the known next gap.
+- QEMU stock-Zelda boot now clears the whole OSPI/OTFDEC init sequence
+  and parks in a legitimate `while (!flag) WFI;` wait (`0x0800e5a8`,
+  flag `0x2000ad40`) for a not-yet-identified IRQ — no longer in any
+  error path.
+- **Methodology correction #1 (parts 7-9)**: the parts-6-8 "real
+  hardware has code-like bytes at address 0, QEMU has zeroes" thread
+  was a testing artifact — stale SRAM from a previous boot surviving
+  SWD/`nSRST` resets (only a power cycle clears it), not a QEMU bug.
+  Also documented: OpenOCD `wp` silently fails to register >4KB
+  watchpoints on this board's `hla_target` (false-negative timeouts).
+- **Methodology correction #2 (part 10)**: the physical device is
+  running gnwmanager's FULL CFW patch set (reset vector replaced,
+  OTFDEC disabled, save-crypto skips, ~100 flash diff ranges vs stock),
+  not our 2-byte standby patch — real hardware is no longer a valid
+  stock-behavior reference for OTFDEC/bootloader/save-crypto regions or
+  anything above `0x1B3E0`. Check `gnw_patch/zelda.py`'s patch list
+  before trusting any hardware trace in a given region.
+
+## 2026-07-12 (later session, part 6) — real OCTOSPI IRQ modeled; firmware self-trap found, root cause still open
+
+Full narrative: `docs/session-2026-07-12-breakpoint-lockstep-tracing.md`
+("Follow-up session (same day, part 6)" section).
+
+- **Real fix**: `hw/misc/gnw_h7b0_ospi.c`/`.h` gained a real, level-
+  sensitive IRQ line for OCTOSPI1/2 (`ospi_update_irq()`, gated by CR's
+  `TEIE`/`TCIE`/`FTIE`/`SMIE`/`TOIE` against SR, re-evaluated on every
+  SR/CR-affecting write) — neither instance had any IRQ modeled before
+  this. Wired to NVIC in `hw/arm/gnw_h7b0_soc.c`
+  (`OCTOSPI1_IRQn=92`/`OCTOSPI2_IRQn=150`, per
+  `sdk/cmsis-device-h7/Include/stm32h7b0xx.h`), which also required
+  bumping `armv7m`'s `num-irq` property `96`→`160` (NVIC sizes must be
+  multiples of 32; 150 didn't fit in 96, tripped an assertion on boot).
+- Found (not yet fixed): stock Zelda firmware deliberately traps itself
+  in an infinite `b .` loop at `0x080164b8` on a HAL-style error
+  return, tracing back to an OCTOSPI1 RSTEN-command helper
+  (`FUN_0800e45c`/`FUN_080112b6`). The OCTOSPI IRQ fix above didn't
+  resolve it — every core register matches between QEMU and real
+  hardware at the exact failing checkpoint except one register's
+  dereferenced value, which reads real code-like bytes at address
+  `0x0` on real hardware but all-zeroes on QEMU. Root cause still
+  open; leading theory is a firmware ITCM-populating copy loop that
+  doesn't run identically (or at all) on QEMU. See the doc for the
+  full trace and concrete next steps.
+- A same-session attempt to fix the address-`0x0` divergence by
+  aliasing flash bank 1 there was **wrong and reverted** — the SoC
+  already has a legitimate ITCM region at that address
+  (`ITCM_BASE_ADDRESS = 0x00000000`), and the new alias just shadowed
+  it instead of fixing anything.
+- New tooling: `scripts/probe_11536_state.py` (arbitrary-register +
+  dereferenced-pointer + NVIC/peripheral-state comparison at a single
+  checkpoint on both targets) and `scripts/resume_and_sample.py`
+  (resume + repeated halt-and-sample-PC, to tell a genuine CPU stall
+  apart from a breakpoint-detection artifact).
+
 ## 2026-07-12 (later session, part 5) — real ADC battery-threshold bug found and fixed via lockstep tracing
 
 Full narrative: `docs/session-2026-07-12-breakpoint-lockstep-tracing.md`

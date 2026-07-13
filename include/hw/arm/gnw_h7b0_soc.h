@@ -45,6 +45,8 @@
 #include "hw/misc/gnw_h7b0_flash_r.h"
 #include "hw/misc/gnw_h7b0_fmc.h"
 #include "hw/misc/gnw_h7b0_crs.h"
+#include "hw/misc/gnw_h7b0_otfdec.h"
+#include "hw/misc/gnw_h7b0_cryp.h"
 #include "hw/misc/gnw_h7b0_octospim.h"
 #include "hw/misc/gnw_h7b0_exti.h"
 #include "hw/misc/gnw_h7b0_syscfg.h"
@@ -99,6 +101,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  * 128K single-bank. Modeled as plain RAM for now (no program/erase
  * register semantics yet); content loading and bank-select-to-address-0
  * mirroring is future work, see docs/roadmap.md Phase 1.
+ *
+ * NOTE (2026-07-12 breakpoint-lockstep tracing session): a same-day
+ * attempt to add a flash-bank1-at-address-0 alias to explain a
+ * null-pointer-dereference divergence was reverted -- ITCM_BASE_ADDRESS
+ * is *already* 0x00000000 (see below), so the alias shadowed the
+ * pre-existing, legitimate ITCM region instead of fixing anything.
+ * Real hardware's address-0 content at the point traced turned out to
+ * be code-like bytes, not flash's raw vector table -- consistent with
+ * firmware copying a startup/hot-code section into ITCM early in boot
+ * (a common STM32H7 pattern), which our existing ITCM-as-RAM-at-0
+ * model should already reproduce once that copy loop runs identically
+ * on both targets -- investigate whether it actually does before
+ * adding any address-0 remap logic.
  */
 #define FLASH_BANK1_BASE_ADDRESS 0x08000000
 #define FLASH_BANK2_BASE_ADDRESS 0x08100000
@@ -201,6 +216,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  * same rationale as the other not-yet-modeled peripherals above.
  */
 #define CRS_BASE_ADDRESS 0x40008400
+#define OTFDEC1_BASE_ADDRESS 0x5200b800
+#define OTFDEC2_BASE_ADDRESS 0x5200bc00
+#define CRYP_BASE_ADDRESS 0x48021000
 #define CRS_SIZE          0x400
 
 /*
@@ -216,6 +234,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  */
 #define OCTOSPI1_BASE_ADDRESS 0x52005000
 #define OCTOSPI2_BASE_ADDRESS 0x5200A000
+/* Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type. */
+#define OCTOSPI1_IRQn 92
+#define OCTOSPI2_IRQn 150
 /*
  * OCTOSPI IO manager -- plain RAM for now (pin-mux config only, no
  * transfer semantics needed there).
@@ -461,6 +482,9 @@ struct GnwH7B0State {
     GnwH7B0FmcState fmc;
     GnwH7B0CrsState crs;
     GnwH7B0OctospimState octospim;
+    GnwH7B0OtfdecState otfdec1;
+    GnwH7B0OtfdecState otfdec2;
+    GnwH7B0CrypState cryp;
     GnwH7B0ExtiState exti;
     GnwH7B0SyscfgState syscfg;
     GnwH7B0DmaState dma;

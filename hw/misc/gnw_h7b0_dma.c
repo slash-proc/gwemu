@@ -57,6 +57,8 @@
 #define DMA_SxCR_HTIE  (1U << 3)
 #define DMA_SxCR_TCIE  (1U << 4)
 #define DMA_SxCR_CIRC  (1U << 8)
+#define DMA_SxCR_DBM   (1U << 18)
+#define DMA_SxCR_CT    (1U << 19)
 
 #define GNW_H7B0_DMA_ASSUMED_ITEM_RATE_HZ 48000ULL
 #define GNW_H7B0_DMA_MIN_HALF_DELAY_NS (1 * SCALE_MS)
@@ -113,8 +115,13 @@ static void gnw_h7b0_dma_set_isr_bit(GnwH7B0DmaState *s, int stream,
          * S0NDTR/S0PAR/S0M0AR offsets in the regs header). */
         hwaddr stream_base = ctrl_base + GNW_H7B0_DMA_S0CR_OFFSET +
                               (hwaddr)local * GNW_H7B0_DMA_STREAM_STRIDE;
+        uint32_t cr = s->regs[stream_base >> 2];
         uint32_t ndtr = s->regs[(stream_base + 0x4) >> 2];
-        uint32_t m0ar = s->regs[(stream_base + 0xc) >> 2];
+        /* In double-buffer mode the transfer in flight streams from
+         * M1AR (+0x10) when CT is set, M0AR (+0xc) otherwise. */
+        hwaddr mar_off = ((cr & DMA_SxCR_DBM) && (cr & DMA_SxCR_CT))
+                          ? 0x10 : 0xc;
+        uint32_t m0ar = s->regs[(stream_base + mar_off) >> 2];
         s->stream_notifier[stream](s->stream_notifier_opaque[stream], half,
                                     m0ar, ndtr);
     }
@@ -136,6 +143,62 @@ void gnw_h7b0_dma_set_stream_rate_fn(GnwH7B0DmaState *s, int stream,
     assert(stream >= 0 && stream < GNW_H7B0_DMA_STREAM_COUNT);
     s->stream_rate_fn[stream] = fn;
     s->stream_rate_fn_opaque[stream] = opaque;
+}
+
+/* DMAMUX1's CxCR shadow block starts at the third 0x400 block (see the
+ * header's layout comment); one CR per channel, DMAREQ_ID in bits 6:0. */
+#define GNW_H7B0_DMAMUX_BLOCK_OFFSET 0x800
+#define GNW_H7B0_DMAMUX_REQ_ID_MASK  0x7F
+
+/*
+ * Re-derive which stream the registered request-ID peripheral is bound
+ * to from the current DMAMUX1 routing, and (re)attach the notifier/rate
+ * callbacks there. Called on registration and on every DMAMUX CxCR
+ * write, so the binding tracks firmware's actual routing.
+ */
+static void gnw_h7b0_dma_rebind_request(GnwH7B0DmaState *s)
+{
+    int stream = -1;
+
+    if (s->req_notifier) {
+        for (int ch = 0; ch < GNW_H7B0_DMA_STREAM_COUNT; ch++) {
+            uint32_t ccr = s->regs[(GNW_H7B0_DMAMUX_BLOCK_OFFSET
+                                     + 4 * ch) >> 2];
+            if ((int)(ccr & GNW_H7B0_DMAMUX_REQ_ID_MASK) == s->req_id) {
+                stream = ch;
+                break;
+            }
+        }
+    }
+
+    if (stream == s->req_bound_stream) {
+        return;
+    }
+    if (s->req_bound_stream >= 0) {
+        gnw_h7b0_dma_set_stream_notifier(s, s->req_bound_stream, NULL, NULL);
+        gnw_h7b0_dma_set_stream_rate_fn(s, s->req_bound_stream, NULL, NULL);
+    }
+    if (stream >= 0) {
+        gnw_h7b0_dma_set_stream_notifier(s, stream, s->req_notifier,
+                                          s->req_notifier_opaque);
+        gnw_h7b0_dma_set_stream_rate_fn(s, stream, s->req_rate_fn,
+                                         s->req_rate_opaque);
+    }
+    s->req_bound_stream = stream;
+}
+
+void gnw_h7b0_dma_set_request_notifier(GnwH7B0DmaState *s, int request,
+                                        GnwH7B0DmaStreamNotifier cb,
+                                        void *cb_opaque,
+                                        GnwH7B0DmaStreamRateFn rate_fn,
+                                        void *rate_opaque)
+{
+    s->req_id = request;
+    s->req_notifier = cb;
+    s->req_notifier_opaque = cb_opaque;
+    s->req_rate_fn = rate_fn;
+    s->req_rate_opaque = rate_opaque;
+    gnw_h7b0_dma_rebind_request(s);
 }
 
 static uint64_t gnw_h7b0_dma_half_delay_ns(GnwH7B0DmaState *s, int stream)
@@ -201,6 +264,15 @@ static void gnw_h7b0_dma_stream_tick(void *opaque)
                      (hwaddr)local * GNW_H7B0_DMA_STREAM_STRIDE;
     uint32_t cr = s->regs[cr_off >> 2];
 
+    {
+        static int n;
+        if (n < 40) {
+            fprintf(stderr, "[dma-debug] tick stream=%d cr=%08x half_pending=%d\n",
+                    stream, cr, s->stream_half_pending[stream]);
+            n++;
+        }
+    }
+
     if (!(cr & DMA_SxCR_EN)) {
         return;
     }
@@ -215,7 +287,20 @@ static void gnw_h7b0_dma_stream_tick(void *opaque)
 
     gnw_h7b0_dma_set_isr_bit(s, stream, false);
 
-    if (cr & DMA_SxCR_CIRC) {
+    if (cr & (DMA_SxCR_CIRC | DMA_SxCR_DBM)) {
+        /*
+         * Circular mode restarts the same buffer; double-buffer mode
+         * (stock Zelda's audio path: DMA2 Stream6, SAI1_A) additionally
+         * toggles CT at each transfer-complete so firmware's TC ISR can
+         * refill the now-inactive MxAR while hardware streams the other
+         * -- EN stays set in both, real hardware auto-reloads NDTR.
+         * Treating DBM as one-shot (the old behavior) killed the stream
+         * after its first 240-sample chime buffer and hung stock's
+         * power-on/TIME transition state machine forever.
+         */
+        if (cr & DMA_SxCR_DBM) {
+            s->regs[cr_off >> 2] = cr ^ DMA_SxCR_CT;
+        }
         s->stream_half_pending[stream] = true;
         gnw_h7b0_dma_schedule_next(s, stream,
                                     gnw_h7b0_dma_half_delay_ns(s, stream));
@@ -243,6 +328,8 @@ static void gnw_h7b0_dma_reset(DeviceState *dev)
         s->stream_half_pending[i] = false;
         qemu_set_irq(s->irq[i], 0);
     }
+    /* DMAMUX routing reset to zero above; drop any request binding. */
+    gnw_h7b0_dma_rebind_request(s);
 }
 
 static uint64_t gnw_h7b0_dma_read(void *opaque, hwaddr addr, unsigned int size)
@@ -260,6 +347,19 @@ static void gnw_h7b0_dma_write(void *opaque, hwaddr addr, uint64_t val64, unsign
     GnwH7B0DmaState *s = GNW_H7B0_DMA(opaque);
     if (addr >= GNW_H7B0_DMA_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%"HWADDR_PRIx"\n", __func__, addr);
+        return;
+    }
+
+    /* DMAMUX1 block: plain raw shadow (the DMA1 mask tables don't apply
+     * to its layout), plus request-binding re-resolution on any CxCR
+     * write so a request-registered peripheral (SAI1) tracks firmware's
+     * actual routing. */
+    if (addr >= GNW_H7B0_DMAMUX_BLOCK_OFFSET) {
+        s->regs[addr >> 2] = (uint32_t)val64;
+        if (addr < GNW_H7B0_DMAMUX_BLOCK_OFFSET +
+                    4 * GNW_H7B0_DMA_STREAM_COUNT) {
+            gnw_h7b0_dma_rebind_request(s);
+        }
         return;
     }
 
@@ -322,6 +422,7 @@ static const MemoryRegionOps gnw_h7b0_dma_ops = {
 
 static void gnw_h7b0_dma_init(Object *obj)
 {
+    GNW_H7B0_DMA(obj)->req_bound_stream = -1;
     GnwH7B0DmaState *s = GNW_H7B0_DMA(obj);
     memory_region_init_io(&s->mmio, obj, &gnw_h7b0_dma_ops, s, TYPE_GNW_H7B0_DMA, GNW_H7B0_DMA_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);

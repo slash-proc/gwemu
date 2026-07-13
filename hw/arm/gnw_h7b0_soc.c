@@ -57,6 +57,9 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     object_initialize_child(obj, "fmc", &s->fmc, TYPE_GNW_H7B0_FMC);
     object_initialize_child(obj, "crs", &s->crs, TYPE_GNW_H7B0_CRS);
     object_initialize_child(obj, "octospim", &s->octospim, TYPE_GNW_H7B0_OCTOSPIM);
+    object_initialize_child(obj, "otfdec1", &s->otfdec1, TYPE_GNW_H7B0_OTFDEC);
+    object_initialize_child(obj, "otfdec2", &s->otfdec2, TYPE_GNW_H7B0_OTFDEC);
+    object_initialize_child(obj, "cryp", &s->cryp, TYPE_GNW_H7B0_CRYP);
     object_initialize_child(obj, "exti", &s->exti, TYPE_GNW_H7B0_EXTI);
     object_initialize_child(obj, "syscfg", &s->syscfg, TYPE_GNW_H7B0_SYSCFG);
     object_initialize_child(obj, "dma", &s->dma, TYPE_GNW_H7B0_DMA);
@@ -174,7 +177,6 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     create_unimplemented_device("DCMI", 0x48020000, 0x400);
     create_unimplemented_device("PSSI", 0x48020400, 0x6b);
     create_unimplemented_device("HSEM", 0x48020800, 0x400);
-    create_unimplemented_device("CRYP", 0x48021000, 0x400);
     create_unimplemented_device("RNG", 0x48021800, 0x400);
     create_unimplemented_device("SDMMC2", 0x48022400, 0x400);
     create_unimplemented_device("DELAY_Block_SDMMC2", 0x48022800, 0x400);
@@ -186,8 +188,6 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     create_unimplemented_device("DELAY_Block_SDMMC1", 0x52008000, 0x400);
     create_unimplemented_device("RAMECC", 0x52009000, 0x400);
     create_unimplemented_device("Delay_Block_OCTOSPI2", 0x5200b000, 0x400);
-    create_unimplemented_device("OTFDEC1", 0x5200b800, 0x400);
-    create_unimplemented_device("OTFDEC2", 0x5200bc00, 0x400);
     create_unimplemented_device("LPUART1", 0x58000c00, 0x400);
     create_unimplemented_device("SPI6", 0x58001400, 0x400);
     create_unimplemented_device("I2C4", 0x58001c00, 0x400);
@@ -249,7 +249,13 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
 #undef INIT_RAM_REGION
 
     armv7m = DEVICE(&s->armv7m);
-    qdev_prop_set_uint32(armv7m, "num-irq", 96);
+    /*
+     * Was 96 -- too small for OCTOSPI2_IRQn (150), added when wiring
+     * up real OCTOSPI1/2 IRQ lines (see gnw_h7b0_ospi.h). NVIC's
+     * num-irq must be a multiple of 32; 160 is the smallest multiple
+     * covering every IRQn this SoC model currently uses.
+     */
+    qdev_prop_set_uint32(armv7m, "num-irq", 160);
     qdev_prop_set_uint8(armv7m, "num-prio-bits", 4);
     qdev_prop_set_string(armv7m, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m7"));
     qdev_prop_set_bit(armv7m, "enable-bitband", true);
@@ -313,6 +319,8 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->octospi1), 0, OCTOSPI1_BASE_ADDRESS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->octospi1), 0,
+                        qdev_get_gpio_in(armv7m, OCTOSPI1_IRQn));
     /*
      * Real hardware's single external NOR is wired to OCTOSPI1; give
      * it a host pointer into the same extflash RAM region the CPU
@@ -328,6 +336,8 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->octospi2), 0, OCTOSPI2_BASE_ADDRESS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->octospi2), 0,
+                        qdev_get_gpio_in(armv7m, OCTOSPI2_IRQn));
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->adc), errp)) {
         return;
@@ -413,6 +423,22 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->octospim), 0, OCTOSPIM_BASE_ADDRESS);
 
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->otfdec1), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->otfdec1), 0, OTFDEC1_BASE_ADDRESS);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->otfdec2), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->otfdec2), 0, OTFDEC2_BASE_ADDRESS);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->cryp), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->cryp), 0, CRYP_BASE_ADDRESS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->cryp), 0, qdev_get_gpio_in(armv7m, 79));
+
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->exti), errp)) {
         return;
     }
@@ -437,6 +463,7 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      * GPIO -> EXTI isn't a real hardware bus relationship worth modeling
      * more formally for one internal notification. */
     s->gpio.exti = &s->exti;
+    s->gpio.syscfg = &s->syscfg;
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->syscfg), errp)) {
         return;

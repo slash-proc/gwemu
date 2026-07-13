@@ -2296,7 +2296,20 @@ static sd_rsp_type_t sd_cmd_SEND_OP_COND(SDState *sd, SDRequest req)
     }
 
     if (sd_is_spi(sd)) {
-        sd->state = sd_ready_state;
+        /*
+         * In SPI mode there is no CMD2/CMD3/CMD7 identification phase:
+         * once power-up completes the card must be usable for data
+         * transfer commands (CMD17, etc.) directly.  Going only to
+         * sd_ready_state would strand the card unless the host happened
+         * to issue CMD9/CMD10 (whose SPI handlers promote to transfer
+         * state as a side effect), which spec-conforming drivers need
+         * not do.  While power-up is still in progress, stay in
+         * sd_idle_state so repeated ACMD41 polling keeps seeing the R1
+         * idle bit and passes this command's entry-state check.
+         */
+        if (FIELD_EX32(sd->ocr, OCR, CARD_POWER_UP)) {
+            sd->state = sd_transfer_state;
+        }
         return sd_r1;
     } else {
         if (FIELD_EX32(sd->ocr & req.arg, OCR, VDD_VOLTAGE_WINDOW)) {

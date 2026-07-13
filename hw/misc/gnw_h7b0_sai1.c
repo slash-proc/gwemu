@@ -31,6 +31,7 @@
 #define SAI_xCR1_MCKDIV_SHIFT 20
 #define SAI_xCR1_MCKDIV_MASK  (0x3fU << SAI_xCR1_MCKDIV_SHIFT)
 #define SAI_xCR1_OSR          (1U << 26)
+#define SAI_xCR1_NODIV        (1U << 19)
 
 /* gw_audio.c only ever configures Block A for 16-bit I2S at
  * AUDIO_SAMPLE_RATE (gw_audio.h) -- see task summary; no need to
@@ -105,6 +106,21 @@ static uint32_t gnw_h7b0_sai1_get_rate_hz(GnwH7B0Sai1State *s)
     kernel_hz = gnw_h7b0_rcc_get_sai1_kernel_hz(s->rcc);
     if (kernel_hz == 0) {
         return GNW_H7B0_SAI1_RATE;
+    }
+
+    /*
+     * NODIV=1 (stock Zelda's config: PLL2P ~= 12.288MHz, MCKDIV=4,
+     * FRL+1=64 -> exactly 48000Hz) bypasses the /256 master divider:
+     * SCK = sai_ker_ck / MCKDIV, and the frame rate is SCK divided by
+     * the frame length (FRCR.FRL+1). The original NODIV=0-only formula
+     * decoded this config as 12kHz -- audibly "deep and slow", and,
+     * since DMA pacing derives from this same rate, ran the entire
+     * audio-paced firmware at quarter speed.
+     */
+    if (acr1 & SAI_xCR1_NODIV) {
+        uint32_t frl1 = (s->regs[GNW_H7B0_SAI1_SAI_AFRCR_OFFSET >> 2]
+                          & 0xFF) + 1;
+        return kernel_hz / (mckdiv * frl1);
     }
 
     return kernel_hz / (mckdiv * ((acr1 & SAI_xCR1_OSR) ? 512 : 256));
@@ -219,10 +235,9 @@ static void gnw_h7b0_sai1_update_voice(GnwH7B0Sai1State *s)
             audio_be_set_active_out(s->audio_be, s->voice, true);
             s->voice_open = true;
             if (s->dma) {
-                gnw_h7b0_dma_set_stream_notifier(s->dma,
-                    GNW_H7B0_SAI1_DMA_STREAM, gnw_h7b0_sai1_dma_notify, s);
-                gnw_h7b0_dma_set_stream_rate_fn(s->dma,
-                    GNW_H7B0_SAI1_DMA_STREAM, gnw_h7b0_sai1_dma_rate_fn, s);
+                gnw_h7b0_dma_set_request_notifier(s->dma,
+                    GNW_H7B0_SAI1_DMA_REQUEST, gnw_h7b0_sai1_dma_notify, s,
+                    gnw_h7b0_sai1_dma_rate_fn, s);
             }
         }
     } else if (!want_enabled && s->voice_open) {
@@ -230,10 +245,8 @@ static void gnw_h7b0_sai1_update_voice(GnwH7B0Sai1State *s)
         s->voice_open = false;
         fifo8_reset(&s->fifo);
         if (s->dma) {
-            gnw_h7b0_dma_set_stream_notifier(s->dma,
-                GNW_H7B0_SAI1_DMA_STREAM, NULL, NULL);
-            gnw_h7b0_dma_set_stream_rate_fn(s->dma,
-                GNW_H7B0_SAI1_DMA_STREAM, NULL, NULL);
+            gnw_h7b0_dma_set_request_notifier(s->dma,
+                GNW_H7B0_SAI1_DMA_REQUEST, NULL, NULL, NULL, NULL);
         }
     }
 }
@@ -242,10 +255,9 @@ void gnw_h7b0_sai1_set_dma(GnwH7B0Sai1State *s, GnwH7B0DmaState *dma)
 {
     s->dma = dma;
     if (s->voice_open) {
-        gnw_h7b0_dma_set_stream_notifier(s->dma, GNW_H7B0_SAI1_DMA_STREAM,
-                                          gnw_h7b0_sai1_dma_notify, s);
-        gnw_h7b0_dma_set_stream_rate_fn(s->dma, GNW_H7B0_SAI1_DMA_STREAM,
-                                         gnw_h7b0_sai1_dma_rate_fn, s);
+        gnw_h7b0_dma_set_request_notifier(s->dma, GNW_H7B0_SAI1_DMA_REQUEST,
+                                           gnw_h7b0_sai1_dma_notify, s,
+                                           gnw_h7b0_sai1_dma_rate_fn, s);
     }
 }
 
@@ -265,10 +277,8 @@ static void gnw_h7b0_sai1_reset(DeviceState *dev)
         s->voice_open = false;
         fifo8_reset(&s->fifo);
         if (s->dma) {
-            gnw_h7b0_dma_set_stream_notifier(s->dma,
-                GNW_H7B0_SAI1_DMA_STREAM, NULL, NULL);
-            gnw_h7b0_dma_set_stream_rate_fn(s->dma,
-                GNW_H7B0_SAI1_DMA_STREAM, NULL, NULL);
+            gnw_h7b0_dma_set_request_notifier(s->dma,
+                GNW_H7B0_SAI1_DMA_REQUEST, NULL, NULL, NULL, NULL);
         }
     }
 }

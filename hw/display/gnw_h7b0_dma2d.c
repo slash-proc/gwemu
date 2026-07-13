@@ -316,10 +316,18 @@ static uint32_t gnw_h7b0_dma2d_blend_over(uint32_t fg, unsigned int fa,
 
 static void gnw_h7b0_dma2d_update_irq(GnwH7B0Dma2dState *s)
 {
-    bool pending = ((s->regs[GNW_H7B0_DMA2D_ISR >> 2] & DMA2D_ISR_TCIF) &&
-                    (s->regs[GNW_H7B0_DMA2D_CR >> 2] & DMA2D_CR_TCIE)) ||
-                   ((s->regs[GNW_H7B0_DMA2D_ISR >> 2] & DMA2D_ISR_TEIF) &&
-                    (s->regs[GNW_H7B0_DMA2D_CR >> 2] & DMA2D_CR_TEIE));
+    /*
+     * All six ISR flags gate the one DMA2D interrupt line: ISR bits 0-5
+     * (TEIF/TCIF/TWIF/CAEIF/CTCIF/CEIF) pair positionally with CR's IE
+     * bits 8-13. Originally only TCIF/TEIF were checked, which left
+     * stock Zelda's palette-fade transitions hung forever: its display
+     * state machine starts a background CLUT load (BGPFCCR.START) with
+     * CR.CTCIE enabled and sleeps until the CLUT-transfer-complete
+     * interrupt -- CTCIF was set but never raised the line.
+     */
+    uint32_t isr = s->regs[GNW_H7B0_DMA2D_ISR >> 2];
+    uint32_t cr = s->regs[GNW_H7B0_DMA2D_CR >> 2];
+    bool pending = (isr & 0x3F & (cr >> 8)) != 0;
 
     qemu_set_irq(s->irq, pending);
 }
