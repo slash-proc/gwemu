@@ -152,16 +152,6 @@ static void gnw_h7b0_ltdc_recalc_timers(GnwH7B0LtdcState *s, int64_t now)
     int64_t frame_ns = NANOSECONDS_PER_SECOND / vblank_hz;
     int64_t line_ns = frame_ns / totalh;
 
-    {
-        static uint32_t last_hz_logged;
-        if (vblank_hz != last_hz_logged) {
-            fprintf(stderr, "[ltdc-debug] vblank_hz=%u (pll3r=%u totalw=%u totalh=%u)\n",
-                    vblank_hz, s->rcc ? gnw_h7b0_rcc_get_pll3r_hz(s->rcc) : 0,
-                    totalw, totalh);
-            last_hz_logged = vblank_hz;
-        }
-    }
-
     timer_mod(s->vblank_timer, now + frame_ns);
 
     if (lipcr < totalh) {
@@ -225,8 +215,11 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
             s->vbr_deferred_capture = false;
         }
     } else {
-        /* Auto-capture for firmware (like gnwmanager) that doesn't use VBR */
-        if (!s->content_dirty && gnw_h7b0_ltdc_enabled(s)) {
+        /* Auto-capture for firmware (like gnwmanager) that doesn't use VBR
+         * at all. Gated on vbr_ever_used so this never fires for firmware
+         * (like retro-go) that does reload via VBR -- otherwise a vblank
+         * landing between two VBR writes can grab a mid-draw frame. */
+        if (!s->vbr_ever_used && !s->content_dirty && gnw_h7b0_ltdc_enabled(s)) {
             gnw_h7b0_ltdc_capture_if_enabled(s);
         }
     }
@@ -254,6 +247,7 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
     s->pf_warned = false;
     s->vbr_reload_pending = false;
     s->vbr_deferred_capture = false;
+    s->vbr_ever_used = false;
 
     g_free(s->shadow_buffer);
     s->shadow_buffer = NULL;
@@ -290,25 +284,21 @@ static inline uint32_t gnw_h7b0_ltdc_rgb565_to_pixel32(uint16_t px)
     return 0xFF000000U | (r8 << 16) | (g8 << 8) | b8;
 }
 
-static uint32_t gnw_h7b0_ltdc_read_pixel(hwaddr addr, uint32_t pfcr)
+/*
+ * Decodes one already-fetched pixel from `buf` (part of a row batch-read by
+ * the caller) -- see gnw_h7b0_ltdc_capture_rows()'s l2_linebuf comment for
+ * why this takes an in-memory buffer instead of a guest physical address
+ * plus its own cpu_physical_memory_read() call per pixel.
+ */
+static uint32_t gnw_h7b0_ltdc_read_pixel_buf(const uint8_t *buf, uint32_t pfcr)
 {
     switch (pfcr) {
     case 0: /* ARGB8888 */
-    {
-        uint8_t buf[4];
-        cpu_physical_memory_read(addr, buf, 4);
         return ldl_le_p(buf);
-    }
     case 2: /* RGB565 */
-    {
-        uint8_t buf[2];
-        cpu_physical_memory_read(addr, buf, 2);
         return gnw_h7b0_ltdc_rgb565_to_pixel32(lduw_le_p(buf));
-    }
     case 3: /* ARGB1555 */
     {
-        uint8_t buf[2];
-        cpu_physical_memory_read(addr, buf, 2);
         uint16_t px = lduw_le_p(buf);
         unsigned int a1 = (px >> 15) & 0x1;
         unsigned int r5 = (px >> 10) & 0x1F;
@@ -321,8 +311,6 @@ static uint32_t gnw_h7b0_ltdc_read_pixel(hwaddr addr, uint32_t pfcr)
     }
     case 4: /* ARGB4444 */
     {
-        uint8_t buf[2];
-        cpu_physical_memory_read(addr, buf, 2);
         uint16_t px = lduw_le_p(buf);
         unsigned int a4 = (px >> 12) & 0xF;
         unsigned int r4 = (px >> 8) & 0xF;
@@ -510,7 +498,7 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
     uint32_t pfcr = s->active_l1pfcr & LTDC_LxPFCR_PF_MASK;
     bool l1_l8 = (pfcr == LTDC_PF_L8);
     int src_width = cols * (l1_l8 ? 1 : 2);
-    g_autofree uint8_t *linebuf = g_malloc(src_width);
+    int nrows = row_end - row_start;
 
     bool l1_colken = s->active_l1cr & LTDC_LxCR_COLKEN;
     uint32_t l1_ckcr = s->active_l1ckcr;
@@ -559,13 +547,36 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
     int ahbp = (s->active_bpcr >> LTDC_BPCR_AHBP_SHIFT) & LTDC_BPCR_AHBP_MASK;
     int avbp = s->active_bpcr & LTDC_BPCR_AVBP_MASK;
 
+    /*
+     * Batch Layer1 and Layer2's *entire* row span into one buffer each with
+     * one cpu_physical_memory_read() call total, instead of one call per
+     * row (this function is always called with row_start=0, i.e. the whole
+     * frame in one span, so every row is contiguous guest memory -- no
+     * per-row gaps to work around). This is on top of 2026-07-13's earlier
+     * per-*pixel*-to-per-*row* batching fix for Layer2 (see CHANGELOG):
+     * that fix cut ~240*392*60Hz calls/sec down to ~240*60Hz; this cuts
+     * that ~240*60Hz down to ~60Hz (one read per full-frame capture instead
+     * of one per scanline). g_malloc(0) is valid and returns NULL, so this
+     * is safe even when Layer2 is disabled.
+     */
+    g_autofree uint8_t *framebuf = g_malloc((size_t)src_width * nrows);
+    g_autofree uint8_t *l2_framebuf =
+        g_malloc(l2_en ? (size_t)l2_src_width * nrows : 0);
+
+    cpu_physical_memory_read(cfbar + (hwaddr)row_start * src_width, framebuf,
+                             (size_t)src_width * nrows);
+    if (l2_en && l2_bpp > 0) {
+        cpu_physical_memory_read(l2_cfbar + (hwaddr)row_start * l2_src_width,
+                                 l2_framebuf, (size_t)l2_src_width * nrows);
+    }
+
     for (int y = row_start; y < row_end; y++) {
         int abs_y = avbp + y + 1;
         bool l1_row_in = abs_y >= l1_wvstpos && abs_y <= l1_wvsppos;
         bool l2_row_in = abs_y >= l2_wvstpos && abs_y <= l2_wvsppos;
-
-        cpu_physical_memory_read(cfbar + (hwaddr)y * src_width, linebuf,
-                                 src_width);
+        uint8_t *linebuf = framebuf + (hwaddr)(y - row_start) * src_width;
+        uint8_t *l2_linebuf =
+            l2_framebuf + (hwaddr)(y - row_start) * l2_src_width;
 
         for (int x = 0; x < cols; x++) {
             int abs_x = ahbp + x + 1;
@@ -580,13 +591,7 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
              * over that result -- real STM32 LTDC hardware always
              * displays Layer2 above/in front of Layer1 (RM0455's LTDC
              * overview: "Layer 2 is displayed in the foreground of
-             * Layer 1"). Had this backwards until 2026-07-13: Layer1
-             * (RGB565, no alpha channel -> every pixel fully opaque)
-             * was being drawn *over* Layer2, so Layer2's content
-             * (confirmed via pixel-level tracing to be real, correctly
-             * decoded AL44 overlay text -- Mario's GAME/PAUSE menu) was
-             * always fully obscured by Layer1's opaque clock-face
-             * pixels, even after the AL44 decode itself was fixed.
+             * Layer 1").
              */
             unsigned int l1_alpha;
             uint32_t l1_resolved = gnw_h7b0_ltdc_resolve_layer(
@@ -602,49 +607,27 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
                 uint32_t l2_resolved;
 
                 if (l2_l8) {
-                    uint8_t idx;
-                    cpu_physical_memory_read(
-                        l2_cfbar + (hwaddr)y * l2_src_width + (hwaddr)x,
-                        &idx, 1);
+                    uint8_t idx = l2_linebuf[x];
                     l2_raw = s->clut2[idx];
                 } else if (l2_al44) {
                     /*
                      * AL44 (A4L4): raw byte packs a 4-bit alpha (upper
-                     * nibble) and a 4-bit luminance (lower nibble).
-                     * Confirmed via live 2026-07-13 tracing that this is
-                     * NOT a flat 256-entry CLUT-indexed format (an
-                     * earlier attempt at this fix treated it that way,
-                     * matching HAL_LTDC_ConfigCLUT()'s generic CLUT-load
-                     * API surface for AL44 -- but firmware only ever
-                     * writes L2CLUTWR for the 16 "diagonal" indices
-                     * 0,17,34,...255 = luminance*17, e.g. observed
-                     * writes at idx=0 and idx=255 but never idx=240/241/
-                     * 242/244, which are real luminance values (0,1,2,4)
-                     * combined with a nonzero alpha nibble -- i.e. only
-                     * a 16-entry grayscale-ish sub-palette gets loaded,
-                     * keyed by luminance*17, with alpha supplied
-                     * directly by the pixel's own alpha nibble rather
-                     * than through the CLUT at all). Look up the CLUT
-                     * using the luminance nibble replicated to a full
-                     * byte (matching ConfigCLUT's own idx encoding) for
-                     * RGB, and apply the pixel's own alpha nibble
-                     * (replicated to 8 bits) directly, overriding
+                     * nibble) and a 4-bit luminance (lower nibble) --
+                     * looked up via the luminance nibble replicated to a
+                     * full byte (matching ConfigCLUT's own idx encoding)
+                     * for RGB, with the pixel's own alpha nibble applied
+                     * directly (replicated to 8 bits), overriding
                      * whatever alpha the CLUT entry itself carries.
                      */
-                    uint8_t raw;
-                    cpu_physical_memory_read(
-                        l2_cfbar + (hwaddr)y * l2_src_width + (hwaddr)x,
-                        &raw, 1);
+                    uint8_t raw = l2_linebuf[x];
                     unsigned int a4 = (raw >> 4) & 0xF;
                     unsigned int l4 = raw & 0xF;
                     unsigned int a8 = a4 * 0x11U;
                     uint32_t clut_rgb = s->clut2[l4 * 0x11U] & 0x00FFFFFFU;
                     l2_raw = (a8 << 24) | clut_rgb;
                 } else {
-                    l2_raw = gnw_h7b0_ltdc_read_pixel(
-                        l2_cfbar + (hwaddr)y * l2_src_width +
-                            (hwaddr)x * l2_bpp,
-                        l2_pfcr);
+                    l2_raw = gnw_h7b0_ltdc_read_pixel_buf(
+                        l2_linebuf + x * l2_bpp, l2_pfcr);
                 }
 
                 l2_resolved = gnw_h7b0_ltdc_resolve_layer(
@@ -802,6 +785,7 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
         }
         if (value & LTDC_SRCR_VBR) {
             s->vbr_reload_pending = true;
+            s->vbr_ever_used = true;
 
             /* The guest has finished drawing the frame and requested a swap.
              * Capture it NOW to avoid capturing it mid-draw during the next

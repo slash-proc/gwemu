@@ -254,6 +254,19 @@ struct GnwH7B0LtdcState {
      * the old mode and the display appears frozen.
      */
     bool vbr_deferred_capture;
+    /*
+     * Set on the first SRCR.VBR write this firmware ever makes. Gates
+     * vblank_tick()'s no-VBR auto-capture fallback (added for gnwmanager/
+     * OFW firmware that never reloads via VBR) so it stays off for any
+     * firmware -- like retro-go -- that does use VBR. Without this, a
+     * single vblank landing between two VBR writes (content_dirty already
+     * false because the UI thread just consumed the last capture) made
+     * the fallback grab a frame mid-draw, reintroducing the exact
+     * mid-draw tearing/flicker the shadow_buffer capture-at-VBR design
+     * was meant to eliminate -- most visible around retro-go's pause
+     * overlay, where SRCR write timing goes irregular.
+     */
+    bool vbr_ever_used;
 
     /*
      * Additional active-set snapshots for the generalized per-layer
