@@ -215,11 +215,26 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
             s->vbr_deferred_capture = false;
         }
     } else {
-        /* Auto-capture for firmware (like gnwmanager) that doesn't use VBR
-         * at all. Gated on vbr_ever_used so this never fires for firmware
-         * (like retro-go) that does reload via VBR -- otherwise a vblank
-         * landing between two VBR writes can grab a mid-draw frame. */
-        if (!s->vbr_ever_used && !s->content_dirty && gnw_h7b0_ltdc_enabled(s)) {
+        /*
+         * Auto-capture for firmware (like gnwmanager, or retro-go's own
+         * main-menu UI) that doesn't reload via VBR at all -- it just
+         * paints pixels directly into an already-configured Layer1/2.
+         * Gated on vbr_active, which tracks "is the *current* screen/
+         * config VBR-paced" rather than "has this device ever used VBR":
+         * an idle-timeout version of this gate was tried and reverted --
+         * real in-game firmware can leave multi-hundred-ms real gaps
+         * between VBR writes on its own (see the SMW APU-catchup-burst
+         * investigation), so any timeout short enough to un-stick the
+         * menu promptly was also short enough to spuriously re-arm this
+         * fallback mid-game during those same bursts, reintroducing
+         * mid-draw tearing exactly when the game stutters. vbr_active is
+         * instead reset by IMR reloads (see the SRCR write handler),
+         * which real screen/config transitions actually use -- letting a
+         * genuinely non-VBR screen (the menu) re-arm the fallback
+         * immediately after taking over the layers, without depending on
+         * any elapsed-time guess.
+         */
+        if (!s->vbr_active && !s->content_dirty && gnw_h7b0_ltdc_enabled(s)) {
             gnw_h7b0_ltdc_capture_if_enabled(s);
         }
     }
@@ -247,7 +262,7 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
     s->pf_warned = false;
     s->vbr_reload_pending = false;
     s->vbr_deferred_capture = false;
-    s->vbr_ever_used = false;
+    s->vbr_active = false;
 
     g_free(s->shadow_buffer);
     s->shadow_buffer = NULL;
@@ -768,6 +783,15 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
          * so IMR reloads never raised it at all.
          */
         if (value & LTDC_SRCR_IMR) {
+            /*
+             * An IMR reload means firmware is applying a fresh layer/
+             * format config -- the natural checkpoint for "a new screen
+             * just took over the layers, prove it uses VBR before we
+             * disable the no-VBR fallback for it again" (see the
+             * vblank_tick() comment for why this isn't a permanent
+             * latch or a timeout).
+             */
+            s->vbr_active = false;
             gnw_h7b0_ltdc_reload_active(s);
             s->regs[GNW_H7B0_LTDC_ISR >> 2] |= LTDC_ISR_RRIF;
             gnw_h7b0_ltdc_update_irq(s);
@@ -785,7 +809,7 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
         }
         if (value & LTDC_SRCR_VBR) {
             s->vbr_reload_pending = true;
-            s->vbr_ever_used = true;
+            s->vbr_active = true;
 
             /* The guest has finished drawing the frame and requested a swap.
              * Capture it NOW to avoid capturing it mid-draw during the next

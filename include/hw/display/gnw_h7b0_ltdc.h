@@ -255,18 +255,27 @@ struct GnwH7B0LtdcState {
      */
     bool vbr_deferred_capture;
     /*
-     * Set on the first SRCR.VBR write this firmware ever makes. Gates
+     * Tracks "is the *current* screen/config VBR-paced" -- set on every
+     * SRCR.VBR write, cleared on every SRCR.IMR write (real screen/config
+     * transitions -- e.g. retro-go leaving a game for its own main menu --
+     * apply their new layer config via an immediate IMR reload). Gates
      * vblank_tick()'s no-VBR auto-capture fallback (added for gnwmanager/
-     * OFW firmware that never reloads via VBR) so it stays off for any
-     * firmware -- like retro-go -- that does use VBR. Without this, a
-     * single vblank landing between two VBR writes (content_dirty already
-     * false because the UI thread just consumed the last capture) made
-     * the fallback grab a frame mid-draw, reintroducing the exact
-     * mid-draw tearing/flicker the shadow_buffer capture-at-VBR design
-     * was meant to eliminate -- most visible around retro-go's pause
-     * overlay, where SRCR write timing goes irregular.
+     * OFW firmware, and retro-go's own main-menu UI, that paint pixels
+     * directly without ever reloading via VBR).
+     *
+     * A permanent "has this device ever used VBR" latch made the main
+     * menu screen stay black forever after returning from *any* game
+     * (the menu itself never writes SRCR again to re-trigger a capture).
+     * An idle-timeout version of that latch was tried next and also
+     * reverted: real in-game firmware can leave multi-hundred-ms real
+     * gaps between VBR writes on its own (see the SMW APU-catchup-burst
+     * investigation), so any timeout short enough to un-stick the menu
+     * promptly was also short enough to spuriously re-arm this fallback
+     * mid-game during those same bursts -- reintroducing mid-draw
+     * tearing exactly when the game stutters. Resetting on IMR instead
+     * avoids guessing at a time threshold entirely.
      */
-    bool vbr_ever_used;
+    bool vbr_active;
 
     /*
      * Additional active-set snapshots for the generalized per-layer

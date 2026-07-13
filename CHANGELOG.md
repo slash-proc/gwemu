@@ -1,5 +1,153 @@
 # Changelog
 
+## 2026-07-13 (later same day, part 6) — general stutter root cause found: SysTick tick-loss under TCG load; `-icount` scoped as the real fix
+
+- Full writeup: `docs/session-2026-07-13-part5-retro-go-ltdc-vbr-and-stutter-investigation.md`
+  (continuation of part 5's investigation).
+- Replaced `vbr_ever_used` (permanent latch, committed `014612c688`) with
+  `vbr_active` in `hw/display/gnw_h7b0_ltdc.c`/`gnw_h7b0_ltdc.h`: the
+  latch fixed the pause-overlay flicker but permanently blacked out
+  retro-go's main menu after playing any game (the menu never writes
+  `SRCR` again to re-arm the no-VBR auto-capture fallback). `vbr_active`
+  resets on every `SRCR.IMR` write instead — real screen/config
+  transitions apply their layer config via IMR — rather than a one-way
+  latch or an idle-timeout (idle-timeout was tried and reverted: real
+  in-game firmware can leave multi-hundred-ms gaps between VBR writes on
+  its own, so any timeout short enough to un-stick the menu was also
+  short enough to spuriously re-arm the fallback mid-game).
+- Found and resolved a second, unrelated black-screen cause: this
+  project's flash images are persistent by default, and repeated hard
+  `kill`s of QEMU mid-session while games were running had corrupted the
+  backing files — fresh copies of `backup/qemu-images/zelda-*.bin` fixed
+  it immediately, no code involved.
+- Root-caused the general gameplay stutter the user flagged as the real
+  priority (previously suspected SMW-specific): PC-sampled both SMW
+  (SNES engine) and Link's Awakening DX (gnuboy GBC core) mid-stutter;
+  both showed their hottest code in their own independent
+  audio-rendering function, confirming a shared cause rather than a
+  per-game one. Ruled out (via live tracing) a dynamic DMAMUX-based
+  DMA/SAI1 rebind mechanism added in `77e86eacdd` for stock-Zelda/OFW
+  compatibility as a suspect. Found the actual mechanism: SysTick's
+  pending-IRQ state is a single bit, not a counter, so under QEMU/TCG (where
+  `SysTick_Handler` takes far longer in real wall-clock time than on real
+  hardware) a tick that fires while the CPU is still busy with the
+  previous one is silently lost, regardless of how correctly
+  `hw/core/ptimer.c` schedules its own deadlines. This corrects a specific
+  claim in `docs/session-2026-07-12-breakpoint-lockstep-tracing.md` part
+  22 (which attributed the gap to a ptimer catch-up policy bug — see the
+  correction note added there) while keeping that doc's empirical
+  host-throughput-correlation finding intact.
+- Decision, agreed with the user: fixing this for real needs `-icount`
+  (deterministic instruction-scaled virtual time), not another
+  device-model patch. Scoped as a separate, larger follow-up effort
+  rather than folded into this session, since it's a global timing-model
+  change needing re-validation of `gnw_h7b0_dma.c`'s accumulator-scheduled
+  timers, LTDC's vblank period, and SAI1 audio pacing.
+
+## 2026-07-13 (later same day, part 5) — retro-go pause-overlay flicker/menu black-screen fixes, SMW stutter root-caused (not fixed here)
+
+- Full session writeup: `docs/session-2026-07-13-part5-retro-go-ltdc-vbr-and-stutter-investigation.md`.
+- Fixed a real tearing regression in `hw/display/gnw_h7b0_ltdc.c`'s
+  no-VBR auto-capture fallback (`gnw_h7b0_ltdc_vblank_tick()`): it fired
+  on any vblank with `content_dirty` false, unable to tell "firmware that
+  never uses VBR" apart from "firmware using VBR that just landed
+  between two writes" (the latter grabbed a mid-draw frame). First fix
+  (committed `014612c688`): a `vbr_ever_used` latch gating the fallback
+  off once any `SRCR.VBR` write happens.
+- Found that latch then permanently blacks out retro-go's main menu
+  after playing any game (the menu paints pixels directly without ever
+  writing `SRCR` again to re-arm the fallback). Replaced the permanent
+  latch with `vbr_active`, reset on every `SRCR.IMR` write (real
+  screen/config transitions use IMR) instead of a `vbr_ever_used`
+  one-way latch or an idle-timeout (idle-timeout was tried and reverted:
+  real in-game firmware can leave multi-hundred-ms gaps between VBR
+  writes on its own, so any timeout short enough to un-stick the menu
+  was also short enough to spuriously re-arm the fallback mid-game).
+- Root-caused (not fixed here — belongs in the `game-and-watch-retro-go-sd`
+  sibling repo) a real stutter during SMW gameplay to
+  `external/smw/src/common_rtl.c`'s `RtlSetUploadingApu()` forcing a
+  synchronous 10,000-emulated-cycle APU catchup burst on every SPC
+  sound-driver reupload — negligible on real hardware, hundreds of ms
+  under QEMU's TCG interpretation. Whether this generalizes to a shared
+  qemu-gnw-side cause behind other cores' stutter (vs. SMW-specific) is
+  still open per the user's own correct pushback — not yet confirmed
+  either way.
+- A separate, unrelated black-screen cause (corrupted persistent
+  `backup/qemu-images/zelda-*.bin` state from repeated hard `kill`s of
+  QEMU mid-session) was found and resolved with fresh image copies — no
+  code involved; a reminder that this project's flash images are
+  persistent by default and abrupt kills mid-write are a real corruption
+  risk.
+
+## 2026-07-13 (later same day, part 3) — gnw-web-builder integration: real HASH/erase device-model bugs, gdbstub live memory access, persistent flash images
+
+- Full session writeup: `docs/session-2026-07-13-web-builder-integration-fixes.md`.
+- Added a real STM32H7B0 HASH peripheral device model
+  (`hw/misc/gnw_h7b0_hash.c`, MD5/SHA-1/SHA-224/SHA-256 backed by QEMU's
+  own `crypto/hash.h`), replacing `create_unimplemented_device("HASH",
+  ...)`. gnwmanager's RAM stub calls `HAL_HASHEx_SHA256_Start(...,
+  HAL_MAX_DELAY)` after every flash write to verify it; the stub always
+  reading 0 meant the digest-complete flag never set, permanently
+  wedging every internal-flash write.
+- Fixed `hw/misc/gnw_h7b0_flash_r.c`: internal-flash erase
+  (`FLASH_CR1`/`CR2`'s `SER`/`BER`+`START` bits) was a pure register stub
+  with no connection to the actual flash memory — erasing finished
+  instantly and silently changed nothing. Now wired to the real
+  `flash_bank1`/`flash_bank2` memory (`gnw_h7b0_flash_r_set_banks()`,
+  called from `gnw_h7b0_soc.c`), so a sector/bank erase actually
+  `memset`s the real backing memory to `0xFF`.
+- `gdbstub/gdbstub.c`: memory read/write (`m`/`M`) packets no longer halt
+  the VM. Upstream's blanket "any byte while running halts the target"
+  rule was a protocol default, not a real requirement —
+  `cpu_memory_rw_debug()` is exactly as safe to call from a running VM as
+  a halted one. Every other command (registers, continue/step,
+  breakpoints, etc.) still halts first, unchanged.
+- Added optional persistent flash-image backing: `gnw_h7b0_soc.c` gained
+  `bank1-image`/`bank2-image`/`extflash-image` string properties
+  (`-global gnw-h7b0-soc.<name>=<path>`) that back that region directly
+  with the named file (`memory_region_init_ram_from_file`, `RAM_SHARED`)
+  instead of anonymous RAM seeded once via `-device loader` — guest
+  writes (flashing, erasing) now persist to the file live. This is now
+  `scripts/boot_qemu.sh`'s default (`--ephemeral` opts back out to the
+  old discard-on-exit behavior) since it matches how real hardware
+  actually behaves.
+- New tool: `scripts/gdb_tap.py`, a logging TCP proxy for QEMU's GDB RSP
+  port, with `TCP_NODELAY`/re-armed `TCP_QUICKACK` (fixes a ~40ms Nagle/
+  delayed-ACK stall per request) and single-active-client preemption
+  (QEMU's gdbstub only serves one client; a stale browser-tab connection
+  no longer starves out a one-shot `gnwmanager --qemu` invocation).
+- Cross-repo fixes found via the above (not in this repo, noted for
+  context): `gnw-web-builder`'s mailbox status-poll interval (10ms ->
+  150ms, was starving the guest CPU against the gdbstub's old
+  resume-debounce), `backend/src/server.ts`'s QEMU-bridge socket
+  (`TCP_NODELAY`), `qemuTransport.ts` (memory ops no longer pre-emptively
+  halt), and `gnwmanager/ocdbackend/gdb_backend.py`'s socket
+  (`TCP_NODELAY`, ~12x speedup on `gnwmanager --qemu info`).
+
+## 2026-07-13 (later same day, part 2) — Fixed real per-pixel MMIO overhead in LTDC Layer2 and DMA2D, cutting effective slowdown roughly in half
+
+- Investigated Zelda CFW's own reported ~50% real-hardware speed
+  slowdown (separate from the Mario CSI/PLL1 fix below). Found LTDC's
+  Layer2 compositing path (`hw/display/gnw_h7b0_ltdc.c`) and DMA2D's
+  `M2M_PFC`/`M2M_BLEND*` transfer modes (`hw/display/gnw_h7b0_dma2d.c`)
+  both issued a full `cpu_physical_memory_read()`/`_write()` guest-memory-
+  translation call *per pixel* instead of batching a row at a time (JPEG
+  cover-art's YCbCr decode did 3 such calls per pixel; DMA2D's L8 CLUT
+  lookup re-fetched the same 256-entry table from guest memory once per
+  pixel too). `perf record` on the live QEMU process confirmed this
+  address-translation machinery (`phys_page_find`/`flatview_*`/
+  `address_space_translate_internal`) was ~30% of total process CPU time.
+  Batched both to fetch/write one row per `cpu_physical_memory_read()`/
+  `_write()` call (CLUT loaded once per DMA2D transfer instead of once per
+  pixel); confirmed via `perf` that this overhead is now gone from the hot
+  path. Measured effect via SysTick-fire-rate counting (Zelda CFW):
+  ~415Hz -> ~643Hz (real hardware is 1000Hz) — real, substantial, but not
+  a full fix; remaining gap is genuine QEMU TCG instruction-interpretation
+  cost, not further addressable at the device-model level. Also removed a
+  stray capped-but-still-leftover debug `fprintf` in
+  `hw/misc/gnw_h7b0_dma.c`'s stream-tick handler. Full investigation in
+  `docs/session-2026-07-12-breakpoint-lockstep-tracing.md` parts 20-23.
+
 ## 2026-07-13 (later same day) — Fixed: RCC_CR never mirrored CSION into CSIRDY, blocking Mario CFW's PLL1 overclock
 
 - User reported Mario CFW running at roughly half real-hardware speed;
