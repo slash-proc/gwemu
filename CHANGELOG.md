@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-07-14 — performance-improvement research + new GBC-core-to-menu black-screen bug found
+
+- Dispatched a forked agent to research a code-verified plan for finding
+  materially more raw TCG throughput. Full writeup:
+  `docs/session-2026-07-14-perf-improvement-candidates.md`. Top finding:
+  DMA2D's YCbCr->RGB conversion (`hw/display/gnw_h7b0_dma2d.c:166`) uses
+  floating-point math per output pixel on the JPEG cover-art path — a
+  fixed-point BT.601 conversion is the highest-confidence, lowest-risk
+  win identified. No safe generic QEMU/TCG-level tuning knob was found
+  (BQL/MMIO dispatch and `accel/tcg/` both checked and ruled out); `-icount`
+  confirmed to cost ~27% more host CPU for no throughput gain (determinism
+  feature, not a speed fix). No code changes made yet — plan only.
+- Found (not yet fixed) a new black-screen repro: returning to retro-go's
+  main menu specifically from the GBC core (Link's Awakening DX)
+  intermittently freezes on black. Confirmed via live debug logging that
+  this transition never issues an `LTDC_SRCR.IMR` write, so the
+  `vbr_active` flag added in `7ac66634e5` never resets, permanently
+  disabling the no-VBR auto-capture fallback for this specific
+  transition — same symptom as that commit's bug, different trigger its
+  fix didn't cover.
+
 ## 2026-07-14 — general post-pause stutter: definitive root cause confirmed via direct hardware-vs-QEMU comparison
 
 - Full writeup: `docs/session-2026-07-14-frame-integrator-hw-vs-qemu-comparison.md`.

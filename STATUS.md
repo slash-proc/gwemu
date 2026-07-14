@@ -1,6 +1,30 @@
 # Status
 
-Last updated: 2026-07-13
+Last updated: 2026-07-14
+
+**Performance-improvement candidates researched (2026-07-14, no code
+changes yet).** Full writeup: `docs/session-2026-07-14-perf-improvement-candidates.md`.
+User asked for a code-verified plan to find materially more raw TCG
+throughput (~50% target). Highest-confidence finding: DMA2D's
+YCbCr->RGB pixel conversion (`hw/display/gnw_h7b0_dma2d.c:166`,
+`gnw_h7b0_dma2d_read_ycbcr_buf`) does floating-point math per output
+pixel on the JPEG-cover-art path; a fixed-point BT.601 conversion would
+remove all FP ops from the hottest per-pixel loop and is the
+recommended next step. Also confirmed (measured this session):
+`-icount` costs ~27% more host CPU for no throughput gain — it's a
+determinism feature, not a speed fix, don't re-propose it. No safe
+generic QEMU/TCG tuning knob was found; any further win has to come
+from our own device models, not QEMU internals.
+
+**New, still-open black-screen bug: GBC-core -> retro-go main-menu
+transition.** Confirmed (intermittent repro) that this specific
+transition never issues an `LTDC_SRCR.IMR` write, so the `vbr_active`
+flag added in `7ac66634e5` never resets, permanently disabling the
+no-VBR auto-capture fallback — same visible symptom (`L1CFBAR` frozen,
+zero further `SRCR` writes) as the bug that commit fixed, but for a
+transition its "reset on IMR" assumption doesn't cover. Not yet fixed.
+Debug `fprintf`s currently sit uncommitted in `hw/display/gnw_h7b0_ltdc.c`
+confirming the mechanism — strip before committing any real fix.
 
 ## Where things stand
 
