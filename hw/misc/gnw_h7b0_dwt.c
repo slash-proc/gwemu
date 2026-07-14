@@ -55,7 +55,6 @@ static uint64_t gnw_h7b0_dwt_read(void *opaque, hwaddr addr, unsigned int size)
 {
     GnwH7B0DwtState *s = GNW_H7B0_DWT(opaque);
 
-    fprintf(stderr, "[dwt-debug] read addr=0x%"HWADDR_PRIx"\n", addr);
     if (addr >= GNW_H7B0_DWT_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%"HWADDR_PRIx"\n",
                       __func__, addr);
@@ -73,8 +72,6 @@ static void gnw_h7b0_dwt_write(void *opaque, hwaddr addr, uint64_t val64,
     GnwH7B0DwtState *s = GNW_H7B0_DWT(opaque);
     uint32_t value = val64;
 
-    fprintf(stderr, "[dwt-debug] write addr=0x%"HWADDR_PRIx" val=0x%x\n",
-            addr, value);
     if (addr >= GNW_H7B0_DWT_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%"HWADDR_PRIx"\n",
                       __func__, addr);

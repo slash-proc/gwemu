@@ -442,12 +442,9 @@ static void armv7m_realize(DeviceState *dev, Error **errp)
      * RAZ/WI (always reading 0, i.e. "no time ever elapses") corrupts
      * that pacing in ways that are otherwise very hard to diagnose.
      */
-    fprintf(stderr, "[armv7m-dwt-debug] s->dwt_mr=%p\n", s->dwt_mr);
     if (s->dwt_mr) {
         memory_region_add_subregion_overlap(&s->container, 0xe0001000,
                                             s->dwt_mr, 1);
-        fprintf(stderr, "[armv7m-dwt-debug] added dwt_mr overlap, size=%"
-                PRIu64 "\n", memory_region_size(s->dwt_mr));
     }
 
     /* Wire the NVIC up to the CPU */
