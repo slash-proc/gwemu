@@ -2,19 +2,32 @@
 
 Last updated: 2026-07-14
 
-**Performance-improvement candidates researched (2026-07-14, no code
-changes yet).** Full writeup: `docs/session-2026-07-14-perf-improvement-candidates.md`.
-User asked for a code-verified plan to find materially more raw TCG
-throughput (~50% target). Highest-confidence finding: DMA2D's
-YCbCr->RGB pixel conversion (`hw/display/gnw_h7b0_dma2d.c:166`,
-`gnw_h7b0_dma2d_read_ycbcr_buf`) does floating-point math per output
-pixel on the JPEG-cover-art path; a fixed-point BT.601 conversion would
-remove all FP ops from the hottest per-pixel loop and is the
-recommended next step. Also confirmed (measured this session):
-`-icount` costs ~27% more host CPU for no throughput gain — it's a
-determinism feature, not a speed fix, don't re-propose it. No safe
-generic QEMU/TCG tuning knob was found; any further win has to come
-from our own device models, not QEMU internals.
+**Performance-improvement candidates (2026-07-14) — landed.** Full
+writeup: `docs/session-2026-07-14-perf-improvement-candidates.md`. Of
+the four viable candidates: (1) DMA2D's YCbCr->RGB conversion now uses
+Q16 fixed-point BT.601 constants instead of floating-point math,
+verified bit-identical to the old float output, alongside a
+per-pixel-MMIO-to-per-row-buffer batching refactor for the same file
+(commit `160e516579`); (2) LTDC's per-pixel horizontal window-clip test
+is now precomputed once per column instead of re-evaluated every pixel
+every row, plus a blend_over fast path for fully-opaque/fully-
+transparent pixels (measured 10.29%->2.40% CPU in one profiling
+scenario) (commit `279b08904d`); (3) the non-VBR auto-capture fallback
+now skips a full recomposite when neither layer's framebuffer RAM nor
+any composition register has actually changed, using QEMU's real
+DIRTY_MEMORY_VGA dirty-bitmap mechanism (same approach `hw/display/vga.c`
+uses) rather than a register-write-only proxy — a first, rejected
+attempt at (3) used register writes only and would have frozen a game
+still rendering behind a static overlay; the RAM-dirty version was
+verified live to not affect the (separately tracked) black-screen bug
+below (commit `343fbc19ed`); (4) the two LTDC helper functions flagged
+as "likely already inlined" were confirmed via release-build
+disassembly to already be fully inlined by GCC at `-O3` — no code
+change needed. Also confirmed (measured this session): `-icount` costs
+~27% more host CPU for no throughput gain — it's a determinism feature,
+not a speed fix, don't re-propose it. No safe generic QEMU/TCG tuning
+knob was found; any further win has to come from our own device
+models, not QEMU internals.
 
 **New, still-open black-screen bug: GBC-core -> retro-go main-menu
 transition.** Confirmed (intermittent repro) that this specific

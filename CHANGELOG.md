@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-07-14 — landed all four perf-improvement candidates from the research plan
+
+- DMA2D: replaced the YCbCr->RGB conversion's floating-point BT.601
+  constants with Q16 fixed-point equivalents (verified bit-identical
+  output across the full cb/cr range), and batched per-pixel
+  `cpu_physical_memory_read`/`write` calls (and per-pixel CLUT lookups)
+  into one read/write per row plus one CLUT load per transfer
+  (`160e516579`).
+- LTDC: added a `blend_over` fast path for fully-opaque/fully-transparent
+  per-pixel-alpha pixels (measured 10.29%->2.40% CPU in one profiling
+  scenario), and hoisted the per-pixel horizontal window-clip test
+  (WHSTPOS/WHSPPOS, row-invariant) out of the row loop into a
+  precomputed per-column array (`279b08904d`).
+- LTDC: the non-VBR auto-capture fallback now skips a full frame
+  recomposite when nothing that affects pixel output has changed, using
+  QEMU's real RAM dirty-bitmap mechanism (`DIRTY_MEMORY_VGA`, the same
+  approach `hw/display/vga.c` uses) over Layer1/Layer2's actual
+  framebuffer ranges, not a register-write proxy — a first attempt using
+  register writes only was rejected mid-review because it would have
+  frozen a game still rendering behind a static overlay with no further
+  register writes; the RAM-dirty version was live-verified to not affect
+  the (separately tracked) GBC-menu black-screen bug below (`343fbc19ed`).
+- Confirmed via release-build disassembly that `gnw_h7b0_ltdc_resolve_layer`/
+  `gnw_h7b0_ltdc_blend_over` are already fully inlined by GCC at `-O3` —
+  no code change needed for that candidate.
+- Full research writeup: `docs/session-2026-07-14-perf-improvement-candidates.md`.
+
 ## 2026-07-14 — performance-improvement research + new GBC-core-to-menu black-screen bug found
 
 - Dispatched a forked agent to research a code-verified plan for finding
