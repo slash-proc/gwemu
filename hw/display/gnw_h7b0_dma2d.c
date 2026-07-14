@@ -333,6 +333,28 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
     }
 
     if (mode == DMA2D_MODE_R2M) {
+        /*
+         * OCOLR is NOT an ARGB8888 value here -- RM0455 18.5.15-18.5.18
+         * documents OCOLR as a set of *alternate* register layouts, one
+         * per output color mode selected by OPFCCR.CM: "The same register
+         * is used to show the color values, with different formats
+         * depending on the color mode" -- and 18.3.9 spells out that in
+         * R2M mode "the configured output rectangle is filled by the
+         * color specified in DMA2D_OCOLR which contains a fixed 32-, 24-,
+         * or 16-bit value. The format is selected by CM[2:0] in
+         * DMA2D_OPFCCR." I.e. real firmware (see
+         * sdk/stm32h7xx-hal-driver/Src/stm32h7xx_hal_dma2d.c's
+         * DMA2D_SetConfig()) pre-packs the fill color into the *output*
+         * format's bit layout before writing OCOLR (e.g. for RGB565 it
+         * writes a 16-bit RGB565 value into the low 16 bits), and real
+         * hardware just copies OCOLR's raw low out_bpp bytes straight to
+         * memory for every pixel -- no further ARGB8888->CM conversion
+         * happens. Previously this code fed OCOLR into
+         * gnw_h7b0_dma2d_write_output_buf() (which assumes an ARGB8888
+         * input and re-encodes to the output format), applying that
+         * conversion a second time and corrupting every R2M fill color
+         * whose output format isn't ARGB8888.
+         */
         uint32_t ocolr = s->regs[GNW_H7B0_DMA2D_OCOLR >> 2];
         hwaddr out_stride = (hwaddr)(pixels_per_line + oor) * out_bpp;
         hwaddr row_bytes = (hwaddr)pixels_per_line * out_bpp;
@@ -343,8 +365,12 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
         g_autofree uint8_t *rowbuf = g_malloc(row_bytes);
 
         for (uint32_t x = 0; x < pixels_per_line; x++) {
-            gnw_h7b0_dma2d_write_output_buf(out_cm, rowbuf + (hwaddr)x * out_bpp,
-                                             ocolr);
+            uint8_t *dst = rowbuf + (hwaddr)x * out_bpp;
+            if (out_bpp == 4) {
+                stl_le_p(dst, ocolr);
+            } else {
+                stw_le_p(dst, (uint16_t)ocolr);
+            }
         }
         for (uint32_t y = 0; y < lines; y++) {
             cpu_physical_memory_write(omar + (hwaddr)y * out_stride, rowbuf,

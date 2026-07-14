@@ -21,7 +21,16 @@
 #define GNW_H7B0_CRC_INIT_WMASK  0xffffffff
 
 #define GNW_H7B0_CRC_POL_OFFSET 0x14
-#define GNW_H7B0_CRC_POL_RESET  0x00000000
+/*
+ * STM32H7B0.svd lists this register's <resetValue> as 0x00000000, but
+ * that's wrong -- RM0455 22.4.5 "CRC polynomial (CRC_POL)" explicitly
+ * states "Reset value: 0x04C1 1DB7" (the standard CRC-32 polynomial,
+ * matching stm32h7xx_hal_crc.h's DEFAULT_CRC32_POLY / stm32h7xx_ll_crc.h's
+ * LL_CRC_DEFAULT_CRC32_POLY). Firmware that doesn't explicitly reprogram
+ * POL (relying on the documented hardware default) would otherwise see
+ * every CRC computation run against a zero polynomial here.
+ */
+#define GNW_H7B0_CRC_POL_RESET  0x04c11db7
 #define GNW_H7B0_CRC_POL_WMASK  0xffffffff
 
 static inline uint32_t get_crc_write_mask(uint32_t offset) {
