@@ -29,15 +29,20 @@ not a speed fix, don't re-propose it. No safe generic QEMU/TCG tuning
 knob was found; any further win has to come from our own device
 models, not QEMU internals.
 
-**New, still-open black-screen bug: GBC-core -> retro-go main-menu
-transition.** Confirmed (intermittent repro) that this specific
-transition never issues an `LTDC_SRCR.IMR` write, so the `vbr_active`
-flag added in `7ac66634e5` never resets, permanently disabling the
-no-VBR auto-capture fallback — same visible symptom (`L1CFBAR` frozen,
-zero further `SRCR` writes) as the bug that commit fixed, but for a
-transition its "reset on IMR" assumption doesn't cover. Not yet fixed.
-Debug `fprintf`s currently sit uncommitted in `hw/display/gnw_h7b0_ltdc.c`
-confirming the mechanism — strip before committing any real fix.
+**GBC-core -> retro-go main-menu black-screen bug — RESOLVED.** Root
+cause: this transition can end on a VBR-type `SRCR` reload (not IMR)
+with no further reloads ever coming, permanently latching `vbr_active`
+true (it only ever reset on IMR) and blocking the no-VBR auto-capture
+fallback forever — same visible symptom (`L1CFBAR` frozen, zero further
+`SRCR` writes) as the bug `7ac66634e5` fixed, but a transition its
+"reset on IMR" assumption didn't cover. Fixed by letting the fallback
+also engage once VBR has gone idle for ~130ms (`srcr_idle_ticks`), but
+only combined with the RAM-dirty check from the perf work above — safe
+where a bare elapsed-time guess previously wasn't, since a stalled game
+isn't writing new framebuffer content during its stall, only a firmware
+path still actively drawing without reloading is (commit `3b946997d8`).
+Verified live: could no longer reproduce across repeated attempts;
+normal VBR/IMR-paced gameplay unaffected.
 
 ## Where things stand
 

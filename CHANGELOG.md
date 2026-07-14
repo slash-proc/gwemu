@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-07-14 — fixed GBC-core-to-menu black screen (vbr_active idle-fallback gap)
+
+- Root cause confirmed live: the transition can end on a VBR-type
+  `SRCR` reload (not IMR) with no further reloads ever coming, so
+  `vbr_active` (only ever reset on IMR) latches true permanently and
+  blocks the no-VBR auto-capture fallback forever, freezing on whatever
+  frame was active at that last VBR reload.
+- Fix: a new `srcr_idle_ticks` counter (reset on every `SRCR` write,
+  incremented each vblank tick otherwise) lets the fallback also engage
+  once VBR has gone idle for ~130ms, but only combined with the RAM-
+  dirty check landed in `343fbc19ed` — the same combination that makes
+  this safe where a bare elapsed-time idle guess previously wasn't (a
+  stalled game isn't writing new framebuffer content during its stall,
+  so it can't spuriously re-arm and reintroduce mid-draw tearing the way
+  the earlier reverted timeout attempt did) (`3b946997d8`).
+- A detour mid-investigation into a suspected DMA1-Stream0/SAI1-audio
+  NVIC interrupt-storm hang was pursued and then retracted: real-time
+  breakpoints at `HAL_DMA_IRQHandler`'s entry and return both hit
+  cleanly in sequence, proving the handler runs to completion normally.
+  The earlier "stuck forever" reading came from naive `halt()`-based PC
+  sampling in this gdbstub, which appears to snap to interrupt-vector
+  boundaries rather than the true instantaneous PC — not a real hang.
+  Not a device-model bug; no code change from that detour.
+
 ## 2026-07-14 — landed all four perf-improvement candidates from the research plan
 
 - DMA2D: replaced the YCbCr->RGB conversion's floating-point BT.601
