@@ -362,18 +362,42 @@ struct GnwH7B0LtdcState {
      * branch's comment): a firmware transition can end on a VBR-type
      * reload (not IMR) with no further reloads ever coming, which
      * otherwise permanently blocks the fallback with no other signal
-     * that VBR pacing has actually stopped. Gated ALWAYS alongside the
-     * RAM-dirty check (gnw_h7b0_ltdc_fb_dirty_check_and_clear()), not
-     * used alone -- a bare elapsed-time idle guess was tried and
-     * reverted previously specifically because normal in-game stalls
-     * (real, multi-hundred-ms VBR gaps, e.g. the SMW APU-catchup-burst
-     * case) spuriously re-armed it and reintroduced mid-draw tearing;
-     * requiring the framebuffer to also have genuinely new, uncaptured
-     * content avoids that, since a stalled game isn't writing new frame
-     * data during its stall, only a firmware path that's still actively
-     * drawing without reloading (the actual failure mode here) is.
+     * that VBR pacing has actually stopped.
+     *
+     * NOT sufficient alone, and not even alongside the RAM-dirty check --
+     * confirmed live (2026-07-14) that ordinary in-game frame-skipping
+     * (game-and-watch-retro-go-sd's common_emu_frame_loop()/
+     * frame_integrator catch-up mechanism, the same one root-caused for
+     * the general post-pause stutter) ALSO suppresses lcd_swap()/VBR
+     * reloads for the same duration as any real stutter, and the
+     * framebuffer keeps getting genuinely new content throughout (the
+     * game is still trying to render, just skipping some draws) -- so
+     * "VBR idle + framebuffer dirty" alone fires just as often during
+     * completely normal stutter as during a real abandoned-VBR
+     * transition, reintroducing mid-draw tearing/flicker during any bad
+     * stutter in any game. See structural_transition_pending below for
+     * the fix: also require evidence of a genuine screen/layer
+     * transition, not just an idle timer.
      */
     int srcr_idle_ticks;
+
+    /*
+     * Set by gnw_h7b0_ltdc_reload_active() whenever a reload changes
+     * pixel format, layer enable, or window geometry relative to the
+     * currently-active config (gnw_h7b0_ltdc_reload_is_structural_change())
+     * -- deliberately EXCLUDES CFBAR (buffer address), which flips every
+     * frame during completely normal double buffering and so can't be
+     * used to distinguish "a new screen just took over" from "same
+     * screen, routine frame swap." Required, alongside srcr_idle_ticks
+     * crossing its threshold, before the non-VBR fallback is allowed to
+     * override a still-true vbr_active -- see srcr_idle_ticks' doc
+     * comment for why the idle-timer signal alone isn't enough. Not
+     * cleared after being consumed: once idle_ticks resets on the next
+     * genuine SRCR write (VBR resuming normally), the fallback is gated
+     * off again regardless of this flag's value, so leaving it set
+     * causes no harm and needs no explicit reset.
+     */
+    bool structural_transition_pending;
 
     /*
      * Layer1's hardware CLUT (L1CLUTWR), used only when active_l1pfcr

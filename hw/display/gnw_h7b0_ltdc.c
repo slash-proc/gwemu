@@ -102,6 +102,30 @@ static void gnw_h7b0_ltdc_update_irq(GnwH7B0LtdcState *s)
     qemu_set_irq(s->irq, pending != 0);
 }
 
+/*
+ * Whether this reload represents a genuine layer/screen transition
+ * (format, layer-enable, or window geometry differs from the
+ * currently-active config) as opposed to routine same-screen double
+ * buffering, which only ever changes CFBAR (the buffer address) --
+ * deliberately excluded from this comparison since it flips every
+ * frame during completely normal steady-state VBR-paced gameplay. See
+ * srcr_idle_ticks'/structural_transition_pending's doc comments in
+ * gnw_h7b0_ltdc.h for why this distinction matters.
+ */
+static bool gnw_h7b0_ltdc_reload_is_structural_change(GnwH7B0LtdcState *s)
+{
+    return s->active_l1pfcr != s->regs[GNW_H7B0_LTDC_L1PFCR >> 2] ||
+           (s->active_l1cr & LTDC_LxCR_LEN) !=
+               (s->regs[GNW_H7B0_LTDC_L1CR >> 2] & LTDC_LxCR_LEN) ||
+           s->active_l2pfcr != s->regs[GNW_H7B0_LTDC_L2PFCR >> 2] ||
+           (s->active_l2cr & LTDC_LxCR_LEN) !=
+               (s->regs[GNW_H7B0_LTDC_L2CR >> 2] & LTDC_LxCR_LEN) ||
+           s->active_l1whpcr != s->regs[GNW_H7B0_LTDC_L1WHPCR >> 2] ||
+           s->active_l1wvpcr != s->regs[GNW_H7B0_LTDC_L1WVPCR >> 2] ||
+           s->active_l2whpcr != s->regs[GNW_H7B0_LTDC_L2WHPCR >> 2] ||
+           s->active_l2wvpcr != s->regs[GNW_H7B0_LTDC_L2WVPCR >> 2];
+}
+
 static void gnw_h7b0_ltdc_reload_active(GnwH7B0LtdcState *s)
 {
     /*
@@ -111,6 +135,10 @@ static void gnw_h7b0_ltdc_reload_active(GnwH7B0LtdcState *s)
      * check in gnw_h7b0_ltdc_fb_dirty_check_and_clear().
      */
     s->fb_reg_dirty = true;
+
+    if (gnw_h7b0_ltdc_reload_is_structural_change(s)) {
+        s->structural_transition_pending = true;
+    }
 
     s->active_l1cr = s->regs[GNW_H7B0_LTDC_L1CR >> 2];
     s->active_l1cfbar = s->regs[GNW_H7B0_LTDC_L1CFBAR >> 2];
@@ -272,13 +300,18 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
          * true with nothing left to reset it -- see srcr_idle_ticks'
          * doc comment in gnw_h7b0_ltdc.h. Once VBR has gone idle for
          * GNW_H7B0_LTDC_SRCR_IDLE_TICKS_THRESHOLD ticks, allow the
-         * fallback even with vbr_active still true, but ONLY alongside
-         * the same RAM-dirty requirement as the normal case -- a stalled
-         * game isn't writing new framebuffer content during its stall,
-         * so this can't spuriously re-arm mid-game the way a bare
-         * elapsed-time guess did.
+         * fallback even with vbr_active still true -- but ONLY if the
+         * last reload also represented a genuine structural transition
+         * (structural_transition_pending), not just an idle timer:
+         * confirmed live that ordinary in-game frame-skipping suppresses
+         * VBR reloads for the exact same duration as a real abandoned
+         * transition, so the idle timer alone (even combined with the
+         * RAM-dirty check) fires just as often during normal stutter,
+         * reintroducing mid-draw tearing/flicker -- see
+         * structural_transition_pending's doc comment in gnw_h7b0_ltdc.h.
          */
-        bool vbr_idle = s->srcr_idle_ticks >= GNW_H7B0_LTDC_SRCR_IDLE_TICKS_THRESHOLD;
+        bool vbr_idle = s->srcr_idle_ticks >= GNW_H7B0_LTDC_SRCR_IDLE_TICKS_THRESHOLD &&
+                         s->structural_transition_pending;
         if ((!s->vbr_active || vbr_idle) && !s->content_dirty &&
             gnw_h7b0_ltdc_enabled(s) &&
             gnw_h7b0_ltdc_fb_dirty_check_and_clear(s)) {
@@ -312,6 +345,7 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
     s->vbr_deferred_capture = false;
     s->vbr_active = false;
     s->srcr_idle_ticks = 0;
+    s->structural_transition_pending = false;
 
     g_free(s->shadow_buffer);
     s->shadow_buffer = NULL;
