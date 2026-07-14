@@ -71,6 +71,19 @@ struct GnwH7B0CrcState {
     uint32_t cr;    /* POLYSIZE/REV_IN/REV_OUT; RESET self-clears. */
     uint32_t init;
     uint32_t pol;
+
+    /*
+     * Table-driven-CRC cache: table[n] is the bit-serial engine's
+     * result of feeding byte `n` into an all-zero accumulator for the
+     * *current* s->pol. Rebuilt lazily (see crc_table_for()) whenever
+     * s->pol changes, so this is purely a performance cache -- it has
+     * no effect on computed CRC values, which remain bit-identical to
+     * the bit-serial algorithm (verified against it for every
+     * POLYSIZE/REV_IN combination before landing this).
+     */
+    uint32_t table[256];
+    uint32_t table_pol;
+    bool table_valid;
 };
 
 #endif

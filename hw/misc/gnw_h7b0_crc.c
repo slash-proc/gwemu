@@ -40,27 +40,69 @@ static uint32_t bit_reverse(uint32_t v, unsigned int width_bits)
 }
 
 /*
- * One bit-serial CRC step, matching the real STM32 CRC unit's
- * documented behaviour (RM0455 "CRC calculation unit" chapter): the
- * new data word (after optional REV_IN bit-reversal) is XORed into
- * the top of the 32-bit accumulator, then shifted/XORed against the
- * polynomial one bit per input bit. gnw-chainloader's ofw_crc32()
- * only ever exercises the 32-bit/no-reversal path (explicitly forces
- * CR to that state before every use), but the smaller POLYSIZE widths
- * and REV_IN/REV_OUT are cheap to support faithfully too.
+ * Byte-at-a-time table lookup, standard MSB-first ("non-reflected")
+ * CRC construction: table[n] is what the bit-serial engine below
+ * would produce feeding byte `n` alone into a zero accumulator for
+ * the current polynomial. Processing 8 bits via one table lookup +
+ * shift + XOR is mathematically identical to running the bit-serial
+ * loop 8 times (verified by direct comparison across random inputs,
+ * all four POLYSIZE widths, and both REV_IN settings before landing
+ * this) -- this is a performance cache only, not a semantic change.
+ * Rebuilt lazily whenever s->pol changes (writes to CRC_POL are rare
+ * -- effectively init-time only -- while CRC_DR feeds are the hot
+ * path a benchmark like crypto_crc32 hammers).
+ */
+static void crc_rebuild_table(GnwH7B0CrcState *s)
+{
+    for (unsigned int n = 0; n < 256; n++) {
+        uint32_t c = (uint32_t)n << 24;
+        for (unsigned int k = 0; k < 8; k++) {
+            c = (c & 0x80000000U) ? (c << 1) ^ s->pol : (c << 1);
+        }
+        s->table[n] = c;
+    }
+    s->table_pol = s->pol;
+    s->table_valid = true;
+}
+
+static const uint32_t *crc_table_for(GnwH7B0CrcState *s)
+{
+    if (!s->table_valid || s->table_pol != s->pol) {
+        crc_rebuild_table(s);
+    }
+    return s->table;
+}
+
+/*
+ * CRC step matching the real STM32 CRC unit's documented behaviour
+ * (RM0455 "CRC calculation unit" chapter): the new data word (after
+ * optional REV_IN bit-reversal) is XORed into the top of the 32-bit
+ * accumulator, then shifted/XORed against the polynomial one bit per
+ * input bit. gnw-chainloader's ofw_crc32() only ever exercises the
+ * 32-bit/no-reversal path (explicitly forces CR to that state before
+ * every use), but the smaller POLYSIZE widths and REV_IN/REV_OUT are
+ * supported too. Implemented as a table-driven byte-at-a-time loop
+ * (see crc_rebuild_table()) instead of a 32-iteration bit-serial loop
+ * per feed -- this was found to be the dominant cost of the
+ * crypto_crc32 benchmark's ~11x QEMU-vs-real-hardware slowdown (a
+ * dedicated hardware LFSR does the bit-serial work in a couple of
+ * cycles; a host C bit-serial loop re-run on every guest MMIO write
+ * does not).
  */
 static void crc_feed(GnwH7B0CrcState *s, uint32_t data, unsigned int width_bits)
 {
     unsigned int rev_in = (s->cr & CRC_CR_REV_IN_MASK) >> CRC_CR_REV_IN_SHIFT;
+    const uint32_t *table = crc_table_for(s);
     uint32_t crc = s->dr;
 
     if (rev_in) {
         data = bit_reverse(data, width_bits);
     }
 
-    crc ^= data << (32 - width_bits);
-    for (unsigned int i = 0; i < width_bits; i++) {
-        crc = (crc & 0x80000000U) ? (crc << 1) ^ s->pol : (crc << 1);
+    for (unsigned int shift = width_bits; shift > 0; shift -= 8) {
+        uint32_t byte = (data >> (shift - 8)) & 0xFFU;
+        uint32_t idx = ((crc >> 24) ^ byte) & 0xFFU;
+        crc = (crc << 8) ^ table[idx];
     }
 
     s->dr = crc;
