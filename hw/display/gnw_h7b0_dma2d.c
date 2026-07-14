@@ -59,144 +59,130 @@ static bool gnw_h7b0_dma2d_format_bpp(uint32_t cm, int *bpp)
 }
 
 /*
- * fixed_colr is only consulted for A8 (real hardware pairs an A8 alpha
- * mask with that layer's FGCOLR/BGCOLR fixed 24-bit RGB register --
- * previously dead/unread registers in this file, now wired in for real).
+ * Buffer-based counterpart of the per-pixel physical-memory pixel decoder
+ * this replaced (see git history if the old cpu_physical_memory_read()-per-
+ * pixel version is ever needed for reference) -- decodes one pixel already
+ * sitting in a row buffer the caller batch-fetched with a
+ * single cpu_physical_memory_read() per row, instead of this function doing
+ * its own cpu_physical_memory_read() per pixel. clut256, if non-NULL, is a
+ * 256-entry ARGB8888 table pre-loaded once per transfer (not once per pixel)
+ * by gnw_h7b0_dma2d_load_clut() -- see gnw_h7b0_dma2d_do_transfer()'s row
+ * loops for why (perf profiling during 2026-07-13's LTDC investigation
+ * found the same per-pixel-cpu_physical_memory_read pattern to be a large,
+ * avoidable chunk of total emulation CPU time; DMA2D had the identical
+ * pattern, worse here since L8's CLUT lookup was a *second* physical read
+ * per pixel on top of the pixel data itself).
  */
-static uint32_t gnw_h7b0_dma2d_read_argb8888(uint32_t cm, hwaddr addr,
-                                              hwaddr clut_addr,
-                                              uint32_t fixed_colr)
+static uint32_t gnw_h7b0_dma2d_read_argb8888_buf(uint32_t cm,
+                                                  const uint8_t *buf,
+                                                  const uint32_t *clut256,
+                                                  uint32_t fixed_colr)
 {
     switch (cm) {
-    case DMA2D_INPUT_ARGB8888: {
-        uint8_t buf[4];
-        cpu_physical_memory_read(addr, buf, 4);
+    case DMA2D_INPUT_ARGB8888:
         return ldl_le_p(buf);
-    }
     case DMA2D_INPUT_RGB565: {
-        uint8_t buf[2];
-        uint16_t px;
-        unsigned int r5, g6, b5, r8, g8, b8;
-
-        cpu_physical_memory_read(addr, buf, 2);
-        px = lduw_le_p(buf);
-        r5 = (px >> 11) & 0x1F;
-        g6 = (px >> 5) & 0x3F;
-        b5 = px & 0x1F;
-        r8 = (r5 << 3) | (r5 >> 2);
-        g8 = (g6 << 2) | (g6 >> 4);
-        b8 = (b5 << 3) | (b5 >> 2);
+        uint16_t px = lduw_le_p(buf);
+        unsigned int r5 = (px >> 11) & 0x1F, g6 = (px >> 5) & 0x3F,
+                     b5 = px & 0x1F;
+        unsigned int r8 = (r5 << 3) | (r5 >> 2);
+        unsigned int g8 = (g6 << 2) | (g6 >> 4);
+        unsigned int b8 = (b5 << 3) | (b5 >> 2);
         return 0xFF000000U | (r8 << 16) | (g8 << 8) | b8;
     }
     case DMA2D_INPUT_ARGB1555: {
-        uint8_t buf[2];
-        uint16_t px;
-        unsigned int a1, r5, g5, b5, r8, g8, b8;
-
-        cpu_physical_memory_read(addr, buf, 2);
-        px = lduw_le_p(buf);
-        a1 = (px >> 15) & 0x1;
-        r5 = (px >> 10) & 0x1F;
-        g5 = (px >> 5) & 0x1F;
-        b5 = px & 0x1F;
-        r8 = (r5 << 3) | (r5 >> 2);
-        g8 = (g5 << 3) | (g5 >> 2);
-        b8 = (b5 << 3) | (b5 >> 2);
+        uint16_t px = lduw_le_p(buf);
+        unsigned int a1 = (px >> 15) & 0x1;
+        unsigned int r5 = (px >> 10) & 0x1F, g5 = (px >> 5) & 0x1F,
+                     b5 = px & 0x1F;
+        unsigned int r8 = (r5 << 3) | (r5 >> 2);
+        unsigned int g8 = (g5 << 3) | (g5 >> 2);
+        unsigned int b8 = (b5 << 3) | (b5 >> 2);
         return (a1 ? 0xFF000000U : 0U) | (r8 << 16) | (g8 << 8) | b8;
     }
     case DMA2D_INPUT_ARGB4444: {
-        uint8_t buf[2];
-        uint16_t px;
-        unsigned int a4, r4, g4, b4;
-
-        cpu_physical_memory_read(addr, buf, 2);
-        px = lduw_le_p(buf);
-        a4 = (px >> 12) & 0xF;
-        r4 = (px >> 8) & 0xF;
-        g4 = (px >> 4) & 0xF;
-        b4 = px & 0xF;
+        uint16_t px = lduw_le_p(buf);
+        unsigned int a4 = (px >> 12) & 0xF, r4 = (px >> 8) & 0xF,
+                     g4 = (px >> 4) & 0xF, b4 = px & 0xF;
         return ((a4 * 0x11U) << 24) | ((r4 * 0x11U) << 16) |
                ((g4 * 0x11U) << 8) | (b4 * 0x11U);
     }
     case DMA2D_INPUT_L8: {
-        uint8_t idx;
+        uint8_t idx = buf[0];
 
-        cpu_physical_memory_read(addr, &idx, 1);
-        if (clut_addr == 0) {
-            /* No CLUT loaded: treat as opaque grayscale, closest
-             * sane fallback rather than reading garbage memory. */
+        if (!clut256) {
             return 0xFF000000U | (idx << 16) | (idx << 8) | idx;
-        } else {
-            uint8_t buf[4];
-
-            cpu_physical_memory_read(clut_addr + (hwaddr)idx * 4, buf, 4);
-            return ldl_le_p(buf);
         }
+        return clut256[idx];
     }
-    case DMA2D_INPUT_A8: {
-        uint8_t alpha;
-
-        cpu_physical_memory_read(addr, &alpha, 1);
-        return ((uint32_t)alpha << 24) | (fixed_colr & 0x00FFFFFFU);
-    }
+    case DMA2D_INPUT_A8:
+        return ((uint32_t)buf[0] << 24) | (fixed_colr & 0x00FFFFFFU);
     default:
         return 0xFF000000U;
     }
 }
 
 /*
- * Real fetch for the JPEG device's YCbCr planes (replaces the old
- * "raw pointer hack" -- see docs/plan for the real-DOR-register JPEG
- * change this pairs with). Firmware's own polling loop
- * (HAL_JPEG_Decode()/JPEG_Process()) drains JPEG's DOR register into a
- * guest-RAM buffer at a firmware-controlled address, laid out as
- * y_plane || cb_plane || cr_plane (each plane_w*plane_h bytes) -- that
- * guest address is FGMAR here, exactly like every other input format.
- * Converts via standard BT.601 YCbCr->RGB (inverse of the JPEG device's
- * RGB->YCbCr conversion).
+ * Pre-loads a 256-entry ARGB8888 CLUT from guest memory in one bulk read,
+ * instead of gnw_h7b0_dma2d_read_argb8888()'s previous per-pixel
+ * cpu_physical_memory_read(clut_addr + idx*4). Returns false (nothing
+ * loaded) if clut_addr is 0, matching the existing "no CLUT loaded" fallback
+ * semantics.
  */
-static uint32_t gnw_h7b0_dma2d_read_ycbcr(hwaddr fg_mar, uint32_t plane_w,
-                                          uint32_t plane_h, uint32_t chroma_w,
-                                          uint32_t chroma_h, uint32_t x, uint32_t y)
+static bool gnw_h7b0_dma2d_load_clut(hwaddr clut_addr, uint32_t *clut256_out)
 {
-    /*
-     * The guest buffer is tightly packed: a full-resolution Y plane
-     * (plane_w*plane_h bytes) followed by Cb/Cr planes subsampled to
-     * chroma_w*chroma_h bytes each (per the image's real SOF0 H/V
-     * sampling factors -- matching real hardware/firmware's expected
-     * output size; serving unsubsampled chroma made our DOR output much
-     * larger than firmware's destination buffer, which then only
-     * partially drained it, leaving stale bytes in the tail -- visible
-     * as banded corruption). Reading past the real width/height (the
-     * DMA2D transfer's own NLR geometry can exceed the actual decoded
-     * image, e.g. a smaller placeholder "no cover" image) would walk
-     * into the next row's bytes (no row padding to skip) -- treat
-     * out-of-bounds columns/rows as fully transparent instead.
-     */
-    if (x >= plane_w || y >= plane_h || chroma_w == 0 || chroma_h == 0) {
-        return 0x00000000U;
+    if (clut_addr == 0) {
+        return false;
     }
 
-    uint32_t y_size = plane_w * plane_h;
-    uint32_t c_size = chroma_w * chroma_h;
-    uint32_t y_off = y * plane_w + x;
+    g_autofree uint8_t *raw = g_malloc(256 * 4);
+    cpu_physical_memory_read(clut_addr, raw, 256 * 4);
+    for (int i = 0; i < 256; i++) {
+        clut256_out[i] = ldl_le_p(raw + i * 4);
+    }
+    return true;
+}
+
+/*
+ * Real fetch for the JPEG device's YCbCr planes: firmware's own polling
+ * loop (HAL_JPEG_Decode()/JPEG_Process()) drains JPEG's DOR register into a
+ * guest-RAM buffer at a firmware-controlled address, laid out as
+ * y_plane || cb_plane || cr_plane (each plane_w*plane_h bytes, chroma
+ * planes subsampled to chroma_w*chroma_h per the image's real SOF0 H/V
+ * sampling factors) -- that guest address is FGMAR, exactly like every
+ * other input format. Converts via standard BT.601 YCbCr->RGB (inverse of
+ * the JPEG device's RGB->YCbCr conversion).
+ *
+ * Buffer-based: decodes one
+ * pixel from Y/Cb/Cr row buffers the caller batch-fetched once per output
+ * row (one cpu_physical_memory_read() each), instead of three separate
+ * per-pixel physical reads (this was the worst offender of the per-pixel
+ * MMIO pattern: 3 calls/pixel instead of 1, directly on the coverflow
+ * cover-art path STATUS.md already flags as the most expensive on-screen
+ * content). x is the column within the row buffers (row buffers already
+ * account for x >= plane_w via the caller not fetching/calling this at
+ * all for out-of-range columns).
+ */
+static uint32_t gnw_h7b0_dma2d_read_ycbcr_buf(const uint8_t *y_row,
+                                               const uint8_t *cb_row,
+                                               const uint8_t *cr_row,
+                                               uint32_t plane_w,
+                                               uint32_t chroma_w, uint32_t x)
+{
     uint32_t cx = x * chroma_w / plane_w;
-    uint32_t cy = y * chroma_h / plane_h;
-    if (cx >= chroma_w) cx = chroma_w - 1;
-    if (cy >= chroma_h) cy = chroma_h - 1;
-    uint32_t c_off = cy * chroma_w + cx;
-    uint8_t yv, cb, cr;
+    if (cx >= chroma_w) {
+        cx = chroma_w - 1;
+    }
 
-    cpu_physical_memory_read(fg_mar + y_off, &yv, 1);
-    cpu_physical_memory_read(fg_mar + y_size + c_off, &cb, 1);
-    cpu_physical_memory_read(fg_mar + (hwaddr)y_size + c_size + c_off, &cr, 1);
-
-    int yi = yv;
-    int cbi = (int)cb - 128;
-    int cri = (int)cr - 128;
-    int r = yi + (int)(1.402 * cri);
-    int g = yi - (int)(0.344136 * cbi) - (int)(0.714136 * cri);
-    int b = yi + (int)(1.772 * cbi);
+    int yi = y_row[x];
+    int cbi = (int)cb_row[cx] - 128;
+    int cri = (int)cr_row[cx] - 128;
+    /* Q16 fixed-point BT.601 constants, replaces float math for perf */
+    const int32_t c_r = 91881, c_gb = 22553, c_gr = 46802, c_b = 116130;
+    int r = yi + (c_r * cri >= 0 ? (c_r * cri) >> 16 : -((-(c_r * cri)) >> 16));
+    int g = yi - (c_gb * cbi >= 0 ? (c_gb * cbi) >> 16 : -((-(c_gb * cbi)) >> 16))
+               - (c_gr * cri >= 0 ? (c_gr * cri) >> 16 : -((-(c_gr * cri)) >> 16));
+    int b = yi + (c_b * cbi >= 0 ? (c_b * cbi) >> 16 : -((-(c_b * cbi)) >> 16));
 
     if (r < 0) r = 0; else if (r > 255) r = 255;
     if (g < 0) g = 0; else if (g > 255) g = 255;
@@ -205,8 +191,14 @@ static uint32_t gnw_h7b0_dma2d_read_ycbcr(hwaddr fg_mar, uint32_t plane_w,
     return 0xFF000000U | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
-static void gnw_h7b0_dma2d_write_output(uint32_t cm, hwaddr addr,
-                                         uint32_t argb8888)
+/*
+ * Buffer-based output pixel encoder -- encodes one
+ * pixel into an output row buffer the caller batch-writes once per row
+ * (one cpu_physical_memory_write() each) instead of one physical write per
+ * pixel.
+ */
+static void gnw_h7b0_dma2d_write_output_buf(uint32_t cm, uint8_t *buf,
+                                             uint32_t argb8888)
 {
     unsigned int a = (argb8888 >> 24) & 0xFF;
     unsigned int r = (argb8888 >> 16) & 0xFF;
@@ -214,44 +206,22 @@ static void gnw_h7b0_dma2d_write_output(uint32_t cm, hwaddr addr,
     unsigned int b = argb8888 & 0xFF;
 
     switch (cm) {
-    case DMA2D_OUTPUT_ARGB8888: {
-        uint8_t buf[4];
-
+    case DMA2D_OUTPUT_ARGB8888:
         stl_le_p(buf, argb8888);
-        cpu_physical_memory_write(addr, buf, 4);
         break;
-    }
-    case DMA2D_OUTPUT_RGB565: {
-        uint16_t px = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) |
-                                  (b >> 3));
-        uint8_t buf[2];
-
-        stw_le_p(buf, px);
-        cpu_physical_memory_write(addr, buf, 2);
+    case DMA2D_OUTPUT_RGB565:
+        stw_le_p(buf, (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) |
+                                  (b >> 3)));
         break;
-    }
-    case DMA2D_OUTPUT_ARGB1555: {
-        uint16_t px = (uint16_t)(((a & 0x80) << 8) | ((r & 0xF8) << 7) |
-                                  ((g & 0xF8) << 2) | (b >> 3));
-        uint8_t buf[2];
-
-        stw_le_p(buf, px);
-        cpu_physical_memory_write(addr, buf, 2);
+    case DMA2D_OUTPUT_ARGB1555:
+        stw_le_p(buf, (uint16_t)(((a & 0x80) << 8) | ((r & 0xF8) << 7) |
+                                  ((g & 0xF8) << 2) | (b >> 3)));
         break;
-    }
-    case DMA2D_OUTPUT_ARGB4444: {
-        uint16_t px = (uint16_t)(((a & 0xF0) << 8) | ((r & 0xF0) << 4) |
-                                  (g & 0xF0) | (b >> 4));
-        uint8_t buf[2];
-
-        stw_le_p(buf, px);
-        cpu_physical_memory_write(addr, buf, 2);
+    case DMA2D_OUTPUT_ARGB4444:
+        stw_le_p(buf, (uint16_t)(((a & 0xF0) << 8) | ((r & 0xF0) << 4) |
+                                  (g & 0xF0) | (b >> 4)));
         break;
-    }
     default:
-        qemu_log_mask(LOG_UNIMP,
-                      "gnw_h7b0_dma2d: unsupported output color mode %u\n",
-                      cm);
         break;
     }
 }
@@ -365,14 +335,20 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
     if (mode == DMA2D_MODE_R2M) {
         uint32_t ocolr = s->regs[GNW_H7B0_DMA2D_OCOLR >> 2];
         hwaddr out_stride = (hwaddr)(pixels_per_line + oor) * out_bpp;
+        hwaddr row_bytes = (hwaddr)pixels_per_line * out_bpp;
+        /* Fill color is constant for the whole transfer -- build one row
+         * of encoded pixels once and reuse it for every line, instead of
+         * re-encoding (and separately physical-writing) the same pixel
+         * pixels_per_line*lines times. */
+        g_autofree uint8_t *rowbuf = g_malloc(row_bytes);
 
+        for (uint32_t x = 0; x < pixels_per_line; x++) {
+            gnw_h7b0_dma2d_write_output_buf(out_cm, rowbuf + (hwaddr)x * out_bpp,
+                                             ocolr);
+        }
         for (uint32_t y = 0; y < lines; y++) {
-            hwaddr row = omar + (hwaddr)y * out_stride;
-
-            for (uint32_t x = 0; x < pixels_per_line; x++) {
-                gnw_h7b0_dma2d_write_output(out_cm, row + (hwaddr)x * out_bpp,
-                                            ocolr);
-            }
+            cpu_physical_memory_write(omar + (hwaddr)y * out_stride, rowbuf,
+                                      row_bytes);
         }
         return;
     }
@@ -435,25 +411,65 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
     hwaddr out_stride = (hwaddr)(pixels_per_line + oor) * out_bpp;
 
     if (mode == DMA2D_MODE_M2M_PFC) {
+        uint32_t clut256[256];
+        bool have_clut = !is_jpeg_ycbcr &&
+                          gnw_h7b0_dma2d_load_clut(fg_clut, clut256);
+        hwaddr out_row_bytes = (hwaddr)pixels_per_line * out_bpp;
+        g_autofree uint8_t *fg_linebuf = is_jpeg_ycbcr ? NULL
+            : g_malloc((hwaddr)pixels_per_line * fg_bpp);
+        g_autofree uint8_t *out_linebuf = g_malloc(out_row_bytes);
+        g_autofree uint8_t *y_row = is_jpeg_ycbcr ? g_malloc(jpeg_w) : NULL;
+        g_autofree uint8_t *cb_row = is_jpeg_ycbcr ? g_malloc(jpeg_cw) : NULL;
+        g_autofree uint8_t *cr_row = is_jpeg_ycbcr ? g_malloc(jpeg_cw) : NULL;
+
         for (uint32_t y = 0; y < lines; y++) {
-            hwaddr fg_row = fg_mar + (hwaddr)y * fg_stride;
             hwaddr out_row = omar + (hwaddr)y * out_stride;
+            bool row_in_bounds = true;
+
+            if (is_jpeg_ycbcr) {
+                row_in_bounds = y < jpeg_h;
+                if (row_in_bounds) {
+                    uint32_t y_size = jpeg_w * jpeg_h;
+                    uint32_t c_size = jpeg_cw * jpeg_ch;
+                    uint32_t cy = y * jpeg_ch / jpeg_h;
+                    if (cy >= jpeg_ch) {
+                        cy = jpeg_ch - 1;
+                    }
+                    cpu_physical_memory_read(fg_mar + (hwaddr)y * jpeg_w,
+                                             y_row, jpeg_w);
+                    cpu_physical_memory_read(
+                        fg_mar + y_size + (hwaddr)cy * jpeg_cw, cb_row,
+                        jpeg_cw);
+                    cpu_physical_memory_read(
+                        fg_mar + (hwaddr)y_size + c_size + (hwaddr)cy * jpeg_cw,
+                        cr_row, jpeg_cw);
+                }
+            } else {
+                cpu_physical_memory_read(fg_mar + (hwaddr)y * fg_stride,
+                                         fg_linebuf,
+                                         (hwaddr)pixels_per_line * fg_bpp);
+            }
 
             for (uint32_t x = 0; x < pixels_per_line; x++) {
                 uint32_t argb;
                 if (is_jpeg_ycbcr) {
-                    argb = gnw_h7b0_dma2d_read_ycbcr(fg_mar, jpeg_w, jpeg_h, jpeg_cw, jpeg_ch, x, y);
+                    argb = (row_in_bounds && x < jpeg_w)
+                        ? gnw_h7b0_dma2d_read_ycbcr_buf(y_row, cb_row, cr_row,
+                                                        jpeg_w, jpeg_cw, x)
+                        : 0x00000000U;
                 } else {
-                    argb = gnw_h7b0_dma2d_read_argb8888(
-                        fg_cm, fg_row + (hwaddr)x * fg_bpp, fg_clut, fg_colr);
+                    argb = gnw_h7b0_dma2d_read_argb8888_buf(
+                        fg_cm, fg_linebuf + (hwaddr)x * fg_bpp,
+                        have_clut ? clut256 : NULL, fg_colr);
                 }
                 unsigned int a = gnw_h7b0_dma2d_apply_alpha_mode(
                     fg_pfccr, (argb >> 24) & 0xFF);
 
                 argb = (argb & 0x00FFFFFFU) | (a << 24);
-                gnw_h7b0_dma2d_write_output(
-                    out_cm, out_row + (hwaddr)x * out_bpp, argb);
+                gnw_h7b0_dma2d_write_output_buf(
+                    out_cm, out_linebuf + (hwaddr)x * out_bpp, argb);
             }
+            cpu_physical_memory_write(out_row, out_linebuf, out_row_bytes);
         }
         return;
     }
@@ -494,34 +510,84 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
         hwaddr bg_stride = bg_is_fixed ? 0
             : (hwaddr)(pixels_per_line + bg_or) * bg_bpp;
 
+        uint32_t fg_clut256[256], bg_clut256[256];
+        bool have_fg_clut = !fg_is_fixed && !is_jpeg_ycbcr &&
+                             gnw_h7b0_dma2d_load_clut(fg_clut, fg_clut256);
+        bool have_bg_clut = !bg_is_fixed &&
+                             gnw_h7b0_dma2d_load_clut(bg_clut, bg_clut256);
+        hwaddr out_row_bytes = (hwaddr)pixels_per_line * out_bpp;
+        g_autofree uint8_t *fg_linebuf =
+            (fg_is_fixed || is_jpeg_ycbcr) ? NULL
+                : g_malloc((hwaddr)pixels_per_line * fg_bpp);
+        g_autofree uint8_t *bg_linebuf = bg_is_fixed ? NULL
+            : g_malloc((hwaddr)pixels_per_line * bg_bpp);
+        g_autofree uint8_t *out_linebuf = g_malloc(out_row_bytes);
+        g_autofree uint8_t *y_row = is_jpeg_ycbcr ? g_malloc(jpeg_w) : NULL;
+        g_autofree uint8_t *cb_row = is_jpeg_ycbcr ? g_malloc(jpeg_cw) : NULL;
+        g_autofree uint8_t *cr_row = is_jpeg_ycbcr ? g_malloc(jpeg_cw) : NULL;
+
         for (uint32_t y = 0; y < lines; y++) {
-            hwaddr fg_row = fg_mar + (hwaddr)y * fg_stride;
-            hwaddr bg_row = bg_is_fixed ? 0 : bg_mar + (hwaddr)y * bg_stride;
             hwaddr out_row = omar + (hwaddr)y * out_stride;
+            bool row_in_bounds = true;
+
+            if (is_jpeg_ycbcr) {
+                row_in_bounds = y < jpeg_h;
+                if (row_in_bounds) {
+                    uint32_t y_size = jpeg_w * jpeg_h;
+                    uint32_t c_size = jpeg_cw * jpeg_ch;
+                    uint32_t cy = y * jpeg_ch / jpeg_h;
+                    if (cy >= jpeg_ch) {
+                        cy = jpeg_ch - 1;
+                    }
+                    cpu_physical_memory_read(fg_mar + (hwaddr)y * jpeg_w,
+                                             y_row, jpeg_w);
+                    cpu_physical_memory_read(
+                        fg_mar + y_size + (hwaddr)cy * jpeg_cw, cb_row,
+                        jpeg_cw);
+                    cpu_physical_memory_read(
+                        fg_mar + (hwaddr)y_size + c_size + (hwaddr)cy * jpeg_cw,
+                        cr_row, jpeg_cw);
+                }
+            } else if (!fg_is_fixed) {
+                cpu_physical_memory_read(fg_mar + (hwaddr)y * fg_stride,
+                                         fg_linebuf,
+                                         (hwaddr)pixels_per_line * fg_bpp);
+            }
+            if (!bg_is_fixed) {
+                cpu_physical_memory_read(bg_mar + (hwaddr)y * bg_stride,
+                                         bg_linebuf,
+                                         (hwaddr)pixels_per_line * bg_bpp);
+            }
 
             for (uint32_t x = 0; x < pixels_per_line; x++) {
                 uint32_t fg;
                 if (fg_is_fixed) {
                     fg = 0xFF000000U | (fg_colr_fixed & 0x00FFFFFFU);
                 } else if (is_jpeg_ycbcr) {
-                    fg = gnw_h7b0_dma2d_read_ycbcr(fg_mar, jpeg_w, jpeg_h, jpeg_cw, jpeg_ch, x, y);
+                    fg = (row_in_bounds && x < jpeg_w)
+                        ? gnw_h7b0_dma2d_read_ycbcr_buf(y_row, cb_row, cr_row,
+                                                        jpeg_w, jpeg_cw, x)
+                        : 0x00000000U;
                 } else {
-                    fg = gnw_h7b0_dma2d_read_argb8888(
-                        fg_cm, fg_row + (hwaddr)x * fg_bpp, fg_clut, fg_colr);
+                    fg = gnw_h7b0_dma2d_read_argb8888_buf(
+                        fg_cm, fg_linebuf + (hwaddr)x * fg_bpp,
+                        have_fg_clut ? fg_clut256 : NULL, fg_colr);
                 }
                 uint32_t bg = bg_is_fixed
                     ? (0xFF000000U | (bg_colr & 0x00FFFFFFU))
-                    : gnw_h7b0_dma2d_read_argb8888(
-                          bg_cm, bg_row + (hwaddr)x * bg_bpp, bg_clut, bg_colr);
+                    : gnw_h7b0_dma2d_read_argb8888_buf(
+                          bg_cm, bg_linebuf + (hwaddr)x * bg_bpp,
+                          have_bg_clut ? bg_clut256 : NULL, bg_colr);
                 unsigned int fa = gnw_h7b0_dma2d_apply_alpha_mode(
                     fg_pfccr, (fg >> 24) & 0xFF);
                 unsigned int ba = gnw_h7b0_dma2d_apply_alpha_mode(
                     bg_pfccr, (bg >> 24) & 0xFF);
                 uint32_t argb = gnw_h7b0_dma2d_blend_over(fg, fa, bg, ba);
 
-                gnw_h7b0_dma2d_write_output(
-                    out_cm, out_row + (hwaddr)x * out_bpp, argb);
+                gnw_h7b0_dma2d_write_output_buf(
+                    out_cm, out_linebuf + (hwaddr)x * out_bpp, argb);
             }
+            cpu_physical_memory_write(out_row, out_linebuf, out_row_bytes);
         }
         return;
     }
