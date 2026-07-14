@@ -416,6 +416,28 @@ static uint32_t gnw_h7b0_ltdc_blend_over(uint32_t fg, unsigned int fg_a,
 {
     unsigned int bf1 = (bfcr >> LTDC_LxBFCR_BF1_SHIFT) & LTDC_LxBFCR_BF1_MASK;
     unsigned int bf2 = bfcr & LTDC_LxBFCR_BF2_MASK;
+
+    /*
+     * Fast paths for the two overwhelmingly common cases in any
+     * alpha-blended overlay (anti-aliased text/UI: mostly fully
+     * transparent or fully opaque pixels, with only edge pixels
+     * partially blended) -- skips the divisions below entirely. Only
+     * safe when both factors use PA (per-pixel-alpha) mode -- the
+     * default/reset BFCR value and the only mode retro-go/stock
+     * firmware's AL44 overlays configure (see the file comment above) --
+     * since with constant-alpha (non-PA) mode a "fully transparent"
+     * source pixel can still contribute via a fixed ca, and skipping the
+     * general path would silently drop that contribution.
+     */
+    if ((bf1 & LTDC_LxBFCR_MODE_PA) && (bf2 & LTDC_LxBFCR_MODE_PA)) {
+        if (fg_a == 0) {
+            return bg;
+        }
+        if (fg_a == 255 && ca == 255) {
+            return fg;
+        }
+    }
+
     unsigned int factor1 = (bf1 & LTDC_LxBFCR_MODE_PA) ? (fg_a * ca) / 255U : ca;
     unsigned int factor2_base = (bf2 & LTDC_LxBFCR_MODE_PA) ? (fg_a * ca) / 255U : ca;
     unsigned int factor2 = 255U - factor2_base;
@@ -585,6 +607,19 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
                                  l2_framebuf, (size_t)l2_src_width * nrows);
     }
 
+    /*
+     * l1_whstpos/whsppos (and l2's) don't depend on y, so the horizontal
+     * window-clip test is identical for every row -- precompute it once per
+     * column instead of re-evaluating two comparisons per pixel per row.
+     */
+    g_autofree bool *l1_x_in = g_malloc(cols * sizeof(bool));
+    g_autofree bool *l2_x_in = g_malloc(cols * sizeof(bool));
+    for (int x = 0; x < cols; x++) {
+        int abs_x = ahbp + x + 1;
+        l1_x_in[x] = abs_x >= l1_whstpos && abs_x <= l1_whsppos;
+        l2_x_in[x] = abs_x >= l2_whstpos && abs_x <= l2_whsppos;
+    }
+
     for (int y = row_start; y < row_end; y++) {
         int abs_y = avbp + y + 1;
         bool l1_row_in = abs_y >= l1_wvstpos && abs_y <= l1_wvsppos;
@@ -595,7 +630,7 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
 
         for (int x = 0; x < cols; x++) {
             int abs_x = ahbp + x + 1;
-            bool l1_in = l1_row_in && abs_x >= l1_whstpos && abs_x <= l1_whsppos;
+            bool l1_in = l1_row_in && l1_x_in[x];
             uint32_t l1_raw = l1_l8 ? s->clut[linebuf[x]]
                                     : gnw_h7b0_ltdc_rgb565_to_pixel32(
                                           lduw_le_p(linebuf + x * 2));
@@ -615,8 +650,7 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
                                                        l1_bfcr, l1_cacr, bccr);
 
             if (l2_en && l2_bpp > 0) {
-                bool l2_in = l2_row_in && abs_x >= l2_whstpos &&
-                             abs_x <= l2_whsppos;
+                bool l2_in = l2_row_in && l2_x_in[x];
                 uint32_t l2_raw;
                 unsigned int l2_alpha;
                 uint32_t l2_resolved;
