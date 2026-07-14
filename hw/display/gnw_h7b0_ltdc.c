@@ -466,13 +466,28 @@ static bool gnw_h7b0_ltdc_fb_range_dirty(MemoryRegionSection *section,
     if (len == 0) {
         return false;
     }
-    if (!section->mr) {
+    /*
+     * memory_region_snapshot_and_clear_dirty()/_get_dirty() both do
+     * assert(mr->ram_block) internally -- fine in a debug build (loud
+     * abort), but assertions compile out under NDEBUG (this project's
+     * release builds), silently proceeding into undefined behavior on
+     * a non-RAM-backed region instead. Confirmed via a real,
+     * reproducible segfault in a release/PGO build at this exact call
+     * site (deterministic: identical link-time crash address across
+     * multiple runs) -- check memory_region_is_ram() ourselves, a real
+     * runtime check that can't be compiled away, instead of trusting
+     * QEMU's own assert to catch this.
+     */
+    if (!section->mr || !memory_region_is_ram(section->mr)) {
         return true;
     }
 
     addr = section->offset_within_region;
     snap = memory_region_snapshot_and_clear_dirty(section->mr, addr, len,
                                                    DIRTY_MEMORY_VGA);
+    if (!snap) {
+        return true;
+    }
     dirty = memory_region_snapshot_get_dirty(section->mr, snap, addr, len);
     g_free(snap);
     return dirty;
