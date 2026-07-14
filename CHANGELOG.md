@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-07-14 — fixed two RAM dirty-bitmap bugs found while re-profiling the frame_integrator stutter
+
+- LTDC dirty-bitmap teardown (added alongside `3b946997d8`, meant to
+  disable `DIRTY_MEMORY_VGA` logging on the framebuffer once normal
+  VBR-paced gameplay resumes) never actually worked: it called
+  `framebuffer_update_memory_section(..., 0, 0, 0)`, which internally
+  does a zero-size `memory_region_find(root, 0, 0)` whenever the old
+  section was bound, silently re-enabling logging on whatever real RAM
+  sits at guest address 0 instead of leaving nothing tracked. Fixed by
+  tearing down directly (`memory_region_set_log(false)` + `unref` +
+  clear, no redundant lookup).
+- AXISRAM1/2/3 were declared as three separate `MemoryRegion` objects in
+  `hw/arm/gnw_h7b0_soc.c` despite real H7B0 AXI SRAM being one genuinely
+  contiguous ~1MB block (RM0455, confirmed zero gap between the three
+  subdivisions). Any guest buffer straddling one of those artificial
+  boundaries — including the actual framebuffer, which spans
+  AXISRAM1/AXISRAM2 — was unreachable via a single `memory_region_find()`
+  call, meaning the LTDC non-VBR fallback's RAM dirty-bitmap tracking
+  (landed in `343fbc19ed`) had silently failed to bind on every single
+  call since it landed, always conservatively defaulting to "assume
+  dirty." Fixed by merging the three into one `MemoryRegion` spanning
+  the real contiguous range — a more faithful hardware model, not just a
+  workaround (`a03ba2854a`).
+- Neither bug explains the pause-resume stutter's own CPU cost during
+  the burst itself (profiled at >50% of cycles in generic
+  `notdirty_write`/CPU-TLB-path machinery specifically during the
+  burst) — `tb_flush` and `tlb_flush` call frequency were both directly
+  measured and ruled out as the cause. Root mechanism still open; likely
+  in `notdirty_write`'s/`physical_memory_is_clean()`'s own dirty-bitmap-
+  client interaction, not yet traced to a conclusion.
+- A detour investigating a suspected excessive-MPU-write/`tlb_flush`
+  theory (Cortex-M `prbar_write`/`prlar_write` in `target/arm/helper.c`
+  unconditionally call `tlb_flush()` on every MPU region-config write)
+  was ruled out by direct measurement: only ~200 `tlb_flush` calls total
+  across the whole session, none during the active burst window.
+
 ## 2026-07-14 — fixed GBC-core-to-menu black screen (vbr_active idle-fallback gap)
 
 - Root cause confirmed live: the transition can end on a VBR-type

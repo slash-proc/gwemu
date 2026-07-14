@@ -44,6 +44,38 @@ path still actively drawing without reloading is (commit `3b946997d8`).
 Verified live: could no longer reproduce across repeated attempts;
 normal VBR/IMR-paced gameplay unaffected.
 
+**Two more real bugs found and fixed while re-profiling the frame_integrator
+stutter (commit `a03ba2854a`).** (1) The RAM dirty-bitmap teardown added
+alongside `3b946997d8` (disabling `DIRTY_MEMORY_VGA` logging once normal
+VBR-paced gameplay resumes) never actually worked — it called
+`framebuffer_update_memory_section(..., 0, 0, 0)`, which does a
+zero-size `memory_region_find(root, 0, 0)` internally whenever the old
+section was bound, silently re-enabling logging on whatever real RAM
+sits at guest address 0 instead of leaving nothing tracked. Fixed by
+tearing down directly. (2) AXISRAM1/2/3 were three separate
+`MemoryRegion` objects despite being one genuinely contiguous ~1MB block
+on real hardware (RM0455, zero gap between them) — any guest buffer
+straddling one of those artificial boundaries (e.g. the actual
+framebuffer, which spans AXISRAM1/2) was unreachable via a single
+`memory_region_find()` call, meaning the RAM dirty-bitmap tracking from
+item (3) above had silently failed to bind on **every single call**
+since it landed, always falling back to its safe "assume dirty"
+default — the whole optimization had never really been exercised. Fixed
+by merging the three into one region spanning the real contiguous
+range, which is also a more faithful hardware model, not just a
+workaround.
+
+Neither bug turned out to explain the pause-resume stutter's own CPU
+cost during the burst itself — that's a separate, still-open generic-TCG
+`notdirty_write`/CPU-TLB-path cost (profiled at >50% of cycles during
+the burst specifically). `tb_flush` and `tlb_flush` call frequency were
+both directly measured and ruled out (near-zero during the burst); the
+likely remaining explanation is in `notdirty_write`'s/
+`physical_memory_is_clean()`'s own dirty-bitmap-client interaction,
+not yet traced to a conclusion. See
+`docs/session-2026-07-14-perf-improvement-candidates.md` and this
+STATUS entry's commit history for the full trail before re-opening this.
+
 ## Where things stand
 
 Repo is a fork of upstream QEMU (`qemu/qemu`), pinned to tag `v11.0.2`.
