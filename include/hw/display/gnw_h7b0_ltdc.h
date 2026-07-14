@@ -314,6 +314,46 @@ struct GnwH7B0LtdcState {
     int shadow_height;
 
     /*
+     * RAM dirty-bitmap tracking for the non-VBR auto-capture fallback
+     * (see gnw_h7b0_ltdc_vblank_tick()'s else-branch): lets that path
+     * skip a full recomposite when neither layer's guest-RAM
+     * framebuffer nor any composition-affecting register has changed
+     * since the last fallback capture, instead of recompositing
+     * unconditionally on every tick. Uses the same
+     * MemoryRegionSection + DIRTY_MEMORY_VGA dirty-bitmap API as
+     * hw/display/vga.c and hw/display/framebuffer.c (this file's own
+     * structural template, pl110.c, uses the same API) -- NOT a
+     * register-write-only flag, since firmware commonly paints new
+     * pixels directly into an already-configured framebuffer without
+     * touching any LTDC register again (e.g. a game continuing to
+     * render behind a static menu overlay). fb_l1_track_base/_len and
+     * fb_l2_track_base/_len record what range each section is
+     * currently bound to, so a rebind (via
+     * framebuffer_update_memory_section(), which toggles
+     * memory_region_set_log() and is too costly to call every tick --
+     * see pl110_update_display()) only happens when the tracked range
+     * actually changes, not on every fallback check.
+     */
+    MemoryRegionSection fb_l1_section;
+    MemoryRegionSection fb_l2_section;
+    hwaddr fb_l1_track_base;
+    hwaddr fb_l1_track_len;
+    hwaddr fb_l2_track_base;
+    hwaddr fb_l2_track_len;
+    /*
+     * Secondary, additional signal alongside the RAM-dirty check above:
+     * set whenever gnw_h7b0_ltdc_reload_active() applies a fresh set of
+     * composition-affecting registers (window position, blend factors,
+     * etc.), so a register-only change with an otherwise-unwritten
+     * framebuffer (e.g. a window move) still forces a fallback
+     * recapture. Cleared once the fallback consumes it. This is
+     * deliberately NOT the primary mechanism (see the file-level
+     * rejected-attempt history) -- only an additional net to catch
+     * changes the RAM-dirty check structurally cannot see.
+     */
+    bool fb_reg_dirty;
+
+    /*
      * Layer1's hardware CLUT (L1CLUTWR), used only when active_l1pfcr
      * selects L8 -- retro-go switches Layer1 into L8 at runtime to save
      * framebuffer RAM (see Core/Src/gw_lcd.c's lcd_setup_framebuffers()/

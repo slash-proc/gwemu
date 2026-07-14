@@ -32,10 +32,17 @@
 #include "ui/pixel_ops.h"
 #include "hw/display/gnw_h7b0_ltdc.h"
 #include "hw/display/gnw_h7b0_regs_ltdc.h"
+#include "framebuffer.h"
+#include "system/address-spaces.h"
 
 static int gnw_h7b0_ltdc_capture_setup(GnwH7B0LtdcState *s);
 static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
                                         int row_end);
+static bool gnw_h7b0_ltdc_fb_dirty_check_and_clear(GnwH7B0LtdcState *s);
+static int gnw_h7b0_ltdc_layer_stride_bytes(uint32_t cfblr);
+static void gnw_h7b0_ltdc_fb_track_range(MemoryRegionSection *section,
+                                          hwaddr *cur_base, hwaddr *cur_len,
+                                          hwaddr base, hwaddr len);
 
 static bool gnw_h7b0_ltdc_enabled(GnwH7B0LtdcState *s)
 {
@@ -83,6 +90,14 @@ static void gnw_h7b0_ltdc_update_irq(GnwH7B0LtdcState *s)
 
 static void gnw_h7b0_ltdc_reload_active(GnwH7B0LtdcState *s)
 {
+    /*
+     * Composition-affecting registers are about to change -- see
+     * fb_reg_dirty's comment in gnw_h7b0_ltdc.h for why this is an
+     * additional signal alongside (not instead of) the RAM-dirty
+     * check in gnw_h7b0_ltdc_fb_dirty_check_and_clear().
+     */
+    s->fb_reg_dirty = true;
+
     s->active_l1cr = s->regs[GNW_H7B0_LTDC_L1CR >> 2];
     s->active_l1cfbar = s->regs[GNW_H7B0_LTDC_L1CFBAR >> 2];
     s->active_l1cfblr = s->regs[GNW_H7B0_LTDC_L1CFBLR >> 2];
@@ -234,8 +249,18 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
          * immediately after taking over the layers, without depending on
          * any elapsed-time guess.
          */
-        if (!s->vbr_active && !s->content_dirty && gnw_h7b0_ltdc_enabled(s)) {
+        {
+            static uint64_t n;
+            n++;
+            if (n % 60 == 1) {
+                fprintf(stderr, "[ltdc-fallback-check] vbr_active=%d content_dirty=%d enabled=%d\n",
+                        s->vbr_active, s->content_dirty, gnw_h7b0_ltdc_enabled(s));
+            }
+        }
+        if (!s->vbr_active && !s->content_dirty && gnw_h7b0_ltdc_enabled(s) &&
+            gnw_h7b0_ltdc_fb_dirty_check_and_clear(s)) {
             gnw_h7b0_ltdc_capture_if_enabled(s);
+            s->fb_reg_dirty = false;
         }
     }
 
@@ -271,6 +296,11 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
     memset(s->clut, 0, sizeof(s->clut));
     memset(s->clut2, 0, sizeof(s->clut2));
 
+    gnw_h7b0_ltdc_fb_track_range(&s->fb_l1_section, &s->fb_l1_track_base,
+                                  &s->fb_l1_track_len, 0, 0);
+    gnw_h7b0_ltdc_fb_track_range(&s->fb_l2_section, &s->fb_l2_track_base,
+                                  &s->fb_l2_track_len, 0, 0);
+
     gnw_h7b0_ltdc_reload_active(s);
     gnw_h7b0_ltdc_recalc_timers(s, now);
 }
@@ -285,6 +315,159 @@ static int gnw_h7b0_ltdc_layer_stride_bytes(uint32_t cfblr)
         stride = line_bytes;
     }
     return stride;
+}
+
+/*
+ * Bytes-per-pixel for Layer2's supported formats -- mirrors the l2_bpp
+ * switch inside gnw_h7b0_ltdc_capture_rows() (kept as a separate literal
+ * copy there rather than refactored to share this helper, to avoid
+ * touching that already-working per-pixel hot path while adding this
+ * dirty-tracking feature). Returns 0 for an unsupported/disabled format,
+ * same convention as capture_rows()'s l2_bpp.
+ */
+static int gnw_h7b0_ltdc_l2_bpp(uint32_t l2_pfcr)
+{
+    switch (l2_pfcr) {
+    case 0: return 4; /* ARGB8888 */
+    case 2: case 3: case 4: return 2; /* RGB565/ARGB1555/ARGB4444 */
+    case 5: return 1; /* L8 */
+    case 6: return 1; /* AL44 */
+    default: return 0;
+    }
+}
+
+/*
+ * Track (and rebind, only when the underlying range actually changes)
+ * one framebuffer range's MemoryRegionSection for DIRTY_MEMORY_VGA
+ * dirty-bitmap tracking, same pattern as pl110.c's s->fbsection via
+ * framebuffer_update_memory_section() -- see that function's doc
+ * comment in hw/display/framebuffer.h. Rebinding toggles
+ * memory_region_set_log() when the logging refcount transitions
+ * 0<->1, which can trigger a memory-transaction/TLB update, so this
+ * must only run when `base`/`len` actually change from what's already
+ * tracked (checked via cur_base/cur_len), not unconditionally every
+ * tick -- pl110_update_display() only calls the equivalent on
+ * s->invalidate for the same reason.
+ */
+static void gnw_h7b0_ltdc_fb_track_range(MemoryRegionSection *section,
+                                          hwaddr *cur_base, hwaddr *cur_len,
+                                          hwaddr base, hwaddr len)
+{
+    if (len == 0) {
+        if (section->mr) {
+            framebuffer_update_memory_section(section, get_system_memory(),
+                                               0, 0, 0);
+        }
+        *cur_base = 0;
+        *cur_len = 0;
+        return;
+    }
+
+    if (section->mr && *cur_base == base && *cur_len == len) {
+        return;
+    }
+
+    framebuffer_update_memory_section(section, get_system_memory(), base, 1,
+                                       len);
+    *cur_base = base;
+    *cur_len = len;
+}
+
+/*
+ * Check (and clear, so subsequent guest writes are what's tracked for
+ * next time) whether any byte in one tracked framebuffer range has been
+ * written since the last check. Returns true (dirty) whenever the range
+ * couldn't be resolved to plain guest RAM at all -- e.g.
+ * framebuffer_update_memory_section() found no backing region, a region
+ * smaller than requested, or a non-RAM region (MMIO alias, etc). Per
+ * this feature's explicit design constraint: a missed dirty write would
+ * freeze the screen permanently, so any case we can't positively prove
+ * clean must be treated as dirty.
+ */
+static bool gnw_h7b0_ltdc_fb_range_dirty(MemoryRegionSection *section,
+                                          hwaddr len)
+{
+    DirtyBitmapSnapshot *snap;
+    hwaddr addr;
+    bool dirty;
+
+    if (len == 0) {
+        return false;
+    }
+    if (!section->mr) {
+        return true;
+    }
+
+    addr = section->offset_within_region;
+    snap = memory_region_snapshot_and_clear_dirty(section->mr, addr, len,
+                                                   DIRTY_MEMORY_VGA);
+    dirty = memory_region_snapshot_get_dirty(section->mr, snap, addr, len);
+    g_free(snap);
+    return dirty;
+}
+
+/*
+ * Primary dirty-tracking check for gnw_h7b0_ltdc_vblank_tick()'s non-VBR
+ * auto-capture fallback (see that function's else-branch and
+ * fb_reg_dirty's doc comment in gnw_h7b0_ltdc.h for full rationale).
+ * Checks Layer1's and (if enabled) Layer2's actual guest-RAM
+ * framebuffer ranges via the RAM dirty bitmap -- NOT just LTDC register
+ * writes -- since firmware commonly paints new pixels directly into an
+ * already-configured framebuffer without touching any LTDC register
+ * again. ORs in fb_reg_dirty as an additional (not primary) signal for
+ * register-only composition changes (e.g. a window move) that wouldn't
+ * touch the framebuffer itself. Only called when the fallback is about
+ * to actually consume a capture decision (see call site), so it's safe
+ * for this call to also be the point where tracked ranges are
+ * (re)bound and the dirty bitmap is cleared.
+ */
+static bool gnw_h7b0_ltdc_fb_dirty_check_and_clear(GnwH7B0LtdcState *s)
+{
+    uint32_t pfcr = s->active_l1pfcr & LTDC_LxPFCR_PF_MASK;
+    bool l1_l8 = (pfcr == LTDC_PF_L8);
+    int cols = s->shadow_width;
+    int rows = s->shadow_height;
+    bool l1_dirty, l2_dirty = false;
+    hwaddr l1_len;
+
+    /* Shadow buffer not sized yet (e.g. never captured before) -- can't
+     * know the range, so force a capture attempt. */
+    if (cols <= 0 || rows <= 0) {
+        return true;
+    }
+
+    l1_len = (hwaddr)(cols * (l1_l8 ? 1 : 2)) * rows;
+    gnw_h7b0_ltdc_fb_track_range(&s->fb_l1_section, &s->fb_l1_track_base,
+                                  &s->fb_l1_track_len, s->active_l1cfbar,
+                                  l1_len);
+    l1_dirty = gnw_h7b0_ltdc_fb_range_dirty(&s->fb_l1_section, l1_len);
+
+    if (s->active_l2cr & LTDC_LxCR_LEN) {
+        uint32_t l2_pfcr = s->active_l2pfcr & LTDC_LxPFCR_PF_MASK;
+        int l2_bpp = gnw_h7b0_ltdc_l2_bpp(l2_pfcr);
+
+        if (l2_bpp > 0) {
+            int l2_src_width =
+                gnw_h7b0_ltdc_layer_stride_bytes(s->active_l2cfblr);
+            hwaddr l2_len = (hwaddr)l2_src_width * rows;
+
+            gnw_h7b0_ltdc_fb_track_range(&s->fb_l2_section,
+                                          &s->fb_l2_track_base,
+                                          &s->fb_l2_track_len,
+                                          s->active_l2cfbar, l2_len);
+            l2_dirty = gnw_h7b0_ltdc_fb_range_dirty(&s->fb_l2_section,
+                                                     l2_len);
+        } else {
+            gnw_h7b0_ltdc_fb_track_range(&s->fb_l2_section,
+                                          &s->fb_l2_track_base,
+                                          &s->fb_l2_track_len, 0, 0);
+        }
+    } else {
+        gnw_h7b0_ltdc_fb_track_range(&s->fb_l2_section, &s->fb_l2_track_base,
+                                      &s->fb_l2_track_len, 0, 0);
+    }
+
+    return l1_dirty || l2_dirty || s->fb_reg_dirty;
 }
 
 static inline uint32_t gnw_h7b0_ltdc_rgb565_to_pixel32(uint16_t px)
@@ -816,6 +999,7 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
          * only ever set (unconditionally, wrongly) from the vblank tick,
          * so IMR reloads never raised it at all.
          */
+        fprintf(stderr, "[ltdc-srcr-write] value=0x%x vbr_active_before=%d\n", value, s->vbr_active);
         if (value & LTDC_SRCR_IMR) {
             /*
              * An IMR reload means firmware is applying a fresh layer/
