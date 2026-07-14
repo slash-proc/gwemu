@@ -100,12 +100,24 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
 
     INIT_RAM_REGION(itcm, "GNW_H7B0.itcm", ITCM_BASE_ADDRESS, ITCM_SIZE);
     INIT_RAM_REGION(dtcm, "GNW_H7B0.dtcm", DTCM_BASE_ADDRESS, DTCM_SIZE);
+    /*
+     * Real H7B0 AXI SRAM is one genuinely contiguous ~1MB block (RM0455);
+     * AXISRAM1/2/3 are just documentation/sizing subdivisions of it, not
+     * separate hardware blocks -- confirmed no gap between them
+     * (AXISRAM1_BASE+SIZE == AXISRAM2_BASE, and likewise for 2->3).
+     * Modeling them as three separate MemoryRegion objects made any
+     * guest buffer straddling one of those artificial boundaries
+     * unreachable via a single memory_region_find() call -- found via
+     * live profiling when the LTDC non-VBR fallback's RAM dirty-bitmap
+     * tracking (gnw_h7b0_ltdc_fb_dirty_check_and_clear()) silently
+     * failed to bind on every call for a framebuffer that happened to
+     * span AXISRAM1/AXISRAM2. One region for the whole span is a more
+     * faithful model of the real contiguous hardware, not just a
+     * workaround, and fixes this for any future code with the same
+     * assumption.
+     */
     INIT_RAM_REGION(axisram1, "GNW_H7B0.axisram1", AXISRAM1_BASE_ADDRESS,
-                     AXISRAM1_SIZE);
-    INIT_RAM_REGION(axisram2, "GNW_H7B0.axisram2", AXISRAM2_BASE_ADDRESS,
-                     AXISRAM2_SIZE);
-    INIT_RAM_REGION(axisram3, "GNW_H7B0.axisram3", AXISRAM3_BASE_ADDRESS,
-                     AXISRAM3_SIZE);
+                     AXISRAM1_SIZE + AXISRAM2_SIZE + AXISRAM3_SIZE);
     INIT_RAM_REGION(ahbsram1, "GNW_H7B0.ahbsram1", AHBSRAM1_BASE_ADDRESS,
                      AHBSRAM1_SIZE);
     INIT_RAM_REGION(ahbsram2, "GNW_H7B0.ahbsram2", AHBSRAM2_BASE_ADDRESS,

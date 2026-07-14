@@ -499,9 +499,13 @@ struct GnwH7B0State {
 
     MemoryRegion itcm;
     MemoryRegion dtcm;
+    /*
+     * Covers AXISRAM1+2+3's whole real, genuinely contiguous ~1MB span
+     * (see gnw_h7b0_soc_realize()'s comment) -- one MemoryRegion, not
+     * three, despite the field name matching only the first
+     * subdivision's name/base.
+     */
     MemoryRegion axisram1;
-    MemoryRegion axisram2;
-    MemoryRegion axisram3;
     MemoryRegion ahbsram1;
     MemoryRegion ahbsram2;
     MemoryRegion srdsram;

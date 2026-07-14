@@ -378,9 +378,23 @@ static void gnw_h7b0_ltdc_fb_track_range(MemoryRegionSection *section,
                                           hwaddr base, hwaddr len)
 {
     if (len == 0) {
+        /*
+         * Tear down directly instead of calling
+         * framebuffer_update_memory_section(..., 0, 0, 0) -- that helper
+         * calls memory_region_find(root, 0, 0) for the "new" section
+         * whenever the old one is non-NULL, and a zero-size lookup at
+         * address 0 can still match whatever real RAM region happens to
+         * sit at guest physical address 0 (e.g. this SoC's boot flash
+         * alias), silently turning DIRTY_MEMORY_VGA logging back on for
+         * an unrelated region instead of actually leaving nothing
+         * tracked. Confirmed via profiling: this bug meant the "torn
+         * down" logging was never really gone, so the intended teardown
+         * fix had no effect.
+         */
         if (section->mr) {
-            framebuffer_update_memory_section(section, get_system_memory(),
-                                               0, 0, 0);
+            memory_region_set_log(section->mr, false, DIRTY_MEMORY_VGA);
+            memory_region_unref(section->mr);
+            section->mr = NULL;
         }
         *cur_base = 0;
         *cur_len = 0;
@@ -1052,6 +1066,28 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
         if (value & LTDC_SRCR_VBR) {
             s->vbr_reload_pending = true;
             s->vbr_active = true;
+
+            /*
+             * Tear down the RAM dirty-bitmap tracking bound for the
+             * non-VBR fallback (see gnw_h7b0_ltdc_fb_dirty_check_and_clear()
+             * and fb_reg_dirty's doc comment in gnw_h7b0_ltdc.h) now that
+             * VBR-paced double buffering is active again -- leaving
+             * DIRTY_MEMORY_VGA logging bound to the framebuffer taxes
+             * *every* guest write into it via QEMU's slow notdirty TLB
+             * path (profiled: >50% of total CPU cycles during active
+             * gameplay), and once bound it otherwise stays bound
+             * indefinitely (gnw_h7b0_ltdc_fb_track_range() only rebinds
+             * when the tracked range changes, which a game's fixed
+             * framebuffer address usually never does). The fallback lazily
+             * re-binds it the next time it's actually needed, so this is
+             * safe to tear down unconditionally here.
+             */
+            gnw_h7b0_ltdc_fb_track_range(&s->fb_l1_section,
+                                          &s->fb_l1_track_base,
+                                          &s->fb_l1_track_len, 0, 0);
+            gnw_h7b0_ltdc_fb_track_range(&s->fb_l2_section,
+                                          &s->fb_l2_track_base,
+                                          &s->fb_l2_track_len, 0, 0);
 
             /* The guest has finished drawing the frame and requested a swap.
              * Capture it NOW to avoid capturing it mid-draw during the next
