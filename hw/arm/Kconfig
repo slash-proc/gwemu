@@ -413,6 +413,7 @@ config GNW_H7B0_SOC
     select GNW_H7B0_SPI
     select GNW_H7B0_RTC
     select GNW_H7B0_CRC
+    select GNW_H7B0_HASH
     select GNW_H7B0_GPIO
     select SSI_SD
     select GNW_H7B0_DBGMCU
@@ -433,6 +434,8 @@ config GNW_H7B0_SOC
     select GNW_H7B0_TAMP
     select GNW_H7B0_WWDG
     select GNW_H7B0_TIM2
+    select GNW_H7B0_IWDG
+    select GNW_H7B0_LPUART1
 
 config B_L475E_IOT01A
     bool

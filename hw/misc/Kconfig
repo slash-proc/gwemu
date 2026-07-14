@@ -125,6 +125,9 @@ config GNW_H7B0_RTC
 config GNW_H7B0_CRC
     bool
 
+config GNW_H7B0_HASH
+    bool
+
 config GNW_H7B0_GPIO
     bool
 
@@ -337,6 +340,12 @@ config GNW_H7B0_TAMP
     bool
 
 config GNW_H7B0_WWDG
+    bool
+
+config GNW_H7B0_IWDG
+    bool
+
+config GNW_H7B0_LPUART1
     bool
 
 config GNW_H7B0_TIM2

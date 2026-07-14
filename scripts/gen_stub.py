@@ -13,7 +13,7 @@ header = f"""/* Auto-generated stub for {p_upper} */
 #ifndef HW_MISC_GNW_H7B0_{p_upper}_H
 #define HW_MISC_GNW_H7B0_{p_upper}_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_{p_upper} "gnw-h7b0-{p_lower}"
@@ -91,7 +91,7 @@ static const VMStateDescription vmstate_gnw_h7b0_{p_lower} = {{
     }}
 }};
 
-static void gnw_h7b0_{p_lower}_class_init(ObjectClass *klass, void *data)
+static void gnw_h7b0_{p_lower}_class_init(ObjectClass *klass, const void *data)
 {{
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->vmsd = &vmstate_gnw_h7b0_{p_lower};

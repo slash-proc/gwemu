@@ -71,6 +71,8 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     object_initialize_child(obj, "tamp", &s->tamp, TYPE_GNW_H7B0_TAMP);
     object_initialize_child(obj, "wwdg", &s->wwdg, TYPE_GNW_H7B0_WWDG);
     object_initialize_child(obj, "tim2", &s->tim2, TYPE_GNW_H7B0_TIM2);
+    object_initialize_child(obj, "iwdg", &s->iwdg, TYPE_GNW_H7B0_IWDG);
+    object_initialize_child(obj, "lpuart1", &s->lpuart1, TYPE_GNW_H7B0_LPUART1);
 
 
     s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
@@ -142,7 +144,6 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      * already covered by a real device model below is stubbed here so
      * accesses log instead of faulting.
      */
-    create_unimplemented_device("IWDG1", 0x58004800, 0x400);
     create_unimplemented_device("HASH", 0x48021400, 0x400);
     create_unimplemented_device("SPI3", 0x40003c00, 0x400);
     create_unimplemented_device("SPDIFRX", 0x40004000, 0x400);
@@ -200,7 +201,6 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     create_unimplemented_device("DELAY_Block_SDMMC1", 0x52008000, 0x400);
     create_unimplemented_device("RAMECC", 0x52009000, 0x400);
     create_unimplemented_device("Delay_Block_OCTOSPI2", 0x5200b000, 0x400);
-    create_unimplemented_device("LPUART1", 0x58000c00, 0x400);
     create_unimplemented_device("SPI6", 0x58001400, 0x400);
     create_unimplemented_device("I2C4", 0x58001c00, 0x400);
     create_unimplemented_device("LPTIM2", 0x58002400, 0x400);
@@ -542,6 +542,16 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->tim2), 0, TIM2_BLOCK_BASE_ADDRESS);
     gnw_h7b0_tim2_set_rcc(&s->tim2, &s->rcc);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->iwdg), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->iwdg), 0, IWDG_BASE_ADDRESS);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->lpuart1), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->lpuart1), 0, LPUART1_BASE_ADDRESS);
 
     /*
      * Remaining peripherals (DMA2D, GPIO, USART, real flash/QSPI boot)

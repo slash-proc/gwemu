@@ -58,6 +58,8 @@
 #include "hw/misc/gnw_h7b0_tamp.h"
 #include "hw/misc/gnw_h7b0_wwdg.h"
 #include "hw/misc/gnw_h7b0_tim2.h"
+#include "hw/misc/gnw_h7b0_iwdg.h"
+#include "hw/misc/gnw_h7b0_lpuart1.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_SOC "gnw-h7b0-soc"
@@ -289,6 +291,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 #define TIM2_BLOCK_SIZE          0x2800
 
 /*
+ * IWDG (independent watchdog) and LPUART1, per STM32H7B0.svd. Modeled
+ * as real (if minimal) devices, not create_unimplemented_device()
+ * stubs -- found via the sibling stm32h7b0-diag correctness-test
+ * suite's real-hardware register-dump comparison that
+ * create_unimplemented_device()'s always-reads-zero behavior made
+ * IWDG_RLR/IWDG_WINR (real reset value 0x00000FFF) and LPUART1_ISR
+ * (real reset value 0x000000C0) read wrong at reset.
+ */
+#define IWDG_BASE_ADDRESS 0x58004800
+#define LPUART1_BASE_ADDRESS 0x58000c00
+
+/*
  * CRC (hardware CRC-32 unit), per STM32H7B0.svd baseAddress
  * 0x40023000. Modeled as a real device (hw/misc/gnw_h7b0_crc.c) --
  * found once gnw-chainloader's OSPI_Init() stopped hanging (see
@@ -496,6 +510,8 @@ struct GnwH7B0State {
     GnwH7B0TampState tamp;
     GnwH7B0WwdgState wwdg;
     GnwH7B0Tim2State tim2;
+    GnwH7B0IwdgState iwdg;
+    GnwH7B0Lpuart1State lpuart1;
 
     MemoryRegion itcm;
     MemoryRegion dtcm;
