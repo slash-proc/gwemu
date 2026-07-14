@@ -80,6 +80,20 @@ static bool gnw_h7b0_ltdc_capture_if_enabled(GnwH7B0LtdcState *s)
  */
 #define GNW_H7B0_LTDC_SCALE 2
 
+/*
+ * How many consecutive vblank ticks with no SRCR write (VBR or IMR) at
+ * all count as "VBR mode has gone idle" -- see srcr_idle_ticks' doc
+ * comment in gnw_h7b0_ltdc.h. ~130ms at the nominal 60Hz vblank rate:
+ * comfortably longer than a single dropped/late frame, but much shorter
+ * than the multi-hundred-ms real gaps normal in-game stalls can produce
+ * (safe specifically because this is additionally gated on the
+ * framebuffer having genuinely new content, which a stalled game isn't
+ * producing during its stall). _MAX just bounds the counter itself so
+ * it can't silently wrap on a long-running static screen.
+ */
+#define GNW_H7B0_LTDC_SRCR_IDLE_TICKS_THRESHOLD 8
+#define GNW_H7B0_LTDC_SRCR_IDLE_TICKS_MAX 1000000
+
 static void gnw_h7b0_ltdc_update_irq(GnwH7B0LtdcState *s)
 {
     uint32_t pending = s->regs[GNW_H7B0_LTDC_ISR >> 2] &
@@ -249,15 +263,24 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
          * immediately after taking over the layers, without depending on
          * any elapsed-time guess.
          */
-        {
-            static uint64_t n;
-            n++;
-            if (n % 60 == 1) {
-                fprintf(stderr, "[ltdc-fallback-check] vbr_active=%d content_dirty=%d enabled=%d\n",
-                        s->vbr_active, s->content_dirty, gnw_h7b0_ltdc_enabled(s));
-            }
+        if (s->srcr_idle_ticks < GNW_H7B0_LTDC_SRCR_IDLE_TICKS_MAX) {
+            s->srcr_idle_ticks++;
         }
-        if (!s->vbr_active && !s->content_dirty && gnw_h7b0_ltdc_enabled(s) &&
+        /*
+         * A transition can end on a VBR-type reload (not IMR) with no
+         * further reloads ever coming, permanently latching vbr_active
+         * true with nothing left to reset it -- see srcr_idle_ticks'
+         * doc comment in gnw_h7b0_ltdc.h. Once VBR has gone idle for
+         * GNW_H7B0_LTDC_SRCR_IDLE_TICKS_THRESHOLD ticks, allow the
+         * fallback even with vbr_active still true, but ONLY alongside
+         * the same RAM-dirty requirement as the normal case -- a stalled
+         * game isn't writing new framebuffer content during its stall,
+         * so this can't spuriously re-arm mid-game the way a bare
+         * elapsed-time guess did.
+         */
+        bool vbr_idle = s->srcr_idle_ticks >= GNW_H7B0_LTDC_SRCR_IDLE_TICKS_THRESHOLD;
+        if ((!s->vbr_active || vbr_idle) && !s->content_dirty &&
+            gnw_h7b0_ltdc_enabled(s) &&
             gnw_h7b0_ltdc_fb_dirty_check_and_clear(s)) {
             gnw_h7b0_ltdc_capture_if_enabled(s);
             s->fb_reg_dirty = false;
@@ -288,6 +311,7 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
     s->vbr_reload_pending = false;
     s->vbr_deferred_capture = false;
     s->vbr_active = false;
+    s->srcr_idle_ticks = 0;
 
     g_free(s->shadow_buffer);
     s->shadow_buffer = NULL;
@@ -999,7 +1023,7 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
          * only ever set (unconditionally, wrongly) from the vblank tick,
          * so IMR reloads never raised it at all.
          */
-        fprintf(stderr, "[ltdc-srcr-write] value=0x%x vbr_active_before=%d\n", value, s->vbr_active);
+        s->srcr_idle_ticks = 0;
         if (value & LTDC_SRCR_IMR) {
             /*
              * An IMR reload means firmware is applying a fresh layer/

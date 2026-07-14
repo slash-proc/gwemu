@@ -354,6 +354,28 @@ struct GnwH7B0LtdcState {
     bool fb_reg_dirty;
 
     /*
+     * Counts consecutive gnw_h7b0_ltdc_vblank_tick() calls since the last
+     * SRCR write of any kind (VBR or IMR) -- reset to 0 on every SRCR
+     * write, incremented each tick otherwise. Lets the non-VBR fallback
+     * also fire once VBR mode has gone idle for a while even though
+     * vbr_active is still latched true (see the vblank_tick() else-
+     * branch's comment): a firmware transition can end on a VBR-type
+     * reload (not IMR) with no further reloads ever coming, which
+     * otherwise permanently blocks the fallback with no other signal
+     * that VBR pacing has actually stopped. Gated ALWAYS alongside the
+     * RAM-dirty check (gnw_h7b0_ltdc_fb_dirty_check_and_clear()), not
+     * used alone -- a bare elapsed-time idle guess was tried and
+     * reverted previously specifically because normal in-game stalls
+     * (real, multi-hundred-ms VBR gaps, e.g. the SMW APU-catchup-burst
+     * case) spuriously re-armed it and reintroduced mid-draw tearing;
+     * requiring the framebuffer to also have genuinely new, uncaptured
+     * content avoids that, since a stalled game isn't writing new frame
+     * data during its stall, only a firmware path that's still actively
+     * drawing without reloading (the actual failure mode here) is.
+     */
+    int srcr_idle_ticks;
+
+    /*
      * Layer1's hardware CLUT (L1CLUTWR), used only when active_l1pfcr
      * selects L8 -- retro-go switches Layer1 into L8 at runtime to save
      * framebuffer RAM (see Core/Src/gw_lcd.c's lcd_setup_framebuffers()/
