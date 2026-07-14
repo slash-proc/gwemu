@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-07-14 — fixed DMA2D R2M and CRC_POL bugs; narrowed LTDC idle-fallback trigger
+
+- Fixed two real device-model bugs reported by the sibling
+  `stm32h7b0-diag` correctness-test suite (real-hardware comparison,
+  both confirmed against RM0455): DMA2D's R2M fill mode was
+  double-converting `OCOLR` (real firmware already pre-packs it into
+  the output format, so the emulator's own ARGB8888-assuming encoder
+  was converting it a second time); `CRC_POL`'s reset value was
+  `0x00000000` instead of the real `0x04C11DB7`, inherited from an
+  incorrect `STM32H7B0.svd` reset-value entry (`7f5c5afbe0`).
+- Narrowed the LTDC non-VBR idle-fallback (`srcr_idle_ticks`, from the
+  GBC-menu black-screen fix) to also require evidence of a genuine
+  structural layer-config change (pixel format/layer-enable/window
+  geometry, excluding CFBAR which flips every frame during normal
+  double buffering) before overriding a still-true `vbr_active`
+  (`87168aeef3`) — confirmed live that ordinary in-game frame-skipping
+  (the same `frame_integrator` mechanism behind the general stutter)
+  also suppresses VBR reloads for the same duration as a genuine
+  abandoned transition, so the idle timer alone fired just as often
+  during normal stutter as during the real bug, risking mid-draw
+  tearing/flicker. **This fix has not yet been re-confirmed against the
+  actual reported menu-flicker regression** — it was developed while
+  chasing a different, unconfirmed lead (zelda3's attract loop) and still needs
+  verification against the real repro.
+
 ## 2026-07-14 — fixed two RAM dirty-bitmap bugs found while re-profiling the frame_integrator stutter
 
 - LTDC dirty-bitmap teardown (added alongside `3b946997d8`, meant to

@@ -2,6 +2,30 @@
 
 Last updated: 2026-07-14
 
+**Two real device-model bugs fixed (2026-07-14, commit `7f5c5afbe0`),
+found by the sibling `stm32h7b0-diag` correctness-test suite's real-
+hardware comparison.** DMA2D's R2M (solid-fill) mode was applying a
+second, spurious color-format conversion to `OCOLR` on top of the one
+real firmware already performs before writing it, corrupting every
+fill whose output format wasn't ARGB8888 (RM0455 18.3.9/18.5.15-18.5.18
+confirm OCOLR is pre-packed into the output format already). `CRC_POL`'s
+modeled reset value was `0x00000000` (inherited from an incorrect
+`STM32H7B0.svd` `<resetValue>`) instead of the real `0x04C11DB7`
+(RM0455 22.4.5). Both fixed, build clean, smoke-tested.
+
+**Reported menu-flicker regression — NOT YET CONFIRMED/reproduced
+against the real scenario.** A `srcr_idle_ticks`-based fix was applied
+after chasing a *different* lead (zelda3's attract loop spuriously
+triggering the LTDC non-VBR fallback during ordinary frame-skipping,
+not menu content) — see
+`docs/session-2026-07-14-perf-improvement-candidates.md`'s LTDC section
+and [[project_qemu_gnw_ltdc_vbr_and_stutter]] for the mix-up. That fix
+(gating the idle-fallback on a genuine structural layer-config change,
+not just an idle timer) is real and defensible on its own merits, but
+was never actually confirmed against the original menu-flicker report.
+Next session: reproduce the actual menu flicker first, don't assume
+it's fixed.
+
 **Performance-improvement candidates (2026-07-14) — landed.** Full
 writeup: `docs/session-2026-07-14-perf-improvement-candidates.md`. Of
 the four viable candidates: (1) DMA2D's YCbCr->RGB conversion now uses
