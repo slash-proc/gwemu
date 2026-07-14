@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-07-14 — IWDG/LPUART1 device models, CRC table-driven perf fix, DWT debug-print removal
+
+- Added real minimal IWDG/LPUART1 device models replacing bare
+  `create_unimplemented_device()` stubs, fixing wrong reset values
+  (`IWDG_RLR`/`IWDG_WINR` real value `0x00000FFF`, `LPUART1_ISR` real
+  value `0x000000C0` — both previously read `0x00000000`) found by the
+  sibling `stm32h7b0-diag` suite's real-hardware comparison
+  (`347ca514dc`). Also fixed two latent bugs in `scripts/gen_stub.py`
+  itself this exposed (outdated `hw/sysbus.h` include path, outdated
+  `class_init` signature — both predating this fork's v11.0.2 pin).
+- Replaced `hw/misc/gnw_h7b0_crc.c`'s bit-serial (32-iteration-per-word)
+  CRC-32 computation with the standard table-driven byte-at-a-time
+  algorithm, fixing a ~11x QEMU-vs-hardware wall-clock slowdown the
+  diag suite's `crypto_crc32` benchmark found. Verified bit-identical
+  across 64,000 random trials (`1d6506baea`).
+- Removed an unconditional, un-rate-limited `fprintf()` on *every
+  single* DWT register access in `hw/misc/gnw_h7b0_dwt.c` (committed
+  since `d6a56195c7`, never noticed) — `DWT_CYCCNT` is the standard ARM
+  cycle counter real firmware uses for precise timing measurement, so
+  this was a real, previously-unnoticed source of wall-clock inflation
+  for exactly the kind of timing-sensitive benchmarks the diag suite
+  has been flagging as broadly slower in QEMU (`93d54eb378`). Also
+  cleaned up two lower-severity one-shot (not per-access) debug prints
+  in `hw/arm/armv7m.c` found in the same sweep; confirmed via a full
+  audit that no other `gnw_h7b0_*` device model has an unconditional
+  per-access print (the one exception, `gnw_h7b0_gpio.c`'s
+  `[gpio-debug]`, is gated on human button-press events, not a hot
+  path, and was left alone).
+- Investigated (not fixed) `hash_sha256`'s reported ~400x QEMU slowdown:
+  confirmed `hw/misc/gnw_h7b0_hash.c` is already properly incremental
+  (buffers into a message array, calls `qcrypto_hash_bytes()` once at
+  finalize, not a naive per-word recompute) and the crypto backend
+  itself is fast in isolation (~2ms for the exact benchmark workload on
+  this host) — the remaining gap is most likely generic QEMU MMIO/TCG
+  dispatch overhead across many register accesses (compounded by the
+  DWT bug above, now fixed) rather than a HASH-specific bug. Not fully
+  root-caused; live in-QEMU profiling was attempted but blocked by
+  environment process-management flakiness.
+
 ## 2026-07-14 — fixed DMA2D R2M and CRC_POL bugs; narrowed LTDC idle-fallback trigger
 
 - Fixed two real device-model bugs reported by the sibling
