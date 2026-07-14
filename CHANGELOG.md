@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-07-14 — general post-pause stutter: definitive root cause confirmed via direct hardware-vs-QEMU comparison
+
+- Full writeup: `docs/session-2026-07-14-frame-integrator-hw-vs-qemu-comparison.md`.
+- Supersedes the 2026-07-13 part 6 SysTick/`-icount` hypothesis below with
+  a precise, confirmed mechanism, found by directly comparing identical
+  breakpoint-based traces on QEMU and real hardware side by side (no
+  resets, attached to an already-paused live repro on both), at the
+  user's explicit direction after pushing back on treating this as
+  inherent/unfixable.
+- Root cause: `game-and-watch-retro-go-sd`'s `Core/Src/porting/common.c`
+  (`common_emu_frame_loop()`/`open_pause_menu()`, shared by every core)
+  tracks a leaky integrator (`frame_integrator`) of how far behind real
+  time the emulated core is, and runs the core 2x per iteration
+  (`skip_frames=2`) to pay off a backlog. On real hardware that costs a
+  negligible fraction of a real frame at native clock speed, so the
+  integrator stays in a small, bounded, spike-free steady-state
+  (confirmed live: -2500 to -5000 across 60 samples, zero spikes). Under
+  QEMU/TCG, that same catch-up work is measurably slow, and its own
+  execution cost inflates the *next* iteration's measured elapsed time —
+  feeding back into the integrator and demanding more catch-up, a
+  genuine positive feedback loop confirmed live on QEMU (real spikes:
+  6445→8112→11279 across three consecutive samples) that's structurally
+  impossible on real hardware but forms naturally under TCG.
+- Not a QEMU device-model bug. Two candidate real fixes identified, not
+  yet implemented: clamping `frame_integrator`'s growth in the firmware
+  (lowest-risk, now explicitly in-scope per the user), or `-icount`
+  (bigger, not yet confirmed against this specific mechanism in
+  isolation).
+- Tooling notes: this fork's gdbstub acks `Z1` (hardware breakpoint) set
+  requests but they silently never trigger — use `Z0` (software
+  breakpoint) instead. `OCDBackend["openocd"]().open()` in default
+  `attach` mode does not reset the target, confirmed safe to attach to a
+  live, already-running/paused real device mid-session.
+
 ## 2026-07-13 (later same day, part 6) — general stutter root cause found: SysTick tick-loss under TCG load; `-icount` scoped as the real fix
 
 - Full writeup: `docs/session-2026-07-13-part5-retro-go-ltdc-vbr-and-stutter-investigation.md`

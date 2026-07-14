@@ -61,9 +61,13 @@ register-visible). Next-session starting point (already narrowed to
 `docs/session-2026-07-12-breakpoint-lockstep-tracing.md` part 20.
 
 **Retro-go pause-overlay flicker + main-menu black-screen — RESOLVED.
-General gameplay stutter — root cause found (SysTick tick-loss under
-TCG load); real fix is `-icount`, scoped as a separate follow-up.**
-Full writeup: `docs/session-2026-07-13-part5-retro-go-ltdc-vbr-and-stutter-investigation.md`.
+General post-pause gameplay stutter — root cause definitively confirmed
+via direct hardware-vs-QEMU comparison: `frame_integrator` positive
+feedback loop in shared retro-go firmware code, not a QEMU device-model
+bug.** Full writeup:
+`docs/session-2026-07-13-part5-retro-go-ltdc-vbr-and-stutter-investigation.md`
+and `docs/session-2026-07-14-frame-integrator-hw-vs-qemu-comparison.md`
+(the definitive one — read this one first for the stutter specifically).
 The no-VBR auto-capture fallback in `gnw_h7b0_ltdc_vblank_tick()` (added
 `1663797f50`, flagged by its own commit message as a flicker-regression
 risk) needed to distinguish "firmware that never uses VBR" (gnwmanager,
@@ -82,34 +86,38 @@ default, and repeated hard `kill`s of QEMU mid-session while games were
 running had genuinely corrupted the backing files — fresh copies fixed
 it immediately, no code involved.
 
-The general gameplay stutter the user flagged as the real priority
-turned out to have a shared root cause across completely unrelated
-emulator cores (confirmed via PC-sampling both SMW's SNES engine and
-Link's Awakening DX's gnuboy GBC core mid-stutter — both showed their
-hottest code in their own audio-rendering function, `smw__dsp_cycle` and
-`apu_snd::render` respectively). A dynamic DMAMUX-based DMA/SAI1 rebind
-mechanism (added `77e86eacdd` for stock-Zelda/OFW compatibility) was a
-strong suspect but was ruled out live (traced, only fired 3 times, all
-during boot, none during the freezes). The actual mechanism: during a
-freeze, live register reads showed the system genuinely parked on bare
-HSI (both CSI and PLL1 disabled) for 5+ real seconds after a STOP2
-sleep/wake cycle (retro-go's idle "attract loop" power-saving path,
-`game-and-watch-retro-go-sd`'s `Core/Src/gw_sleep.c`), with `uwTick`
-still incrementing but at ~228/sec instead of ~1000/sec. Root cause:
-SysTick's pending-IRQ state is a single bit, not a counter — under
-QEMU/TCG, `SysTick_Handler` takes far longer in real wall-clock time to
-execute than on real hardware, so a tick that fires while the CPU is
-still busy with the *previous* one is silently lost, no matter how
-correctly `hw/core/ptimer.c` schedules its own deadlines. This is
-consistent with (and refines) the already-known "~2x tick rate gap"
-below, and also applies to SMW's own catchup-burst finding (real guest
-firmware behavior, imperceptible on real hardware, made visible here by
-the same TCG-speed mismatch). **Decision, agreed with the user**: this
-needs `-icount` (deterministic instruction-scaled virtual time) to
-actually fix, not another device-model patch — tracked as a separate,
-larger follow-up effort, since it's a global timing-model change that
-needs re-validating `gnw_h7b0_dma.c`'s accumulator-scheduled timers,
-LTDC's vblank period, and SAI1 audio pacing against it.
+The general gameplay stutter the user flagged as the real priority went
+through several superseded hypotheses (SysTick tick-loss under TCG load;
+a dynamic DMAMUX-based DMA/SAI1 rebind mechanism added `77e86eacdd` for
+stock-Zelda/OFW compatibility, ruled out live via call-frequency tracing;
+a STOP2-sleep/HSI-clock-stuck freeze, confirmed real but a *different*,
+narrower bug) before the user correctly pushed back on treating this as
+inherent/unfixable and asked for a direct hardware comparison instead of
+more QEMU-side theorizing. That comparison — same two breakpoints, same
+repro, no resets, run side-by-side on QEMU and real hardware — found the
+actual, precise, confirmed mechanism: `Core/Src/porting/common.c`'s
+`common_emu_frame_loop()` (shared by every core: SMW, zelda3, gnuboy/
+tgbdual, Celeste) tracks a leaky integrator (`frame_integrator`) of "how
+far behind real time is the emulated core," and asks the core to run 2x
+per iteration (`skip_frames=2`) to pay off a backlog. On real hardware
+that 2x catch-up work costs a negligible sliver of a real frame at
+native ~340MHz, so the integrator settles into a small, bounded,
+spike-free steady-state (confirmed live: -2500 to -5000, zero spikes
+across 60 samples). Under QEMU/TCG, that same catch-up work is
+measurably slow, and its own execution cost shows up as a large
+`elapsed_10us` on the *next* iteration — feeding right back into the
+integrator and demanding *more* catch-up: a genuine positive feedback
+loop, confirmed live (QEMU showed real spikes: 6445→8112→11279 across
+three consecutive samples) that is structurally impossible on real
+hardware but forms naturally under TCG interpretation. Not a QEMU
+device-model bug, not a firmware bug in the conventional sense (correct,
+battle-tested logic on real hardware) — an emergent interaction between
+a real-time control loop and a host that can't always execute its "make
+up for lost time" work fast enough. See the 2026-07-14 doc for the full
+trace data and candidate fixes (clamping `frame_integrator`'s growth in
+the firmware — lowest-risk, now explicitly in-scope per the user's
+direction — vs. `-icount`, bigger/riskier, not yet confirmed to resolve
+this specific mechanism on its own).
 
 **Actively in progress:** getting *stock* (official Nintendo, unpatched)
 Game & Watch firmware booting to visible display output — separate from
