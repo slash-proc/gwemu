@@ -391,11 +391,20 @@ struct GnwH7B0LtdcState {
      * screen, routine frame swap." Required, alongside srcr_idle_ticks
      * crossing its threshold, before the non-VBR fallback is allowed to
      * override a still-true vbr_active -- see srcr_idle_ticks' doc
-     * comment for why the idle-timer signal alone isn't enough. Not
-     * cleared after being consumed: once idle_ticks resets on the next
-     * genuine SRCR write (VBR resuming normally), the fallback is gated
-     * off again regardless of this flag's value, so leaving it set
-     * causes no harm and needs no explicit reset.
+     * comment for why the idle-timer signal alone isn't enough. Reset
+     * to false on every SRCR write (alongside srcr_idle_ticks), not
+     * just when consumed by the fallback -- an earlier "sticky forever"
+     * design was confirmed live to be a real bug: since srcr_idle_ticks
+     * alone crosses its threshold during ordinary stutter too, leaving
+     * this flag permanently armed after a single genuine transition
+     * anywhere in a session meant every later stutter burst re-
+     * triggered the fallback, causing a real, self-inflicted
+     * tlb_reset_dirty/notdirty-write cost (confirmed via profiling:
+     * gnw_h7b0_ltdc_fb_dirty_check_and_clear()'s own
+     * memory_region_snapshot_and_clear_dirty() call forces the
+     * framebuffer's TLB entries back into slow tracking every time it
+     * runs). gnw_h7b0_ltdc_reload_active() re-arms it if the write that
+     * triggered this reset is itself a genuine structural change.
      */
     bool structural_transition_pending;
 

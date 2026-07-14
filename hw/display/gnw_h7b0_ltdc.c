@@ -1072,6 +1072,20 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
          * so IMR reloads never raised it at all.
          */
         s->srcr_idle_ticks = 0;
+        /*
+         * Reset alongside srcr_idle_ticks, not just when the idle-
+         * fallback consumes it -- confirmed via live profiling that
+         * leaving this "sticky" (as originally designed) meant a single
+         * genuine transition anywhere in a session left it permanently
+         * armed, so EVERY later ordinary stutter burst (which also
+         * crosses the srcr_idle_ticks threshold, see that field's doc
+         * comment) re-triggered the fallback for the rest of the
+         * session, reintroducing the self-inflicted tlb_reset_dirty/
+         * notdirty churn this was meant to avoid. reload_active() below
+         * re-arms it if THIS write's reload is itself a genuine
+         * structural change.
+         */
+        s->structural_transition_pending = false;
         if (value & LTDC_SRCR_IMR) {
             /*
              * An IMR reload means firmware is applying a fresh layer/
