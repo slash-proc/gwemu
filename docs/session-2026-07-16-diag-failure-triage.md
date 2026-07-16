@@ -8,12 +8,13 @@ everything else**. Baseline snapshot (main checkout, before this pass):
 `docs/session-2026-07-16-perf-expert-panel-and-jpeg-encode.md` for how
 that baseline was captured).
 
-**Current confirmed state (main checkout, all three priority-1/2 fixes
-applied and independently verified by the coordinator): 85 OK / 18 FAIL
-(0 genuine UNRUN — one blocked case remains, see JPEG section below;
-some residual "UNRUN" count in raw harness output is blank padding slots
-beyond the real registered case count, a harness quirk, not a real
-gap).**
+**Current confirmed state (main checkout, everything through priority 4g
+applied and independently verified live): every genuinely-broken case
+found this session is fixed. The only remaining FAIL seen in the latest
+full-suite run (`gpio_output_readback`) is believed to be host-contention
+flakiness, not a real bug -- see priority 4g. (Residual "UNRUN" counts in
+raw harness output are blank padding slots beyond the real registered
+case count, a harness quirk, not a real gap.)**
 
 ## Priority 1 — CRC32: FIXED ✅
 
@@ -205,12 +206,81 @@ Both cases verified live.
 
 **Files changed**: `hw/misc/gnw_h7b0_dac.c`.
 
-## Priority 4d — everything else (3 remaining fails, NOT YET TRIAGED individually)
+## Priority 4d — CRC16 reconfig: FIXED ✅
 
-Confirmed current fails after re-running the full live suite with CRC32 +
-HASH/HMAC + LTDC + JPEG + DMA1/DMA2/MDMA m2m + RNG + DAC1/DAC2 all applied
-(2026-07-16): `crypto_crc16_reconfig`, `timer_tim6_update`,
-`exti_edge_config`.
+`crypto_crc16_reconfig` reconfigures `CR.POLYSIZE` to 16-bit and expects
+a real CRC-16/CCITT-FALSE result. The CRC device model's table-driven
+accumulator (`crc_rebuild_table()`/`crc_feed()`/`crc_read_dr()`) was
+hardcoded to always operate as a 32-bit-wide LFSR (`n << 24`, testing bit
+31) regardless of `CR.POLYSIZE` -- so a 16-bit-configured CRC silently
+computed a 32-bit-algorithm result instead. Fixed by deriving the
+accumulator width from `CR.POLYSIZE` (`crc_width_bits()`) and
+parameterizing the table build, feed, and read-out on that width, instead
+of a hardcoded 32.
+
+**Files changed**: `hw/misc/gnw_h7b0_crc.c`, `include/hw/misc/gnw_h7b0_crc.h`.
+
+## Priority 4e — TIM6 update timing (and a much bigger, project-wide bug): FIXED ✅
+
+`timer_tim6_update` looked like a missing-TIM6-model problem at first, but
+TIM6 (and TIM3/4/5/7) *are* already covered by `gnw_h7b0_tim2.c`'s shared
+TIM2-TIM14-block device (`soc.h`'s `TIM2_BLOCK_BASE_ADDRESS`, 6 real
+instances on the correct 0x400 stride). The actual bug: the write handler
+looked up `get_tim2_write_mask(addr)`/reset applied
+`get_tim2_reset_value(i*4)` using the *raw block-wide* address --
+but those auto-generated tables (from a single TIM2 instance's own
+register layout) only recognize offsets within the first 0x400 window.
+Every instance past TIM2 itself (TIM3-TIM7) hit their `default:` case
+(mask 0) for **every single register**, silently turning every write to
+TIM3-TIM7 -- CR1, PSC, ARR, SR, all of it -- into a no-op, project-wide,
+for any firmware, not just this diag case. Confirmed via debug
+instrumentation: `TIM6->CR1 = TIM_CR1_CEN` never actually set the
+in-memory CR1 bit, so `gnw_h7b0_tim2_start_counting()` never ran; more
+subtly, firmware's own `TIM6->SR = 0` (meant to clear the UIF that the
+existing EGR.UG side-effect had just set) was *also* silently dropped,
+so the busy-wait loop saw UIF already latched from the earlier EGR.UG
+write and returned near-instantly with a bogus low cycle count.
+
+Fixed by folding to the per-instance local offset (`addr & 0x3ff`)
+before consulting either table, matching what the existing EGR/CR1
+side-effect logic several lines below already correctly did.
+
+**Files changed**: `hw/misc/gnw_h7b0_tim2.c`.
+
+## Priority 4f — EXTI SWIER->PR1 (fixes exti_edge_config AND exti_sw_trigger): FIXED ✅
+
+`exti_edge_config`'s own header comment claimed its final SWIER-related
+assertion was *expected* to fail, citing `case_exti_sw_trigger.c`'s
+documented "SWIER doesn't set PR1" hardware anomaly -- but
+`case_exti_sw_trigger.c` itself carries a newer (same-session,
+2026-07-16) "BUG FIX" comment superseding that: confirmed empirically
+against real hardware, SWIER *does* latch PR1, but only for a line with
+an edge direction armed (`RTSR1`/`FTSR1`) -- SWIER feeds a synthetic edge
+through the same edge-detect logic those registers configure, rather
+than bypassing it outright. `exti_edge_config`'s comment was written
+against the pre-fix understanding and never updated. Since
+`exti_edge_config` always arms `RTSR1`/`FTSR1` before each SWIER probe,
+its PR1 assertions should genuinely pass on real hardware -- and our
+EXTI model didn't implement SWIER1's side effect at all (plain
+read/write shadow), so PR1 could never latch that way regardless of
+RTSR1/FTSR1, failing both this case and `exti_sw_trigger` deterministically.
+
+Fixed by adding the real SWIER1 side effect: on a SWIER1 write, any bit
+also armed in `RTSR1|FTSR1` and unmasked in `CPUIMR1` sets `CPUPR1` and
+pulses the matching NVIC line, matching the empirically-confirmed
+edge-detect-logic behavior.
+
+**Files changed**: `hw/misc/gnw_h7b0_exti.c`.
+
+## Priority 4g — remaining: only known-flaky (host-contention) fails left
+
+After all of the above, a full suite re-run showed **zero** confirmed-stable
+fails. `gpio_output_readback` reappeared as FAIL in this run (previously
+seen passing and failing across different runs this session, consistent
+with the host-contention-flake pattern already established for
+`dwt_vs_systick`/`exti_sw_trigger`/`boot_option_bytes` earlier) -- re-run
+on a quiet host before treating it as real. No other case in the same run
+failed.
 
 Also appearing as FAIL in this same run, worth double-checking for
 host-contention flake vs. real regression before triaging (this host has

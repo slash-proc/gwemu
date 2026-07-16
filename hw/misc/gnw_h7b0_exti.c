@@ -12,6 +12,7 @@
 
 #define EXTI_RTSR1   (GNW_H7B0_EXTI_RTSR1_OFFSET >> 2)
 #define EXTI_FTSR1   (GNW_H7B0_EXTI_FTSR1_OFFSET >> 2)
+#define EXTI_SWIER1  (GNW_H7B0_EXTI_SWIER1_OFFSET >> 2)
 #define EXTI_CPUIMR1 (GNW_H7B0_EXTI_CPUIMR1_OFFSET >> 2)
 #define EXTI_CPUPR1  (GNW_H7B0_EXTI_CPUPR1_OFFSET >> 2)
 
@@ -104,6 +105,41 @@ static void gnw_h7b0_exti_write(void *opaque, hwaddr addr, uint64_t val64, unsig
 
     uint32_t mask = get_exti_write_mask(addr);
     s->regs[addr >> 2] = (s->regs[addr >> 2] & ~mask) | ((uint32_t)val64 & mask);
+
+    /*
+     * SWIER1 (software interrupt event register): each set bit is
+     * meant to force that line's pending bit, but NOT unconditionally
+     * -- confirmed empirically against real hardware (this repo has no
+     * Reference Manual): with no edge direction selected at all, SWIER1
+     * never sets PR1, for every line tried. Setting RTSR1 (or FTSR1)
+     * for the line, even with no real physical edge to detect, is what
+     * makes it latch -- SWIER turns out to feed a synthetic edge
+     * through the same edge-detect logic RTSR/FTSR configure, rather
+     * than bypassing it outright. See
+     * stm32h7b0-diag/fw/cases/case_exti_sw_trigger.c's 2026-07-16 "BUG
+     * FIX" header comment for the full empirical trail this is modeled
+     * on. Previously unimplemented entirely (SWIER1 was a plain
+     * read/write shadow with no side effect), which meant PR1 could
+     * never be set this way at all, regardless of RTSR1/FTSR1 --
+     * failing stm32h7b0-diag's exti_sw_trigger/exti_edge_config cases
+     * (both of which expect PR1 to latch once an edge direction is
+     * armed) even though the RTSR1/FTSR1 register round-trip itself was
+     * already correct.
+     */
+    if ((addr >> 2) == EXTI_SWIER1) {
+        uint32_t armed = s->regs[EXTI_RTSR1] | s->regs[EXTI_FTSR1];
+        uint32_t fired = (uint32_t)val64 & armed & (s->regs[EXTI_CPUIMR1]);
+
+        s->regs[EXTI_CPUPR1] |= fired;
+        while (fired) {
+            int line = ctz32(fired);
+            int idx = line_to_irq_index(line);
+            if (idx >= 0) {
+                qemu_irq_pulse(s->irq[idx]);
+            }
+            fired &= fired - 1;
+        }
+    }
 }
 
 static const MemoryRegionOps gnw_h7b0_exti_ops = {
