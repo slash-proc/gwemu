@@ -36,8 +36,10 @@
 #include "system/address-spaces.h"
 
 static int gnw_h7b0_ltdc_capture_setup(GnwH7B0LtdcState *s);
-static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
-                                        int row_end);
+static void gnw_h7b0_ltdc_composite_from_job(GnwH7B0LtdcState *s,
+                                              GnwH7B0LtdcCaptureJob *job,
+                                              uint32_t *out);
+static void gnw_h7b0_ltdc_wait_compositor_idle(GnwH7B0LtdcState *s);
 static bool gnw_h7b0_ltdc_fb_dirty_check_and_clear(GnwH7B0LtdcState *s);
 static int gnw_h7b0_ltdc_layer_stride_bytes(uint32_t cfblr);
 static void gnw_h7b0_ltdc_fb_track_range(MemoryRegionSection *section,
@@ -51,7 +53,45 @@ static bool gnw_h7b0_ltdc_enabled(GnwH7B0LtdcState *s)
             (s->active_l2cr & LTDC_LxCR_LEN));
 }
 
-/* Return true when a full frame was captured into shadow_buffer. */
+static void gnw_h7b0_ltdc_snapshot_and_dispatch(GnwH7B0LtdcState *s, int rows);
+
+/*
+ * Cheap peek at job_busy, used by vblank_tick()'s non-VBR fallback to
+ * avoid calling gnw_h7b0_ltdc_fb_dirty_check_and_clear() (which
+ * *consumes* the RAM dirty bitmap -- see that function's doc comment)
+ * for a capture we already know gnw_h7b0_ltdc_capture_if_enabled() would
+ * just drop for being busy. Without this, the dirty-bitmap signal would
+ * be lost even though no capture actually happened -- a real gap
+ * capture_if_enabled()'s own return-value checks alone don't cover,
+ * since by the time it runs the dirty bitmap would already be cleared.
+ */
+static bool gnw_h7b0_ltdc_compositor_busy(GnwH7B0LtdcState *s)
+{
+    bool busy;
+
+    qemu_mutex_lock(&s->job_lock);
+    busy = s->job_busy;
+    qemu_mutex_unlock(&s->job_lock);
+    return busy;
+}
+
+/*
+ * Return true when a capture job was actually dispatched to the
+ * compositor worker thread this call (NOT when the resulting frame has
+ * finished compositing -- that happens asynchronously; see
+ * gnw_h7b0_ltdc_composite_from_job() and the worker thread function).
+ * Returns false if LTDC/Layer1 is disabled/unsupported, or if the worker
+ * is still busy with a previous frame (job_busy) -- every call site
+ * that needs eventual delivery of a dropped request (SRCR.VBR's
+ * vbr_deferred_capture, the non-VBR fallback's fb_reg_dirty) already
+ * checks this return value and retries on the next vblank tick instead
+ * of assuming a call here always succeeds, which is the one behavior
+ * change this device's existing capture-gating logic (all of which
+ * predates and is unrelated to the compositor thread -- vbr_active,
+ * structural_transition_pending, the RAM-dirty-bitmap fallback -- see
+ * gnw_h7b0_ltdc_vblank_tick()) needed to keep working correctly now that
+ * a "capture" is no longer instantaneous.
+ */
 static bool gnw_h7b0_ltdc_capture_if_enabled(GnwH7B0LtdcState *s)
 {
     int rows;
@@ -60,14 +100,28 @@ static bool gnw_h7b0_ltdc_capture_if_enabled(GnwH7B0LtdcState *s)
         return false;
     }
 
+    /*
+     * Check job_busy BEFORE calling capture_setup(): capture_setup() may
+     * resize shadow_buffer/compositor_back_buffer, which is only safe
+     * while the compositor worker thread is provably not touching either
+     * buffer. The producer side (this function) always runs with the
+     * BQL held, so it can never race a *concurrent* producer -- only the
+     * worker matters here, and job_busy==false is exactly "the worker
+     * already published its last frame and is asleep waiting for work".
+     */
+    qemu_mutex_lock(&s->job_lock);
+    if (s->job_busy) {
+        qemu_mutex_unlock(&s->job_lock);
+        return false;
+    }
+    qemu_mutex_unlock(&s->job_lock);
+
     rows = gnw_h7b0_ltdc_capture_setup(s);
     if (rows <= 0) {
         return false;
     }
 
-    gnw_h7b0_ltdc_capture_rows(s, 0, rows);
-    s->content_dirty = true;
-    s->invalidate = 1;
+    gnw_h7b0_ltdc_snapshot_and_dispatch(s, rows);
     return true;
 }
 
@@ -267,10 +321,6 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
         s->regs[GNW_H7B0_LTDC_SRCR >> 2] &= ~LTDC_SRCR_VBR;
         s->regs[GNW_H7B0_LTDC_ISR >> 2] |= LTDC_ISR_RRIF;
         gnw_h7b0_ltdc_update_irq(s);
-        if (s->vbr_deferred_capture) {
-            gnw_h7b0_ltdc_capture_if_enabled(s);
-            s->vbr_deferred_capture = false;
-        }
     } else {
         /*
          * Auto-capture for firmware (like gnwmanager, or retro-go's own
@@ -314,9 +364,36 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
                          s->structural_transition_pending;
         if ((!s->vbr_active || vbr_idle) && !s->content_dirty &&
             gnw_h7b0_ltdc_enabled(s) &&
+            !gnw_h7b0_ltdc_compositor_busy(s) &&
             gnw_h7b0_ltdc_fb_dirty_check_and_clear(s)) {
-            gnw_h7b0_ltdc_capture_if_enabled(s);
-            s->fb_reg_dirty = false;
+            /*
+             * Only clear fb_reg_dirty if the dispatch actually happened
+             * (it always should here, given the !compositor_busy() check
+             * just above -- gnw_h7b0_ltdc_capture_if_enabled() can still
+             * legitimately return false for other reasons, e.g. an
+             * unsupported Layer1 pixel format, in which case there is
+             * nothing to redo next tick and leaving fb_reg_dirty set
+             * would just harmlessly re-check RAM dirtiness again).
+             */
+            if (gnw_h7b0_ltdc_capture_if_enabled(s)) {
+                s->fb_reg_dirty = false;
+            }
+        }
+    }
+
+    /*
+     * Retried every vblank tick (not just the one where vbr_reload_pending
+     * just resolved) since the compositor worker thread may still have
+     * been busy with a previous frame the first time this was attempted
+     * (gnw_h7b0_ltdc_capture_if_enabled() returns false, without
+     * dispatching, when job_busy) -- only clear the flag once a job is
+     * actually dispatched, so a deferred capture is never silently lost
+     * to worker-thread backpressure the way it could be if this only
+     * fired once inside the vbr_reload_pending branch above.
+     */
+    if (s->vbr_deferred_capture) {
+        if (gnw_h7b0_ltdc_capture_if_enabled(s)) {
+            s->vbr_deferred_capture = false;
         }
     }
 
@@ -336,6 +413,18 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
     GnwH7B0LtdcState *s = GNW_H7B0_LTDC(dev);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    /*
+     * Reset can run at any time, including with a compositor job still
+     * in flight on the worker thread -- wait for it to finish and
+     * publish before tearing down shadow_buffer/compositor_back_buffer/
+     * clut below, or the worker's pending pointer swap/CLUT read could
+     * race a free() here (a real use-after-free, not a style nit: reset
+     * is BQL-synchronous but the worker thread is not).
+     */
+    if (s->compositor_running) {
+        gnw_h7b0_ltdc_wait_compositor_idle(s);
+    }
+
     for (int i = 0; i < (GNW_H7B0_LTDC_SIZE / 4); i++) {
         s->regs[i] = get_ltdc_reset_value(i * 4);
     }
@@ -349,6 +438,8 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
 
     g_free(s->shadow_buffer);
     s->shadow_buffer = NULL;
+    g_free(s->compositor_back_buffer);
+    s->compositor_back_buffer = NULL;
     s->shadow_width = 0;
     s->shadow_height = 0;
     memset(s->clut, 0, sizeof(s->clut));
@@ -656,10 +747,25 @@ static int gnw_h7b0_ltdc_capture_setup(GnwH7B0LtdcState *s)
     }
 
     if (cols != s->shadow_width || rows != s->shadow_height) {
+        /*
+         * Only reachable when the compositor worker thread is provably
+         * idle (see gnw_h7b0_ltdc_capture_if_enabled()'s job_busy check,
+         * always performed before this function is called), so neither
+         * buffer can be concurrently read/written by the worker here.
+         * Still take compositor_publish_lock around the shadow_buffer/
+         * dimensions update, since gnw_h7b0_ltdc_update_display() (main
+         * thread) may be reading the old pointer/dims right up until
+         * this resize.
+         */
+        qemu_mutex_lock(&s->compositor_publish_lock);
         g_free(s->shadow_buffer);
         s->shadow_buffer = g_new0(uint32_t, cols * rows);
         s->shadow_width = cols;
         s->shadow_height = rows;
+        qemu_mutex_unlock(&s->compositor_publish_lock);
+
+        g_free(s->compositor_back_buffer);
+        s->compositor_back_buffer = g_new0(uint32_t, cols * rows);
     }
 
     return rows;
@@ -932,35 +1038,31 @@ static inline uint32_t gnw_h7b0_ltdc_dither_pixel(uint32_t px, int x, int y)
     return (px & 0xFF000000U) | (r << 16) | (g << 8) | b;
 }
 
-static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
-                                        int row_end)
+/*
+ * Cheap (memcpy-only, no per-pixel conversion) synchronous snapshot of
+ * everything the compositor worker thread needs, taken on the BQL-
+ * holding producer thread. Fills s->compositor_job and hands it to the
+ * worker; the expensive per-pixel work happens in
+ * gnw_h7b0_ltdc_composite_from_job() below, entirely off this thread.
+ * Only called when job_busy is already known false (see
+ * gnw_h7b0_ltdc_capture_if_enabled()), so s->compositor_job is not
+ * touched concurrently by the worker while this runs. Batches each
+ * layer's entire row span into one cpu_physical_memory_read() call, same
+ * as the synchronous capture_rows() this replaces used to (see that
+ * function's git history for the perf rationale -- one read per capture
+ * instead of one per scanline).
+ */
+static void gnw_h7b0_ltdc_snapshot_and_dispatch(GnwH7B0LtdcState *s, int rows)
 {
-    uint32_t cfbar = s->active_l1cfbar;
+    GnwH7B0LtdcCaptureJob *job = &s->compositor_job;
     int cols = s->shadow_width;
     uint32_t pfcr = s->active_l1pfcr & LTDC_LxPFCR_PF_MASK;
     bool l1_l8 = (pfcr == LTDC_PF_L8);
-    int src_width = cols * (l1_l8 ? 1 : 2);
-    int nrows = row_end - row_start;
-
-    bool l1_colken = s->active_l1cr & LTDC_LxCR_COLKEN;
-    uint32_t l1_ckcr = s->active_l1ckcr;
-    uint32_t l1_dccr = s->active_l1dccr;
-    uint32_t l1_bfcr = s->active_l1bfcr;
-    uint32_t l1_cacr = s->active_l1cacr & 0xFF;
-    int l1_whstpos = s->active_l1whpcr & LTDC_LxWHPCR_WHSTPOS_MASK;
-    int l1_whsppos = (s->active_l1whpcr >> LTDC_LxWHPCR_WHSPPOS_SHIFT) &
-                      LTDC_LxWHPCR_WHSPPOS_MASK;
-    int l1_wvstpos = s->active_l1wvpcr & LTDC_LxWVPCR_WVSTPOS_MASK;
-    int l1_wvsppos = (s->active_l1wvpcr >> LTDC_LxWVPCR_WVSPPOS_SHIFT) &
-                      LTDC_LxWVPCR_WVSPPOS_MASK;
+    int l1_src_width = cols * (l1_l8 ? 1 : 2);
 
     bool l2_en = s->active_l2cr & LTDC_LxCR_LEN;
-    uint32_t l2_cfbar = s->active_l2cfbar;
     uint32_t l2_pfcr = s->active_l2pfcr & LTDC_LxPFCR_PF_MASK;
-    bool l2_l8 = (l2_pfcr == LTDC_PF_L8);
-    bool l2_al44 = (l2_pfcr == LTDC_PF_AL44);
-    uint32_t l2_cfblr = s->active_l2cfblr;
-    int l2_src_width = gnw_h7b0_ltdc_layer_stride_bytes(l2_cfblr);
+    int l2_src_width = gnw_h7b0_ltdc_layer_stride_bytes(s->active_l2cfblr);
     int l2_bpp = 0;
     /*
      * l2_src_width > 0 is required, not just l2_en: firmware can leave
@@ -968,87 +1070,165 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
      * mid-transition (e.g. reconfiguring Layer2 for JPEG-decoded cover
      * art), which makes l2_src_width 0. Without this check l2_bpp would
      * still come out > 0 for a recognized pixel format below, but
-     * l2_framebuf is allocated as g_malloc(l2_src_width * nrows) == 0
-     * bytes == NULL (g_malloc(0) is valid and returns NULL -- see the
-     * comment above framebuf's allocation), and l2_linebuf derived from
-     * it (l2_framebuf + row * l2_src_width) stays NULL for every row.
-     * The per-pixel loop below only gates on l2_en && l2_bpp > 0, so it
-     * would then dereference that NULL l2_linebuf pointer -- the real
-     * cause of a confirmed host segfault in an inlined 2-byte pixel load
-     * (lduw_he_p()) once real firmware sequences started actually
-     * hitting this transient zero-stride state.
+     * job->l2_raw is allocated as g_malloc(l2_src_width * rows) == 0
+     * bytes == NULL (g_malloc(0) is valid and returns NULL), and
+     * l2_linebuf derived from it in gnw_h7b0_ltdc_composite_from_job()
+     * would stay NULL for every row while still gating only on
+     * l2_en && l2_bpp > 0 -- the real cause of a confirmed host segfault
+     * in an inlined 2-byte pixel load (lduw_he_p()) once real firmware
+     * sequences started actually hitting this transient zero-stride
+     * state.
      */
     if (l2_en && l2_src_width > 0) {
         switch (l2_pfcr) {
         case 0: l2_bpp = 4; break;
         case 2: case 3: case 4: l2_bpp = 2; break;
         case 5: l2_bpp = 1; break; /* L8 */
-        case 6: l2_bpp = 1; break; /* AL44 -- 4-bit alpha + 4-bit luminance */
+        case 6: l2_bpp = 1; break; /* AL44 */
         default: l2_bpp = 0; break;
         }
     }
     /*
-     * Layer2's own column count, derived from its own stride/bpp --
-     * NOT assumed equal to Layer1's `cols` (shadow_width). Real firmware
-     * can configure Layer2 with a narrower CFBLR/stride than Layer1's
-     * (e.g. a smaller cover-art overlay composited over a full-width
-     * background), and the per-pixel loop below is driven by Layer1's
-     * `cols`. Without this bound, `x` can run past how many whole pixels
-     * l2_framebuf/l2_linebuf actually holds (l2_src_width bytes per row),
-     * reading past the end of that per-row heap allocation -- a real,
-     * confirmed second host segfault (a 4-byte ARGB8888 read via
-     * gnw_h7b0_ltdc_read_pixel_buf()) distinct from the l2_src_width==0
-     * NULL-pointer case handled by the l2_bpp assignment's own guard
-     * above. Zero when l2_bpp is 0 so it never wrongly reads as "in
-     * bounds" for an unsupported/disabled format.
+     * Layer2's own column count, derived from its own stride/bpp -- NOT
+     * assumed equal to Layer1's `cols` (shadow_width). Real firmware can
+     * configure Layer2 with a narrower CFBLR/stride than Layer1's (e.g.
+     * a smaller cover-art overlay composited over a full-width
+     * background), and the compositor worker's per-pixel loop is driven
+     * by Layer1's `cols`. Without this bound, `x` can run past how many
+     * whole pixels job->l2_raw actually holds (l2_src_width bytes per
+     * row) -- a real, confirmed second host segfault (a 4-byte ARGB8888
+     * read via gnw_h7b0_ltdc_read_pixel_buf()) distinct from the
+     * l2_src_width==0 NULL-pointer case the l2_bpp assignment's own
+     * guard above handles. Zero when l2_bpp is 0 so it never wrongly
+     * reads as "in bounds" for an unsupported/disabled format. Stored
+     * into the job (see below) since gnw_h7b0_ltdc_composite_from_job()
+     * runs on the worker thread and can't recompute it from live `s->`
+     * register state.
      */
     int l2_cols = l2_bpp > 0 ? l2_src_width / l2_bpp : 0;
-    uint32_t l2_cacr = s->active_l2cacr & 0xFF;
-    bool l2_colken = s->active_l2cr & LTDC_LxCR_COLKEN;
-    uint32_t l2_ckcr = s->active_l2ckcr;
-    uint32_t l2_dccr = s->active_l2dccr;
-    uint32_t l2_bfcr = s->active_l2bfcr;
-    int l2_whstpos = s->active_l2whpcr & LTDC_LxWHPCR_WHSTPOS_MASK;
-    int l2_whsppos = (s->active_l2whpcr >> LTDC_LxWHPCR_WHSPPOS_SHIFT) &
-                      LTDC_LxWHPCR_WHSPPOS_MASK;
-    int l2_wvstpos = s->active_l2wvpcr & LTDC_LxWVPCR_WVSTPOS_MASK;
-    int l2_wvsppos = (s->active_l2wvpcr >> LTDC_LxWVPCR_WVSPPOS_SHIFT) &
-                      LTDC_LxWVPCR_WVSPPOS_MASK;
 
-    uint32_t bccr = 0xFF000000U | (s->active_bccr & 0xFFFFFFU);
-    bool dither_en = s->active_gcr & LTDC_GCR_DEN;
+    job->cols = cols;
+    job->rows = rows;
 
-    int ahbp = (s->active_bpcr >> LTDC_BPCR_AHBP_SHIFT) & LTDC_BPCR_AHBP_MASK;
-    int avbp = s->active_bpcr & LTDC_BPCR_AVBP_MASK;
+    job->active_l1cr = s->active_l1cr;
+    job->active_l1pfcr = s->active_l1pfcr;
+    job->active_l1cfblr = s->active_l1cfblr;
+    job->active_l1ckcr = s->active_l1ckcr;
+    job->active_l1dccr = s->active_l1dccr;
+    job->active_l1bfcr = s->active_l1bfcr;
+    job->active_l1cacr = s->active_l1cacr;
+    job->active_l1whpcr = s->active_l1whpcr;
+    job->active_l1wvpcr = s->active_l1wvpcr;
 
-    /*
-     * Batch Layer1 and Layer2's *entire* row span into one buffer each with
-     * one cpu_physical_memory_read() call total, instead of one call per
-     * row (this function is always called with row_start=0, i.e. the whole
-     * frame in one span, so every row is contiguous guest memory -- no
-     * per-row gaps to work around). This is on top of 2026-07-13's earlier
-     * per-*pixel*-to-per-*row* batching fix for Layer2 (see CHANGELOG):
-     * that fix cut ~240*392*60Hz calls/sec down to ~240*60Hz; this cuts
-     * that ~240*60Hz down to ~60Hz (one read per full-frame capture instead
-     * of one per scanline). g_malloc(0) is valid and returns NULL, so this
-     * is safe even when Layer2 is disabled.
-     */
-    g_autofree uint8_t *framebuf = g_malloc((size_t)src_width * nrows);
-    g_autofree uint8_t *l2_framebuf =
-        g_malloc(l2_en ? (size_t)l2_src_width * nrows : 0);
+    job->l2_en = l2_en;
+    job->active_l2cr = s->active_l2cr;
+    job->active_l2pfcr = s->active_l2pfcr;
+    job->active_l2cfblr = s->active_l2cfblr;
+    job->active_l2ckcr = s->active_l2ckcr;
+    job->active_l2dccr = s->active_l2dccr;
+    job->active_l2bfcr = s->active_l2bfcr;
+    job->active_l2cacr = s->active_l2cacr;
+    job->active_l2whpcr = s->active_l2whpcr;
+    job->active_l2wvpcr = s->active_l2wvpcr;
 
-    cpu_physical_memory_read(cfbar + (hwaddr)row_start * src_width, framebuf,
-                             (size_t)src_width * nrows);
+    job->active_bccr = s->active_bccr;
+    job->active_gcr = s->active_gcr;
+    job->active_bpcr = s->active_bpcr;
+
+    job->l1_src_width = l1_src_width;
+    job->l2_src_width = l2_src_width;
+    job->l2_bpp = l2_bpp;
+    job->l2_cols = l2_cols;
+
+    size_t l1_needed = (size_t)l1_src_width * rows;
+    if (job->l1_raw_size < l1_needed) {
+        g_free(job->l1_raw);
+        job->l1_raw = g_malloc(l1_needed);
+        job->l1_raw_size = l1_needed;
+    }
+    cpu_physical_memory_read(s->active_l1cfbar, job->l1_raw, l1_needed);
+
     if (l2_en && l2_bpp > 0) {
-        cpu_physical_memory_read(l2_cfbar + (hwaddr)row_start * l2_src_width,
-                                 l2_framebuf, (size_t)l2_src_width * nrows);
+        size_t l2_needed = (size_t)l2_src_width * rows;
+        if (job->l2_raw_size < l2_needed) {
+            g_free(job->l2_raw);
+            job->l2_raw = g_malloc(l2_needed);
+            job->l2_raw_size = l2_needed;
+        }
+        cpu_physical_memory_read(s->active_l2cfbar, job->l2_raw, l2_needed);
     }
 
-    /*
-     * l1_whstpos/whsppos (and l2's) don't depend on y, so the horizontal
-     * window-clip test is identical for every row -- precompute it once per
-     * column instead of re-evaluating two comparisons per pixel per row.
-     */
+    memcpy(job->clut, s->clut, sizeof(job->clut));
+    memcpy(job->clut2, s->clut2, sizeof(job->clut2));
+
+    qemu_mutex_lock(&s->job_lock);
+    s->job_busy = true;
+    s->job_pending = true;
+    qemu_cond_signal(&s->job_cond);
+    qemu_mutex_unlock(&s->job_lock);
+}
+
+/*
+ * The actual per-pixel convert/blend/dither work (identical logic to
+ * this device's previous synchronous gnw_h7b0_ltdc_capture_rows(), just
+ * sourcing from a GnwH7B0LtdcCaptureJob snapshot instead of live guest
+ * RAM/s->regs/s->clut). Runs on the compositor worker thread, without
+ * the BQL held, writing into `out` (the worker's private back buffer --
+ * never touched by any other thread while this runs). Preserves both of
+ * capture_rows()'s existing perf optimizations: the per-column window-
+ * clip precompute (l1_x_in/l2_x_in) and gnw_h7b0_ltdc_blend_over()'s
+ * fully-transparent/fully-opaque fast paths.
+ */
+static void gnw_h7b0_ltdc_composite_from_job(GnwH7B0LtdcState *s,
+                                              GnwH7B0LtdcCaptureJob *job,
+                                              uint32_t *out)
+{
+    int cols = job->cols;
+    uint32_t pfcr = job->active_l1pfcr & LTDC_LxPFCR_PF_MASK;
+    bool l1_l8 = (pfcr == LTDC_PF_L8);
+    int src_width = job->l1_src_width;
+
+    bool l1_colken = job->active_l1cr & LTDC_LxCR_COLKEN;
+    uint32_t l1_ckcr = job->active_l1ckcr;
+    uint32_t l1_dccr = job->active_l1dccr;
+    uint32_t l1_bfcr = job->active_l1bfcr;
+    uint32_t l1_cacr = job->active_l1cacr & 0xFF;
+    int l1_whstpos = job->active_l1whpcr & LTDC_LxWHPCR_WHSTPOS_MASK;
+    int l1_whsppos = (job->active_l1whpcr >> LTDC_LxWHPCR_WHSPPOS_SHIFT) &
+                      LTDC_LxWHPCR_WHSPPOS_MASK;
+    int l1_wvstpos = job->active_l1wvpcr & LTDC_LxWVPCR_WVSTPOS_MASK;
+    int l1_wvsppos = (job->active_l1wvpcr >> LTDC_LxWVPCR_WVSPPOS_SHIFT) &
+                      LTDC_LxWVPCR_WVSPPOS_MASK;
+
+    bool l2_en = job->l2_en;
+    uint32_t l2_pfcr = job->active_l2pfcr & LTDC_LxPFCR_PF_MASK;
+    bool l2_l8 = (l2_pfcr == LTDC_PF_L8);
+    bool l2_al44 = (l2_pfcr == LTDC_PF_AL44);
+    int l2_src_width = job->l2_src_width;
+    int l2_bpp = job->l2_bpp;
+    /* See gnw_h7b0_ltdc_snapshot_and_dispatch()'s computation of this
+     * field -- required to keep the per-pixel loop below from reading
+     * past job->l2_raw's per-row allocation when Layer2's stride is
+     * narrower than Layer1's `cols`. */
+    int l2_cols = job->l2_cols;
+    uint32_t l2_cacr = job->active_l2cacr & 0xFF;
+    bool l2_colken = job->active_l2cr & LTDC_LxCR_COLKEN;
+    uint32_t l2_ckcr = job->active_l2ckcr;
+    uint32_t l2_dccr = job->active_l2dccr;
+    uint32_t l2_bfcr = job->active_l2bfcr;
+    int l2_whstpos = job->active_l2whpcr & LTDC_LxWHPCR_WHSTPOS_MASK;
+    int l2_whsppos = (job->active_l2whpcr >> LTDC_LxWHPCR_WHSPPOS_SHIFT) &
+                      LTDC_LxWHPCR_WHSPPOS_MASK;
+    int l2_wvstpos = job->active_l2wvpcr & LTDC_LxWVPCR_WVSTPOS_MASK;
+    int l2_wvsppos = (job->active_l2wvpcr >> LTDC_LxWVPCR_WVSPPOS_SHIFT) &
+                      LTDC_LxWVPCR_WVSPPOS_MASK;
+
+    uint32_t bccr = 0xFF000000U | (job->active_bccr & 0xFFFFFFU);
+    bool dither_en = job->active_gcr & LTDC_GCR_DEN;
+
+    int ahbp = (job->active_bpcr >> LTDC_BPCR_AHBP_SHIFT) & LTDC_BPCR_AHBP_MASK;
+    int avbp = job->active_bpcr & LTDC_BPCR_AVBP_MASK;
+
     g_autofree bool *l1_x_in = g_malloc(cols * sizeof(bool));
     g_autofree bool *l2_x_in = g_malloc(cols * sizeof(bool));
     for (int x = 0; x < cols; x++) {
@@ -1073,35 +1253,27 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
         gnw_h7b0_ltdc_bfcr_is_pa_pa(l1_bfcr) && !(l2_en && l2_bpp > 0) &&
         !dither_en && cols > 0 && l1_x_in[0] && l1_x_in[cols - 1];
 
-    for (int y = row_start; y < row_end; y++) {
+    for (int y = 0; y < job->rows; y++) {
         int abs_y = avbp + y + 1;
         bool l1_row_in = abs_y >= l1_wvstpos && abs_y <= l1_wvsppos;
         bool l2_row_in = abs_y >= l2_wvstpos && abs_y <= l2_wvsppos;
-        uint8_t *linebuf = framebuf + (hwaddr)(y - row_start) * src_width;
-        uint8_t *l2_linebuf =
-            l2_framebuf + (hwaddr)(y - row_start) * l2_src_width;
+        const uint8_t *linebuf = job->l1_raw + (size_t)y * src_width;
+        const uint8_t *l2_linebuf = (l2_en && l2_bpp > 0) ?
+            job->l2_raw + (size_t)y * l2_src_width : NULL;
 
         if (l1_fast_eligible && l1_row_in) {
             gnw_h7b0_ltdc_rgb565_row_to_argb8888(
-                linebuf, s->shadow_buffer + (hwaddr)y * cols, cols);
+                linebuf, out + (hwaddr)y * cols, cols);
             continue;
         }
 
         for (int x = 0; x < cols; x++) {
             int abs_x = ahbp + x + 1;
             bool l1_in = l1_row_in && l1_x_in[x];
-            uint32_t l1_raw = l1_l8 ? s->clut[linebuf[x]]
+            uint32_t l1_raw = l1_l8 ? job->clut[linebuf[x]]
                                     : gnw_h7b0_ltdc_rgb565_to_pixel32(
                                           lduw_le_p(linebuf + x * 2));
 
-            /*
-             * Layer1 first/bottom, composited over the opaque background
-             * color (BCCR); Layer2 second/top (foreground), composited
-             * over that result -- real STM32 LTDC hardware always
-             * displays Layer2 above/in front of Layer1 (RM0455's LTDC
-             * overview: "Layer 2 is displayed in the foreground of
-             * Layer 1").
-             */
             unsigned int l1_alpha;
             uint32_t l1_resolved = gnw_h7b0_ltdc_resolve_layer(
                 l1_raw, l1_in, l1_dccr, l1_colken, l1_ckcr, &l1_alpha);
@@ -1116,22 +1288,13 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
 
                 if (l2_l8) {
                     uint8_t idx = l2_linebuf[x];
-                    l2_raw = s->clut2[idx];
+                    l2_raw = job->clut2[idx];
                 } else if (l2_al44) {
-                    /*
-                     * AL44 (A4L4): raw byte packs a 4-bit alpha (upper
-                     * nibble) and a 4-bit luminance (lower nibble) --
-                     * looked up via the luminance nibble replicated to a
-                     * full byte (matching ConfigCLUT's own idx encoding)
-                     * for RGB, with the pixel's own alpha nibble applied
-                     * directly (replicated to 8 bits), overriding
-                     * whatever alpha the CLUT entry itself carries.
-                     */
                     uint8_t raw = l2_linebuf[x];
                     unsigned int a4 = (raw >> 4) & 0xF;
                     unsigned int l4 = raw & 0xF;
                     unsigned int a8 = a4 * 0x11U;
-                    uint32_t clut_rgb = s->clut2[l4 * 0x11U] & 0x00FFFFFFU;
+                    uint32_t clut_rgb = job->clut2[l4 * 0x11U] & 0x00FFFFFFU;
                     l2_raw = (a8 << 24) | clut_rgb;
                 } else {
                     l2_raw = gnw_h7b0_ltdc_read_pixel_buf(
@@ -1150,44 +1313,134 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
                 px = gnw_h7b0_ltdc_dither_pixel(px, abs_x, abs_y);
             }
 
-            s->shadow_buffer[y * cols + x] = px;
+            out[y * cols + x] = px;
         }
     }
+}
+
+static void *gnw_h7b0_ltdc_compositor_thread_fn(void *opaque)
+{
+    GnwH7B0LtdcState *s = GNW_H7B0_LTDC(opaque);
+
+    qemu_mutex_lock(&s->job_lock);
+    while (!s->compositor_stop) {
+        while (!s->job_pending && !s->compositor_stop) {
+            qemu_cond_wait(&s->job_cond, &s->job_lock);
+        }
+        if (s->compositor_stop) {
+            break;
+        }
+        s->job_pending = false;
+        qemu_mutex_unlock(&s->job_lock);
+
+        /*
+         * s->compositor_job and s->compositor_back_buffer are safe to
+         * touch here without any lock: the producer side is guaranteed
+         * (by job_busy, still true) not to mutate compositor_job again,
+         * and compositor_back_buffer is never read/written by anything
+         * but this worker thread.
+         */
+        gnw_h7b0_ltdc_composite_from_job(s, &s->compositor_job,
+                                          s->compositor_back_buffer);
+
+        qemu_mutex_lock(&s->compositor_publish_lock);
+        {
+            uint32_t *tmp = s->shadow_buffer;
+            s->shadow_buffer = s->compositor_back_buffer;
+            s->compositor_back_buffer = tmp;
+        }
+        s->content_dirty = true;
+        s->invalidate = 1;
+        qemu_mutex_unlock(&s->compositor_publish_lock);
+
+        qemu_mutex_lock(&s->job_lock);
+        s->job_busy = false;
+        /* Wake gnw_h7b0_ltdc_wait_compositor_idle() (reset/unrealize),
+         * which waits on this same condvar for job_busy to clear. */
+        qemu_cond_broadcast(&s->job_cond);
+    }
+    qemu_mutex_unlock(&s->job_lock);
+    return NULL;
+}
+
+/*
+ * Block until the compositor worker thread is idle (no job in flight).
+ * Must be called before anything that frees/reassigns shadow_buffer,
+ * compositor_back_buffer, or compositor_job's raw snapshot buffers
+ * outside the normal job_busy-gated resize path in
+ * gnw_h7b0_ltdc_capture_setup() -- currently that's device reset and
+ * unrealize, both of which can race an in-flight compositor job
+ * otherwise (reset in particular runs under the BQL but that says
+ * nothing about the worker thread, which runs without it).
+ */
+static void gnw_h7b0_ltdc_wait_compositor_idle(GnwH7B0LtdcState *s)
+{
+    qemu_mutex_lock(&s->job_lock);
+    while (s->job_busy) {
+        qemu_cond_wait(&s->job_cond, &s->job_lock);
+    }
+    qemu_mutex_unlock(&s->job_lock);
 }
 
 static void gnw_h7b0_ltdc_update_display(void *opaque)
 {
     GnwH7B0LtdcState *s = GNW_H7B0_LTDC(opaque);
     DisplaySurface *surface = qemu_console_surface(s->con);
+    uint32_t *buf;
+    int width, height;
+    bool dirty;
 
-    if (!s->shadow_buffer || s->shadow_width <= 0 || s->shadow_height <= 0) {
+    /*
+     * Snapshot the currently-published buffer pointer/dims/dirty flag
+     * under compositor_publish_lock -- the ONLY thing that can change
+     * concurrently with this function now that compositing runs on the
+     * worker thread: a publish is a pointer swap the worker performs
+     * under this same lock (see gnw_h7b0_ltdc_compositor_thread_fn()).
+     * Once snapshotted, `buf` is guaranteed stable for the rest of this
+     * function: the worker thread only ever writes into whichever
+     * buffer is NOT currently published (i.e. never `buf` after this
+     * point), until its NEXT publish, which cannot happen before this
+     * function releases the lock and returns.
+     */
+    qemu_mutex_lock(&s->compositor_publish_lock);
+    buf = s->shadow_buffer;
+    width = s->shadow_width;
+    height = s->shadow_height;
+    dirty = s->content_dirty;
+    qemu_mutex_unlock(&s->compositor_publish_lock);
+
+    if (!buf || width <= 0 || height <= 0) {
+        qemu_mutex_lock(&s->compositor_publish_lock);
         s->content_dirty = false;
+        qemu_mutex_unlock(&s->compositor_publish_lock);
         return;
     }
 
     if (surface_bits_per_pixel(surface) != 32) {
+        qemu_mutex_lock(&s->compositor_publish_lock);
         s->content_dirty = false;
+        qemu_mutex_unlock(&s->compositor_publish_lock);
         return;
     }
 
-    if (!s->content_dirty && !s->invalidate) {
+    if (!dirty && !s->invalidate) {
         return;
     }
 
     if (s->invalidate ||
-        s->shadow_width * GNW_H7B0_LTDC_SCALE != surface_width(surface) ||
-        s->shadow_height * GNW_H7B0_LTDC_SCALE != surface_height(surface)) {
-        qemu_console_resize(s->con, s->shadow_width * GNW_H7B0_LTDC_SCALE,
-                            s->shadow_height * GNW_H7B0_LTDC_SCALE);
+        width * GNW_H7B0_LTDC_SCALE != surface_width(surface) ||
+        height * GNW_H7B0_LTDC_SCALE != surface_height(surface)) {
+        qemu_console_resize(s->con, width * GNW_H7B0_LTDC_SCALE,
+                            height * GNW_H7B0_LTDC_SCALE);
         surface = qemu_console_surface(s->con);
     }
 
-    for (int y = 0; y < s->shadow_height; y++) {
+    for (int y = 0; y < height; y++) {
         uint8_t *drow0 = surface_data(surface) +
                           (hwaddr)y * GNW_H7B0_LTDC_SCALE * surface_stride(surface);
 
-        for (int x = 0; x < s->shadow_width; x++) {
-            uint32_t px = s->shadow_buffer[y * s->shadow_width + x];
+        for (int x = 0; x < width; x++) {
+            uint32_t px = buf[y * width + x];
             for (int sy = 0; sy < GNW_H7B0_LTDC_SCALE; sy++) {
                 uint32_t *drow = (uint32_t *)(drow0 +
                                               (hwaddr)sy * surface_stride(surface));
@@ -1198,10 +1451,22 @@ static void gnw_h7b0_ltdc_update_display(void *opaque)
         }
     }
 
-    dpy_gfx_update(s->con, 0, 0, s->shadow_width * GNW_H7B0_LTDC_SCALE,
-                   s->shadow_height * GNW_H7B0_LTDC_SCALE);
+    dpy_gfx_update(s->con, 0, 0, width * GNW_H7B0_LTDC_SCALE,
+                   height * GNW_H7B0_LTDC_SCALE);
     s->invalidate = 0;
-    s->content_dirty = false;
+
+    /*
+     * Only clear content_dirty if the worker hasn't already published a
+     * newer frame while we were blitting (buf would then no longer
+     * match s->shadow_buffer) -- otherwise we'd silently drop that
+     * newer frame's dirty flag and it would never get drawn until the
+     * next unrelated invalidate.
+     */
+    qemu_mutex_lock(&s->compositor_publish_lock);
+    if (s->shadow_buffer == buf) {
+        s->content_dirty = false;
+    }
+    qemu_mutex_unlock(&s->compositor_publish_lock);
 }
 
 static void gnw_h7b0_ltdc_invalidate_display(void *opaque)
@@ -1312,8 +1577,18 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
              * picks up the new framebuffer layout (lcd_setup_framebuffers()
              * calls SetPixelFormat/SetAddress then a separate VBR reload,
              * but intermediate IMR reloads from the HAL must still refresh).
+             *
+             * If the compositor worker thread is still busy with a
+             * previous frame, this dispatch is dropped (see
+             * gnw_h7b0_ltdc_capture_if_enabled()'s doc comment) -- fall
+             * back to the same vbr_deferred_capture retry-on-next-
+             * vblank-tick mechanism the VBR path below uses, since an
+             * IMR-triggered geometry/format change is exactly the kind
+             * of update that must not silently get lost.
              */
-            gnw_h7b0_ltdc_capture_if_enabled(s);
+            if (!gnw_h7b0_ltdc_capture_if_enabled(s)) {
+                s->vbr_deferred_capture = true;
+            }
         }
         if (value & LTDC_SRCR_VBR) {
             s->vbr_reload_pending = true;
@@ -1344,9 +1619,12 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
             /* The guest has finished drawing the frame and requested a swap.
              * Capture it NOW to avoid capturing it mid-draw during the next
              * frame. Only capture if the UI thread has finished blitting the
-             * previous capture. */
-            if (!s->content_dirty) {
-                gnw_h7b0_ltdc_capture_if_enabled(s);
+             * previous capture. Also retry on the next vblank tick if the
+             * dispatch itself was dropped because the compositor worker
+             * thread was still busy with a previous frame (see
+             * gnw_h7b0_ltdc_capture_if_enabled()'s doc comment) -- not just
+             * when content_dirty was already true. */
+            if (!s->content_dirty && gnw_h7b0_ltdc_capture_if_enabled(s)) {
                 s->vbr_deferred_capture = false;
             } else {
                 s->vbr_deferred_capture = true;
@@ -1444,6 +1722,52 @@ static void gnw_h7b0_ltdc_realize(DeviceState *dev, Error **errp)
                                     gnw_h7b0_ltdc_vblank_tick, s);
     s->line_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                   gnw_h7b0_ltdc_line_tick, s);
+
+    qemu_mutex_init(&s->compositor_publish_lock);
+    qemu_mutex_init(&s->job_lock);
+    qemu_cond_init(&s->job_cond);
+    s->compositor_stop = false;
+    qemu_thread_create(&s->compositor_thread, "gnw-h7b0-ltdc-compositor",
+                        gnw_h7b0_ltdc_compositor_thread_fn, s,
+                        QEMU_THREAD_JOINABLE);
+    s->compositor_running = true;
+}
+
+static void gnw_h7b0_ltdc_unrealize(DeviceState *dev)
+{
+    GnwH7B0LtdcState *s = GNW_H7B0_LTDC(dev);
+
+    /*
+     * Stop the compositor worker thread and join it before tearing down
+     * anything it might still touch. Signalled the same way a real job
+     * is (job_lock held, job_cond signalled) so the worker's existing
+     * wait loop picks up compositor_stop without needing a second wakeup
+     * path.
+     */
+    qemu_mutex_lock(&s->job_lock);
+    s->compositor_stop = true;
+    qemu_cond_broadcast(&s->job_cond);
+    qemu_mutex_unlock(&s->job_lock);
+    qemu_thread_join(&s->compositor_thread);
+    s->compositor_running = false;
+
+    qemu_mutex_destroy(&s->job_lock);
+    qemu_cond_destroy(&s->job_cond);
+    qemu_mutex_destroy(&s->compositor_publish_lock);
+
+    g_free(s->shadow_buffer);
+    s->shadow_buffer = NULL;
+    g_free(s->compositor_back_buffer);
+    s->compositor_back_buffer = NULL;
+    g_free(s->compositor_job.l1_raw);
+    s->compositor_job.l1_raw = NULL;
+    g_free(s->compositor_job.l2_raw);
+    s->compositor_job.l2_raw = NULL;
+
+    gnw_h7b0_ltdc_fb_track_range(&s->fb_l1_section, &s->fb_l1_track_base,
+                                  &s->fb_l1_track_len, 0, 0);
+    gnw_h7b0_ltdc_fb_track_range(&s->fb_l2_section, &s->fb_l2_track_base,
+                                  &s->fb_l2_track_len, 0, 0);
 }
 
 static const VMStateDescription vmstate_gnw_h7b0_ltdc = {
@@ -1461,6 +1785,7 @@ static void gnw_h7b0_ltdc_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = gnw_h7b0_ltdc_realize;
+    dc->unrealize = gnw_h7b0_ltdc_unrealize;
     dc->vmsd = &vmstate_gnw_h7b0_ltdc;
     device_class_set_legacy_reset(dc, gnw_h7b0_ltdc_reset);
 }

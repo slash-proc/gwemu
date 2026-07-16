@@ -82,6 +82,7 @@
 #include "hw/core/irq.h"
 #include "system/memory.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
 #include "qom/object.h"
 #include "hw/misc/gnw_h7b0_rcc.h"
 
@@ -200,6 +201,69 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0LtdcState, GNW_H7B0_LTDC)
  */
 #define GNW_H7B0_LTDC_VBLANK_HZ 60
 
+/*
+ * A raw, self-contained snapshot of everything
+ * gnw_h7b0_ltdc_composite_from_job() (the compositor worker thread's
+ * per-pixel convert/blend/dither work, moved out of the old synchronous
+ * gnw_h7b0_ltdc_capture_rows()) needs, taken cheaply (memcpy only, no
+ * per-pixel conversion) on the BQL-holding producer thread so the worker
+ * thread never touches live guest RAM, s->regs, s->clut/clut2, or any of
+ * the RAM-dirty-bitmap tracking state again -- only this struct, which
+ * the producer guarantees not to mutate again until the worker clears
+ * job_busy. l1_raw/l2_raw are reallocated (by the producer, under the
+ * same "compositor provably idle" guarantee) only when frame geometry
+ * changes, same cadence as shadow_buffer's own resizing.
+ *
+ * Deliberately does NOT include anything from the RAM-dirty-bitmap
+ * fallback (fb_l1_section/fb_reg_dirty/etc below) -- that machinery
+ * decides *whether* to dispatch a job at all and stays entirely on the
+ * producer/BQL thread (see gnw_h7b0_ltdc_vblank_tick()'s comment), since
+ * it calls QEMU's dirty-bitmap API (memory_region_snapshot_and_clear_dirty()
+ * and friends), which is not documented as safe to call outside the BQL.
+ */
+typedef struct GnwH7B0LtdcCaptureJob {
+    int cols;
+    int rows;
+
+    uint32_t active_l1cr, active_l1pfcr, active_l1cfblr;
+    uint32_t active_l1ckcr, active_l1dccr, active_l1bfcr, active_l1cacr;
+    uint32_t active_l1whpcr, active_l1wvpcr;
+
+    bool l2_en;
+    uint32_t active_l2cr;
+    uint32_t active_l2pfcr, active_l2cfblr;
+    uint32_t active_l2ckcr, active_l2dccr, active_l2bfcr, active_l2cacr;
+    uint32_t active_l2whpcr, active_l2wvpcr;
+
+    uint32_t active_bccr;
+    uint32_t active_gcr;
+    uint32_t active_bpcr;
+
+    int l1_src_width;
+    int l2_src_width;
+    int l2_bpp;
+    /*
+     * Layer2's own column count, derived from its own stride/bpp -- NOT
+     * assumed equal to Layer1's `cols`. Real firmware can configure
+     * Layer2 with a narrower CFBLR/stride than Layer1 (e.g. a smaller
+     * cover-art overlay over a full-width background); without this
+     * bound, the compositor worker's per-pixel loop (driven by Layer1's
+     * `cols`) can read past the end of l2_raw's per-row allocation -- a
+     * real, previously-confirmed host segfault (see
+     * gnw_h7b0_ltdc_snapshot_and_dispatch()'s computation of this field
+     * for the full history). Zero whenever l2_bpp is 0.
+     */
+    int l2_cols;
+
+    uint8_t *l1_raw;
+    size_t l1_raw_size;
+    uint8_t *l2_raw;
+    size_t l2_raw_size;
+
+    uint32_t clut[256];
+    uint32_t clut2[256];
+} GnwH7B0LtdcCaptureJob;
+
 struct GnwH7B0LtdcState {
     SysBusDevice parent_obj;
 
@@ -308,10 +372,84 @@ struct GnwH7B0LtdcState {
      * (the instant before the next VBLANK) to guarantee a tear-free image.
      * (A progressive/scanline-timed capture was tried here and reverted --
      * see gnw_h7b0_ltdc_vblank_tick()'s comment for why.)
+     *
+     * As of the LTDC-compositor worker-thread change: "shadow_buffer" is
+     * now the *published/front* buffer -- the one
+     * gnw_h7b0_ltdc_update_display() (called from the BQL-holding UI-
+     * refresh path) reads from. It is a ping-pong pair with
+     * compositor_back_buffer (see below): the compositor worker thread
+     * writes a freshly-composited frame into whichever of the two is NOT
+     * currently published, then atomically swaps the two pointers under
+     * compositor_publish_lock. Every access to shadow_buffer/
+     * shadow_width/shadow_height must hold compositor_publish_lock
+     * EXCEPT from gnw_h7b0_ltdc_capture_setup(), which only (re)sizes
+     * both buffers while the compositor is provably idle (see
+     * gnw_h7b0_ltdc_capture_if_enabled()'s job_busy gate, checked before
+     * capture_setup() is ever called) -- so no concurrent writer can
+     * exist at resize time either way, but the lock is still taken there
+     * too since update_display() may be reading the old pointer
+     * concurrently on the main thread right up until the resize.
      */
     uint32_t *shadow_buffer;
     int shadow_width;
     int shadow_height;
+
+    /*
+     * The compositor worker thread's private scratch buffer -- the other
+     * half of the front/back ping-pong pair described above. Touched
+     * ONLY by the compositor worker thread (never the vCPU/main/BQL
+     * thread) between the moment it wakes up for a job and the moment it
+     * swaps pointers with shadow_buffer under compositor_publish_lock,
+     * so no lock is needed for the compositor's own reads/writes of this
+     * pointer -- only the swap itself needs the lock.
+     */
+    uint32_t *compositor_back_buffer;
+
+    /*
+     * Guards shadow_buffer/compositor_back_buffer (pointer values only,
+     * plus shadow_width/shadow_height and content_dirty) against the one
+     * genuine cross-thread race this device now has: the compositor
+     * worker thread publishing a finished frame (a pointer swap) versus
+     * the main/BQL thread's gnw_h7b0_ltdc_update_display() reading the
+     * currently-published pointer. Held only for the swap itself / a
+     * short read, never across the expensive per-pixel compositing work
+     * or the display blit -- see gnw_h7b0_ltdc_composite_from_job() and
+     * gnw_h7b0_ltdc_update_display().
+     */
+    QemuMutex compositor_publish_lock;
+
+    /*
+     * Job handoff between the BQL-holding producer side (MMIO write
+     * handler / vblank timer callback -- mutually exclusive with each
+     * other already via the BQL, so effectively a single producer) and
+     * the compositor worker thread (single consumer). job_lock/job_cond
+     * implement a classic bounded (depth-1) work queue: the producer
+     * snapshots raw guest RAM + register/CLUT state into compositor_job
+     * (a cheap memcpy-only step, still done synchronously on the vCPU/
+     * main thread, AFTER the RAM-dirty-bitmap fallback check below has
+     * already decided a capture is warranted) and sets job_pending,
+     * waking the worker; the worker clears job_pending, does the
+     * expensive per-pixel convert/blend/dither work OUTSIDE any lock
+     * (reading only compositor_job, which the producer is guaranteed not
+     * to touch again until it observes job_busy false), then clears
+     * job_busy once done. The producer uses job_busy (checked/set under
+     * job_lock) as a "compositor still busy with the previous frame"
+     * throttle -- a new capture request arriving while busy is simply
+     * dropped (the existing vbr_deferred_capture/fb_reg_dirty retry-on-
+     * next-vblank-tick mechanisms already handle redelivery -- see
+     * gnw_h7b0_ltdc_capture_if_enabled()'s doc comment), which is the
+     * same "drop a frame under load" policy real double-buffered display
+     * pipelines use, not a new correctness compromise.
+     */
+    QemuMutex job_lock;
+    QemuCond job_cond;
+    bool job_pending;
+    bool job_busy;
+    GnwH7B0LtdcCaptureJob compositor_job;
+
+    QemuThread compositor_thread;
+    bool compositor_running;
+    bool compositor_stop;
 
     /*
      * RAM dirty-bitmap tracking for the non-VBR auto-capture fallback
