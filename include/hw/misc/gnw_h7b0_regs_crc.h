@@ -17,7 +17,18 @@
 #define GNW_H7B0_CRC_CR_WMASK  0x000000f9
 
 #define GNW_H7B0_CRC_INIT_OFFSET 0x10
-#define GNW_H7B0_CRC_INIT_RESET  0x00000000
+/*
+ * STM32H7B0.svd lists this register's <resetValue> as 0x00000000, but
+ * that's wrong -- RM0455 22.4.4 "CRC independent init value (CRC_INIT)"
+ * explicitly states "Reset value: 0xFFFF FFFF" (the standard CRC-32
+ * initial value, matching stm32h7xx_hal_crc.h's DEFAULT_CRC_INITVALUE).
+ * Firmware that doesn't explicitly reprogram INIT (relying on the
+ * documented hardware default, e.g. the diag suite's crypto_crc32 case)
+ * would otherwise see every CRC computation start from zero instead of
+ * all-ones, producing a wrong result. Same discrepancy class as
+ * GNW_H7B0_CRC_POL_RESET above.
+ */
+#define GNW_H7B0_CRC_INIT_RESET  0xffffffff
 #define GNW_H7B0_CRC_INIT_WMASK  0xffffffff
 
 #define GNW_H7B0_CRC_POL_OFFSET 0x14
