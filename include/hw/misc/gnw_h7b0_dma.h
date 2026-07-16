@@ -52,6 +52,25 @@ typedef void (*GnwH7B0DmaStreamNotifier)(void *opaque, bool half,
  * know right now", falling back to the flat assumption. */
 typedef uint32_t (*GnwH7B0DmaStreamRateFn)(void *opaque);
 
+/* One request-ID-based registration slot -- see GnwH7B0DmaState's
+ * req_reg[] comment for why this is an array, not a single set of
+ * fields. */
+typedef struct GnwH7B0DmaReqReg {
+    int req_id; /* -1 = free slot */
+    GnwH7B0DmaStreamNotifier notifier;
+    void *notifier_opaque;
+    GnwH7B0DmaStreamRateFn rate_fn;
+    void *rate_opaque;
+    /* See gnw_h7b0_dma_set_request_notifier()'s low_latency parameter. */
+    bool low_latency;
+    int bound_stream; /* -1 = unbound */
+} GnwH7B0DmaReqReg;
+
+/* Max simultaneous request-ID registrations. Currently used by SAI1
+ * (audio, request 87) and HASH (DMA-in, request 78); generously
+ * headroomed for future DMA-capable peripherals. */
+#define GNW_H7B0_DMA_REQ_REG_COUNT 4
+
 struct GnwH7B0DmaState {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
@@ -80,22 +99,34 @@ struct GnwH7B0DmaState {
     GnwH7B0DmaStreamRateFn stream_rate_fn[GNW_H7B0_DMA_STREAM_COUNT];
     void *stream_rate_fn_opaque[GNW_H7B0_DMA_STREAM_COUNT];
 
+    /* Per-stream mirror of the owning request registration's
+     * low_latency flag (see gnw_h7b0_dma_set_request_notifier()) --
+     * gnw_h7b0_dma_half_delay_ns() needs this indexed by stream, not
+     * by request id. */
+    bool stream_low_latency[GNW_H7B0_DMA_STREAM_COUNT];
+
     /*
      * Request-ID-based registration (see
-     * gnw_h7b0_dma_set_request_notifier()): which DMAMUX1 request ID the
+     * gnw_h7b0_dma_set_request_notifier()): which DMAMUX1 request ID each
      * registered peripheral owns, and where its callbacks are currently
      * bound. Different firmware routes the same peripheral to different
      * streams (retro-go: SAI1_A on DMA1 Stream0/DMAMUX ch0; stock
      * Zelda: DMA2 Stream6/DMAMUX ch14), so the binding is re-resolved
      * from the DMAMUX1 CxCR shadow registers on every CxCR write
      * instead of being a compile-time stream number.
+     *
+     * This is a small fixed-size registry, not a single slot -- more
+     * than one peripheral can have a live request-ID registration at
+     * once (e.g. SAI1's audio request id 87 and HASH's DMA-in request
+     * id 78 simultaneously). A single-slot version of this used to
+     * exist and was a real bug: SAI1 re-registers itself on every
+     * enable/disable (see gnw_h7b0_sai1.c), which silently clobbered
+     * HASH's one-time boot-time registration, permanently breaking
+     * hash_*_dma/hmac_*_dma firmware test cases (confirmed via live
+     * tracing: the HASH DMA notifier never fired at all once SAI1's
+     * audio path re-registered after boot).
      */
-    int req_id;
-    GnwH7B0DmaStreamNotifier req_notifier;
-    void *req_notifier_opaque;
-    GnwH7B0DmaStreamRateFn req_rate_fn;
-    void *req_rate_opaque;
-    int req_bound_stream; /* -1 = unbound */
+    GnwH7B0DmaReqReg req_reg[GNW_H7B0_DMA_REQ_REG_COUNT];
 };
 
 void gnw_h7b0_dma_set_stream_notifier(GnwH7B0DmaState *s, int stream,
@@ -112,11 +143,32 @@ void gnw_h7b0_dma_set_stream_rate_fn(GnwH7B0DmaState *s, int stream,
  * DMA1 streams 0-7 (global stream index 0-7), channels 8-15 feed DMA2
  * streams 0-7 (global 8-15). The binding follows later CxCR rewrites
  * automatically.
+ *
+ * `low_latency`: gnw_h7b0_dma_half_delay_ns()'s pacing model (a flat
+ * assumed item rate, floored at a 1ms-per-half minimum) exists purely
+ * to make audio DMA (SAI1) sound right -- real hardware's actual
+ * transfer rate is far higher, but pacing it realistically would
+ * fire this controller's timer thousands of times a second for no
+ * benefit. That same 1ms-per-half floor is wrong for a bulk, one-shot,
+ * not-perceptually-paced consumer like HASH_IN: real hardware moves an
+ * 8KB buffer over DMA in microseconds, and firmware waiting on such a
+ * transfer (e.g. this project's diag suite's hash_*_dma cases) bounds
+ * its wait with a fixed CPU busy-spin count -- under light host load,
+ * TCG races through that spin count far faster than our artificial
+ * 1ms-per-half floor, so the wait times out before the real transfer
+ * "completes", intermittently (confirmed via repeated live runs: same
+ * case flip-flopped OK/FAIL run to run with no code change in between,
+ * the signature of a real timing race rather than a logic bug).
+ * Pass true for consumers like this to skip the floor (and the flat-
+ * rate assumption entirely) and complete near-instantly instead; pass
+ * false for perceptually-paced consumers like SAI1 where the floor is
+ * the intended behavior.
  */
 void gnw_h7b0_dma_set_request_notifier(GnwH7B0DmaState *s, int request,
                                         GnwH7B0DmaStreamNotifier cb,
                                         void *cb_opaque,
                                         GnwH7B0DmaStreamRateFn rate_fn,
-                                        void *rate_opaque);
+                                        void *rate_opaque,
+                                        bool low_latency);
 
 #endif
