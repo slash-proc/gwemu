@@ -39,6 +39,7 @@
 #include "hw/misc/gnw_h7b0_spi.h"
 #include "hw/misc/gnw_h7b0_rtc.h"
 #include "hw/misc/gnw_h7b0_crc.h"
+#include "hw/misc/gnw_h7b0_hash.h"
 #include "hw/misc/gnw_h7b0_gpio.h"
 #include "hw/misc/gnw_h7b0_dbgmcu.h"
 #include "hw/misc/gnw_h7b0_dwt.h"
@@ -316,6 +317,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 #define CRC_BASE_ADDRESS 0x40023000
 
 /*
+ * HASH (hardware MD5/SHA-1/SHA-224/SHA-256 processor), per
+ * STM32H7B0.svd baseAddress 0x48021400. Modeled as a real device
+ * (hw/misc/gnw_h7b0_hash.c) -- gnwmanager's RAM flash util calls
+ * HAL_HASHEx_SHA256_Start(..., HAL_MAX_DELAY) after every flash write
+ * to verify it, and HAL_MAX_DELAY means no timeout: an unimplemented-
+ * device stub (always reads 0) left the digest-complete flag
+ * permanently unset, wedging the guest CPU forever on every internal-
+ * flash write. See gnw_h7b0_hash.h.
+ */
+#define HASH_BASE_ADDRESS 0x48021400
+
+/*
  * ADC1/ADC2 (+ common registers), per STM32H7B0.svd (0x40022000/
  * 0x40022100, 0x100 each, plus shared ADC_COMMON registers at +0x300).
  * Modeled as a real minimal device (hw/misc/gnw_h7b0_adc.c), RCC/PWR-
@@ -489,6 +502,7 @@ struct GnwH7B0State {
     GnwH7B0SpiState spi1;
     GnwH7B0RtcState rtc;
     GnwH7B0CrcState crc;
+    GnwH7B0HashState hash;
     GnwH7B0GpioState gpio;
     GnwH7B0DbgmcuState dbgmcu;
     GnwH7B0DwtState dwt;

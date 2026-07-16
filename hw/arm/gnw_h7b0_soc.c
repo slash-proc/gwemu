@@ -50,6 +50,7 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     qdev_prop_set_bit(DEVICE(&s->spi1), "sd-card", true);
     object_initialize_child(obj, "rtc", &s->rtc, TYPE_GNW_H7B0_RTC);
     object_initialize_child(obj, "crc", &s->crc, TYPE_GNW_H7B0_CRC);
+    object_initialize_child(obj, "hash", &s->hash, TYPE_GNW_H7B0_HASH);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_GNW_H7B0_GPIO);
     object_initialize_child(obj, "dbgmcu", &s->dbgmcu, TYPE_GNW_H7B0_DBGMCU);
     object_initialize_child(obj, "dwt", &s->dwt, TYPE_GNW_H7B0_DWT);
@@ -144,7 +145,6 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      * already covered by a real device model below is stubbed here so
      * accesses log instead of faulting.
      */
-    create_unimplemented_device("HASH", 0x48021400, 0x400);
     create_unimplemented_device("SPI3", 0x40003c00, 0x400);
     create_unimplemented_device("SPDIFRX", 0x40004000, 0x400);
     create_unimplemented_device("USART2", 0x40004400, 0x400);
@@ -392,6 +392,11 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->crc), 0, CRC_BASE_ADDRESS);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->hash), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->hash), 0, HASH_BASE_ADDRESS);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio), errp)) {
         return;
