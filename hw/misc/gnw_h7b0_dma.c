@@ -45,6 +45,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "migration/vmstate.h"
+#include "exec/cpu-common.h"
 #include "hw/core/irq.h"
 #include "hw/misc/gnw_h7b0_dma.h"
 #include "hw/misc/gnw_h7b0_regs_dma.h"
@@ -56,7 +57,15 @@
 #define DMA_SxCR_EN    (1U << 0)
 #define DMA_SxCR_HTIE  (1U << 3)
 #define DMA_SxCR_TCIE  (1U << 4)
+#define DMA_SxCR_DIR         (0x3U << 6)
+#define DMA_SxCR_DIR_M2M     (0x2U << 6)
 #define DMA_SxCR_CIRC  (1U << 8)
+#define DMA_SxCR_PINC  (1U << 9)
+#define DMA_SxCR_MINC  (1U << 10)
+#define DMA_SxCR_PSIZE_SHIFT 11
+#define DMA_SxCR_PSIZE       (0x3U << DMA_SxCR_PSIZE_SHIFT)
+#define DMA_SxCR_MSIZE_SHIFT 13
+#define DMA_SxCR_MSIZE       (0x3U << DMA_SxCR_MSIZE_SHIFT)
 #define DMA_SxCR_DBM   (1U << 18)
 #define DMA_SxCR_CT    (1U << 19)
 
@@ -151,58 +160,131 @@ void gnw_h7b0_dma_set_stream_rate_fn(GnwH7B0DmaState *s, int stream,
 #define GNW_H7B0_DMAMUX_REQ_ID_MASK  0x7F
 
 /*
- * Re-derive which stream the registered request-ID peripheral is bound
+ * Re-derive which stream each registered request-ID peripheral is bound
  * to from the current DMAMUX1 routing, and (re)attach the notifier/rate
  * callbacks there. Called on registration and on every DMAMUX CxCR
  * write, so the binding tracks firmware's actual routing.
+ *
+ * Iterates every live registration in req_reg[] -- this used to handle
+ * only a single registration, which meant a second peripheral
+ * registering (e.g. HASH, request 78) silently stomped the first's
+ * (SAI1, request 87) fields, and SAI1 re-registering later (it does so
+ * on every enable/disable) would then stomp back over HASH's, leaving
+ * whichever one registered last as the only one that actually worked.
  */
 static void gnw_h7b0_dma_rebind_request(GnwH7B0DmaState *s)
 {
-    int stream = -1;
+    for (int slot = 0; slot < GNW_H7B0_DMA_REQ_REG_COUNT; slot++) {
+        GnwH7B0DmaReqReg *reg = &s->req_reg[slot];
+        int stream = -1;
 
-    if (s->req_notifier) {
+        if (reg->req_id < 0 || !reg->notifier) {
+            continue;
+        }
+
         for (int ch = 0; ch < GNW_H7B0_DMA_STREAM_COUNT; ch++) {
             uint32_t ccr = s->regs[(GNW_H7B0_DMAMUX_BLOCK_OFFSET
                                      + 4 * ch) >> 2];
-            if ((int)(ccr & GNW_H7B0_DMAMUX_REQ_ID_MASK) == s->req_id) {
+            if ((int)(ccr & GNW_H7B0_DMAMUX_REQ_ID_MASK) == reg->req_id) {
                 stream = ch;
                 break;
             }
         }
-    }
 
-    if (stream == s->req_bound_stream) {
-        return;
+        if (stream == reg->bound_stream) {
+            continue;
+        }
+        if (reg->bound_stream >= 0) {
+            gnw_h7b0_dma_set_stream_notifier(s, reg->bound_stream, NULL, NULL);
+            gnw_h7b0_dma_set_stream_rate_fn(s, reg->bound_stream, NULL, NULL);
+            s->stream_low_latency[reg->bound_stream] = false;
+        }
+        if (stream >= 0) {
+            gnw_h7b0_dma_set_stream_notifier(s, stream, reg->notifier,
+                                              reg->notifier_opaque);
+            gnw_h7b0_dma_set_stream_rate_fn(s, stream, reg->rate_fn,
+                                             reg->rate_opaque);
+            s->stream_low_latency[stream] = reg->low_latency;
+        }
+        reg->bound_stream = stream;
     }
-    if (s->req_bound_stream >= 0) {
-        gnw_h7b0_dma_set_stream_notifier(s, s->req_bound_stream, NULL, NULL);
-        gnw_h7b0_dma_set_stream_rate_fn(s, s->req_bound_stream, NULL, NULL);
-    }
-    if (stream >= 0) {
-        gnw_h7b0_dma_set_stream_notifier(s, stream, s->req_notifier,
-                                          s->req_notifier_opaque);
-        gnw_h7b0_dma_set_stream_rate_fn(s, stream, s->req_rate_fn,
-                                         s->req_rate_opaque);
-    }
-    s->req_bound_stream = stream;
 }
 
 void gnw_h7b0_dma_set_request_notifier(GnwH7B0DmaState *s, int request,
                                         GnwH7B0DmaStreamNotifier cb,
                                         void *cb_opaque,
                                         GnwH7B0DmaStreamRateFn rate_fn,
-                                        void *rate_opaque)
+                                        void *rate_opaque,
+                                        bool low_latency)
 {
-    s->req_id = request;
-    s->req_notifier = cb;
-    s->req_notifier_opaque = cb_opaque;
-    s->req_rate_fn = rate_fn;
-    s->req_rate_opaque = rate_opaque;
+    GnwH7B0DmaReqReg *reg = NULL;
+
+    /* Reuse an existing slot for this request id if one's already
+     * registered (re-registration, e.g. SAI1's enable/disable-time
+     * calls, or a NULL-cb clear); otherwise claim the first free slot. */
+    for (int slot = 0; slot < GNW_H7B0_DMA_REQ_REG_COUNT; slot++) {
+        if (s->req_reg[slot].req_id == request) {
+            reg = &s->req_reg[slot];
+            break;
+        }
+    }
+    if (!reg) {
+        for (int slot = 0; slot < GNW_H7B0_DMA_REQ_REG_COUNT; slot++) {
+            if (s->req_reg[slot].req_id < 0) {
+                reg = &s->req_reg[slot];
+                break;
+            }
+        }
+    }
+    if (!reg) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                       "gnw-h7b0-dma: no free request-notifier slot for "
+                       "request %d (bump GNW_H7B0_DMA_REQ_REG_COUNT)\n",
+                       request);
+        return;
+    }
+
+    if (cb == NULL) {
+        /* Clearing: fully free the slot so it doesn't shadow a future
+         * registration for the same request id. */
+        if (reg->bound_stream >= 0) {
+            gnw_h7b0_dma_set_stream_notifier(s, reg->bound_stream, NULL, NULL);
+            gnw_h7b0_dma_set_stream_rate_fn(s, reg->bound_stream, NULL, NULL);
+            s->stream_low_latency[reg->bound_stream] = false;
+        }
+        reg->req_id = -1;
+        reg->notifier = NULL;
+        reg->notifier_opaque = NULL;
+        reg->rate_fn = NULL;
+        reg->rate_opaque = NULL;
+        reg->low_latency = false;
+        reg->bound_stream = -1;
+        return;
+    }
+
+    reg->req_id = request;
+    reg->notifier = cb;
+    reg->notifier_opaque = cb_opaque;
+    reg->rate_fn = rate_fn;
+    reg->rate_opaque = rate_opaque;
+    reg->low_latency = low_latency;
     gnw_h7b0_dma_rebind_request(s);
 }
 
 static uint64_t gnw_h7b0_dma_half_delay_ns(GnwH7B0DmaState *s, int stream)
 {
+    /* See gnw_h7b0_dma_set_request_notifier()'s low_latency parameter:
+     * the flat-rate/1ms-floor pacing model below exists for perceptual
+     * realism (audio), not correctness, and is actively wrong for a
+     * bulk one-shot consumer like HASH_IN whose real transfer time is
+     * microseconds -- skip straight to a near-instant, unclamped delay
+     * for those. */
+    if (s->stream_low_latency[stream]) {
+        return 1; /* 1ns: effectively immediate, but still a real timer
+                    * fire (not synchronous), preserving normal
+                    * half-then-full notification ordering. */
+    }
+
     int ctrl = stream / GNW_H7B0_DMA_STREAMS_PER_CTRL;
     int local = stream % GNW_H7B0_DMA_STREAMS_PER_CTRL;
     hwaddr ndtr_off = (hwaddr)ctrl * GNW_H7B0_DMA_CTRL_SIZE +
@@ -264,15 +346,6 @@ static void gnw_h7b0_dma_stream_tick(void *opaque)
                      (hwaddr)local * GNW_H7B0_DMA_STREAM_STRIDE;
     uint32_t cr = s->regs[cr_off >> 2];
 
-    {
-        static int n;
-        if (n < 40) {
-            fprintf(stderr, "[dma-debug] tick stream=%d cr=%08x half_pending=%d\n",
-                    stream, cr, s->stream_half_pending[stream]);
-            n++;
-        }
-    }
-
     if (!(cr & DMA_SxCR_EN)) {
         return;
     }
@@ -309,8 +382,117 @@ static void gnw_h7b0_dma_stream_tick(void *opaque)
     }
 }
 
+/*
+ * This device only ever models transfer timing/IRQs -- the actual byte
+ * movement for every other stream use (SAI1 audio, HASH input) is done by
+ * the consuming peripheral itself pulling straight from M0AR/NDTR via a
+ * registered stream notifier, never by this DMA controller. Pure
+ * memory-to-memory transfers (DMA_MEMORY_TO_MEMORY, no peripheral
+ * involved at all -- diag suite's dma1_m2m/dma2_m2m cases) have no such
+ * consumer, so nothing was ever actually copying guest memory: firmware's
+ * completion wait was satisfied (a real bug fix, see the stream_tick
+ * history above), but the destination buffer stayed all-zero, failing
+ * every correctness check. Perform the real copy synchronously on the
+ * EN 0->1 edge, matching HAL_DMA_SetConfig()'s M2M address convention
+ * (PAR = source, M0AR = destination -- same as the P2M case, see
+ * sdk/stm32h7xx-hal-driver/Src/stm32h7xx_hal_dma.c's DMA_SetConfig()).
+ * Only the common PINC/MINC-enabled, equal-PSIZE/MSIZE case (the only
+ * one any known firmware here uses) is implemented; anything else logs
+ * unimplemented rather than silently doing the wrong thing.
+ */
+static void gnw_h7b0_dma_do_m2m_copy(GnwH7B0DmaState *s, int stream)
+{
+    int ctrl = stream / GNW_H7B0_DMA_STREAMS_PER_CTRL;
+    int local = stream % GNW_H7B0_DMA_STREAMS_PER_CTRL;
+    hwaddr stream_base = (hwaddr)ctrl * GNW_H7B0_DMA_CTRL_SIZE +
+                          GNW_H7B0_DMA_S0CR_OFFSET +
+                          (hwaddr)local * GNW_H7B0_DMA_STREAM_STRIDE;
+    uint32_t cr = s->regs[stream_base >> 2];
+
+    if ((cr & DMA_SxCR_DIR) != DMA_SxCR_DIR_M2M) {
+        return;
+    }
+
+    uint32_t ndtr = s->regs[(stream_base + 0x4) >> 2];
+    uint32_t par  = s->regs[(stream_base + 0x8) >> 2];
+    uint32_t m0ar = s->regs[(stream_base + 0xc) >> 2];
+    uint32_t psize = 1U << ((cr & DMA_SxCR_PSIZE) >> DMA_SxCR_PSIZE_SHIFT);
+    uint32_t msize = 1U << ((cr & DMA_SxCR_MSIZE) >> DMA_SxCR_MSIZE_SHIFT);
+    bool pinc = (cr & DMA_SxCR_PINC) != 0;
+    bool minc = (cr & DMA_SxCR_MINC) != 0;
+
+    if (psize != msize) {
+        qemu_log_mask(LOG_UNIMP,
+                      "gnw-h7b0-dma: M2M stream %d PSIZE(%u) != MSIZE(%u) "
+                      "not implemented\n", stream, psize, msize);
+        return;
+    }
+
+    for (uint32_t i = 0; i < ndtr; i++) {
+        uint8_t buf[4];
+        hwaddr src = par + (pinc ? (hwaddr)i * psize : 0);
+        hwaddr dst = m0ar + (minc ? (hwaddr)i * msize : 0);
+
+        cpu_physical_memory_read(src, buf, psize);
+        cpu_physical_memory_write(dst, buf, msize);
+    }
+}
+
 static void gnw_h7b0_dma_start_stream(GnwH7B0DmaState *s, int stream)
 {
+    gnw_h7b0_dma_do_m2m_copy(s, stream);
+
+    if (s->stream_low_latency[stream]) {
+        /*
+         * Complete synchronously in this same call, no QEMUTimer round
+         * trip at all -- see gnw_h7b0_dma_set_request_notifier()'s
+         * low_latency parameter doc. A real (even a ~0ns) timer_mod()
+         * still only fires on QEMU's next event-loop iteration, whose
+         * timing depends on host scheduling; under real host
+         * contention (this dev machine routinely runs several
+         * concurrent qemu-gnw instances from other agents) that can
+         * still lose the race against firmware's fixed CPU busy-spin
+         * completion wait, confirmed via repeated live runs: the same
+         * hash_*_dma/hmac_*_dma cases flip-flopped OK/FAIL run to run
+         * with a mere 1ns-timer version of this fix in place. Doing the
+         * whole half+full sequence inline removes the host-timing
+         * dependency entirely for these consumers.
+         */
+        int ctrl = stream / GNW_H7B0_DMA_STREAMS_PER_CTRL;
+        int local = stream % GNW_H7B0_DMA_STREAMS_PER_CTRL;
+        hwaddr cr_off = (hwaddr)ctrl * GNW_H7B0_DMA_CTRL_SIZE +
+                         GNW_H7B0_DMA_S0CR_OFFSET +
+                         (hwaddr)local * GNW_H7B0_DMA_STREAM_STRIDE;
+        uint32_t cr;
+
+        gnw_h7b0_dma_set_isr_bit(s, stream, true);
+        cr = s->regs[cr_off >> 2];
+        gnw_h7b0_dma_set_isr_bit(s, stream, false);
+
+        if (cr & (DMA_SxCR_CIRC | DMA_SxCR_DBM)) {
+            /* No current low_latency consumer (HASH_IN, one-shot only)
+             * uses circular/double-buffer mode; recursing synchronously
+             * here to "auto-restart" would be an unbounded recursion
+             * for a stream that never clears EN, so just log and leave
+             * EN set for a real timer-driven restart instead of
+             * pretending to support it. */
+            qemu_log_mask(LOG_UNIMP,
+                          "gnw-h7b0-dma: low_latency stream %d is "
+                          "circular/DBM -- unsupported combination, "
+                          "falling back to timer-paced restart\n", stream);
+            if (cr & DMA_SxCR_DBM) {
+                s->regs[cr_off >> 2] = cr ^ DMA_SxCR_CT;
+            }
+            s->stream_half_pending[stream] = true;
+            s->stream_deadline_ns[stream] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            gnw_h7b0_dma_schedule_next(s, stream,
+                                        gnw_h7b0_dma_half_delay_ns(s, stream));
+        } else {
+            s->regs[cr_off >> 2] = cr & ~DMA_SxCR_EN;
+        }
+        return;
+    }
+
     s->stream_half_pending[stream] = true;
     s->stream_deadline_ns[stream] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     gnw_h7b0_dma_schedule_next(s, stream,
@@ -422,8 +604,11 @@ static const MemoryRegionOps gnw_h7b0_dma_ops = {
 
 static void gnw_h7b0_dma_init(Object *obj)
 {
-    GNW_H7B0_DMA(obj)->req_bound_stream = -1;
     GnwH7B0DmaState *s = GNW_H7B0_DMA(obj);
+    for (int slot = 0; slot < GNW_H7B0_DMA_REQ_REG_COUNT; slot++) {
+        s->req_reg[slot].req_id = -1;
+        s->req_reg[slot].bound_stream = -1;
+    }
     memory_region_init_io(&s->mmio, obj, &gnw_h7b0_dma_ops, s, TYPE_GNW_H7B0_DMA, GNW_H7B0_DMA_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
 

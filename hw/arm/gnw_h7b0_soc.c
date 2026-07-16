@@ -51,6 +51,7 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     object_initialize_child(obj, "rtc", &s->rtc, TYPE_GNW_H7B0_RTC);
     object_initialize_child(obj, "crc", &s->crc, TYPE_GNW_H7B0_CRC);
     object_initialize_child(obj, "hash", &s->hash, TYPE_GNW_H7B0_HASH);
+    object_initialize_child(obj, "mdma", &s->mdma, TYPE_GNW_H7B0_MDMA);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_GNW_H7B0_GPIO);
     object_initialize_child(obj, "dbgmcu", &s->dbgmcu, TYPE_GNW_H7B0_DBGMCU);
     object_initialize_child(obj, "dwt", &s->dwt, TYPE_GNW_H7B0_DWT);
@@ -101,6 +102,33 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         memory_region_add_subregion(system_memory, base, &s->field); \
     } while (0)
 
+    /*
+     * Like INIT_RAM_REGION, but backed directly by `image_path` (created/
+     * truncated to `size` if it doesn't already exist yet) when non-NULL/
+     * non-empty, so guest writes land in that file live instead of
+     * anonymous memory -- see the bank1_image/bank2_image/extflash_image
+     * doc comment in gnw_h7b0_soc.h. Falls back to plain anonymous RAM
+     * (today's behavior, seeded only via `-device loader`) otherwise.
+     */
+#define INIT_RAM_OR_FILE_REGION(field, name, base, size, image_path) \
+    do { \
+        if ((image_path) != NULL && (image_path)[0] != '\0') { \
+            if (!memory_region_init_ram_from_file(&s->field, OBJECT(dev_soc), name, \
+                                                   size, 0, RAM_SHARED, (image_path), \
+                                                   0, &err)) { \
+                error_propagate(errp, err); \
+                return; \
+            } \
+        } else { \
+            memory_region_init_ram(&s->field, OBJECT(dev_soc), name, size, &err); \
+            if (err != NULL) { \
+                error_propagate(errp, err); \
+                return; \
+            } \
+        } \
+        memory_region_add_subregion(system_memory, base, &s->field); \
+    } while (0)
+
     INIT_RAM_REGION(itcm, "GNW_H7B0.itcm", ITCM_BASE_ADDRESS, ITCM_SIZE);
     INIT_RAM_REGION(dtcm, "GNW_H7B0.dtcm", DTCM_BASE_ADDRESS, DTCM_SIZE);
     /*
@@ -129,12 +157,14 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
                      SRDSRAM_SIZE);
     INIT_RAM_REGION(bkpsram, "GNW_H7B0.bkpsram", BKPSRAM_BASE_ADDRESS,
                      BKPSRAM_SIZE);
-    INIT_RAM_REGION(flash_bank1, "GNW_H7B0.flash_bank1",
-                     FLASH_BANK1_BASE_ADDRESS, FLASH_BANK_SIZE);
-    INIT_RAM_REGION(flash_bank2, "GNW_H7B0.flash_bank2",
-                     FLASH_BANK2_BASE_ADDRESS, FLASH_BANK_SIZE);
-    INIT_RAM_REGION(extflash, "GNW_H7B0.extflash", EXTFLASH_BASE_ADDRESS,
-                     EXTFLASH_SIZE);
+    INIT_RAM_OR_FILE_REGION(flash_bank1, "GNW_H7B0.flash_bank1",
+                             FLASH_BANK1_BASE_ADDRESS, FLASH_BANK_SIZE,
+                             s->bank1_image);
+    INIT_RAM_OR_FILE_REGION(flash_bank2, "GNW_H7B0.flash_bank2",
+                             FLASH_BANK2_BASE_ADDRESS, FLASH_BANK_SIZE,
+                             s->bank2_image);
+    INIT_RAM_OR_FILE_REGION(extflash, "GNW_H7B0.extflash", EXTFLASH_BASE_ADDRESS,
+                             EXTFLASH_SIZE, s->extflash_image);
     INIT_RAM_REGION(uid, "GNW_H7B0.uid", UID_BASE_ADDRESS, UID_SIZE);
 
     /*
@@ -195,7 +225,6 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     create_unimplemented_device("DELAY_Block_SDMMC2", 0x48022800, 0x400);
     create_unimplemented_device("BDMA1", 0x48022c00, 0x400);
     create_unimplemented_device("AXI", 0x51000000, 0x100000);
-    create_unimplemented_device("MDMA", 0x52000000, 0x1000);
     create_unimplemented_device("Delay_Block_OCTOSPI1", 0x52006000, 0x400);
     create_unimplemented_device("SDMMC1", 0x52007000, 0x3fd);
     create_unimplemented_device("DELAY_Block_SDMMC1", 0x52008000, 0x400);
@@ -397,6 +426,15 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->hash), 0, HASH_BASE_ADDRESS);
+    /* HASH_RNG shared line (NVIC IRQ 80, see STM32H7B0.svd) -- RNG is
+     * still an unimplemented_device stub with no real IRQ source, so
+     * this line is HASH's alone for now. */
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->hash), 0, qdev_get_gpio_in(armv7m, 80));
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->mdma), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->mdma), 0, MDMA_BASE_ADDRESS);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio), errp)) {
         return;
@@ -424,6 +462,7 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->flash_r), 0, FLASH_R_BASE_ADDRESS);
+    gnw_h7b0_flash_r_set_banks(&s->flash_r, &s->flash_bank1, &s->flash_bank2);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->fmc), errp)) {
         return;
@@ -511,6 +550,7 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->sai1), 0, SAI1_BASE_ADDRESS);
     gnw_h7b0_sai1_set_dma(&s->sai1, &s->dma);
     gnw_h7b0_sai1_set_rcc(&s->sai1, &s->rcc);
+    gnw_h7b0_hash_set_dma(&s->hash, &s->dma);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dac1), errp)) {
         return;
@@ -564,11 +604,26 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      */
 }
 
+static const Property gnw_h7b0_soc_properties[] = {
+    /*
+     * Optional file-backed persistence for the flash regions -- e.g.
+     * -global gnw-h7b0-soc.extflash-image=backup/qemu-images/zelda-extflash.bin
+     * makes guest writes (flashing/erasing) land in that file live, instead
+     * of only in anonymous RAM seeded once at boot by `-device loader`. See
+     * the doc comment on GnwH7B0State's bank1_image/bank2_image/
+     * extflash_image fields in gnw_h7b0_soc.h.
+     */
+    DEFINE_PROP_STRING("bank1-image", GnwH7B0State, bank1_image),
+    DEFINE_PROP_STRING("bank2-image", GnwH7B0State, bank2_image),
+    DEFINE_PROP_STRING("extflash-image", GnwH7B0State, extflash_image),
+};
+
 static void gnw_h7b0_soc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = gnw_h7b0_soc_realize;
+    device_class_set_props(dc, gnw_h7b0_soc_properties);
 }
 
 static const TypeInfo gnw_h7b0_soc_info = {

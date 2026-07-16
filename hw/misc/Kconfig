@@ -128,6 +128,9 @@ config GNW_H7B0_CRC
 config GNW_H7B0_HASH
     bool
 
+config GNW_H7B0_MDMA
+    bool
+
 config GNW_H7B0_GPIO
     bool
 

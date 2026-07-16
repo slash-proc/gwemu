@@ -102,20 +102,65 @@ Two bugs in `hw/display/gnw_h7b0_ltdc.c`'s `gnw_h7b0_ltdc_capture_rows()`:
 Fixed: `l2_en && l2_src_width > 0` gating, plus a real
 `l2_cols = l2_src_width/l2_bpp` bound on the Layer2 branch.
 
-## Priority 4 — everything else (10 remaining fails, NOT YET TRIAGED individually)
+## Priority 4a — DMA1/DMA2/MDMA memory-to-memory: FIXED ✅
+
+`dma1_m2m`, `dma2_m2m`, `mdma_m2m` all shared one root cause: this device
+model only ever simulated transfer *timing*/IRQ completion, never actually
+moved guest memory -- fine for every other stream use (SAI1 audio, HASH
+input), where the *consuming peripheral itself* pulls bytes straight from
+M0AR/NDTR via a registered stream notifier, but there is no such consumer
+for a pure memory-to-memory transfer (`DMA_MEMORY_TO_MEMORY`/
+`MDMA_REQUEST_SW`, no peripheral involved at all). Firmware's completion
+wait was satisfied, but the destination buffer stayed all-zero, failing
+every correctness check.
+
+- `dma1_m2m`/`dma2_m2m`: fixed by adding a real synchronous copy
+  (`gnw_h7b0_dma_do_m2m_copy()` in `hw/misc/gnw_h7b0_dma.c`) on the stream's
+  `CR.EN` 0->1 edge whenever `CR.DIR` is memory-to-memory, using
+  `PAR`(source)/`M0AR`(dest) per `HAL_DMA_SetConfig()`'s M2M address
+  convention, honoring `PINC`/`MINC`/`PSIZE`/`MSIZE`. Only the
+  equal-PSIZE/MSIZE case is implemented (the only one any known firmware
+  here uses).
+- `mdma_m2m`: MDMA was a bare `create_unimplemented_device()` stub (no
+  register model at all) -- a genuinely separate peripheral from DMA1/DMA2
+  (sits directly on the AXI bus matrix, no DMAMUX). Added a new device
+  model, `hw/misc/gnw_h7b0_mdma.c`/`include/hw/misc/gnw_h7b0_mdma.h`
+  (wired into `hw/arm/gnw_h7b0_soc.c`, `hw/arm/Kconfig`,
+  `hw/misc/Kconfig`, `hw/misc/meson.build`): real 16-channel register
+  layout, triggers a synchronous copy on `CCR.SWRQ`'s 0->1 edge (with
+  `CCR.EN` already set, matching `HAL_MDMA_Start()`'s two-write sequence),
+  sets every completion flag `HAL_MDMA_PollForTransfer()` might poll
+  (`CTCIF`/`BTIF`/`BRTIF`/`TCIF`). Only SW-triggered, non-linked-list
+  transfers are modeled (the only kind any known firmware here uses).
+
+All three independently verified live against the diag suite, both
+individually and in the same full-suite run as everything else above.
+
+**Files changed**: `hw/misc/gnw_h7b0_dma.c`, `hw/misc/gnw_h7b0_mdma.c` (new),
+`include/hw/misc/gnw_h7b0_mdma.h` (new), `hw/arm/gnw_h7b0_soc.c`,
+`include/hw/arm/gnw_h7b0_soc.h`, `hw/arm/Kconfig`, `hw/misc/Kconfig`,
+`hw/misc/meson.build`.
+
+## Priority 4b — everything else (7 remaining fails, NOT YET TRIAGED individually)
 
 Confirmed current fails after re-running the full live suite with CRC32 +
-HASH/HMAC + LTDC + JPEG all applied (2026-07-16):
-`dac1_output_value`, `dac2_output_value`, `dma1_m2m`, `crypto_crc16_reconfig`,
-`timer_tim6_update`, `mdma_m2m`, `crypto_rng_sanity`, `crypto_rng_seed_error`,
-`dma2_m2m`, `exti_edge_config`.
+HASH/HMAC + LTDC + JPEG + DMA1/DMA2/MDMA m2m all applied (2026-07-16):
+`dac1_output_value`, `dac2_output_value`, `crypto_crc16_reconfig`,
+`timer_tim6_update`, `crypto_rng_sanity`, `crypto_rng_seed_error`,
+`exti_edge_config`.
 
-`dwt_vs_systick` (previously flagged as possibly a host-contention flake),
-`boot_option_bytes`, `gpio_output_readback`, and `exti_sw_trigger` are no
-longer failing in this run — consistent with the host-contention-flake
-suspicion, not re-fixed by any code change. `power_sleep_wfi` also not
-observed failing this run.
+Also newly appearing as FAIL in the latest full-suite run (not seen in the
+immediately preceding run, worth double-checking for host-contention flake
+vs. real regression before triaging): `exti_sw_trigger`, `boot_option_bytes`,
+`gpio_output_readback`. All three were confirmed passing in the isolated
+JPEG-verification run earlier this session, so this is very likely the same
+kind of host-contention flakiness already seen with `dwt_vs_systick`, not a
+regression from the DMA/MDMA work -- re-run on a quiet host before treating
+as real.
 
-Next: triage the 10 confirmed fails above individually, prioritized by
-whatever the project owner cares about next (no priority order set yet
-for this bucket).
+`power_sleep_wfi` not observed failing in either run this session.
+
+Next: triage the 7 confirmed-stable fails above individually, prioritized
+by whatever the project owner cares about next (no priority order set yet
+for this bucket), after re-confirming the 3 possibly-flaky ones on a quiet
+host.

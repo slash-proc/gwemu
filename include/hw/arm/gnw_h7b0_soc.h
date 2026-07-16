@@ -40,6 +40,7 @@
 #include "hw/misc/gnw_h7b0_rtc.h"
 #include "hw/misc/gnw_h7b0_crc.h"
 #include "hw/misc/gnw_h7b0_hash.h"
+#include "hw/misc/gnw_h7b0_mdma.h"
 #include "hw/misc/gnw_h7b0_gpio.h"
 #include "hw/misc/gnw_h7b0_dbgmcu.h"
 #include "hw/misc/gnw_h7b0_dwt.h"
@@ -327,6 +328,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  * flash write. See gnw_h7b0_hash.h.
  */
 #define HASH_BASE_ADDRESS 0x48021400
+#define MDMA_BASE_ADDRESS 0x52000000
 
 /*
  * ADC1/ADC2 (+ common registers), per STM32H7B0.svd (0x40022000/
@@ -503,6 +505,7 @@ struct GnwH7B0State {
     GnwH7B0RtcState rtc;
     GnwH7B0CrcState crc;
     GnwH7B0HashState hash;
+    GnwH7B0MdmaState mdma;
     GnwH7B0GpioState gpio;
     GnwH7B0DbgmcuState dbgmcu;
     GnwH7B0DwtState dwt;
@@ -546,6 +549,25 @@ struct GnwH7B0State {
     MemoryRegion uid;
 
     Clock *sysclk;
+
+    /*
+     * Optional mmap-backed persistence for flash_bank1/flash_bank2/extflash
+     * (qdev string properties: "bank1-image", "bank2-image",
+     * "extflash-image", e.g. -global gnw-h7b0-soc.extflash-image=foo.bin).
+     * When set, that region is backed directly by the named file (created/
+     * truncated to the region's full size if it doesn't already exist) via
+     * memory_region_init_ram_from_file(..., RAM_SHARED, ...), so guest
+     * writes (flashing, erasing) land in the file itself as they happen --
+     * the same file doubles as both the boot seed and the live, persistent
+     * backing store. Leave unset (the default) to keep the existing
+     * behavior: anonymous RAM seeded once at boot via `-device loader`,
+     * with writes never touching the source file -- e.g. for repeatable
+     * testing against a known-good image without needing to re-copy it
+     * after every run.
+     */
+    char *bank1_image;
+    char *bank2_image;
+    char *extflash_image;
 };
 
 #endif
