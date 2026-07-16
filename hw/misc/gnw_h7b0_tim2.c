@@ -109,7 +109,7 @@ static void gnw_h7b0_tim2_reset(DeviceState *dev)
 {
     GnwH7B0Tim2State *s = GNW_H7B0_TIM2(dev);
     for (int i = 0; i < (GNW_H7B0_TIM2_SIZE / 4); i++) {
-        s->regs[i] = get_tim2_reset_value(i * 4);
+        s->regs[i] = get_tim2_reset_value((i * 4) & 0x3ffu);
     }
     for (int i = 0; i < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; i++) {
         timer_del(s->count_timer[i]);
@@ -133,7 +133,25 @@ static void gnw_h7b0_tim2_write(void *opaque, hwaddr addr, uint64_t val64, unsig
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%"HWADDR_PRIx"\n", __func__, addr);
         return;
     }
-    uint32_t mask = get_tim2_write_mask(addr);
+    /*
+     * get_tim2_write_mask()/get_tim2_reset_value() (auto-generated from
+     * a single TIM2 instance's own register layout) only recognize
+     * offsets within the first 0x400 window -- BUG FIX (2026-07-16):
+     * using the raw block-wide `addr` here meant every instance past
+     * TIM2 itself (TIM3-TIM7, offsets 0x400+) hit those functions'
+     * default case (mask 0) for literally every register, silently
+     * turning every write to TIM3-TIM7 (CR1, PSC, ARR, SR, ...) into a
+     * no-op -- found via stm32h7b0-diag's timer_tim6_update case: with
+     * CR1.CEN never actually taking effect, gnw_h7b0_tim2_start_counting()
+     * never ran, and (more subtly) firmware's own `TIM6->SR = 0` clear
+     * -- meant to clear the UIF that the EGR.UG side effect below had
+     * just set -- was *also* a no-op, so the busy-wait loop saw UIF
+     * already set and returned almost instantly. Fold to the
+     * per-instance local offset before consulting either table, same as
+     * the EGR/CR1 side-effect logic below already correctly does.
+     */
+    uint32_t local_addr = addr & 0x3ffu;
+    uint32_t mask = get_tim2_write_mask(local_addr);
     uint32_t old_value = s->regs[addr >> 2];
     s->regs[addr >> 2] = (old_value & ~mask) | ((uint32_t)val64 & mask);
 
