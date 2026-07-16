@@ -27,6 +27,7 @@
 #include "qapi/error.h"
 #include "migration/vmstate.h"
 #include "exec/cpu-common.h"
+#include "qemu/main-loop.h"
 #include "hw/display/gnw_h7b0_dma2d.h"
 #include "hw/misc/gnw_h7b0_jpeg.h"
 
@@ -303,23 +304,25 @@ static void gnw_h7b0_dma2d_update_irq(GnwH7B0Dma2dState *s)
 }
 
 /*
- * Performs the actual pixel transfer for whatever CR.MODE is currently
- * configured. Runs synchronously (no timer/latency modeling, same choice
- * gnw_h7b0_jpeg.c made for its fake-instant decode) -- real firmware
- * polls ISR.TCIF right after setting CR.START, so by the time it reads
- * back the flag must already be set.
+ * 2026-07-16 worker-thread prototype: pure function of a GnwH7B0Dma2dJob
+ * snapshot (see gnw_h7b0_dma2d.h) instead of GnwH7B0Dma2dState directly, so
+ * it can run on the worker thread without touching s->regs (which the vCPU
+ * thread may be concurrently reading via MMIO) or needing BQL. Body is
+ * otherwise unchanged from the previous synchronous gnw_h7b0_dma2d_do_transfer()
+ * -- same pixel math, same cpu_physical_memory_read/write calls (safe off
+ * BQL: cpu_physical_memory_read/write funnel through address_space_read/
+ * write, which take their own RCU read-side critical section internally;
+ * see system/physmem.c).
  */
-static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
+static void gnw_h7b0_dma2d_execute_job(const GnwH7B0Dma2dJob *job)
 {
-    uint32_t cr = s->regs[GNW_H7B0_DMA2D_CR >> 2];
-    uint32_t mode = (cr & DMA2D_CR_MODE_MASK) >> DMA2D_CR_MODE_SHIFT;
-    uint32_t nlr = s->regs[GNW_H7B0_DMA2D_NLR >> 2];
-    uint32_t lines = nlr & DMA2D_NLR_NL_MASK;
-    uint32_t pixels_per_line = (nlr & DMA2D_NLR_PL_MASK) >> DMA2D_NLR_PL_SHIFT;
-    uint32_t out_cm = s->regs[GNW_H7B0_DMA2D_OPFCCR >> 2] & DMA2D_OPFCCR_CM_MASK;
+    uint32_t mode = job->mode;
+    uint32_t lines = job->lines;
+    uint32_t pixels_per_line = job->pixels_per_line;
+    uint32_t out_cm = job->out_cm;
     int out_bpp = gnw_h7b0_dma2d_output_bpp(out_cm);
-    hwaddr omar = s->regs[GNW_H7B0_DMA2D_OMAR >> 2];
-    uint32_t oor = s->regs[GNW_H7B0_DMA2D_OOR >> 2];
+    hwaddr omar = job->omar;
+    uint32_t oor = job->oor;
 
     if (lines == 0 || pixels_per_line == 0) {
         return;
@@ -355,7 +358,7 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
          * conversion a second time and corrupting every R2M fill color
          * whose output format isn't ARGB8888.
          */
-        uint32_t ocolr = s->regs[GNW_H7B0_DMA2D_OCOLR >> 2];
+        uint32_t ocolr = job->ocolr;
         hwaddr out_stride = (hwaddr)(pixels_per_line + oor) * out_bpp;
         hwaddr row_bytes = (hwaddr)pixels_per_line * out_bpp;
         /* Fill color is constant for the whole transfer -- build one row
@@ -380,23 +383,20 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
     }
 
     /* M2M / M2M_PFC / M2M_BLEND all read a foreground buffer. */
-    uint32_t fg_pfccr = s->regs[GNW_H7B0_DMA2D_FGPFCCR >> 2];
+    uint32_t fg_pfccr = job->fg_pfccr;
     uint32_t fg_cm = fg_pfccr & DMA2D_PFCCR_CM_MASK;
-    hwaddr fg_mar = s->regs[GNW_H7B0_DMA2D_FGMAR >> 2];
-    uint32_t fg_or = s->regs[GNW_H7B0_DMA2D_FGOR >> 2];
-    hwaddr fg_clut = s->regs[GNW_H7B0_DMA2D_FGCMAR >> 2];
-    uint32_t fg_colr = s->regs[GNW_H7B0_DMA2D_FGCOLR >> 2];
+    hwaddr fg_mar = job->fg_mar;
+    uint32_t fg_or = job->fg_or;
+    hwaddr fg_clut = job->fg_clut;
+    uint32_t fg_colr = job->fg_colr;
     int fg_bpp = 0;
 
-    bool is_jpeg_ycbcr = false;
-    uint32_t jpeg_w = 0, jpeg_h = 0;
-    uint32_t jpeg_cw = 0, jpeg_ch = 0;
+    bool is_jpeg_ycbcr = job->is_jpeg_ycbcr;
+    uint32_t jpeg_w = job->jpeg_w, jpeg_h = job->jpeg_h;
+    uint32_t jpeg_cw = job->jpeg_cw, jpeg_ch = job->jpeg_ch;
 
     if (fg_cm == 0xB) { /* DMA2D_INPUT_YCBCR */
-        gnw_h7b0_jpeg_get_last_decoded_size(&jpeg_w, &jpeg_h);
-        gnw_h7b0_jpeg_get_last_chroma_size(&jpeg_cw, &jpeg_ch);
-        if (jpeg_w > 0 && jpeg_h > 0) {
-            is_jpeg_ycbcr = true;
+        if (is_jpeg_ycbcr && jpeg_w > 0 && jpeg_h > 0) {
             fg_bpp = 1; /* One byte per plane per pixel; planes read separately. */
         } else {
             qemu_log_mask(LOG_UNIMP,
@@ -515,13 +515,13 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
      */
     if (mode == DMA2D_MODE_M2M_BLEND || mode == DMA2D_MODE_M2M_BLEND_FG ||
         mode == DMA2D_MODE_M2M_BLEND_BG) {
-        uint32_t bg_pfccr = s->regs[GNW_H7B0_DMA2D_BGPFCCR >> 2];
+        uint32_t bg_pfccr = job->bg_pfccr;
         uint32_t bg_cm = bg_pfccr & DMA2D_PFCCR_CM_MASK;
-        hwaddr bg_mar = s->regs[GNW_H7B0_DMA2D_BGMAR >> 2];
-        uint32_t bg_or = s->regs[GNW_H7B0_DMA2D_BGOR >> 2];
-        hwaddr bg_clut = s->regs[GNW_H7B0_DMA2D_BGCMAR >> 2];
-        uint32_t bg_colr = s->regs[GNW_H7B0_DMA2D_BGCOLR >> 2];
-        uint32_t fg_colr_fixed = s->regs[GNW_H7B0_DMA2D_FGCOLR >> 2];
+        hwaddr bg_mar = job->bg_mar;
+        uint32_t bg_or = job->bg_or;
+        hwaddr bg_clut = job->bg_clut;
+        uint32_t bg_colr = job->bg_colr;
+        uint32_t fg_colr_fixed = job->fg_colr;
         bool fg_is_fixed = (mode == DMA2D_MODE_M2M_BLEND_FG);
         bool bg_is_fixed = (mode == DMA2D_MODE_M2M_BLEND_BG);
         int bg_bpp = 0;
@@ -619,6 +619,92 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
     }
 }
 
+/*
+ * Cheap producer-side snapshot, called under BQL from the CR.START MMIO
+ * write. Copies just the config registers (not any framebuffer/pixel data)
+ * plus the JPEG plane geometry -- see GnwH7B0Dma2dJob's doc comment in
+ * gnw_h7b0_dma2d.h for why the JPEG getters are called here rather than on
+ * the worker thread.
+ */
+static void gnw_h7b0_dma2d_snapshot_job(GnwH7B0Dma2dState *s,
+                                         GnwH7B0Dma2dJob *job)
+{
+    uint32_t cr = s->regs[GNW_H7B0_DMA2D_CR >> 2];
+    uint32_t nlr = s->regs[GNW_H7B0_DMA2D_NLR >> 2];
+
+    job->mode = (cr & DMA2D_CR_MODE_MASK) >> DMA2D_CR_MODE_SHIFT;
+    job->lines = nlr & DMA2D_NLR_NL_MASK;
+    job->pixels_per_line = (nlr & DMA2D_NLR_PL_MASK) >> DMA2D_NLR_PL_SHIFT;
+    job->out_cm = s->regs[GNW_H7B0_DMA2D_OPFCCR >> 2] & DMA2D_OPFCCR_CM_MASK;
+    job->omar = s->regs[GNW_H7B0_DMA2D_OMAR >> 2];
+    job->oor = s->regs[GNW_H7B0_DMA2D_OOR >> 2];
+    job->ocolr = s->regs[GNW_H7B0_DMA2D_OCOLR >> 2];
+
+    job->fg_pfccr = s->regs[GNW_H7B0_DMA2D_FGPFCCR >> 2];
+    job->fg_mar = s->regs[GNW_H7B0_DMA2D_FGMAR >> 2];
+    job->fg_or = s->regs[GNW_H7B0_DMA2D_FGOR >> 2];
+    job->fg_clut = s->regs[GNW_H7B0_DMA2D_FGCMAR >> 2];
+    job->fg_colr = s->regs[GNW_H7B0_DMA2D_FGCOLR >> 2];
+
+    job->bg_pfccr = s->regs[GNW_H7B0_DMA2D_BGPFCCR >> 2];
+    job->bg_mar = s->regs[GNW_H7B0_DMA2D_BGMAR >> 2];
+    job->bg_or = s->regs[GNW_H7B0_DMA2D_BGOR >> 2];
+    job->bg_clut = s->regs[GNW_H7B0_DMA2D_BGCMAR >> 2];
+    job->bg_colr = s->regs[GNW_H7B0_DMA2D_BGCOLR >> 2];
+
+    job->is_jpeg_ycbcr = false;
+    job->jpeg_w = job->jpeg_h = job->jpeg_cw = job->jpeg_ch = 0;
+    if ((job->fg_pfccr & DMA2D_PFCCR_CM_MASK) == 0xB) { /* DMA2D_INPUT_YCBCR */
+        gnw_h7b0_jpeg_get_last_decoded_size(&job->jpeg_w, &job->jpeg_h);
+        gnw_h7b0_jpeg_get_last_chroma_size(&job->jpeg_cw, &job->jpeg_ch);
+        job->is_jpeg_ycbcr = (job->jpeg_w > 0 && job->jpeg_h > 0);
+    }
+}
+
+/*
+ * Worker thread body: waits for a job, runs it off the BQL/vCPU thread, then
+ * re-acquires BQL just long enough to set ISR.TCIF and raise the IRQ --
+ * matching real hardware's asynchronous transfer-complete signaling (see
+ * "2026-07-16 DMA2D worker-thread prototype" note below for why this
+ * exists and what it measured; short version: real firmware's only DMA2D
+ * call site (game-and-watch-retro-go-sd's hw_jpeg_decoder.c) uses
+ * HAL_DMA2D_Start()+HAL_DMA2D_PollForTransfer(), a tight synchronous spin,
+ * so this buys no guest-visible overlap -- it's here because the project
+ * owner asked to measure it directly rather than rely on that analysis).
+ */
+static void *gnw_h7b0_dma2d_worker_thread(void *opaque)
+{
+    GnwH7B0Dma2dState *s = opaque;
+
+    qemu_mutex_lock(&s->thr_mutex);
+    for (;;) {
+        while (!s->job_pending && !s->stopping) {
+            qemu_cond_wait(&s->thr_cond, &s->thr_mutex);
+        }
+        if (s->stopping) {
+            qemu_mutex_unlock(&s->thr_mutex);
+            break;
+        }
+
+        GnwH7B0Dma2dJob job = s->job;
+        s->job_pending = false;
+        qemu_mutex_unlock(&s->thr_mutex);
+
+        gnw_h7b0_dma2d_execute_job(&job);
+
+        bql_lock();
+        s->regs[GNW_H7B0_DMA2D_CR >> 2] &= ~DMA2D_CR_START;
+        s->regs[GNW_H7B0_DMA2D_ISR >> 2] |= DMA2D_ISR_TCIF;
+        gnw_h7b0_dma2d_update_irq(s);
+        bql_unlock();
+
+        qemu_mutex_lock(&s->thr_mutex);
+        s->job_busy = false;
+    }
+
+    return NULL;
+}
+
 static void gnw_h7b0_dma2d_reset(DeviceState *dev)
 {
     GnwH7B0Dma2dState *s = GNW_H7B0_DMA2D(dev);
@@ -681,11 +767,46 @@ static void gnw_h7b0_dma2d_write(void *opaque, hwaddr addr, uint64_t val64,
         }
         return;
     case GNW_H7B0_DMA2D_CR:
-        s->regs[addr >> 2] = value & ~DMA2D_CR_START;
+        /*
+         * IMPORTANT (found via the diag suite's dma2d_fill FAIL while
+         * building this prototype): real hardware's CR.START is a
+         * hardware "busy" bit that STAYS SET until the transfer actually
+         * finishes -- HAL_DMA2D_PollForTransfer() (see
+         * sdk/stm32h7xx-hal-driver/Src/stm32h7xx_hal_dma2d.c) only enters
+         * its TCIF poll loop at all if CR.START is still set when it's
+         * called: `if ((hdma2d->Instance->CR & DMA2D_CR_START) != 0U)`.
+         * The old synchronous model could clear START immediately in this
+         * handler because the transfer was already fully done by the time
+         * the MMIO write returned -- PollForTransfer would see START==0,
+         * skip its own wait loop, and still read correct data (already
+         * written). Once the transfer moves to a worker thread, clearing
+         * START immediately makes PollForTransfer wrongly skip its wait
+         * loop and race the guest's read against the worker's write. So:
+         * keep CR.START set here, and only clear it (alongside setting
+         * ISR.TCIF) when the worker actually finishes, matching real
+         * hardware's semantics and giving PollForTransfer's poll loop
+         * something real to wait on.
+         */
+        s->regs[addr >> 2] = value;
         if (value & DMA2D_CR_START) {
-            gnw_h7b0_dma2d_do_transfer(s);
-            s->regs[GNW_H7B0_DMA2D_ISR >> 2] |= DMA2D_ISR_TCIF;
-            gnw_h7b0_dma2d_update_irq(s);
+            qemu_mutex_lock(&s->thr_mutex);
+            if (s->job_busy) {
+                /*
+                 * Real firmware never issues an overlapping START (it
+                 * always polls TCIF to completion first) -- this is a
+                 * safety net, not an expected path.
+                 */
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "%s: CR.START while a transfer is already in "
+                              "flight, dropping\n", __func__);
+                qemu_mutex_unlock(&s->thr_mutex);
+                return;
+            }
+            gnw_h7b0_dma2d_snapshot_job(s, &s->job);
+            s->job_busy = true;
+            s->job_pending = true;
+            qemu_cond_signal(&s->thr_cond);
+            qemu_mutex_unlock(&s->thr_mutex);
         }
         return;
     default:
@@ -717,6 +838,31 @@ static void gnw_h7b0_dma2d_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
+static void gnw_h7b0_dma2d_realize(DeviceState *dev, Error **errp)
+{
+    GnwH7B0Dma2dState *s = GNW_H7B0_DMA2D(dev);
+
+    qemu_mutex_init(&s->thr_mutex);
+    qemu_cond_init(&s->thr_cond);
+    qemu_thread_create(&s->thread, "gnw-h7b0-dma2d",
+                        gnw_h7b0_dma2d_worker_thread, s,
+                        QEMU_THREAD_JOINABLE);
+}
+
+static void gnw_h7b0_dma2d_unrealize(DeviceState *dev)
+{
+    GnwH7B0Dma2dState *s = GNW_H7B0_DMA2D(dev);
+
+    qemu_mutex_lock(&s->thr_mutex);
+    s->stopping = true;
+    qemu_mutex_unlock(&s->thr_mutex);
+    qemu_cond_signal(&s->thr_cond);
+    qemu_thread_join(&s->thread);
+
+    qemu_cond_destroy(&s->thr_cond);
+    qemu_mutex_destroy(&s->thr_mutex);
+}
+
 static const VMStateDescription vmstate_gnw_h7b0_dma2d = {
     .name = TYPE_GNW_H7B0_DMA2D,
     .version_id = 1,
@@ -733,6 +879,8 @@ static void gnw_h7b0_dma2d_class_init(ObjectClass *klass, const void *data)
 
     dc->vmsd = &vmstate_gnw_h7b0_dma2d;
     device_class_set_legacy_reset(dc, gnw_h7b0_dma2d_reset);
+    dc->realize = gnw_h7b0_dma2d_realize;
+    dc->unrealize = gnw_h7b0_dma2d_unrealize;
 }
 
 static const TypeInfo gnw_h7b0_dma2d_info = {

@@ -52,6 +52,7 @@
 #include "hw/core/irq.h"
 #include "system/memory.h"
 #include "qom/object.h"
+#include "qemu/thread.h"
 
 #define TYPE_GNW_H7B0_DMA2D "gnw-h7b0-dma2d"
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0Dma2dState, GNW_H7B0_DMA2D)
@@ -147,6 +148,43 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0Dma2dState, GNW_H7B0_DMA2D)
 #define GNW_H7B0_DMA2D_LWR     0x48
 #define GNW_H7B0_DMA2D_AMTCR   0x4C
 
+/*
+ * Cheap producer-side snapshot of everything a transfer needs, taken under
+ * BQL on the CR.START write, then handed to the worker thread so it can do
+ * the actual guest-RAM read/pixel-math/guest-RAM write without holding BQL.
+ * Deliberately NOT a framebuffer copy -- just the config registers plus the
+ * already-decoded JPEG plane geometry (gnw_h7b0_jpeg_get_last_decoded_size()/
+ * get_last_chroma_size() are called here, on the BQL thread, precisely so
+ * the worker never has to reach into the JPEG device's state off-thread).
+ * See "2026-07-16 DMA2D worker-thread prototype" note in gnw_h7b0_dma2d.c
+ * for why this exists and what it actually measured.
+ */
+typedef struct GnwH7B0Dma2dJob {
+    uint32_t mode;
+    uint32_t lines;
+    uint32_t pixels_per_line;
+    uint32_t out_cm;
+    hwaddr omar;
+    uint32_t oor;
+    uint32_t ocolr;
+
+    uint32_t fg_pfccr;
+    hwaddr fg_mar;
+    uint32_t fg_or;
+    hwaddr fg_clut;
+    uint32_t fg_colr;
+
+    uint32_t bg_pfccr;
+    hwaddr bg_mar;
+    uint32_t bg_or;
+    hwaddr bg_clut;
+    uint32_t bg_colr;
+
+    bool is_jpeg_ycbcr;
+    uint32_t jpeg_w, jpeg_h;
+    uint32_t jpeg_cw, jpeg_ch;
+} GnwH7B0Dma2dJob;
+
 struct GnwH7B0Dma2dState {
     SysBusDevice parent_obj;
 
@@ -154,6 +192,22 @@ struct GnwH7B0Dma2dState {
     qemu_irq irq;
 
     uint32_t regs[GNW_H7B0_DMA2D_SIZE / 4];
+
+    /*
+     * Worker-thread prototype (2026-07-16, see gnw_h7b0_dma2d.c): CR.START
+     * hands a GnwH7B0Dma2dJob snapshot to thread, which does the actual
+     * pixel transfer off the BQL/vCPU thread and then sets ISR.TCIF and
+     * raises the IRQ under BQL when done, matching real hardware's
+     * asynchronous transfer-complete signaling instead of the previous
+     * finish-before-MMIO-write-returns synchronous model.
+     */
+    QemuThread thread;
+    QemuMutex thr_mutex;
+    QemuCond thr_cond;
+    GnwH7B0Dma2dJob job;
+    bool job_pending;
+    bool job_busy;
+    bool stopping;
 };
 
 #endif
