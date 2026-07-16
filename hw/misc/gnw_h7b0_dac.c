@@ -1,9 +1,90 @@
-/* Auto-generated stub for DAC */
+/*
+ * Auto-generated stub for DAC, extended with real DHR->DOR transfer.
+ *
+ * Was a plain read/write shadow with no side effects at all -- fine for
+ * firmware that only pokes DAC registers without ever reading back the
+ * output, but stm32h7b0-diag's dac1_output_value/dac2_output_value cases
+ * (this firmware's real LCD-backlight control path, MX_DAC1_Init()/
+ * MX_DAC2_Init() in main.c, DAC_Trigger = NONE) write a known code via
+ * HAL_DAC_SetValue() (-> DHR12Rx) and read it back via HAL_DAC_GetValue()
+ * (-> DORx) to verify the digital output pipeline. Per RM0455: with
+ * TENx=0 (untriggered, this firmware's actual config), the DHRx->DORx
+ * transfer happens automatically ~1 APB1 clock after the DHRx write, no
+ * software trigger needed. With no such transfer modeled at all, DORx
+ * stayed permanently 0 regardless of what firmware wrote to DHRx.
+ *
+ * Only the untriggered (TENx=0) auto-transfer is modeled, on writes to
+ * each channel's single-channel DHR registers (DHR12Rx/DHR12Lx/DHR8Rx --
+ * the only ones any known firmware here uses; DHR12RD/DHR12LD/DHR8RD
+ * dual-channel registers are not handled). Software-triggered transfers
+ * (TENx=1 + SWTRGR) are not modeled -- no known firmware here uses them.
+ */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "migration/vmstate.h"
 #include "hw/misc/gnw_h7b0_dac.h"
 #include "hw/misc/gnw_h7b0_regs_dac.h"
+
+#define DAC_CR_EN1  (1U << 0)
+#define DAC_CR_TEN1 (1U << 1)
+#define DAC_CR_EN2  (1U << 16)
+#define DAC_CR_TEN2 (1U << 17)
+
+static void gnw_h7b0_dac_maybe_transfer(GnwH7B0DacState *s, hwaddr addr)
+{
+    uint32_t cr = s->regs[GNW_H7B0_DAC1_CR_OFFSET >> 2];
+    uint32_t val;
+    hwaddr dor_off;
+
+    switch (addr) {
+    case GNW_H7B0_DAC1_DHR12R1_OFFSET:
+        val = s->regs[addr >> 2] & 0xfffU;
+        dor_off = GNW_H7B0_DAC1_DOR1_OFFSET;
+        if (cr & DAC_CR_TEN1) {
+            return;
+        }
+        break;
+    case GNW_H7B0_DAC1_DHR12L1_OFFSET:
+        val = (s->regs[addr >> 2] >> 4) & 0xfffU;
+        dor_off = GNW_H7B0_DAC1_DOR1_OFFSET;
+        if (cr & DAC_CR_TEN1) {
+            return;
+        }
+        break;
+    case GNW_H7B0_DAC1_DHR8R1_OFFSET:
+        val = (s->regs[addr >> 2] & 0xffU) << 4;
+        dor_off = GNW_H7B0_DAC1_DOR1_OFFSET;
+        if (cr & DAC_CR_TEN1) {
+            return;
+        }
+        break;
+    case GNW_H7B0_DAC1_DHR12R2_OFFSET:
+        val = s->regs[addr >> 2] & 0xfffU;
+        dor_off = GNW_H7B0_DAC1_DOR2_OFFSET;
+        if (cr & DAC_CR_TEN2) {
+            return;
+        }
+        break;
+    case GNW_H7B0_DAC1_DHR12L2_OFFSET:
+        val = (s->regs[addr >> 2] >> 4) & 0xfffU;
+        dor_off = GNW_H7B0_DAC1_DOR2_OFFSET;
+        if (cr & DAC_CR_TEN2) {
+            return;
+        }
+        break;
+    case GNW_H7B0_DAC1_DHR8R2_OFFSET:
+        val = (s->regs[addr >> 2] & 0xffU) << 4;
+        dor_off = GNW_H7B0_DAC1_DOR2_OFFSET;
+        if (cr & DAC_CR_TEN2) {
+            return;
+        }
+        break;
+    default:
+        return;
+    }
+
+    s->regs[dor_off >> 2] = val;
+}
 
 static void gnw_h7b0_dac_reset(DeviceState *dev)
 {
@@ -32,6 +113,7 @@ static void gnw_h7b0_dac_write(void *opaque, hwaddr addr, uint64_t val64, unsign
     }
     uint32_t mask = get_dac_write_mask(addr);
     s->regs[addr >> 2] = (s->regs[addr >> 2] & ~mask) | ((uint32_t)val64 & mask);
+    gnw_h7b0_dac_maybe_transfer(s, addr);
 }
 
 static const MemoryRegionOps gnw_h7b0_dac_ops = {

@@ -183,12 +183,34 @@ suite.
 `hw/arm/gnw_h7b0_soc.c`, `include/hw/arm/gnw_h7b0_soc.h`, `hw/arm/Kconfig`,
 `hw/misc/Kconfig`, `hw/misc/meson.build`.
 
-## Priority 4c — everything else (5 remaining fails, NOT YET TRIAGED individually)
+## Priority 4c — DAC1/DAC2 output value: FIXED ✅
+
+`dac1_output_value`/`dac2_output_value` write a known code to
+`DHR12Rx` (via `HAL_DAC_SetValue()`) and read it back from `DORx` (via
+`HAL_DAC_GetValue()`) to verify the digital DHR->DOR transfer pipeline
+this firmware's real LCD-backlight control depends on
+(`MX_DAC1_Init()`/`MX_DAC2_Init()`, `DAC_Trigger = NONE`). The DAC device
+model was a plain register read/write shadow with no side effects at
+all -- `DORx` stayed permanently 0 regardless of what firmware wrote to
+`DHRx`, since real hardware's automatic (untriggered, `TENx=0`) DHR->DOR
+transfer was never modeled. Fixed by adding that transfer in
+`hw/misc/gnw_h7b0_dac.c`: on a write to any single-channel DHR register
+(`DHR12Rx`/`DHR12Lx`/`DHR8Rx`) with that channel's `TENx` clear, the
+value is immediately (De-aligned/shifted as needed) copied into the
+matching `DORx`. Dual-channel `DHR12RD`/`DHR12LD`/`DHR8RD` registers and
+software-triggered (`TENx=1`+`SWTRGR`) transfers are not modeled -- no
+known firmware here uses them.
+
+Both cases verified live.
+
+**Files changed**: `hw/misc/gnw_h7b0_dac.c`.
+
+## Priority 4d — everything else (3 remaining fails, NOT YET TRIAGED individually)
 
 Confirmed current fails after re-running the full live suite with CRC32 +
-HASH/HMAC + LTDC + JPEG + DMA1/DMA2/MDMA m2m + RNG all applied
-(2026-07-16): `dac1_output_value`, `dac2_output_value`,
-`crypto_crc16_reconfig`, `timer_tim6_update`, `exti_edge_config`.
+HASH/HMAC + LTDC + JPEG + DMA1/DMA2/MDMA m2m + RNG + DAC1/DAC2 all applied
+(2026-07-16): `crypto_crc16_reconfig`, `timer_tim6_update`,
+`exti_edge_config`.
 
 Also appearing as FAIL in this same run, worth double-checking for
 host-contention flake vs. real regression before triaging (this host has
