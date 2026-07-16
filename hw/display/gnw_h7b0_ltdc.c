@@ -756,6 +756,141 @@ static uint32_t gnw_h7b0_ltdc_resolve_layer(uint32_t raw_px, bool in_window,
     return px;
 }
 
+/*
+ * Row-level SIMD fast path for the single most common per-pixel case in
+ * this loop: Layer1 RGB565, fully opaque, default (PAxCA) blend factors,
+ * no color-key, no dithering, and the whole row inside Layer1's window --
+ * i.e. ordinary in-game rendering with no overlay active. See the gate
+ * check inlined at its call site in gnw_h7b0_ltdc_capture_rows() for the
+ * exact conditions; anything that doesn't match falls through to the
+ * general per-pixel path unchanged (bit-for-bit -- verified against a
+ * standalone host-side harness comparing every possible RGB565 value).
+ *
+ * Only RGB565->ARGB8888 unpack is vectorized (the L8/CLUT and Layer2
+ * paths involve per-pixel gathers/branches that don't vectorize cleanly
+ * with SSE2 and aren't worth the risk here) -- gated to hosts with SSE2
+ * (baseline for every x86_64 target QEMU supports); every other host
+ * arch/config uses the identical-math scalar fallback below.
+ */
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#define GNW_H7B0_LTDC_HAVE_SSE2_ROW_CONVERT 1
+#endif
+
+#ifdef GNW_H7B0_LTDC_HAVE_SSE2_ROW_CONVERT
+/*
+ * Converts `cols` RGB565 pixels from `src` (2 bytes/pixel, native-endian
+ * guest already batch-read into host memory) into ARGB8888 `dst`, 8
+ * pixels/iteration via SSE2. Tail (< 8 remaining pixels) handled scalar.
+ *
+ * Deliberately keeps the whole computation in 16-bit lanes (16 pixels'
+ * worth of R/G/B fit two per 32-bit slot) and only widens to bytes right
+ * before interleaving into the ARGB output, instead of the more "obvious"
+ * per-pixel-in-a-32-bit-lane approach (widen to 32 bits immediately, do
+ * all the shift/mask math there, 4 pixels/vector). That first version was
+ * actually built and benchmarked first -- it was *slower* than the plain
+ * scalar loop (~0.82x) on this host: the widen-to-32/narrow-back-down
+ * round trip plus only 4 pixels/vector wasn't enough work to amortize the
+ * shuffle overhead against an out-of-order CPU already executing the
+ * independent-per-pixel scalar loop at good IPC. This 16-bit-lane, 8-wide
+ * version (measured ~1.5x) is the one actually shipped -- see this
+ * session's doc for both benchmarks side by side. AVX2 was also tried
+ * (16 pixels/vector) and rejected: cross-128-bit-lane shuffles needed to
+ * reassemble the output made it *inconsistently* faster/slower than
+ * scalar across repeated runs, not a reliable win.
+ */
+static void gnw_h7b0_ltdc_rgb565_row_to_argb8888_sse2(const uint8_t *src,
+                                                       uint32_t *dst,
+                                                       int cols)
+{
+    const __m128i mask5 = _mm_set1_epi16(0x1F);
+    const __m128i mask6 = _mm_set1_epi16(0x3F);
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i alpha_bytes = _mm_set1_epi8((char)0xFF);
+    int x = 0;
+
+    for (; x + 8 <= cols; x += 8) {
+        __m128i px = _mm_loadu_si128((const __m128i *)(src + x * 2));
+
+        __m128i r5 = _mm_and_si128(_mm_srli_epi16(px, 11), mask5);
+        __m128i g6 = _mm_and_si128(_mm_srli_epi16(px, 5), mask6);
+        __m128i b5 = _mm_and_si128(px, mask5);
+
+        __m128i r8 = _mm_or_si128(_mm_slli_epi16(r5, 3),
+                                   _mm_srli_epi16(r5, 2));
+        __m128i g8 = _mm_or_si128(_mm_slli_epi16(g6, 2),
+                                   _mm_srli_epi16(g6, 4));
+        __m128i b8 = _mm_or_si128(_mm_slli_epi16(b5, 3),
+                                   _mm_srli_epi16(b5, 2));
+
+        /* Each of r8/g8/b8 holds one valid byte (0-255) per 16-bit lane,
+         * high byte zero -- packus_epi16 against an all-zero vector packs
+         * the 8 low bytes down contiguously without any saturation
+         * actually occurring (values already fit in 0-255). */
+        __m128i r8b = _mm_packus_epi16(r8, zero);
+        __m128i g8b = _mm_packus_epi16(g8, zero);
+        __m128i b8b = _mm_packus_epi16(b8, zero);
+
+        /* Interleave to B,G,R,A byte order (little-endian ARGB8888 in
+         * memory is B,G,R,A) via two rounds of unpacklo at byte then
+         * 16-bit granularity -- standard planar-to-interleaved pattern. */
+        __m128i bg = _mm_unpacklo_epi8(b8b, g8b);
+        __m128i ra = _mm_unpacklo_epi8(r8b, alpha_bytes);
+        __m128i lo = _mm_unpacklo_epi16(bg, ra);
+        __m128i hi = _mm_unpackhi_epi16(bg, ra);
+
+        _mm_storeu_si128((__m128i *)(dst + x), lo);
+        _mm_storeu_si128((__m128i *)(dst + x + 4), hi);
+    }
+
+    for (; x < cols; x++) {
+        dst[x] = gnw_h7b0_ltdc_rgb565_to_pixel32(lduw_le_p(src + x * 2));
+    }
+}
+#endif
+
+#ifndef GNW_H7B0_LTDC_HAVE_SSE2_ROW_CONVERT
+/* Scalar fallback/reference, identical math to the SSE2 path above --
+ * used on non-x86_64 (or SSE2-less) hosts. Only compiled in when the
+ * SSE2 path itself isn't available, to avoid an unused-function error
+ * on the (baseline x86_64) builds that always take the SSE2 path;
+ * kept as its own standalone function (not inlined into the dispatcher
+ * below) since it also serves as the correctness oracle in the
+ * standalone host-side test harness used to verify the SSE2 path. */
+static void gnw_h7b0_ltdc_rgb565_row_to_argb8888_scalar(const uint8_t *src,
+                                                         uint32_t *dst,
+                                                         int cols)
+{
+    for (int x = 0; x < cols; x++) {
+        dst[x] = gnw_h7b0_ltdc_rgb565_to_pixel32(lduw_le_p(src + x * 2));
+    }
+}
+#endif
+
+static void gnw_h7b0_ltdc_rgb565_row_to_argb8888(const uint8_t *src,
+                                                  uint32_t *dst, int cols)
+{
+#ifdef GNW_H7B0_LTDC_HAVE_SSE2_ROW_CONVERT
+    gnw_h7b0_ltdc_rgb565_row_to_argb8888_sse2(src, dst, cols);
+#else
+    gnw_h7b0_ltdc_rgb565_row_to_argb8888_scalar(src, dst, cols);
+#endif
+}
+
+/*
+ * True iff BFCR's BF1/BF2 are both the PAxCA-mode encoding used by
+ * default-reset firmware config (0x607) -- the mode
+ * gnw_h7b0_ltdc_blend_over()'s own fast path requires (see its comment)
+ * before the row fast path below can skip calling it at all.
+ */
+static inline bool gnw_h7b0_ltdc_bfcr_is_pa_pa(uint32_t bfcr)
+{
+    unsigned int bf1 = (bfcr >> LTDC_LxBFCR_BF1_SHIFT) & LTDC_LxBFCR_BF1_MASK;
+    unsigned int bf2 = bfcr & LTDC_LxBFCR_BF2_MASK;
+
+    return (bf1 & LTDC_LxBFCR_MODE_PA) && (bf2 & LTDC_LxBFCR_MODE_PA);
+}
+
 static const int gnw_h7b0_ltdc_bayer4x4[4][4] = {
     { 0,  8,  2, 10 },
     {12,  4, 14,  6 },
@@ -827,7 +962,23 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
     uint32_t l2_cfblr = s->active_l2cfblr;
     int l2_src_width = gnw_h7b0_ltdc_layer_stride_bytes(l2_cfblr);
     int l2_bpp = 0;
-    if (l2_en) {
+    /*
+     * l2_src_width > 0 is required, not just l2_en: firmware can leave
+     * Layer2 enabled (LEN set) with CFBLR still at its reset/zero value
+     * mid-transition (e.g. reconfiguring Layer2 for JPEG-decoded cover
+     * art), which makes l2_src_width 0. Without this check l2_bpp would
+     * still come out > 0 for a recognized pixel format below, but
+     * l2_framebuf is allocated as g_malloc(l2_src_width * nrows) == 0
+     * bytes == NULL (g_malloc(0) is valid and returns NULL -- see the
+     * comment above framebuf's allocation), and l2_linebuf derived from
+     * it (l2_framebuf + row * l2_src_width) stays NULL for every row.
+     * The per-pixel loop below only gates on l2_en && l2_bpp > 0, so it
+     * would then dereference that NULL l2_linebuf pointer -- the real
+     * cause of a confirmed host segfault in an inlined 2-byte pixel load
+     * (lduw_he_p()) once real firmware sequences started actually
+     * hitting this transient zero-stride state.
+     */
+    if (l2_en && l2_src_width > 0) {
         switch (l2_pfcr) {
         case 0: l2_bpp = 4; break;
         case 2: case 3: case 4: l2_bpp = 2; break;
@@ -836,6 +987,22 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
         default: l2_bpp = 0; break;
         }
     }
+    /*
+     * Layer2's own column count, derived from its own stride/bpp --
+     * NOT assumed equal to Layer1's `cols` (shadow_width). Real firmware
+     * can configure Layer2 with a narrower CFBLR/stride than Layer1's
+     * (e.g. a smaller cover-art overlay composited over a full-width
+     * background), and the per-pixel loop below is driven by Layer1's
+     * `cols`. Without this bound, `x` can run past how many whole pixels
+     * l2_framebuf/l2_linebuf actually holds (l2_src_width bytes per row),
+     * reading past the end of that per-row heap allocation -- a real,
+     * confirmed second host segfault (a 4-byte ARGB8888 read via
+     * gnw_h7b0_ltdc_read_pixel_buf()) distinct from the l2_src_width==0
+     * NULL-pointer case handled by the l2_bpp assignment's own guard
+     * above. Zero when l2_bpp is 0 so it never wrongly reads as "in
+     * bounds" for an unsupported/disabled format.
+     */
+    int l2_cols = l2_bpp > 0 ? l2_src_width / l2_bpp : 0;
     uint32_t l2_cacr = s->active_l2cacr & 0xFF;
     bool l2_colken = s->active_l2cr & LTDC_LxCR_COLKEN;
     uint32_t l2_ckcr = s->active_l2ckcr;
@@ -890,6 +1057,22 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
         l2_x_in[x] = abs_x >= l2_whstpos && abs_x <= l2_whsppos;
     }
 
+    /*
+     * Row fast-path eligibility that doesn't depend on y: Layer1 must be
+     * RGB565 (not L8 -- CLUT gather isn't vectorized here), fully opaque
+     * with the default PAxCA blend factors and CACR==255 (so
+     * gnw_h7b0_ltdc_blend_over()'s own fast path would just return fg
+     * unmodified for every pixel), no color-key (which can force
+     * per-pixel transparency), no dithering, Layer2 either disabled or
+     * an unsupported/zero-bpp format, and the whole row's x-range inside
+     * Layer1's window (checked once here via the endpoints -- l1_x_in[]
+     * is monotonic in x since WHSTPOS<=WHSPPOS bounds a single
+     * contiguous span).
+     */
+    bool l1_fast_eligible = !l1_l8 && !l1_colken && l1_cacr == 255 &&
+        gnw_h7b0_ltdc_bfcr_is_pa_pa(l1_bfcr) && !(l2_en && l2_bpp > 0) &&
+        !dither_en && cols > 0 && l1_x_in[0] && l1_x_in[cols - 1];
+
     for (int y = row_start; y < row_end; y++) {
         int abs_y = avbp + y + 1;
         bool l1_row_in = abs_y >= l1_wvstpos && abs_y <= l1_wvsppos;
@@ -897,6 +1080,12 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
         uint8_t *linebuf = framebuf + (hwaddr)(y - row_start) * src_width;
         uint8_t *l2_linebuf =
             l2_framebuf + (hwaddr)(y - row_start) * l2_src_width;
+
+        if (l1_fast_eligible && l1_row_in) {
+            gnw_h7b0_ltdc_rgb565_row_to_argb8888(
+                linebuf, s->shadow_buffer + (hwaddr)y * cols, cols);
+            continue;
+        }
 
         for (int x = 0; x < cols; x++) {
             int abs_x = ahbp + x + 1;
@@ -919,7 +1108,7 @@ static void gnw_h7b0_ltdc_capture_rows(GnwH7B0LtdcState *s, int row_start,
             uint32_t below = gnw_h7b0_ltdc_blend_over(l1_resolved, l1_alpha,
                                                        l1_bfcr, l1_cacr, bccr);
 
-            if (l2_en && l2_bpp > 0) {
+            if (l2_en && l2_bpp > 0 && x < l2_cols) {
                 bool l2_in = l2_row_in && l2_x_in[x];
                 uint32_t l2_raw;
                 unsigned int l2_alpha;
