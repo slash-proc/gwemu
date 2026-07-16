@@ -237,7 +237,7 @@ static void gnw_h7b0_sai1_update_voice(GnwH7B0Sai1State *s)
             if (s->dma) {
                 gnw_h7b0_dma_set_request_notifier(s->dma,
                     GNW_H7B0_SAI1_DMA_REQUEST, gnw_h7b0_sai1_dma_notify, s,
-                    gnw_h7b0_sai1_dma_rate_fn, s);
+                    gnw_h7b0_sai1_dma_rate_fn, s, false);
             }
         }
     } else if (!want_enabled && s->voice_open) {
@@ -246,7 +246,7 @@ static void gnw_h7b0_sai1_update_voice(GnwH7B0Sai1State *s)
         fifo8_reset(&s->fifo);
         if (s->dma) {
             gnw_h7b0_dma_set_request_notifier(s->dma,
-                GNW_H7B0_SAI1_DMA_REQUEST, NULL, NULL, NULL, NULL);
+                GNW_H7B0_SAI1_DMA_REQUEST, NULL, NULL, NULL, NULL, false);
         }
     }
 }
@@ -257,7 +257,7 @@ void gnw_h7b0_sai1_set_dma(GnwH7B0Sai1State *s, GnwH7B0DmaState *dma)
     if (s->voice_open) {
         gnw_h7b0_dma_set_request_notifier(s->dma, GNW_H7B0_SAI1_DMA_REQUEST,
                                            gnw_h7b0_sai1_dma_notify, s,
-                                           gnw_h7b0_sai1_dma_rate_fn, s);
+                                           gnw_h7b0_sai1_dma_rate_fn, s, false);
     }
 }
 
@@ -278,7 +278,7 @@ static void gnw_h7b0_sai1_reset(DeviceState *dev)
         fifo8_reset(&s->fifo);
         if (s->dma) {
             gnw_h7b0_dma_set_request_notifier(s->dma,
-                GNW_H7B0_SAI1_DMA_REQUEST, NULL, NULL, NULL, NULL);
+                GNW_H7B0_SAI1_DMA_REQUEST, NULL, NULL, NULL, NULL, false);
         }
     }
 }
