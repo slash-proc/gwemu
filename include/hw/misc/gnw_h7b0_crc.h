@@ -83,6 +83,7 @@ struct GnwH7B0CrcState {
      */
     uint32_t table[256];
     uint32_t table_pol;
+    unsigned int table_width;
     bool table_valid;
 };
 

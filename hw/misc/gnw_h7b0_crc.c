@@ -40,35 +40,65 @@ static uint32_t bit_reverse(uint32_t v, unsigned int width_bits)
 }
 
 /*
+ * CRC accumulator width in bits, from CR.POLYSIZE (00=32, 01=16, 10=8;
+ * 11 is reserved on real hardware -- treated as 32-bit here, same as
+ * POLYSIZE's power-on default, rather than silently doing the wrong
+ * thing).
+ */
+static unsigned int crc_width_bits(GnwH7B0CrcState *s)
+{
+    switch ((s->cr & CRC_CR_POLYSIZE_MASK) >> CRC_CR_POLYSIZE_SHIFT) {
+    case 1: return 16;
+    case 2: return 8;
+    default: return 32;
+    }
+}
+
+/*
  * Byte-at-a-time table lookup, standard MSB-first ("non-reflected")
  * CRC construction: table[n] is what the bit-serial engine below
  * would produce feeding byte `n` alone into a zero accumulator for
- * the current polynomial. Processing 8 bits via one table lookup +
- * shift + XOR is mathematically identical to running the bit-serial
- * loop 8 times (verified by direct comparison across random inputs,
- * all four POLYSIZE widths, and both REV_IN settings before landing
- * this) -- this is a performance cache only, not a semantic change.
- * Rebuilt lazily whenever s->pol changes (writes to CRC_POL are rare
- * -- effectively init-time only -- while CRC_DR feeds are the hot
- * path a benchmark like crypto_crc32 hammers).
+ * the current polynomial *and accumulator width*. Processing 8 bits
+ * via one table lookup + shift + XOR is mathematically identical to
+ * running the bit-serial loop 8 times -- this is a performance cache
+ * only, not a semantic change.
+ *
+ * BUG FIX (2026-07-16): this used to hardcode a 32-bit-wide table
+ * (`n << 24`, testing bit 31) regardless of CR.POLYSIZE, silently
+ * computing a 32-bit CRC even when firmware had configured POLYSIZE for
+ * 16- or 8-bit operation -- found via stm32h7b0-diag's
+ * crypto_crc16_reconfig case (CRC-16/CCITT-FALSE, poly 0x1021) coming
+ * back with a 32-bit-algorithm result instead of the real 16-bit one.
+ * Now parameterized on crc_width_bits(): the top byte position (and top
+ * bit test) both scale with the accumulator width, matching a real
+ * variable-width LFSR instead of an always-32-bit one.
+ *
+ * Rebuilt lazily whenever s->pol or the accumulator width changes
+ * (writes to CRC_POL/CR.POLYSIZE are rare -- effectively init-time only
+ * -- while CRC_DR feeds are the hot path a benchmark like crypto_crc32
+ * hammers).
  */
-static void crc_rebuild_table(GnwH7B0CrcState *s)
+static void crc_rebuild_table(GnwH7B0CrcState *s, unsigned int width_bits)
 {
+    uint32_t top_bit = 1U << (width_bits - 1);
+    uint32_t width_mask = (width_bits == 32) ? 0xFFFFFFFFU : (top_bit << 1) - 1;
+
     for (unsigned int n = 0; n < 256; n++) {
-        uint32_t c = (uint32_t)n << 24;
+        uint32_t c = (uint32_t)n << (width_bits - 8);
         for (unsigned int k = 0; k < 8; k++) {
-            c = (c & 0x80000000U) ? (c << 1) ^ s->pol : (c << 1);
+            c = (c & top_bit) ? ((c << 1) ^ s->pol) : (c << 1);
         }
-        s->table[n] = c;
+        s->table[n] = c & width_mask;
     }
     s->table_pol = s->pol;
+    s->table_width = width_bits;
     s->table_valid = true;
 }
 
-static const uint32_t *crc_table_for(GnwH7B0CrcState *s)
+static const uint32_t *crc_table_for(GnwH7B0CrcState *s, unsigned int width_bits)
 {
-    if (!s->table_valid || s->table_pol != s->pol) {
-        crc_rebuild_table(s);
+    if (!s->table_valid || s->table_pol != s->pol || s->table_width != width_bits) {
+        crc_rebuild_table(s, width_bits);
     }
     return s->table;
 }
@@ -89,20 +119,22 @@ static const uint32_t *crc_table_for(GnwH7B0CrcState *s)
  * cycles; a host C bit-serial loop re-run on every guest MMIO write
  * does not).
  */
-static void crc_feed(GnwH7B0CrcState *s, uint32_t data, unsigned int width_bits)
+static void crc_feed(GnwH7B0CrcState *s, uint32_t data, unsigned int data_width_bits)
 {
     unsigned int rev_in = (s->cr & CRC_CR_REV_IN_MASK) >> CRC_CR_REV_IN_SHIFT;
-    const uint32_t *table = crc_table_for(s);
+    unsigned int acc_width = crc_width_bits(s);
+    uint32_t width_mask = (acc_width == 32) ? 0xFFFFFFFFU : (1U << acc_width) - 1;
+    const uint32_t *table = crc_table_for(s, acc_width);
     uint32_t crc = s->dr;
 
     if (rev_in) {
-        data = bit_reverse(data, width_bits);
+        data = bit_reverse(data, data_width_bits);
     }
 
-    for (unsigned int shift = width_bits; shift > 0; shift -= 8) {
+    for (unsigned int shift = data_width_bits; shift > 0; shift -= 8) {
         uint32_t byte = (data >> (shift - 8)) & 0xFFU;
-        uint32_t idx = ((crc >> 24) ^ byte) & 0xFFU;
-        crc = (crc << 8) ^ table[idx];
+        uint32_t idx = ((crc >> (acc_width - 8)) ^ byte) & 0xFFU;
+        crc = ((crc << 8) ^ table[idx]) & width_mask;
     }
 
     s->dr = crc;
@@ -110,8 +142,10 @@ static void crc_feed(GnwH7B0CrcState *s, uint32_t data, unsigned int width_bits)
 
 static uint32_t crc_read_dr(GnwH7B0CrcState *s)
 {
+    unsigned int acc_width = crc_width_bits(s);
+
     if (s->cr & CRC_CR_REV_OUT) {
-        return bit_reverse(s->dr, 32);
+        return bit_reverse(s->dr, acc_width);
     }
     return s->dr;
 }
