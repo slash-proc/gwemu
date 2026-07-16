@@ -183,8 +183,6 @@ static void gnw_h7b0_gpio_input_event(DeviceState *dev, QemuConsole *src,
 
         for (int i = 0; i < GNW_BTN__COUNT; i++) {
             if (s->key_map[i] == qcode) {
-                fprintf(stderr, "[gpio-debug] t=%"PRId64" btn=%d down=%d\n",
-                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), i, key->down);
                 gnw_h7b0_gpio_set_button(s, i, key->down);
                 break;
             }
@@ -247,6 +245,39 @@ static uint64_t gnw_h7b0_gpio_read(void *opaque, hwaddr addr,
     return s->regs[addr >> 2];
 }
 
+/*
+ * Push-pull GPIO output loopback: for every pin in this port currently
+ * configured as general-purpose output (MODER == 01), IDR reads back
+ * exactly what ODR is driving -- real hardware behavior for a push-pull
+ * output stage, confirmed against stm32h7b0-diag's gpio_output_readback
+ * case (writes a pin's own current level back via BSRR, expects IDR to
+ * still read that same level afterward). Pins in any other mode
+ * (input/AF/analog) are left untouched -- their IDR bits are driven by
+ * gnw_h7b0_gpio_set_pin()'s button-input events instead, not by this
+ * function.
+ */
+static void gnw_h7b0_gpio_sync_output_idr(GnwH7B0GpioState *s, int port)
+{
+    hwaddr moder_addr = (hwaddr)port * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_MODER_OFFSET;
+    hwaddr odr_addr = (hwaddr)port * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_ODR_OFFSET;
+    hwaddr idr_addr = (hwaddr)port * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET;
+    uint32_t moder = s->regs[moder_addr >> 2];
+    uint32_t odr = s->regs[odr_addr >> 2];
+    uint32_t idr = s->regs[idr_addr >> 2];
+
+    for (int pin = 0; pin < 16; pin++) {
+        if (((moder >> (pin * 2)) & 0x3u) != 0x1u) {
+            continue; /* not general-purpose output */
+        }
+        if (odr & (1u << pin)) {
+            idr |= (1u << pin);
+        } else {
+            idr &= ~(1u << pin);
+        }
+    }
+    s->regs[idr_addr >> 2] = idr;
+}
+
 static void gnw_h7b0_gpio_write(void *opaque, hwaddr addr,
                                  uint64_t val64, unsigned int size)
 {
@@ -257,13 +288,35 @@ static void gnw_h7b0_gpio_write(void *opaque, hwaddr addr,
                       __func__, addr);
         return;
     }
-    
+
     uint32_t port_offset = addr % GNW_H7B0_GPIO_PORT_SIZE;
     uint32_t mask = get_gpio_write_mask(port_offset);
     s->regs[addr >> 2] = (s->regs[addr >> 2] & ~mask) | (val64 & mask);
     if (port_offset == GNW_H7B0_GPIO_BSRR_OFFSET) {
-        /* BSRR is write-only; real hardware/SVD always read it back as 0. */
+        /*
+         * BUG FIX: BSRR was stored into its own register word and
+         * immediately zeroed (correctly emulating "write-only, reads as
+         * 0"), but the set/reset semantics were never translated into
+         * ODR at all -- the write was simply discarded. Real hardware:
+         * bits[15:0] set the corresponding ODR bit, bits[31:16] reset
+         * it, with set taking priority over reset for the same pin (RM
+         * BSRR semantics). Found via stm32h7b0-diag's
+         * gpio_output_readback case, which writes a pin's own current
+         * level back through BSRR and expects ODR (and IDR, see
+         * gnw_h7b0_gpio_sync_output_idr()) to still reflect it
+         * afterward -- previously ODR just never changed.
+         */
+        uint32_t set_bits = (uint32_t)val64 & 0xFFFFu;
+        uint32_t reset_bits = ((uint32_t)val64 >> 16) & 0xFFFFu;
+        hwaddr odr_addr = (addr - port_offset) + GNW_H7B0_GPIO_ODR_OFFSET;
+        s->regs[odr_addr >> 2] = (s->regs[odr_addr >> 2] | set_bits) & ~reset_bits;
         s->regs[addr >> 2] = 0;
+    }
+    if (port_offset == GNW_H7B0_GPIO_MODER_OFFSET ||
+        port_offset == GNW_H7B0_GPIO_ODR_OFFSET ||
+        port_offset == GNW_H7B0_GPIO_BSRR_OFFSET) {
+        int port = (int)(addr / GNW_H7B0_GPIO_PORT_SIZE);
+        gnw_h7b0_gpio_sync_output_idr(s, port);
     }
 }
 
