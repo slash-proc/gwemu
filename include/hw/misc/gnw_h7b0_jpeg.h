@@ -4,6 +4,7 @@
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "qemu/thread.h"
 
 #define TYPE_GNW_H7B0_JPEG "gnw-h7b0-jpeg"
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0JpegState, GNW_H7B0_JPEG)
@@ -41,6 +42,49 @@ struct GnwH7B0JpegState {
      * mirroring the decode side's y/cb/cr_plane + dor_cursor pattern. */
     GByteArray *encode_out;
     uint32_t enc_dor_cursor;
+
+    /*
+     * Worker-thread offload for the actual decode (native + stb_image
+     * fallback) + YCbCr conversion (the expensive scalar-compute part),
+     * same category of fix as the LTDC compositor worker thread: real
+     * firmware's HAL_JPEG_Decode() runs a tight, uninterruptible polling
+     * loop with no other work interleaved (confirmed against
+     * game-and-watch-retro-go-sd's hw_jpeg_decoder.c and the HAL
+     * source), so this buys firmware itself no wall-clock speedup -- it
+     * still polls the same number of times. What it does buy is not
+     * holding BQL (and therefore stalling every other main-loop
+     * consumer: audio callback pacing, display-refresh timers, gdbstub)
+     * for the full duration of a real scalar JPEG decode, which used to
+     * happen entirely inside one MMIO write handler call (the DIR write
+     * that completes the image, on EOI detection).
+     *
+     * thread_lock protects only the fields below (job handoff + result
+     * publish), never s->regs[] or the y/cb/cr_plane pointers above
+     * directly -- those are only ever touched from the BQL thread, by
+     * gnw_h7b0_jpeg_poll_worker() copying out of the pending_* fields
+     * once decode_done is observed.
+     */
+    QemuThread thread;
+    bool thread_started;
+    QemuMutex thread_lock;
+    QemuCond thread_cond;
+    bool job_pending;    /* BQL thread -> worker: a job is queued */
+    bool decode_done;    /* worker -> BQL thread: pending_* is ready */
+    bool stop_thread;
+    GByteArray *job_input; /* snapshot of inbuf at EOI, owned by worker once posted */
+
+    uint8_t *pending_y;
+    uint8_t *pending_cb;
+    uint8_t *pending_cr;
+    int pending_width;
+    int pending_height;
+    int pending_chroma_width;
+    int pending_chroma_height;
+    int pending_comp;
+    uint32_t pending_confrn1;
+    uint32_t job_epoch;       /* current device epoch, bumped on reset */
+    uint32_t job_input_epoch; /* epoch the currently-queued job was posted under */
+    uint32_t pending_epoch;   /* epoch the finished pending_* result belongs to */
 };
 
 void gnw_h7b0_jpeg_get_last_decoded_size(uint32_t *width, uint32_t *height);

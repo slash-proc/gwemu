@@ -1119,6 +1119,208 @@ static bool gnw_h7b0_jpeg_parse_sof0_luma_sampling(const uint8_t *buf, size_t le
     return false;
 }
 
+/*
+ * Worker thread body: consumes one snapshotted input bitstream at a time,
+ * runs the exact same decode (native decoder, falling back to
+ * stb_image + BT.601 YCbCr conversion) the old synchronous code ran
+ * inline in the DIR write handler on EOI, and publishes the result into
+ * pending_* under thread_lock for the BQL thread to pick up. Never
+ * touches s->regs[]/y_plane/cb_plane/cr_plane/dor_cursor -- those remain
+ * BQL-only state, mutated only by gnw_h7b0_jpeg_poll_worker() below.
+ */
+static void *gnw_h7b0_jpeg_worker_thread(void *opaque)
+{
+    GnwH7B0JpegState *s = opaque;
+
+    qemu_mutex_lock(&s->thread_lock);
+    for (;;) {
+        while (!s->job_pending && !s->stop_thread) {
+            qemu_cond_wait(&s->thread_cond, &s->thread_lock);
+        }
+        if (s->stop_thread) {
+            break;
+        }
+
+        GByteArray *job = s->job_input;
+        uint32_t job_epoch = s->job_input_epoch;
+        s->job_input = NULL;
+        s->job_pending = false;
+        qemu_mutex_unlock(&s->thread_lock);
+
+        int w = 0, h = 0, comp = 3;
+        uint8_t *y = NULL, *cb = NULL, *cr = NULL;
+        int chroma_w = 0, chroma_h = 0;
+        uint32_t confrn1 = 0;
+
+        if (gnw_h7b0_jpeg_decode_native(job->data, job->len, &y, &cb, &cr,
+                                         &w, &h, &chroma_w, &chroma_h)) {
+            int sof_h = 0, sof_v = 0;
+            if (gnw_h7b0_jpeg_parse_sof0_luma_sampling(job->data, job->len,
+                                                        &sof_h, &sof_v) &&
+                sof_h >= 1 && sof_h <= 4 && sof_v >= 1 && sof_v <= 4) {
+                uint32_t nb = (uint32_t)(sof_h * sof_v - 1);
+                confrn1 = (nb << JPEG_CONFRN_NB_SHIFT) |
+                          ((uint32_t)sof_v << JPEG_CONFRN_VSF_SHIFT) |
+                          ((uint32_t)sof_h << JPEG_CONFRN_HSF_SHIFT);
+            } else {
+                confrn1 = 3U << JPEG_CONFRN_NB_SHIFT;
+            }
+            comp = 3;
+        } else {
+            stbi_uc *rgb = stbi_load_from_memory(job->data, job->len, &w, &h,
+                                                  &comp, 3);
+            if (rgb) {
+                int sof_h2 = 0, sof_v2 = 0;
+                if (!gnw_h7b0_jpeg_parse_sof0_luma_sampling(
+                        job->data, job->len, &sof_h2, &sof_v2) ||
+                    sof_h2 < 1 || sof_h2 > 4 || sof_v2 < 1 || sof_v2 > 4) {
+                    sof_h2 = 1;
+                    sof_v2 = 1;
+                }
+                if (comp == 1) {
+                    sof_h2 = 1;
+                    sof_v2 = 1;
+                }
+                chroma_w = (w + sof_h2 - 1) / sof_h2;
+                chroma_h = (h + sof_v2 - 1) / sof_v2;
+
+                int nb_h = 0, nb_v = 0;
+                if (gnw_h7b0_jpeg_parse_sof0_luma_sampling(job->data, job->len,
+                                                            &nb_h, &nb_v) &&
+                    nb_h >= 1 && nb_h <= 4 && nb_v >= 1 && nb_v <= 4) {
+                    uint32_t nb = (uint32_t)(nb_h * nb_v - 1);
+                    confrn1 = (nb << JPEG_CONFRN_NB_SHIFT) |
+                              ((uint32_t)nb_v << JPEG_CONFRN_VSF_SHIFT) |
+                              ((uint32_t)nb_h << JPEG_CONFRN_HSF_SHIFT);
+                } else {
+                    confrn1 = (comp == 1) ? 0 : (3U << JPEG_CONFRN_NB_SHIFT);
+                }
+
+                y = g_malloc(w * h);
+                cb = g_malloc(chroma_w * chroma_h);
+                cr = g_malloc(chroma_w * chroma_h);
+
+                for (int i = 0; i < w * h; i++) {
+                    int r = rgb[i * 3 + 0];
+                    int g = rgb[i * 3 + 1];
+                    int b = rgb[i * 3 + 2];
+                    int yy = (299 * r + 587 * g + 114 * b) / 1000;
+                    y[i] = gnw_h7b0_jpeg_clamp_u8(yy);
+                }
+                for (int cy = 0; cy < chroma_h; cy++) {
+                    for (int cx = 0; cx < chroma_w; cx++) {
+                        int sx = cx * sof_h2;
+                        int sy = cy * sof_v2;
+                        if (sx >= w) sx = w - 1;
+                        if (sy >= h) sy = h - 1;
+                        int idx = sy * w + sx;
+                        int r = rgb[idx * 3 + 0];
+                        int g = rgb[idx * 3 + 1];
+                        int b = rgb[idx * 3 + 2];
+                        int cbv = (-168736 * r - 331264 * g + 500000 * b) / 1000000 + 128;
+                        int crv = (500000 * r - 418688 * g - 81312 * b) / 1000000 + 128;
+                        cb[cy * chroma_w + cx] = gnw_h7b0_jpeg_clamp_u8(cbv);
+                        cr[cy * chroma_w + cx] = gnw_h7b0_jpeg_clamp_u8(crv);
+                    }
+                }
+                stbi_image_free(rgb);
+            }
+        }
+
+        g_byte_array_free(job, TRUE);
+
+        qemu_mutex_lock(&s->thread_lock);
+        s->pending_y = y;
+        s->pending_cb = cb;
+        s->pending_cr = cr;
+        s->pending_width = w;
+        s->pending_height = h;
+        s->pending_chroma_width = chroma_w;
+        s->pending_chroma_height = chroma_h;
+        s->pending_comp = comp;
+        s->pending_confrn1 = confrn1;
+        s->pending_epoch = job_epoch;
+        s->decode_done = true;
+        /* No cond_signal needed: the BQL thread never blocks on this --
+         * it polls decode_done opportunistically on each register read,
+         * exactly mirroring how real firmware polls SR. */
+    }
+    qemu_mutex_unlock(&s->thread_lock);
+    return NULL;
+}
+
+/*
+ * Called from the BQL thread (register read handler) to check whether the
+ * worker has finished a queued decode, and if so, publish it into the real
+ * device-visible state (y/cb/cr_plane, dor_cursor, SR/CONFR* regs). A
+ * non-blocking trylock -- if the worker currently holds thread_lock (e.g.
+ * mid-publish from its own side), we simply try again on the next poll,
+ * same as real EOCF not being set yet.
+ */
+static void gnw_h7b0_jpeg_poll_worker(GnwH7B0JpegState *s)
+{
+    if (!s->thread_started) {
+        return;
+    }
+    if (qemu_mutex_trylock(&s->thread_lock) != 0) {
+        return;
+    }
+    if (!s->decode_done) {
+        qemu_mutex_unlock(&s->thread_lock);
+        return;
+    }
+    s->decode_done = false;
+    if (s->pending_epoch != s->job_epoch) {
+        /* A reset happened after this job was queued -- discard the
+         * stale result instead of publishing decoded content from before
+         * the reset into fresh post-reset device state. */
+        g_free(s->pending_y);
+        g_free(s->pending_cb);
+        g_free(s->pending_cr);
+        s->pending_y = s->pending_cb = s->pending_cr = NULL;
+        qemu_mutex_unlock(&s->thread_lock);
+        return;
+    }
+
+    g_free(s->y_plane);
+    g_free(s->cb_plane);
+    g_free(s->cr_plane);
+    s->y_plane = s->pending_y;
+    s->cb_plane = s->pending_cb;
+    s->cr_plane = s->pending_cr;
+    s->plane_width = s->pending_width;
+    s->plane_height = s->pending_height;
+    s->chroma_width = s->pending_chroma_width;
+    s->chroma_height = s->pending_chroma_height;
+    s->dor_cursor = 0;
+
+    uint32_t c1 = s->regs[GNW_H7B0_JPEG_CONFR1_OFFSET >> 2];
+    uint32_t nf = (s->pending_comp >= 1 && s->pending_comp <= 4)
+                      ? (uint32_t)(s->pending_comp - 1) : 2;
+    s->regs[GNW_H7B0_JPEG_CONFR1_OFFSET >> 2] =
+        (c1 & ~(JPEG_CONFR1_YSIZE_MASK | JPEG_CONFR1_NF_MASK)) |
+        ((uint32_t)s->pending_height << JPEG_CONFR1_YSIZE_SHIFT) | nf;
+    uint32_t c3 = s->regs[GNW_H7B0_JPEG_CONFR3_OFFSET >> 2];
+    s->regs[GNW_H7B0_JPEG_CONFR3_OFFSET >> 2] =
+        (c3 & ~JPEG_CONFR3_XSIZE_MASK) |
+        ((uint32_t)s->pending_width << JPEG_CONFR3_XSIZE_SHIFT);
+    s->regs[GNW_H7B0_JPEG_CONFRN1_OFFSET >> 2] = s->pending_confrn1;
+
+    s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_EOCF;
+    s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &=
+        ~(JPEG_SR_OFTF | JPEG_SR_COF | JPEG_SR_IFTF | JPEG_SR_IFNFF);
+    if (s->y_plane) {
+        uint32_t total0 = (uint32_t)s->plane_width * (uint32_t)s->plane_height +
+                          2 * (uint32_t)s->chroma_width * (uint32_t)s->chroma_height;
+        s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_OFNEF;
+        if (total0 >= 32) {
+            s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_OFTF;
+        }
+    }
+
+    qemu_mutex_unlock(&s->thread_lock);
+}
+
 static void gnw_h7b0_jpeg_reset(DeviceState *dev)
 {
     GnwH7B0JpegState *s = GNW_H7B0_JPEG(dev);
@@ -1139,11 +1341,26 @@ static void gnw_h7b0_jpeg_reset(DeviceState *dev)
         g_byte_array_set_size(s->encode_out, 0);
     }
     s->enc_dor_cursor = 0;
+
+    /* Bump the epoch so any in-flight worker job from before this reset
+     * gets its result discarded by gnw_h7b0_jpeg_poll_worker() instead of
+     * being published into the freshly-reset state above. */
+    if (s->thread_started) {
+        qemu_mutex_lock(&s->thread_lock);
+        s->job_epoch++;
+        qemu_mutex_unlock(&s->thread_lock);
+    } else {
+        s->job_epoch++;
+    }
 }
 
 static uint64_t gnw_h7b0_jpeg_read(void *opaque, hwaddr addr, unsigned int size)
 {
     GnwH7B0JpegState *s = GNW_H7B0_JPEG(opaque);
+    /* Opportunistically publish a completed background decode -- mirrors
+     * firmware polling SR itself; every register read is a chance to
+     * notice the worker finished. */
+    gnw_h7b0_jpeg_poll_worker(s);
     if (addr >= GNW_H7B0_JPEG_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%"HWADDR_PRIx"\n", __func__, addr);
         return 0;
@@ -1292,8 +1509,28 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
         if (s->inbuf) {
             g_byte_array_set_size(s->inbuf, 0);
         }
-        s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &= ~JPEG_SR_EOCF;
+        /*
+         * BUG FIX: also clear OFNEF/OFTF/COF here, not just EOCF -- found
+         * via a real second-decode-on-the-same-device-instance failure
+         * once decode moved to the async worker thread (see
+         * gnw_h7b0_jpeg_worker_thread()/gnw_h7b0_jpeg_poll_worker()
+         * above). The old fully-synchronous decode never needed this:
+         * decode completed inside the very same MMIO write that
+         * triggered it, so there was no window where a previous decode's
+         * "output ready" flags could be read as still valid. With an
+         * async worker, that window is now real -- between this START
+         * and the eventual poll_worker() publish, OFNEF/OFTF (left set
+         * from whatever the *previous* decode on this device published)
+         * would otherwise still read as "output available", letting
+         * firmware start draining DOR immediately and get stale content
+         * from the previous image instead of waiting for EOCF. dor_cursor
+         * is reset too, for the same reason (a previous decode may have
+         * left it non-zero, or mid-drain).
+         */
+        s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &=
+            ~(JPEG_SR_EOCF | JPEG_SR_OFNEF | JPEG_SR_OFTF | JPEG_SR_COF);
         s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= (JPEG_SR_IFTF | JPEG_SR_IFNFF);
+        s->dor_cursor = 0;
     } else if (addr == GNW_H7B0_JPEG_CR_OFFSET) {
         /* IFF/OFF (input/output FIFO flush) are real pulse bits -- the SVD
          * documents them as "always read as 0". Mirror the self-clearing
@@ -1431,119 +1668,49 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
                     }
                 }
                 if (found_eoi) {
-                    uint8_t *native_y = NULL, *native_cb = NULL, *native_cr = NULL;
-                    int native_w = 0, native_h = 0, native_cw = 0, native_ch = 0;
-                    if (gnw_h7b0_jpeg_decode_native(s->inbuf->data, s->inbuf->len,
-                                                     &native_y, &native_cb, &native_cr,
-                                                     &native_w, &native_h,
-                                                     &native_cw, &native_ch)) {
-                        g_free(s->y_plane);
-                        g_free(s->cb_plane);
-                        g_free(s->cr_plane);
-                        s->y_plane = native_y;
-                        s->cb_plane = native_cb;
-                        s->cr_plane = native_cr;
-                        s->plane_width = native_w;
-                        s->plane_height = native_h;
-                        s->chroma_width = native_cw;
-                        s->chroma_height = native_ch;
-                        s->dor_cursor = 0;
-                        goto jpeg_decode_done;
+                    /*
+                     * Hand the real decode + YCbCr conversion (the
+                     * expensive scalar compute) off to a worker thread
+                     * instead of running it inline here on the BQL
+                     * thread -- see gnw_h7b0_jpeg_worker_thread()/
+                     * gnw_h7b0_jpeg_poll_worker() above. This does not
+                     * speed up firmware's own polling loop (it has
+                     * nothing else useful to do while it waits either
+                     * way), but it stops a real multi-millisecond scalar
+                     * JPEG decode from stalling BQL -- and therefore
+                     * every other main-loop consumer (audio pacing,
+                     * display-refresh timers, gdbstub) -- for its whole
+                     * duration.
+                     *
+                     * EOCF/OFNEF/OFTF are left untouched here (whatever
+                     * they were before this write) until
+                     * gnw_h7b0_jpeg_poll_worker() observes completion and
+                     * publishes it on a later register read, exactly
+                     * mirroring how a real, still-busy codec would look
+                     * to a polling loop.
+                     */
+                    if (!s->thread_started) {
+                        qemu_mutex_init(&s->thread_lock);
+                        qemu_cond_init(&s->thread_cond);
+                        qemu_thread_create(&s->thread, "gnw-h7b0-jpeg-worker",
+                                           gnw_h7b0_jpeg_worker_thread, s,
+                                           QEMU_THREAD_JOINABLE);
+                        s->thread_started = true;
                     }
-                    int w, h, comp;
-                    stbi_uc *rgb = stbi_load_from_memory(s->inbuf->data, s->inbuf->len, &w, &h, &comp, 3);
-                    if (rgb) {
-                        /*
-                         * Real hardware/firmware expects chroma-subsampled
-                         * output sized per the image's real SOF0 H/V
-                         * sampling factors (e.g. 4:2:0 => 1.5*w*h total, not
-                         * 3*w*h) -- serving full-resolution chroma made our
-                         * DOR output ~2x the size firmware's own destination
-                         * buffer expects, so firmware's polling loop only
-                         * drained part of it, leaving the buffer's tail
-                         * stale (visible as banded corruption). Derive the
-                         * real H/V factors here (same parse used for
-                         * CONFRN1 above) and subsample Cb/Cr to match.
-                         */
-                        int sof_h2 = 0, sof_v2 = 0;
-                        if (!gnw_h7b0_jpeg_parse_sof0_luma_sampling(
-                                s->inbuf->data, s->inbuf->len, &sof_h2, &sof_v2) ||
-                            sof_h2 < 1 || sof_h2 > 4 || sof_v2 < 1 || sof_v2 > 4) {
-                            sof_h2 = 1;
-                            sof_v2 = 1;
-                        }
-                        if (comp == 1) {
-                            sof_h2 = 1;
-                            sof_v2 = 1;
-                        }
-                        int chroma_w = (w + sof_h2 - 1) / sof_h2;
-                        int chroma_h = (h + sof_v2 - 1) / sof_v2;
 
-                        g_free(s->y_plane);
-                        g_free(s->cb_plane);
-                        g_free(s->cr_plane);
-                        s->y_plane = g_malloc(w * h);
-                        s->cb_plane = g_malloc(chroma_w * chroma_h);
-                        s->cr_plane = g_malloc(chroma_w * chroma_h);
-                        s->plane_width = w;
-                        s->plane_height = h;
-                        s->chroma_width = chroma_w;
-                        s->chroma_height = chroma_h;
-                        s->dor_cursor = 0;
-
-                        for (int i = 0; i < w * h; i++) {
-                            int r = rgb[i * 3 + 0];
-                            int g = rgb[i * 3 + 1];
-                            int b = rgb[i * 3 + 2];
-                            /* BT.601 RGB->YCbCr, fixed-point (Q16)
-                             * approximation of the standard coefficients. */
-                            int y = (299 * r + 587 * g + 114 * b) / 1000;
-                            s->y_plane[i] = gnw_h7b0_jpeg_clamp_u8(y);
-                        }
-                        for (int cy = 0; cy < chroma_h; cy++) {
-                            for (int cx = 0; cx < chroma_w; cx++) {
-                                /* Nearest-sample the source pixel at this
-                                 * chroma cell's top-left corner. */
-                                int sx = cx * sof_h2;
-                                int sy = cy * sof_v2;
-                                if (sx >= w) sx = w - 1;
-                                if (sy >= h) sy = h - 1;
-                                int idx = sy * w + sx;
-                                int r = rgb[idx * 3 + 0];
-                                int g = rgb[idx * 3 + 1];
-                                int b = rgb[idx * 3 + 2];
-                                int cb = (-168736 * r - 331264 * g + 500000 * b) / 1000000 + 128;
-                                int cr = (500000 * r - 418688 * g - 81312 * b) / 1000000 + 128;
-                                s->cb_plane[cy * chroma_w + cx] = gnw_h7b0_jpeg_clamp_u8(cb);
-                                s->cr_plane[cy * chroma_w + cx] = gnw_h7b0_jpeg_clamp_u8(cr);
-                            }
-                        }
-                        stbi_image_free(rgb);
+                    qemu_mutex_lock(&s->thread_lock);
+                    if (s->job_input) {
+                        /* A previous job is still queued/in flight (should
+                         * not happen given firmware's own decode-then-wait
+                         * sequencing, but don't leak if it somehow does). */
+                        g_byte_array_free(s->job_input, TRUE);
                     }
-jpeg_decode_done:
-                    s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_EOCF;
-                    s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &=
-                        ~(JPEG_SR_OFTF | JPEG_SR_COF |
-                          JPEG_SR_IFTF | JPEG_SR_IFNFF);
-                    /* Real output data is now available in y/cb/cr_plane
-                     * (DOR-readable) -- set OFNEF ("output FIFO not empty")
-                     * so a real polling loop (JPEG_Process()) drains DOR,
-                     * and OFTF too (real hardware's output FIFO threshold)
-                     * whenever at least a full 8-word/32-byte chunk is
-                     * available, so firmware takes the bulk-drain path
-                     * instead of checking flags once per single word --
-                     * see the DOR read handler's comment for why this
-                     * matters for performance, not just fidelity. Both
-                     * flags are kept in sync as the DOR read handler
-                     * drains the cursor. */
-                    if (s->y_plane) {
-                        uint32_t total0 = (uint32_t)s->plane_width * (uint32_t)s->plane_height +
-                                          2 * (uint32_t)s->chroma_width * (uint32_t)s->chroma_height;
-                        s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_OFNEF;
-                        if (total0 >= 32) {
-                            s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= JPEG_SR_OFTF;
-                        }
-                    }
+                    s->job_input = g_byte_array_sized_new(s->inbuf->len);
+                    g_byte_array_append(s->job_input, s->inbuf->data, s->inbuf->len);
+                    s->job_input_epoch = s->job_epoch;
+                    s->job_pending = true;
+                    qemu_cond_signal(&s->thread_cond);
+                    qemu_mutex_unlock(&s->thread_lock);
                 }
             }
         }
@@ -1568,6 +1735,26 @@ static void gnw_h7b0_jpeg_init(Object *obj)
     global_jpeg_state = s;
 }
 
+static void gnw_h7b0_jpeg_finalize(Object *obj)
+{
+    GnwH7B0JpegState *s = GNW_H7B0_JPEG(obj);
+    if (s->thread_started) {
+        qemu_mutex_lock(&s->thread_lock);
+        s->stop_thread = true;
+        qemu_cond_signal(&s->thread_cond);
+        qemu_mutex_unlock(&s->thread_lock);
+        qemu_thread_join(&s->thread);
+        qemu_mutex_destroy(&s->thread_lock);
+        qemu_cond_destroy(&s->thread_cond);
+    }
+    if (s->job_input) {
+        g_byte_array_free(s->job_input, TRUE);
+    }
+    g_free(s->pending_y);
+    g_free(s->pending_cb);
+    g_free(s->pending_cr);
+}
+
 static const VMStateDescription vmstate_gnw_h7b0_jpeg = {
     .name = TYPE_GNW_H7B0_JPEG,
     .version_id = 1,
@@ -1590,6 +1777,7 @@ static const TypeInfo gnw_h7b0_jpeg_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(GnwH7B0JpegState),
     .instance_init = gnw_h7b0_jpeg_init,
+    .instance_finalize = gnw_h7b0_jpeg_finalize,
     .class_init    = gnw_h7b0_jpeg_class_init,
 };
 
