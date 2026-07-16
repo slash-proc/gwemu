@@ -2352,19 +2352,28 @@ void gdb_read_byte(uint8_t ch)
         if (ch != '$')
             return;
     }
-    if (runstate_is_running()) {
+    if (runstate_is_running() && ch == 0x03) {
         /*
-         * When the CPU is running, we cannot do anything except stop
-         * it when receiving a char. This is expected on a Ctrl-C in the
-         * gdb client. Because we are in all-stop mode, gdb sends a
-         * 0x03 byte which is not a usual packet, so we handle it specially
-         * here, but it does expect a stop reply.
+         * Explicit interrupt gesture (Ctrl-C): always halt immediately,
+         * matching standard all-stop semantics. This isn't wrapped in a
+         * $...# packet, so there's nothing to buffer/parse -- handle it
+         * here same as upstream always did.
+         *
+         * Any OTHER byte arriving while running (i.e. the start of a
+         * normal $...# packet) used to unconditionally vm_stop() here,
+         * before even knowing what command was coming -- meaning every
+         * m/M memory read/write forced a real halt too, even though
+         * cpu_memory_rw_debug() (what handle_read_mem/handle_write_mem
+         * use) is just as safe to call from a running VM as it is from
+         * a halted one -- it's the same accessor the monitor's x/xp
+         * commands use live. Real hardware's SWD debug access doesn't
+         * require halting the CPU for memory access either. So instead
+         * of gating here, we let the packet parse through below and
+         * only stop (once, right before dispatch) for commands that
+         * actually need a halted CPU -- see the gdb_handle_packet()
+         * call site's runstate check.
          */
-        if (ch != 0x03) {
-            trace_gdbstub_err_unexpected_runpkt(ch);
-        } else {
-            gdbserver_state.allow_stop_reply = true;
-        }
+        gdbserver_state.allow_stop_reply = true;
         vm_stop(RUN_STATE_PAUSED);
     } else
 #endif
@@ -2481,6 +2490,21 @@ void gdb_read_byte(uint8_t ch)
                 /* send ACK reply */
                 reply = '+';
                 gdb_put_buffer(&reply, 1);
+                /*
+                 * Defer the halt-while-running gate to here (was
+                 * previously per-byte in gdb_read_byte, above) and skip
+                 * it for plain memory read/write ('m'/'M'): those don't
+                 * need the CPU stopped to be serviced correctly (see the
+                 * comment above gdb_read_byte's runstate_is_running()
+                 * check). Every other command -- register access,
+                 * continue/step, breakpoints, qXfer, etc. -- still halts
+                 * first, unchanged from before.
+                 */
+                if (runstate_is_running() &&
+                    gdbserver_state.line_buf[0] != 'm' &&
+                    gdbserver_state.line_buf[0] != 'M') {
+                    vm_stop(RUN_STATE_PAUSED);
+                }
                 gdbserver_state.state = gdb_handle_packet(gdbserver_state.line_buf);
             }
             break;
