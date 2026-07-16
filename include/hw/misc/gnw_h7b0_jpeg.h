@@ -33,6 +33,14 @@ struct GnwH7B0JpegState {
     int chroma_width;
     int chroma_height;
     uint32_t dor_cursor;
+
+    /* Encode-direction (CONFR1.DE clear) state: raw YCbCr pixel bytes
+     * accumulated from DIR writes until a full image's worth has
+     * arrived (per CONFR3.XSIZE/CONFR1.YSIZE), then real-encoded into
+     * encode_out; DOR reads drain encode_out via enc_dor_cursor,
+     * mirroring the decode side's y/cb/cr_plane + dor_cursor pattern. */
+    GByteArray *encode_out;
+    uint32_t enc_dor_cursor;
 };
 
 void gnw_h7b0_jpeg_get_last_decoded_size(uint32_t *width, uint32_t *height);
