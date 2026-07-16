@@ -52,6 +52,7 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     object_initialize_child(obj, "crc", &s->crc, TYPE_GNW_H7B0_CRC);
     object_initialize_child(obj, "hash", &s->hash, TYPE_GNW_H7B0_HASH);
     object_initialize_child(obj, "mdma", &s->mdma, TYPE_GNW_H7B0_MDMA);
+    object_initialize_child(obj, "rng", &s->rng, TYPE_GNW_H7B0_RNG);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_GNW_H7B0_GPIO);
     object_initialize_child(obj, "dbgmcu", &s->dbgmcu, TYPE_GNW_H7B0_DBGMCU);
     object_initialize_child(obj, "dwt", &s->dwt, TYPE_GNW_H7B0_DWT);
@@ -220,7 +221,6 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     create_unimplemented_device("DCMI", 0x48020000, 0x400);
     create_unimplemented_device("PSSI", 0x48020400, 0x6b);
     create_unimplemented_device("HSEM", 0x48020800, 0x400);
-    create_unimplemented_device("RNG", 0x48021800, 0x400);
     create_unimplemented_device("SDMMC2", 0x48022400, 0x400);
     create_unimplemented_device("DELAY_Block_SDMMC2", 0x48022800, 0x400);
     create_unimplemented_device("BDMA1", 0x48022c00, 0x400);
@@ -426,15 +426,20 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->hash), 0, HASH_BASE_ADDRESS);
-    /* HASH_RNG shared line (NVIC IRQ 80, see STM32H7B0.svd) -- RNG is
-     * still an unimplemented_device stub with no real IRQ source, so
-     * this line is HASH's alone for now. */
+    /* HASH_RNG shared line (NVIC IRQ 80, see STM32H7B0.svd) -- RNG has no
+     * error-condition IRQ source in this synchronous model (see
+     * gnw_h7b0_rng.c), so this line is HASH's alone for now. */
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->hash), 0, qdev_get_gpio_in(armv7m, 80));
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->mdma), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->mdma), 0, MDMA_BASE_ADDRESS);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->rng), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->rng), 0, RNG_BASE_ADDRESS);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->gpio), errp)) {
         return;

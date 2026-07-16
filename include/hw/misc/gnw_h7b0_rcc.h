@@ -60,6 +60,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
 #define RCC_CR_PLL2RDY      (1U << 27)
 #define RCC_CR_PLL3ON       (1U << 28)
 #define RCC_CR_PLL3RDY      (1U << 29)
+#define RCC_CR_HSI48ON      (1U << 12)
+#define RCC_CR_HSI48RDY     (1U << 13)
 
 #define GNW_H7B0_RCC_CFGR   0x10
 #define RCC_CFGR_SW_SHIFT   0

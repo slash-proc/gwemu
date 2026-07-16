@@ -141,22 +141,65 @@ individually and in the same full-suite run as everything else above.
 `include/hw/arm/gnw_h7b0_soc.h`, `hw/arm/Kconfig`, `hw/misc/Kconfig`,
 `hw/misc/meson.build`.
 
-## Priority 4b — everything else (7 remaining fails, NOT YET TRIAGED individually)
+## Priority 4b — RNG: FIXED ✅
+
+`crypto_rng_sanity`/`crypto_rng_seed_error` looked like an RNG-device
+problem at first (RNG was a bare `create_unimplemented_device()` stub,
+same starting state as MDMA) but the real root cause was one layer up, in
+RCC: both cases enable RNG's kernel clock source (HSI48, `RCC_D2CCIP2R
+.RNGSEL`'s reset default) themselves before touching RNG at all, and
+`RCC_CR.HSI48ON` was never mirrored into `RCC_CR.HSI48RDY` at all -- the
+exact same "*ON set, *RDY never follows" gap the existing CSION->CSIRDY
+fix (see STATUS.md's Mario/Zelda clock-speed history) already fixed for
+every *other* oscillator, just never extended to HSI48. Confirmed via the
+symptom: `crypto_rng_sanity` (which runs first and does the real
+HSI48-enable wait) failed with an ~100ms runtime consistent with a full
+100000-iteration bounded spin-timeout, while `crypto_rng_seed_error`
+(running second, inheriting HSI48 already left on by the first case's
+failed-but-incomplete attempt) passed near-instantly by skipping that same
+wait -- a real tell that the failure was in the HSI48 wait, not in RNG
+itself. Fixed by adding the missing `HSI48ON`->`HSI48RDY` mirror in
+`hw/misc/gnw_h7b0_rcc.c` (`RCC_CR_HSI48ON`/`RCC_CR_HSI48RDY` bit
+definitions added to `include/hw/misc/gnw_h7b0_rcc.h`).
+
+Also implemented the RNG device itself while investigating (was still a
+bare unimplemented-device stub, and would have failed
+`crypto_rng_sanity`'s "8 draws not all identical/not constant-stride"
+liveness check even with HSI48 fixed): new
+`hw/misc/gnw_h7b0_rng.c`/`include/hw/misc/gnw_h7b0_rng.h`, 3-register
+(CR/SR/DR) synchronous model, `DR` reads return a fresh
+`g_random_int()`-sourced word whenever `CR.RNGEN` is set. `CONDRST` is
+accepted (self-clearing pulse bit) but has no observable effect -- this
+model never generates the `CECS`/`SECS` clock-/seed-error conditions
+`CONDRST` exists to recover from, so `crypto_rng_seed_error`'s recovery-
+sequence liveness check just sees `DRDY` stay set throughout, which is
+sufficient for what it actually checks.
+
+Both cases independently verified live, together with the rest of the
+suite.
+
+**Files changed**: `hw/misc/gnw_h7b0_rcc.c`, `include/hw/misc/gnw_h7b0_rcc.h`,
+`hw/misc/gnw_h7b0_rng.c` (new), `include/hw/misc/gnw_h7b0_rng.h` (new),
+`hw/arm/gnw_h7b0_soc.c`, `include/hw/arm/gnw_h7b0_soc.h`, `hw/arm/Kconfig`,
+`hw/misc/Kconfig`, `hw/misc/meson.build`.
+
+## Priority 4c — everything else (5 remaining fails, NOT YET TRIAGED individually)
 
 Confirmed current fails after re-running the full live suite with CRC32 +
-HASH/HMAC + LTDC + JPEG + DMA1/DMA2/MDMA m2m all applied (2026-07-16):
-`dac1_output_value`, `dac2_output_value`, `crypto_crc16_reconfig`,
-`timer_tim6_update`, `crypto_rng_sanity`, `crypto_rng_seed_error`,
-`exti_edge_config`.
+HASH/HMAC + LTDC + JPEG + DMA1/DMA2/MDMA m2m + RNG all applied
+(2026-07-16): `dac1_output_value`, `dac2_output_value`,
+`crypto_crc16_reconfig`, `timer_tim6_update`, `exti_edge_config`.
 
-Also newly appearing as FAIL in the latest full-suite run (not seen in the
-immediately preceding run, worth double-checking for host-contention flake
-vs. real regression before triaging): `exti_sw_trigger`, `boot_option_bytes`,
-`gpio_output_readback`. All three were confirmed passing in the isolated
-JPEG-verification run earlier this session, so this is very likely the same
-kind of host-contention flakiness already seen with `dwt_vs_systick`, not a
-regression from the DMA/MDMA work -- re-run on a quiet host before treating
-as real.
+Also appearing as FAIL in this same run, worth double-checking for
+host-contention flake vs. real regression before triaging (this host has
+been under sustained heavy load all session): `exti_sw_trigger`,
+`boot_option_bytes`, `power_sleep_wfi`, `gpio_output_readback`,
+`ospi_dlyb_readback`. None of these were touched by this session's RCC/RNG
+change; `exti_sw_trigger`/`boot_option_bytes`/`gpio_output_readback` were
+confirmed passing earlier this session (see priority 4a's note), so this
+is very likely the same kind of host-contention flakiness already seen
+with `dwt_vs_systick`, not a real regression -- re-run on a quiet host
+before treating any of these five as real.
 
 `power_sleep_wfi` not observed failing in either run this session.
 

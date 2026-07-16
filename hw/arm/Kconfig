@@ -415,6 +415,7 @@ config GNW_H7B0_SOC
     select GNW_H7B0_CRC
     select GNW_H7B0_HASH
     select GNW_H7B0_MDMA
+    select GNW_H7B0_RNG
     select GNW_H7B0_GPIO
     select SSI_SD
     select GNW_H7B0_DBGMCU

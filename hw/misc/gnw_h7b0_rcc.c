@@ -133,6 +133,22 @@ static void gnw_h7b0_rcc_write(void *opaque, hwaddr addr,
         } else {
             value &= ~RCC_CR_PLL3RDY;
         }
+        /*
+         * HSI48ON -> HSI48RDY, same instant-approximation as every other
+         * oscillator here. Found missing entirely 2026-07-16 while
+         * chasing stm32h7b0-diag's crypto_rng_sanity/crypto_rng_seed_error
+         * cases (RNG's kernel clock source, RCC_D2CCIP2R.RNGSEL's reset
+         * default, is HSI48): firmware's HSI48ON-then-wait-for-HSI48RDY
+         * loop spun for its full bounded iteration count every time,
+         * exactly the same "*ON set, *RDY never mirrors" gap the CSI fix
+         * above describes -- HSI48 just never got the same mirroring
+         * treatment as every other oscillator.
+         */
+        if (value & RCC_CR_HSI48ON) {
+            value |= RCC_CR_HSI48RDY;
+        } else {
+            value &= ~RCC_CR_HSI48RDY;
+        }
         s->regs[addr >> 2] = value;
         return;
     case GNW_H7B0_RCC_CFGR:

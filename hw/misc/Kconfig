@@ -131,6 +131,9 @@ config GNW_H7B0_HASH
 config GNW_H7B0_MDMA
     bool
 
+config GNW_H7B0_RNG
+    bool
+
 config GNW_H7B0_GPIO
     bool
 

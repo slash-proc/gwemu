@@ -41,6 +41,7 @@
 #include "hw/misc/gnw_h7b0_crc.h"
 #include "hw/misc/gnw_h7b0_hash.h"
 #include "hw/misc/gnw_h7b0_mdma.h"
+#include "hw/misc/gnw_h7b0_rng.h"
 #include "hw/misc/gnw_h7b0_gpio.h"
 #include "hw/misc/gnw_h7b0_dbgmcu.h"
 #include "hw/misc/gnw_h7b0_dwt.h"
@@ -329,6 +330,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  */
 #define HASH_BASE_ADDRESS 0x48021400
 #define MDMA_BASE_ADDRESS 0x52000000
+#define RNG_BASE_ADDRESS 0x48021800
 
 /*
  * ADC1/ADC2 (+ common registers), per STM32H7B0.svd (0x40022000/
@@ -506,6 +508,7 @@ struct GnwH7B0State {
     GnwH7B0CrcState crc;
     GnwH7B0HashState hash;
     GnwH7B0MdmaState mdma;
+    GnwH7B0RngState rng;
     GnwH7B0GpioState gpio;
     GnwH7B0DbgmcuState dbgmcu;
     GnwH7B0DwtState dwt;
