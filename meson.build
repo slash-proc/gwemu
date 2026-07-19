@@ -4571,6 +4571,11 @@ if have_tools
   endif
 endif
 
+# gnw-h7b0: always build our own small standalone tools, independent of
+# have_tools (this project only builds --target-list=arm-softmmu, which
+# leaves have_tools false).
+subdir('contrib/gnw-tools')
+
 if stap.found()
   foreach t: traceable
     foreach stp: [
