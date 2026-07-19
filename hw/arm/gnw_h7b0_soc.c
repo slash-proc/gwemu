@@ -27,6 +27,9 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "system/address-spaces.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "hw/arm/gnw_h7b0_soc.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
@@ -92,12 +95,86 @@ static void gnw_h7b0_soc_initfn(Object *obj)
  * otherwise.
  *
  * memory_region_init_ram_from_file() is CONFIG_POSIX-only in QEMU itself
- * (it's mmap-based) -- genuinely unavailable on Windows, not just a missing
- * include. On a non-POSIX host, always fall back to ephemeral RAM even when
- * an image_path was given, but say so loudly (warn_report(), not silence):
- * persistence quietly not working would be a much worse surprise than an
- * explicit "this won't persist" at startup.
+ * (it's mmap-based) -- genuinely unavailable on Windows via QEMU's own
+ * generic memory-backend machinery (backends/hostmem-file.c does the same
+ * #ifndef CONFIG_POSIX: error_setg(...) refusal). On _WIN32 we get real
+ * persistence anyway via a direct CreateFileMapping()/MapViewOfFile() host
+ * pointer, wrapped as guest RAM with memory_region_init_ram_ptr() -- the
+ * same portable "wrap an existing host pointer" primitive this codebase
+ * already relies on for gnw_h7b0_otfdec.c's decrypt-overlay buffers. Only
+ * a truly unknown non-POSIX, non-Windows host falls back to ephemeral RAM,
+ * loudly (warn_report(), not silence): persistence quietly not working
+ * would be a much worse surprise than an explicit "this won't persist".
  */
+#ifdef _WIN32
+static bool gnw_h7b0_init_ram_from_file_win32(MemoryRegion *mr, Object *owner,
+                                               const char *name, uint64_t size,
+                                               const char *image_path,
+                                               Error **errp)
+{
+    HANDLE file = CreateFileA(image_path, GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ, NULL, OPEN_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        error_setg(errp, "%s: CreateFileA(\"%s\") failed (error %lu)",
+                   name, image_path, (unsigned long)GetLastError());
+        return false;
+    }
+
+    LARGE_INTEGER cur_size;
+    if (!GetFileSizeEx(file, &cur_size)) {
+        error_setg(errp, "%s: GetFileSizeEx(\"%s\") failed (error %lu)",
+                   name, image_path, (unsigned long)GetLastError());
+        CloseHandle(file);
+        return false;
+    }
+    /* Created/truncated to `size` if it doesn't already exist yet or is
+     * shorter -- matches memory_region_init_ram_from_file()'s documented
+     * behavior on POSIX. Never shrink an existing longer file. */
+    if ((uint64_t)cur_size.QuadPart < size) {
+        LARGE_INTEGER new_size;
+        new_size.QuadPart = (LONGLONG)size;
+        if (!SetFilePointerEx(file, new_size, NULL, FILE_BEGIN) ||
+            !SetEndOfFile(file)) {
+            error_setg(errp, "%s: extending \"%s\" to %" PRIu64
+                       " bytes failed (error %lu)", name, image_path, size,
+                       (unsigned long)GetLastError());
+            CloseHandle(file);
+            return false;
+        }
+    }
+
+    HANDLE mapping = CreateFileMappingA(file, NULL, PAGE_READWRITE,
+                                         (DWORD)(size >> 32),
+                                         (DWORD)(size & 0xFFFFFFFFu), NULL);
+    if (mapping == NULL) {
+        error_setg(errp, "%s: CreateFileMappingA(\"%s\") failed (error %lu)",
+                   name, image_path, (unsigned long)GetLastError());
+        CloseHandle(file);
+        return false;
+    }
+
+    void *ptr = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE,
+                               0, 0, size);
+    if (ptr == NULL) {
+        error_setg(errp, "%s: MapViewOfFile(\"%s\") failed (error %lu)",
+                   name, image_path, (unsigned long)GetLastError());
+        CloseHandle(mapping);
+        CloseHandle(file);
+        return false;
+    }
+
+    /* The mapping/file HANDLEs are intentionally never closed here: the
+     * view stays valid as long as they're open, this region needs to
+     * stay live for the device's/process's whole lifetime (same "leak
+     * until process exit" convention gnw_h7b0_otfdec.c already uses for
+     * its own host-pointer-backed regions), and Windows keeps the
+     * underlying mapping alive via the still-open view regardless. */
+    memory_region_init_ram_ptr(mr, owner, name, size, ptr);
+    return true;
+}
+#endif
+
 static bool gnw_h7b0_init_ram_or_file(MemoryRegion *mr, Object *owner,
                                        const char *name, uint64_t size,
                                        const char *image_path, Error **errp)
@@ -107,6 +184,9 @@ static bool gnw_h7b0_init_ram_or_file(MemoryRegion *mr, Object *owner,
         return memory_region_init_ram_from_file(mr, owner, name, size, 0,
                                                  RAM_SHARED, image_path, 0,
                                                  errp);
+#elif defined(_WIN32)
+        return gnw_h7b0_init_ram_from_file_win32(mr, owner, name, size,
+                                                  image_path, errp);
 #else
         warn_report("persistent flash-image backing isn't supported on "
                     "this host -- \"%s\" will NOT persist writes, falling "
