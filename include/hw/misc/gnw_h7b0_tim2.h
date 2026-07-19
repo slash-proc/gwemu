@@ -16,7 +16,18 @@
 #define TYPE_GNW_H7B0_TIM2 "gnw-h7b0-tim2"
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0Tim2State, GNW_H7B0_TIM2)
 
-#define GNW_H7B0_TIM2_SIZE 0x2800
+/* TIM2-7 (6 x 0x400 = 0x1800) + TIM12/13/14 (3 x 0x400 = 0xC00) = 0x2400,
+ * ending exactly at LPTIM1's own base (0x40002400) -- NOT 0x2800, which
+ * was off by one 0x400 block and silently overlapped/shadowed the real
+ * LPTIM1 device (gnw_h7b0_lptim1.c) with this plain-shadow stub at the
+ * same priority, since this region is mapped after LPTIM1 in
+ * gnw_h7b0_soc_realize(). Confirmed live via `info mtree` showing both
+ * regions claiming 0x40002400-0x400027ff, and gnw_h7b0_lptim1_write()/
+ * _read() never being reached at all for any access in that range, while
+ * root-causing stm32h7b0-diag's case_lptim1_correct.c genuinely failing
+ * (ISR.ARROK never observed set, CNT never observed advancing) even
+ * after the real LPTIM1 device was added this session. */
+#define GNW_H7B0_TIM2_SIZE 0x2400
 
 /* TIM2/3/4/5/6/7 sit on a uniform 0x400 stride within this block (see
  * gnw_h7b0_tim2.c's EGR/CR1 handling); TIM12/13/14 don't and aren't
