@@ -60,7 +60,12 @@ jobs:
             python3 python3-pip build-essential
 
       - name: Install meson/ninja (pip, for a consistent recent version)
-        run: pip install meson ninja
+        run: |
+          # tomli: meson's mkvenv bootstrap needs a TOML parser; stdlib
+          # tomllib only exists on Python 3.11+, and ubuntu:22.04 ships
+          # 3.10 -- without this, configure fails with "found no usable
+          # tomli, please install it" before meson even starts.
+          pip install tomli meson ninja
 
       - name: Configure
         run: |
@@ -74,9 +79,15 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
+          BIN="$(find build -maxdepth 1 -type f -name qemu-system-arm)"
+          if [ -z "$BIN" ]; then
+            echo "qemu-system-arm not found under build/ -- build tree:" >&2
+            find build -maxdepth 2 >&2
+            exit 1
+          fi
           OUT=gwemu-linux-x86_64
           mkdir -p "$OUT/lib"
-          cp build/qemu-system-arm "$OUT/qemu-system-arm.bin"
+          cp "$BIN" "$OUT/qemu-system-arm.bin"
 
           # Bundle non-base-OS shared libs (SDL2/glib/pixman and their own
           # transitive deps) next to the binary, since those aren't
@@ -86,7 +97,7 @@ jobs:
           # skew on its own (see the container comment above) -- it only
           # covers "SDL2/glib/pixman aren't installed at all" on the
           # target machine.
-          for lib in $(ldd build/qemu-system-arm | awk '{print $3}' | grep -v '^$'); do
+          for lib in $(ldd "$BIN" | awk '{print $3}' | grep -v '^$'); do
             base=$(basename "$lib")
             case "$base" in
               libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-linux*|libresolv.so*|libutil.so*)
@@ -143,9 +154,15 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
+          BIN="$(find build -maxdepth 1 -type f -name qemu-system-arm)"
+          if [ -z "$BIN" ]; then
+            echo "qemu-system-arm not found under build/ -- build tree:" >&2
+            find build -maxdepth 2 >&2
+            exit 1
+          fi
           OUT=gwemu-macos-${{ matrix.arch }}
           mkdir -p "$OUT"
-          cp build/qemu-system-arm "$OUT/qemu-system-arm"
+          cp "$BIN" "$OUT/qemu-system-arm"
 
           # dylibbundler copies non-system dylibs alongside the binary and
           # rewrites its load commands (@executable_path-relative) so it
@@ -194,9 +211,14 @@ jobs:
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-meson
             mingw-w64-x86_64-pkgconf
+            diffutils
             mingw-w64-x86_64-python
             git
             zip
+          # diffutils (provides `diff`): upstream QEMU's own
+          # tests/qapi-schema/meson.build checks for it unconditionally at
+          # configure time, even though this project doesn't run tests --
+          # without it, configure fails with "Program 'diff' not found".
 
       - name: Configure
         run: |
