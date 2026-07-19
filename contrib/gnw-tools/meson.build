@@ -44,3 +44,13 @@ gnw_cfw_engine_lib = static_library('gnw_cfw_engine',
                                      link_with: [gnw_thumb_asm_lib, gnw_lz77_lib, gnw_lzma_lib, gnw_aes128_lib],
                                      dependencies: [gnw_lzma_dep],
                                      install: false)
+
+# Top-level CFW patch driver -- see gnw_make_cfw_images.c's own comment.
+# Verified byte-exact against scripts/make_cfw_images.py for both mario and
+# zelda (see CHANGELOG); wired here as its own CLI tool, same convention as
+# gnw-make-boot-images above.
+executable('gnw-make-cfw-images',
+           files('gnw_make_cfw_images.c', 'gnw_mario_patch.c', 'gnw_zelda_patch.c'),
+           link_with: [gnw_cfw_engine_lib],
+           dependencies: [gnw_lzma_dep],
+           install: false)
