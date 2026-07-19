@@ -70,6 +70,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0GpioState, GNW_H7B0_GPIO)
 
 #define GNW_H7B0_GPIO_IDR_OFFSET  0x10
 
+/* See gnw_h7b0_gpio_reset()'s doc comment on the pa0_release_timer arm
+ * site: an unverified-but-reasonable default, not a real-hardware-
+ * measured button-hold duration. */
+#define GNW_H7B0_GPIO_PA0_RELEASE_DELAY_MS  50
+
 typedef struct GnwH7B0ExtiState GnwH7B0ExtiState;
 typedef struct GnwH7B0SyscfgState GnwH7B0SyscfgState;
 

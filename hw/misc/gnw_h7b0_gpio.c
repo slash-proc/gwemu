@@ -212,6 +212,42 @@ static void gnw_h7b0_gpio_reset(DeviceState *dev)
         hwaddr idr = port * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET;
         s->regs[idr >> 2] = 0xFFFFU;
     }
+
+    /*
+     * Arm gnw_h7b0_gpio_pa0_release() (see its own doc comment) -- this
+     * timer existed since this device's introduction but was never
+     * actually scheduled anywhere, so the EXTI0 rising edge it's meant to
+     * generate never happened under QEMU. Real-hardware live tracing
+     * (2026-07-19, live watchpoint+breakpoint capture against stock Mario
+     * firmware) confirmed the boot-stall this was meant to unblock is a
+     * genuine EXTI0-IRQn(6)-triggered handler (xPSR active-exception
+     * field decoded live as 22 = 16+6 = EXTI0), landing in a function
+     * that arms the main superloop's countdown-enable flag -- i.e. real
+     * firmware's boot sequence genuinely waits on this exact interrupt,
+     * confirmed by the IPSR value captured at the live breakpoint, not
+     * inferred from static analysis alone.
+     *
+     * Does NOT force PA0's IDR bit low here to manufacture the edge from
+     * a level change (that would repeat the PC8/PC13/PD0 mistake this
+     * comment block already warns about -- an unverified guess about a
+     * pin's real electrical state). Unnecessary anyway:
+     * gnw_h7b0_exti_set_line()'s edge detection compares against EXTI's
+     * own line_level[] state, which is independently memset to all-false
+     * in gnw_h7b0_exti_reset() -- so the first call from
+     * gnw_h7b0_gpio_pa0_release() (level=true) is already a genuine
+     * false->true rising edge from EXTI's point of view, regardless of
+     * what GPIOA_IDR itself reads.
+     *
+     * Delay value is an unverified-but-reasonable default (long enough
+     * for firmware to get through early clock/GPIO/EXTI-trigger-config
+     * init before the edge arrives, short enough not to meaningfully
+     * delay boot) -- not a real-hardware-measured button-hold duration.
+     * Revisit with a real measurement if boot timing ever turns out to
+     * be sensitive to the exact value.
+     */
+    timer_mod(s->pa0_release_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + GNW_H7B0_GPIO_PA0_RELEASE_DELAY_MS);
+
     /*
      * PC8, PC13, and PD0 were previously forced low here as unverified
      * guesses to unblock various boot-hang hypotheses (see CHANGELOG.md /
