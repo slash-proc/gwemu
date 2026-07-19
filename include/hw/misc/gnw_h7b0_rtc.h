@@ -107,6 +107,11 @@ struct GnwH7B0RtcState {
     SysBusDevice parent_obj;
 
     MemoryRegion mmio;
+    qemu_irq irq;              /* RTC_Alarm_IRQn (Alarm A/B only -- the
+                                 * wakeup-timer's real IRQ line,
+                                 * RTC_WKUP_IRQn, isn't wired anywhere
+                                 * else in this SoC model and no tested
+                                 * firmware needs it). */
     uint32_t regs[GNW_H7B0_RTC_SIZE / 4];
 
     /*

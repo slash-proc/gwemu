@@ -26,6 +26,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "migration/vmstate.h"
+#include "hw/core/irq.h"
 #include "hw/misc/gnw_h7b0_rtc.h"
 #include "hw/misc/gnw_h7b0_regs_rtc.h"
 
@@ -117,6 +118,27 @@ static void gnw_h7b0_rtc_reset(DeviceState *dev)
     s->rtc_base_epoch = time(NULL);
     s->rtc_base_vclock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     gnw_h7b0_rtc_sync_calendar(s);
+    qemu_irq_lower(s->irq);
+}
+
+/*
+ * Real RTC_Alarm_IRQn covers Alarm A and B only (not the wakeup timer,
+ * a separate IRQ line not modeled here -- see .h file comment). MISR
+ * already holds SR gated by the *IE enable bits (computed in the CR/SCR
+ * write handlers below), so this just ORs the two Alarm bits onto the
+ * one output line. Previously nothing ever called qemu_set_irq() at
+ * all for this device -- MISR/SR tracked correctly, but no firmware
+ * interrupt-driven wait (as opposed to a polling loop) could ever
+ * observe it, since the NVIC never saw the line assert (confirmed via
+ * case_clock_rtc_alarm.c: HAL_RTC_AlarmIRQHandler() never ran, isr
+ * count stayed 0 for the full timeout, despite ALRAF/MISR being set
+ * correctly the whole time).
+ */
+static void gnw_h7b0_rtc_update_irq(GnwH7B0RtcState *s)
+{
+    uint32_t misr = s->regs[GNW_H7B0_RTC_MISR >> 2];
+
+    qemu_set_irq(s->irq, (misr & (RTC_SR_ALRAF | RTC_SR_ALRBF)) != 0);
 }
 
 static uint64_t gnw_h7b0_rtc_read(void *opaque, hwaddr addr, unsigned int size)
@@ -218,11 +240,13 @@ static void gnw_h7b0_rtc_write(void *opaque, hwaddr addr,
                                            : (icsr | RTC_ICSR_ALRBWF);
             s->regs[GNW_H7B0_RTC_ICSR >> 2] = icsr;
         }
+        gnw_h7b0_rtc_update_irq(s);
         return;
     }
     case GNW_H7B0_RTC_SCR:
         s->regs[GNW_H7B0_RTC_SR >> 2] &= ~value;
         s->regs[GNW_H7B0_RTC_MISR >> 2] &= ~value;
+        gnw_h7b0_rtc_update_irq(s);
         return;
     case GNW_H7B0_RTC_TR_OFFSET:
     case GNW_H7B0_RTC_DR_OFFSET:
@@ -259,6 +283,7 @@ static void gnw_h7b0_rtc_init(Object *obj)
     memory_region_init_io(&s->mmio, obj, &gnw_h7b0_rtc_ops, s,
                            TYPE_GNW_H7B0_RTC, GNW_H7B0_RTC_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
 static const VMStateDescription vmstate_gnw_h7b0_rtc = {
