@@ -79,6 +79,27 @@ static void gnw_h7b0_flash_r_reset(DeviceState *dev)
     for (int i = 0; i < (GNW_H7B0_FLASH_R_SIZE / 4); i++) {
         s->regs[i] = get_flash_r_reset_value(i * 4);
     }
+
+    /* OPTSR_CUR/OPTSR_CUR_ (bank1/bank2 aliases, offsets 0x1c/0x11c):
+     * RM0455 documents this register's reset value as "0xXXXX XXXX (see
+     * Table 21: Option byte organization)" -- unlike this device's other
+     * registers, it isn't a fixed silicon constant; it's the shadow copy
+     * of the non-volatile option bytes, loaded at reset. RM0455's option
+     * byte section is explicit about the factory-programmed default
+     * STMicroelectronics ships: "RDP level 0 (option byte value = 0xAA)".
+     * Leaving RDP (bits [15:8]) at the auto-generated stub's 0x00000000
+     * reads back as an *unrelated* non-0xAA/0xCC value, which per RM0455's
+     * own RDP-level decoding is level 1 (protected) -- the opposite of
+     * the real, unprotected factory-default level 0 this hardware
+     * actually boots with. Confirmed independently against real hardware
+     * (OPTSR_CUR reads 0xAA there too). Every other OPTSR_CUR field
+     * (BOR_LEV, IWDG_SW, NRST_STOP/STDY, WDG_FZ_STOP/SDBY, ST_RAM_SIZE,
+     * SECURITY, VDDIO_HSLV, SWAP_BANK_OPT) has no documented non-zero
+     * factory default in RM0455 -- SWAP_BANK_OPT is explicitly called out
+     * as "not available on STM32H7B0 devices... must be kept at '0'" --
+     * so only RDP is seeded here, not a blanket non-zero value. */
+    s->regs[GNW_H7B0_FLASH_OPTSR_CUR_OFFSET >> 2] |= 0xAA00U;
+    s->regs[GNW_H7B0_FLASH_OPTSR_CUR__OFFSET >> 2] |= 0xAA00U;
 }
 
 static uint64_t gnw_h7b0_flash_r_read(void *opaque, hwaddr addr, unsigned int size)
