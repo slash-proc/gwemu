@@ -25,9 +25,22 @@ gnw_lzma_lib = static_library('gnw_lzma',
 
 # AES-128 single-block encrypt (ExtFirmware.crypt()'s OTFDEC keystream) --
 # see gnw_aes128.h. gnw_symbols_{mario,zelda}.h (pre-extracted ELF symbol
-# tables, header-only, no .c to build) complete the set of verified
-# building blocks for the still-in-progress Firmware/Device relocation
-# engine port -- not yet written.
+# tables, header-only, no .c to build) complete the set of building blocks.
 gnw_aes128_lib = static_library('gnw_aes128',
                                  files('gnw_aes128.c'),
                                  install: false)
+
+# Firmware/Device relocation engine (gnw_cfw_engine.h) -- structural port of
+# gnw-web-builder's firmware.ts/device.ts, built on the four libs above.
+# Verified so far: the bit-manipulation primitives (b/bl/relative) against
+# live Python on synthetic offsets, byte-exact. NOT yet verified: a full
+# mario/zelda patch run end-to-end (the actual per-game patch() sequences
+# from mario.py/zelda.py -- ~650 lines of magic-hex-offset call chains --
+# haven't been transcribed/generated yet; see gnw_cfw_engine.h's own
+# module comment and CHANGELOG for the current state of this in-progress
+# port before assuming it's usable).
+gnw_cfw_engine_lib = static_library('gnw_cfw_engine',
+                                     files('gnw_cfw_engine.c'),
+                                     link_with: [gnw_thumb_asm_lib, gnw_lz77_lib, gnw_lzma_lib, gnw_aes128_lib],
+                                     dependencies: [gnw_lzma_dep],
+                                     install: false)
