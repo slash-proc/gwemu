@@ -35,6 +35,24 @@ static void gnw_h7b0_pwr_reset(DeviceState *dev)
     for (int i = 0; i < (GNW_H7B0_PWR_SIZE / 4); i++) {
         s->regs[i] = get_pwr_reset_value(i * 4);
     }
+
+    /*
+     * PWR_CPUCR.SBF (bit 6, "System Standby flag... set by hardware" per
+     * STM32H7B0.svd) is documented as a real hardware-set flag, not a
+     * static POR default -- but on this specific product, every normal
+     * power-on IS a wake-from-Standby event: the physical power button is
+     * wired to PA0/WKUP1 (see hw/misc/gnw_h7b0_gpio.c's pa0_release_timer
+     * and its doc comment), and this device's real "off" state is
+     * silicon Standby, not a true power cut. Confirmed via live real-
+     * hardware vs. QEMU comparison (2026-07-19): stock Mario firmware's
+     * own boot-init code (FUN_08006030 in the decompiled binary) checks
+     * this exact bit and only proceeds into normal display/graphics init
+     * if it's set -- real hardware always has it set at this point in
+     * boot (a live register read confirmed this), QEMU never did,
+     * because nothing here ever set it. Set it unconditionally at reset
+     * to match every observed real boot.
+     */
+    s->regs[GNW_H7B0_PWR_CPUCR_OFFSET >> 2] |= (1u << 6);
 }
 
 static uint64_t gnw_h7b0_pwr_read(void *opaque, hwaddr addr, unsigned int size)
