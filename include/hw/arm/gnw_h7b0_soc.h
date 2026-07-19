@@ -34,6 +34,7 @@
 #include "hw/misc/gnw_h7b0_pwr.h"
 #include "hw/misc/gnw_h7b0_ospi.h"
 #include "hw/misc/gnw_h7b0_adc.h"
+#include "hw/misc/gnw_h7b0_lptim1.h"
 #include "hw/display/gnw_h7b0_ltdc.h"
 #include "hw/display/gnw_h7b0_dma2d.h"
 #include "hw/misc/gnw_h7b0_spi.h"
@@ -279,8 +280,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 /*
  * TIM2/3/4/5 (general purpose) + TIM6/7 (basic) + TIM12/13/14 (general
  * purpose), per STM32H7B0.svd (contiguous 0x400-per-timer blocks,
- * 0x40000000-0x400027FF, right up to LPTIM1 at 0x40002400... wait,
- * LPTIM1 is 0x40002400-0x400027FF so this region stops there).
+ * 0x40000000-0x400023FF, stopping exactly at LPTIM1's own base of
+ * 0x40002400 -- NOT 0x2800: that earlier size was off by one 0x400
+ * block and silently overlapped/shadowed the real LPTIM1 device
+ * (0x40002400-0x400027FF) with this plain-RAM stub, since this block
+ * realizes after LPTIM1 in gnw_h7b0_soc_realize() -- confirmed live
+ * (a poke to LPTIM1_ARR read back with no ISR.ARROK side effect at
+ * all, i.e. plain RAM shadow behavior, not the real device) while
+ * root-causing stm32h7b0-diag's case_lptim1_correct.c genuinely
+ * failing (not hanging) even after the real LPTIM1 device was added.
  * Modeled as plain RAM for now -- same rationale as the other
  * not-yet-modeled peripherals above; found via patched-zelda-bank1.bin
  * (real OEM firmware) touching TIM5 (0x40000C00) during boot, entirely
@@ -291,7 +299,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  * one of these.
  */
 #define TIM2_BLOCK_BASE_ADDRESS 0x40000000
-#define TIM2_BLOCK_SIZE          0x2800
+#define TIM2_BLOCK_SIZE          0x2400
 
 /*
  * IWDG (independent watchdog) and LPUART1, per STM32H7B0.svd. Modeled
@@ -346,6 +354,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
 /* Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type: ADC_IRQn = 18
  * (shared by ADC1/ADC2). */
 #define ADC_IRQn 18
+
+/* LPTIM1 -- was entirely unmapped (see gnw_h7b0_lptim1.h for the real
+ * bug this caused: stm32h7b0-diag's case_lptim1_correct.c HardFaulting
+ * and hanging the whole diag sweep). Base/IRQn per STM32H7B0.svd. */
+#define LPTIM1_BASE_ADDRESS 0x40002400
+#define LPTIM1_IRQn 93
 
 /* Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type. EXTI lines
  * 0-4 each get a dedicated IRQ; 5-9 and 10-15 share one IRQ each. */
@@ -465,6 +479,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  */
 #define RTC_BASE_ADDRESS 0x58004000
 #define RTC_SIZE          0x400
+/* Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type:
+ * RTC_Alarm_IRQn = 41 (Alarm A/B only; the wakeup-timer's separate IRQ
+ * line, RTC_WKUP_IRQn, isn't modeled -- see gnw_h7b0_rtc.h). */
+#define RTC_Alarm_IRQn 41
 
 /*
  * LTDC (LCD-TFT Display Controller), per STM32H7B0.svd baseAddress
@@ -500,6 +518,7 @@ struct GnwH7B0State {
     GnwH7B0OspiState octospi1;
     GnwH7B0OspiState octospi2;
     GnwH7B0AdcState adc;
+    GnwH7B0Lptim1State lptim1;
     GnwH7B0LtdcState ltdc;
     GnwH7B0Dma2dState dma2d;
     GnwH7B0SpiState spi2;

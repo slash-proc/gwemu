@@ -41,6 +41,7 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     object_initialize_child(obj, "octospi1", &s->octospi1, TYPE_GNW_H7B0_OSPI);
     object_initialize_child(obj, "octospi2", &s->octospi2, TYPE_GNW_H7B0_OSPI);
     object_initialize_child(obj, "adc", &s->adc, TYPE_GNW_H7B0_ADC);
+    object_initialize_child(obj, "lptim1", &s->lptim1, TYPE_GNW_H7B0_LPTIM1);
     object_initialize_child(obj, "ltdc", &s->ltdc, TYPE_GNW_H7B0_LTDC);
     object_initialize_child(obj, "dma2d", &s->dma2d, TYPE_GNW_H7B0_DMA2D);
     object_initialize_child(obj, "spi2", &s->spi2, TYPE_GNW_H7B0_SPI);
@@ -387,6 +388,13 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->adc), 0,
                         qdev_get_gpio_in(armv7m, ADC_IRQn));
 
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->lptim1), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->lptim1), 0, LPTIM1_BASE_ADDRESS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->lptim1), 0,
+                        qdev_get_gpio_in(armv7m, LPTIM1_IRQn));
+
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->ltdc), errp)) {
         return;
     }
@@ -416,6 +424,8 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->rtc), 0, RTC_BASE_ADDRESS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc), 0,
+                        qdev_get_gpio_in(armv7m, RTC_Alarm_IRQn));
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->crc), errp)) {
         return;
@@ -488,11 +498,15 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->otfdec1), 0, OTFDEC1_BASE_ADDRESS);
+    gnw_h7b0_otfdec_set_extflash(&s->otfdec1, system_memory, &s->extflash,
+                                  EXTFLASH_BASE_ADDRESS, EXTFLASH_SIZE);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->otfdec2), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->otfdec2), 0, OTFDEC2_BASE_ADDRESS);
+    gnw_h7b0_otfdec_set_extflash(&s->otfdec2, system_memory, &s->extflash,
+                                  EXTFLASH_BASE_ADDRESS, EXTFLASH_SIZE);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->cryp), errp)) {
         return;
@@ -556,6 +570,7 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     gnw_h7b0_sai1_set_dma(&s->sai1, &s->dma);
     gnw_h7b0_sai1_set_rcc(&s->sai1, &s->rcc);
     gnw_h7b0_hash_set_dma(&s->hash, &s->dma);
+    gnw_h7b0_adc_set_dma(&s->adc, &s->dma);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dac1), errp)) {
         return;
@@ -571,6 +586,7 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->tim1), 0, TIM1_BASE_ADDRESS);
+    gnw_h7b0_tim1_set_rcc(&s->tim1, &s->rcc);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->jpeg), errp)) {
         return;
