@@ -10,7 +10,14 @@
 
 #define GNW_H7B0_OCTOSPI2_DCR1_OFFSET 0x8
 #define GNW_H7B0_OCTOSPI2_DCR1_RESET  0x00000000
-#define GNW_H7B0_OCTOSPI2_DCR1_WMASK  0x031f0703
+/* Auto-generated mask was missing DLYBYP (bit 3, 0x8), CKCSHT (bits
+ * 6:4, 0x70), and truncated MTYP by one bit (bit 26, 0x04000000) --
+ * confirmed against stm32h7b0xx.h's OCTOSPI_DCR1_{CKMODE,FRCK,DLYBYP,
+ * CKCSHT,CSHT,DEVSIZE,MTYP}_Msk field definitions. Found via
+ * case_ospi_dlyb_readback.c: firmware's HAL_OSPI_Init() writes DLYBYP
+ * to select delay-block bypass mode, but the old mask silently dropped
+ * that bit, so QEMU never reflected it back on readback. */
+#define GNW_H7B0_OCTOSPI2_DCR1_WMASK  0x071f077b
 
 #define GNW_H7B0_OCTOSPI2_DCR2_OFFSET 0xc
 #define GNW_H7B0_OCTOSPI2_DCR2_RESET  0x00000000
