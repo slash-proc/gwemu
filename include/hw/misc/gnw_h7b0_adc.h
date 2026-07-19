@@ -53,9 +53,16 @@
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "hw/misc/gnw_h7b0_dma.h"
 
 #define TYPE_GNW_H7B0_ADC "gnw-h7b0-adc"
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0AdcState, GNW_H7B0_ADC)
+
+/* DMAMUX1 request line for ADC2 (sdk/stm32h7xx-hal-driver/Inc/
+ * stm32h7xx_hal_dma.h's DMA_REQUEST_ADC2) -- used to register this
+ * device's DMA notifier the same way gnw_h7b0_sai1.c/gnw_h7b0_hash.c
+ * register theirs (see gnw_h7b0_dma_set_request_notifier()). */
+#define GNW_H7B0_ADC_DMA_REQUEST_ADC2 10
 
 #define GNW_H7B0_ADC_SIZE   0x400
 
@@ -70,6 +77,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0AdcState, GNW_H7B0_ADC)
 #define ADC_CR_ADSTART      (1U << 2)
 #define ADC_CR_ADCAL        (1U << 31)
 #define GNW_H7B0_ADC_DR     0x40
+#define GNW_H7B0_ADC_SQR1   0x30
+#define ADC_SQR1_SQ1_SHIFT  6
+#define ADC_SQR1_SQ1_MASK   (0x1FU << ADC_SQR1_SQ1_SHIFT)
+
+/* Regular-sequence channel numbers this stub distinguishes (see DR-value
+ * selection in gnw_h7b0_adc_write()). Everything else still gets
+ * GNW_H7B0_ADC_FULL_BATTERY_RAW, preserving existing battery-read
+ * behavior for any channel not explicitly listed here. */
+#define ADC_CHANNEL_VREFINT  19
 
 /*
  * Fixed regular-conversion result returned on every ADSTART, standing in for
@@ -95,6 +111,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0AdcState, GNW_H7B0_ADC)
  */
 #define GNW_H7B0_ADC_FULL_BATTERY_RAW 0xFFFF
 
+/*
+ * Fixed regular-conversion result for the VREFINT internal channel
+ * (SQR1.SQ1 == ADC_CHANNEL_VREFINT), distinct from
+ * GNW_H7B0_ADC_FULL_BATTERY_RAW. Added because stm32h7b0-diag's
+ * case_adc_vrefint_correct.c/case_adc_vrefint_throughput.c both read
+ * VREFINT specifically (never the battery channel) and independently
+ * reject any reading >= 0xFFF0 as "stuck at rail" -- GNW_H7B0_ADC_
+ * FULL_BATTERY_RAW's 0xFFFF was tripping that check on every sample
+ * before this stub distinguished channels at all (every regular
+ * conversion returned the same fixed battery value regardless of which
+ * channel was actually selected). An arbitrary stable mid-scale value
+ * satisfies both diag cases (consistency across samples, non-rail) --
+ * no real VDDA/VREFINT calibration data exists for this board (see
+ * case_adc_vrefint_correct.c's header comment), so there is no "more
+ * correct" value to pick instead.
+ */
+#define GNW_H7B0_ADC_VREFINT_RAW 0x6000
+
 /* ADC1/ADC2 sub-block stride and count within the combined register file. */
 #define GNW_H7B0_ADC_INSTANCE_STRIDE 0x100
 #define GNW_H7B0_ADC_INSTANCE_COUNT  2
@@ -105,6 +139,16 @@ struct GnwH7B0AdcState {
     MemoryRegion mmio;
     qemu_irq irq;
     uint32_t regs[GNW_H7B0_ADC_SIZE / 4];
+    GnwH7B0DmaState *dma;
 };
+
+/* Wires this ADC up to the shared DMA controller, registering a request
+ * notifier on GNW_H7B0_ADC_DMA_REQUEST_ADC2 so DMA2's ADC2-bound stream
+ * (e.g. case_adc_vrefint_throughput.c's DMA2_Stream1) actually receives
+ * real conversion data instead of the DMA controller's generic transfer-
+ * timing model completing with nothing behind it (that model only
+ * simulates flag/IRQ timing -- real byte movement for non-M2M streams is
+ * the source peripheral's job, same as gnw_h7b0_sai1.c/gnw_h7b0_hash.c). */
+void gnw_h7b0_adc_set_dma(GnwH7B0AdcState *s, GnwH7B0DmaState *dma);
 
 #endif

@@ -25,8 +25,70 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "migration/vmstate.h"
+#include "exec/cpu-common.h"
 #include "hw/core/irq.h"
 #include "hw/misc/gnw_h7b0_adc.h"
+
+/*
+ * DMA request notifier (see gnw_h7b0_adc.h): fills the destination
+ * buffer's half/full-transfer portion with GNW_H7B0_ADC_VREFINT_RAW,
+ * one 32-bit word per item (matches case_adc_vrefint_throughput.c's
+ * DMA_PDATAALIGN_WORD/DMA_MDATAALIGN_WORD config -- the only ADC-DMA
+ * consumer that exists in this codebase so far). Real hardware would
+ * deliver each stream's actual per-channel conversion result per item;
+ * this stub has only one fixed regular-conversion channel value at a
+ * time (see gnw_h7b0_adc_write()'s ADSTART handling), so every item in
+ * the transfer gets the same value -- sufficient for what any known
+ * consumer actually checks (non-poison, non-rail, real DMA motion
+ * happened), not a claim of per-item conversion fidelity.
+ */
+static void gnw_h7b0_adc_dma_notify(void *opaque, bool half,
+                                     uint32_t m0ar, uint32_t ndtr)
+{
+    uint32_t half_items = ndtr / 2;
+    uint32_t addr = m0ar + (half ? 0 : half_items * sizeof(uint32_t));
+
+    if (half_items == 0) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < half_items; i++) {
+        uint32_t val = GNW_H7B0_ADC_VREFINT_RAW;
+        cpu_physical_memory_write(addr + (hwaddr)i * sizeof(uint32_t),
+                                   &val, sizeof(val));
+    }
+}
+
+void gnw_h7b0_adc_set_dma(GnwH7B0AdcState *s, GnwH7B0DmaState *dma)
+{
+    s->dma = dma;
+    if (s->dma) {
+        /*
+         * low_latency=false (NOT true, unlike HASH_IN's registration):
+         * HASH_IN is a genuine one-shot bulk transfer (CR.EN clears
+         * after the first full-transfer tick, so a fixed ~0ns delay
+         * fires at most twice total). ADC2's real firmware usage
+         * (case_adc_vrefint_throughput.c) is CIRCULAR mode, which
+         * restarts automatically forever until firmware explicitly
+         * disables the stream -- see gnw_h7b0_dma_stream_tick()'s CIRC
+         * handling. Combined with a fixed 1ns low_latency re-arm delay,
+         * that produces a virtual timer that keeps re-firing
+         * essentially continuously in real wall-clock time (each fire
+         * has real host-side processing cost) until firmware's polling
+         * loop finally gets enough real CPU time to observe TCIF and
+         * call HAL_ADC_Stop_DMA() -- confirmed via a live repro to
+         * inflate this case from an expected sub-millisecond completion
+         * to ~28 real seconds (right at the harness's 30s timeout,
+         * flaky pass/TIMEOUT depending on host load). Using the normal
+         * rate-derived delay here instead (same mechanism SAI1's own
+         * circular audio DMA already relies on) gives a bounded,
+         * realistic half-transfer cadence instead of a runaway loop.
+         */
+        gnw_h7b0_dma_set_request_notifier(s->dma,
+            GNW_H7B0_ADC_DMA_REQUEST_ADC2, gnw_h7b0_adc_dma_notify, s,
+            NULL, NULL, false);
+    }
+}
 
 static void gnw_h7b0_adc_reset(DeviceState *dev)
 {
@@ -85,8 +147,13 @@ static void gnw_h7b0_adc_write(void *opaque, hwaddr addr,
          * eventually call HAL_ADC_ConvCpltCallback().
          */
         if (value & ADC_CR_ADSTART) {
-            s->regs[(instance_base + GNW_H7B0_ADC_DR) >> 2] =
-                GNW_H7B0_ADC_FULL_BATTERY_RAW;
+            uint32_t sqr1 = s->regs[(instance_base + GNW_H7B0_ADC_SQR1) >> 2];
+            uint32_t sq1 = (sqr1 & ADC_SQR1_SQ1_MASK) >> ADC_SQR1_SQ1_SHIFT;
+            uint32_t dr_value = (sq1 == ADC_CHANNEL_VREFINT)
+                                     ? GNW_H7B0_ADC_VREFINT_RAW
+                                     : GNW_H7B0_ADC_FULL_BATTERY_RAW;
+
+            s->regs[(instance_base + GNW_H7B0_ADC_DR) >> 2] = dr_value;
             s->regs[(instance_base + GNW_H7B0_ADC_ISR) >> 2] |= ADC_ISR_EOC;
             s->regs[addr >> 2] &= ~ADC_CR_ADSTART;
 
