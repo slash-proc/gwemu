@@ -22,3 +22,12 @@ gnw_lzma_lib = static_library('gnw_lzma',
                                files('gnw_lzma.c'),
                                dependencies: [gnw_lzma_dep],
                                install: false)
+
+# AES-128 single-block encrypt (ExtFirmware.crypt()'s OTFDEC keystream) --
+# see gnw_aes128.h. gnw_symbols_{mario,zelda}.h (pre-extracted ELF symbol
+# tables, header-only, no .c to build) complete the set of verified
+# building blocks for the still-in-progress Firmware/Device relocation
+# engine port -- not yet written.
+gnw_aes128_lib = static_library('gnw_aes128',
+                                 files('gnw_aes128.c'),
+                                 install: false)
