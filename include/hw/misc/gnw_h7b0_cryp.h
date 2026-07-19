@@ -94,6 +94,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0CrypState, GNW_H7B0_CRYP)
 #define CRYP_CR_ALGOMODE_AES_CBC 0x00000028U
 #define CRYP_CR_ALGOMODE_AES_CTR 0x00000030U
 #define CRYP_CR_ALGOMODE_AES_GCM 0x00080000U
+#define CRYP_CR_ALGOMODE_AES_CCM 0x00080008U
+/* AES key-preparation mode: real HAL's CRYP_AES_Decrypt() briefly
+ * switches ALGOMODE to this value (while CRYPEN is enabled) before an
+ * ECB/CBC decrypt, to have hardware derive the decryption key schedule;
+ * see the .c file's CR-write handler comment for why this model must
+ * recognize it explicitly instead of falling through to "unimplemented". */
+#define CRYP_CR_ALGOMODE_AES_KEY 0x00000038U
 #define CRYP_CR_DATATYPE_SHIFT  6
 #define CRYP_CR_DATATYPE_MASK   (0x3U << CRYP_CR_DATATYPE_SHIFT)
 #define CRYP_CR_KEYSIZE_SHIFT   8
@@ -134,8 +141,22 @@ struct GnwH7B0CrypState {
     uint8_t round_keys[15][16];
     int num_rounds;
     uint8_t hash_subkey[16];   /* H = AES_Encrypt(key, 0^128) */
-    uint8_t ghash[16];         /* Y, the running GHASH accumulator */
-    uint8_t counter[16];       /* current CTR block (starts at J0) */
+    uint8_t ghash[16];         /* Y, the running GHASH accumulator (GCM) or
+                                * running CBC-MAC accumulator (CCM) -- the
+                                * two modes never run concurrently on one
+                                * device instance, so this field is reused
+                                * rather than duplicated. */
+    uint8_t counter[16];       /* current CTR block (starts at J0(GCM)/CTR1(CCM)) */
+    uint8_t j0[16];            /* GCM only: the ORIGINAL loaded J0, preserved
+                                * separately from `counter` (which advances
+                                * during PAYLOAD) -- HAL_CRYPEx_AESGCM_
+                                * GenerateAuthTAG()'s tag mask needs AES_K(J0)
+                                * specifically, confirmed against real
+                                * hardware (see case_cryp_aes_gcm_correct.c's
+                                * header comment: "the tag generation...
+                                * independently derives AES_K(J0)... despite
+                                * the payload's counter register having been
+                                * loaded with J0+1, not J0"). */
 
     /* DIN/DOUT 4-word block buffers -- real hardware's FIFOs are
      * deeper, but since processing is modeled as instant (no timing

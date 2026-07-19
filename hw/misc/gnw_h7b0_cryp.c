@@ -281,6 +281,18 @@ static void ctr_inc32(uint8_t block[16])
     }
 }
 
+/* Symmetric decrement, same last-32-bits-only scope as ctr_inc32() --
+ * used to derive GCM's J0 from the J0+1 value firmware actually loads
+ * into the IV registers (see gnw_h7b0_cryp_gcm_init_phase()'s comment). */
+static void ctr_dec32(uint8_t block[16])
+{
+    for (int i = 15; i >= 12; i--) {
+        if (block[i]-- != 0) {
+            break;
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Register-level word <-> byte-block helpers.                        */
 /* ------------------------------------------------------------------ */
@@ -383,12 +395,22 @@ static void gnw_h7b0_cryp_gcm_init_phase(GnwH7B0CrypState *s)
 
     gnw_h7b0_cryp_load_key(s);
     aes_encrypt_block(s->round_keys, s->num_rounds, zero, s->hash_subkey);
-    /* This firmware family's HAL config always supplies a full 128-bit
-     * pre-formed Initial Counter Block (J0) directly via IV0LR..IV1RR
-     * (see CRYP_AESGCM_Process()) rather than a shorter nonce for
-     * hardware to derive J0 from -- so no GHASH-based J0 derivation is
-     * needed here, just a literal copy. */
+    /* This firmware family's HAL config always supplies J0+1 (not J0!)
+     * directly via IV0LR..IV1RR -- confirmed against real hardware, see
+     * case_cryp_aes_gcm_correct.c's header comment: loading J0 itself or
+     * the bare IV both produced hardware behavior matching "the loaded
+     * value used completely literally, unincremented, as the first
+     * payload block's keystream input", with no internal J0-vs-J0+1
+     * offset logic at all. `counter` therefore starts at the literal
+     * loaded value (J0+1) and is what PAYLOAD blocks consume; `j0` is
+     * separately derived (loaded value minus one) and preserved
+     * unchanged for FINAL's tag mask, since real hardware independently
+     * re-derives AES_K(J0) there rather than reusing whatever `counter`
+     * has advanced to by then (also confirmed against real hardware,
+     * same header comment). */
     words4_to_block(iv_words, s->counter);
+    memcpy(s->j0, s->counter, 16);
+    ctr_dec32(s->j0);
     memset(s->ghash, 0, 16);
     s->din_count = 0;
     s->dout_count = 0;
@@ -420,9 +442,16 @@ static void gnw_h7b0_cryp_gcm_process_block(GnwH7B0CrypState *s)
     case CRYP_GCM_CCMPH_PAYLOAD: {
         uint8_t keystream[16], outblock[16], ghash_input[16];
 
-        ctr_inc32(s->counter);
+        /* Use the current counter AS-IS for this block's keystream --
+         * NOT pre-incremented. The first PAYLOAD block must consume the
+         * literal J0+1 value INIT loaded (confirmed against real
+         * hardware, see gnw_h7b0_cryp_gcm_init_phase()'s comment); only
+         * advance afterward, so a hypothetical next block would get
+         * J0+2. Previously this incremented before use, which fed the
+         * first block J0+2 instead of J0+1 -- a real, confirmed bug. */
         aes_encrypt_block(s->round_keys, s->num_rounds, s->counter, keystream);
         block_xor(block, keystream, outblock);
+        ctr_inc32(s->counter);
 
         if (npblb > 0 && npblb <= 16) {
             memset(&outblock[16 - npblb], 0, npblb);
@@ -445,14 +474,10 @@ static void gnw_h7b0_cryp_gcm_process_block(GnwH7B0CrypState *s)
 
         block_xor(s->ghash, block, tmp);
         ghash_mult(tmp, s->hash_subkey, s->ghash);
-        aes_encrypt_block(s->round_keys, s->num_rounds, s->counter, tag_mask);
-        /* NOTE: uses the *current* running counter, not a separately
-         * saved J0, matching this model's INIT-phase semantics where
-         * s->counter starts equal to J0 and is only ever advanced by
-         * ctr_inc32() during PAYLOAD blocks -- for an operation that
-         * reaches FINAL without any payload (header/AAD-only GMAC use),
-         * s->counter is still exactly J0 here, which is what the tag
-         * mask must use. */
+        /* Must use the preserved J0 (see gnw_h7b0_cryp_gcm_init_phase()'s
+         * comment), NOT s->counter -- by the time FINAL runs, s->counter
+         * has been advanced past J0+1 by any PAYLOAD blocks that ran. */
+        aes_encrypt_block(s->round_keys, s->num_rounds, s->j0, tag_mask);
         block_xor(s->ghash, tag_mask, tag);
         block_to_words4(tag, s->dout_words);
         s->dout_count = 4;
@@ -465,6 +490,127 @@ static void gnw_h7b0_cryp_gcm_process_block(GnwH7B0CrypState *s)
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: DIN write completed a block during GCM INIT "
                       "phase -- unexpected, ignoring\n", __func__);
+        s->dout_count = 0;
+        s->dout_total = 0;
+        break;
+    }
+}
+
+/*
+ * CCM's CRYPEN 0->1 edge (ALGOMODE=CCM, phase=INIT): unlike GCM, real
+ * hardware does NOT auto-derive anything here -- firmware has already
+ * written IV0LR..IV1RR with CTR1 (masked B0, counter forced to 1, see
+ * CRYP_AESCCM_Process()) *before* this edge, and is about to write the
+ * raw B0 block via DIN right after (handled by
+ * gnw_h7b0_cryp_ccm_process_block()'s INIT case below, not here --
+ * CRYPEN must stay set across those DIN writes, only self-clearing once
+ * B0 has actually been consumed, matching real firmware's "write B0,
+ * then poll for CRYPEN to clear" sequence). This function only loads
+ * the key, latches CTR1 into `counter`, and resets the running CBC-MAC
+ * (reuses `ghash`) to zero.
+ */
+static void gnw_h7b0_cryp_ccm_init_phase(GnwH7B0CrypState *s)
+{
+    uint32_t iv_words[4] = {
+        s->regs[GNW_H7B0_CRYP_IV0LR >> 2], s->regs[GNW_H7B0_CRYP_IV0RR >> 2],
+        s->regs[GNW_H7B0_CRYP_IV1LR >> 2], s->regs[GNW_H7B0_CRYP_IV1RR >> 2],
+    };
+
+    gnw_h7b0_cryp_load_key(s);
+    words4_to_block(iv_words, s->counter);
+    memset(s->ghash, 0, 16);
+    s->din_count = 0;
+    s->dout_count = 0;
+    s->dout_total = 0;
+}
+
+/* Processes one completed 4-word DIN block per the current CCM phase.
+ * See case_cryp_aes_ccm_correct.c's header comment and
+ * stm32h7xx_hal_cryp.c's CRYP_AESCCM_Process()/HAL_CRYPEx_AESCCM_
+ * GenerateAuthTAG() for the real sequencing this mirrors. CBC-MAC
+ * (reusing the `ghash` field) always accumulates over the PLAINTEXT --
+ * the opposite of GCM's GHASH, which always accumulates ciphertext --
+ * so PAYLOAD's direction-dependent selection below is deliberately the
+ * mirror image of gnw_h7b0_cryp_gcm_process_block()'s. */
+static void gnw_h7b0_cryp_ccm_process_block(GnwH7B0CrypState *s)
+{
+    uint32_t cr = s->regs[GNW_H7B0_CRYP_CR >> 2];
+    uint32_t phase = (cr & CRYP_CR_GCM_CCMPH_MASK) >> CRYP_CR_GCM_CCMPH_SHIFT;
+    bool decrypt = (cr & CRYP_CR_ALGODIR) != 0;
+    uint32_t npblb = (cr & CRYP_CR_NPBLB_MASK) >> CRYP_CR_NPBLB_SHIFT;
+    uint8_t block[16], tmp[16];
+
+    words4_to_block(s->din_words, block);
+
+    switch (phase) {
+    case CRYP_GCM_CCMPH_INIT:
+        /* B0, written raw (not masked like the IV registers were) --
+         * first CBC-MAC step: MAC = AES_K(0^128 XOR B0) = AES_K(B0).
+         * Real hardware self-clears CRYPEN once this block is consumed
+         * (firmware's CRYP_AESCCM_Process() polls exactly that, right
+         * after its 4 B0 DIN writes) -- done here, not at the CR-write
+         * edge, since the edge happens *before* B0 arrives. */
+        block_xor(s->ghash, block, tmp);
+        aes_encrypt_block(s->round_keys, s->num_rounds, tmp, s->ghash);
+        s->regs[GNW_H7B0_CRYP_CR >> 2] &= ~CRYP_CR_CRYPEN;
+        s->dout_count = 0;
+        s->dout_total = 0;
+        break;
+
+    case CRYP_GCM_CCMPH_HEADER:
+        /* Standard CBC-MAC step over one AAD block: MAC = AES_K(MAC XOR block). */
+        block_xor(s->ghash, block, tmp);
+        aes_encrypt_block(s->round_keys, s->num_rounds, tmp, s->ghash);
+        s->dout_count = 0;
+        s->dout_total = 0;
+        break;
+
+    case CRYP_GCM_CCMPH_PAYLOAD: {
+        uint8_t keystream[16], outblock[16], mac_input[16];
+
+        /* Same as GCM: use `counter` (CTR1, then CTR2, ...) as-is for
+         * this block, advance only after -- see gnw_h7b0_cryp_gcm_
+         * process_block()'s PAYLOAD comment for why pre-incrementing
+         * would be wrong. */
+        aes_encrypt_block(s->round_keys, s->num_rounds, s->counter, keystream);
+        block_xor(block, keystream, outblock);
+        ctr_inc32(s->counter);
+
+        if (npblb > 0 && npblb <= 16) {
+            memset(&outblock[16 - npblb], 0, npblb);
+        }
+        /* CBC-MAC always accumulates the PLAINTEXT: for encryption
+         * that's our input (block), for decryption it's our output
+         * (outblock, the just-decrypted plaintext) -- the mirror image
+         * of GCM's GHASH-always-ciphertext rule. */
+        memcpy(mac_input, decrypt ? outblock : block, 16);
+        block_xor(s->ghash, mac_input, tmp);
+        aes_encrypt_block(s->round_keys, s->num_rounds, tmp, s->ghash);
+
+        block_to_words4(outblock, s->dout_words);
+        s->dout_count = 4;
+        s->dout_total = 4;
+        break;
+    }
+
+    case CRYP_GCM_CCMPH_FINAL: {
+        /* DIN here carries CTR0 (masked B0, counter forced to 0 -- see
+         * HAL_CRYPEx_AESCCM_GenerateAuthTAG()), not a lengths block like
+         * GCM's FINAL. Tag = MAC XOR AES_K(CTR0). */
+        uint8_t tag_mask[16], tag[16];
+
+        aes_encrypt_block(s->round_keys, s->num_rounds, block, tag_mask);
+        block_xor(s->ghash, tag_mask, tag);
+        block_to_words4(tag, s->dout_words);
+        s->dout_count = 4;
+        s->dout_total = 4;
+        break;
+    }
+
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: DIN write with unknown GCM_CCMPH -- ignoring\n",
+                      __func__);
         s->dout_count = 0;
         s->dout_total = 0;
         break;
@@ -527,6 +673,7 @@ static void gnw_h7b0_cryp_reset(DeviceState *dev)
     memset(s->hash_subkey, 0, sizeof(s->hash_subkey));
     memset(s->ghash, 0, sizeof(s->ghash));
     memset(s->counter, 0, sizeof(s->counter));
+    memset(s->j0, 0, sizeof(s->j0));
     memset(s->din_words, 0, sizeof(s->din_words));
     s->din_count = 0;
     memset(s->dout_words, 0, sizeof(s->dout_words));
@@ -579,6 +726,7 @@ static void gnw_h7b0_cryp_write(void *opaque, hwaddr addr,
     case GNW_H7B0_CRYP_CR: {
         uint32_t old_cr = s->regs[GNW_H7B0_CRYP_CR >> 2];
         bool old_en = (old_cr & CRYP_CR_CRYPEN) != 0;
+        uint32_t old_algomode = old_cr & CRYP_CR_ALGOMODE_MASK;
         bool flush = (value & CRYP_CR_FFLUSH) != 0;
         bool new_en;
         uint32_t algomode;
@@ -593,8 +741,30 @@ static void gnw_h7b0_cryp_write(void *opaque, hwaddr addr,
             s->dout_total = 0;
         }
 
-        if (new_en && !old_en) {
-            algomode = value & CRYP_CR_ALGOMODE_MASK;
+        algomode = value & CRYP_CR_ALGOMODE_MASK;
+
+        /*
+         * Real HAL AES decrypt for ECB/CBC (CRYP_AES_Decrypt(), see
+         * stm32h7xx_hal_cryp.c) does a "key preparation" phase first:
+         * ALGOMODE is set to CRYP_CR_ALGOMODE_AES_KEY (0x38) *at* the
+         * CRYPEN 0->1 edge, then ALGOMODE is switched back to the real
+         * mode (CBC/ECB) via a SEPARATE register write that leaves
+         * CRYPEN already set -- no second edge. The real key/IV setup
+         * this model does below (gnw_h7b0_cryp_load_key() + counter
+         * reload from IV0..1LR/RR) must therefore also run on that
+         * algomode-changes-while-still-enabled transition, not only on
+         * a fresh CRYPEN edge -- otherwise CBC decrypt silently reuses
+         * whatever stale IV/counter state a prior encrypt operation
+         * left behind (confirmed live: this made case_cryp_aes_cbc_
+         * correct.c's decrypt phase decrypt against the wrong "IV",
+         * since s->counter still held the last CBC ciphertext block
+         * from the preceding encrypt call). ECB/CTR happened to dodge
+         * this: ECB doesn't consume s->counter at all, and CTR's own
+         * key-prep path (see CRYP_AES_Decrypt()) never touches ALGOMODE
+         * at all, so its one real edge already lands on CRYP_CR_
+         * ALGOMODE_AES_CTR directly.
+         */
+        if (new_en && (!old_en || algomode != old_algomode)) {
             if (algomode == CRYP_CR_ALGOMODE_AES_GCM) {
                 uint32_t phase = (value & CRYP_CR_GCM_CCMPH_MASK)
                                   >> CRYP_CR_GCM_CCMPH_SHIFT;
@@ -613,6 +783,19 @@ static void gnw_h7b0_cryp_write(void *opaque, hwaddr addr,
                  * words arrive (see gnw_h7b0_cryp_gcm_process_block()).
                  * Counter/GHASH state persists across the CRYPEN
                  * toggles firmware does between phases. */
+            } else if (algomode == CRYP_CR_ALGOMODE_AES_CCM) {
+                uint32_t phase = (value & CRYP_CR_GCM_CCMPH_MASK)
+                                  >> CRYP_CR_GCM_CCMPH_SHIFT;
+                if (phase == CRYP_GCM_CCMPH_INIT) {
+                    /* Unlike GCM, do NOT self-clear CRYPEN here -- CCM's
+                     * INIT phase needs firmware to write the raw B0
+                     * block via DIN first (see gnw_h7b0_cryp_ccm_
+                     * process_block()'s INIT case, which self-clears
+                     * once that arrives). */
+                    gnw_h7b0_cryp_ccm_init_phase(s);
+                }
+                /* HEADER/PAYLOAD/FINAL: same as GCM, no action at the
+                 * edge itself. */
             } else if (algomode == CRYP_CR_ALGOMODE_AES_ECB ||
                        algomode == CRYP_CR_ALGOMODE_AES_CBC ||
                        algomode == CRYP_CR_ALGOMODE_AES_CTR) {
@@ -627,10 +810,20 @@ static void gnw_h7b0_cryp_write(void *opaque, hwaddr addr,
                     words4_to_block(iv_words, s->counter);
                 }
                 s->din_count = 0;
+            } else if (algomode == CRYP_CR_ALGOMODE_AES_KEY) {
+                /* Key-preparation phase for ECB/CBC decrypt (see this
+                 * `if`'s doc comment above) -- (re)compute round_keys
+                 * from the current K0-3 registers now, though the
+                 * subsequent algomode-change-while-enabled transition
+                 * back to the real mode already does this again too
+                 * (harmless/idempotent given unchanged K0-3). Recognized
+                 * explicitly so it doesn't fall into the "unimplemented"
+                 * branch below and log a misleading warning. */
+                gnw_h7b0_cryp_load_key(s);
             } else {
                 qemu_log_mask(LOG_UNIMP,
                               "%s: unimplemented ALGOMODE (CR=%#x) -- "
-                              "DES/TDES/CCM not modeled\n", __func__, value);
+                              "DES/TDES not modeled\n", __func__, value);
             }
         }
 
@@ -655,6 +848,8 @@ static void gnw_h7b0_cryp_write(void *opaque, hwaddr addr,
 
         if (algomode == CRYP_CR_ALGOMODE_AES_GCM) {
             gnw_h7b0_cryp_gcm_process_block(s);
+        } else if (algomode == CRYP_CR_ALGOMODE_AES_CCM) {
+            gnw_h7b0_cryp_ccm_process_block(s);
         } else if (algomode == CRYP_CR_ALGOMODE_AES_ECB ||
                    algomode == CRYP_CR_ALGOMODE_AES_CBC ||
                    algomode == CRYP_CR_ALGOMODE_AES_CTR) {
@@ -716,6 +911,7 @@ static const VMStateDescription vmstate_gnw_h7b0_cryp = {
         VMSTATE_UINT8_ARRAY(hash_subkey, GnwH7B0CrypState, 16),
         VMSTATE_UINT8_ARRAY(ghash, GnwH7B0CrypState, 16),
         VMSTATE_UINT8_ARRAY(counter, GnwH7B0CrypState, 16),
+        VMSTATE_UINT8_ARRAY(j0, GnwH7B0CrypState, 16),
         VMSTATE_UINT32_ARRAY(din_words, GnwH7B0CrypState, 4),
         VMSTATE_INT32(din_count, GnwH7B0CrypState),
         VMSTATE_UINT32_ARRAY(dout_words, GnwH7B0CrypState, 4),
