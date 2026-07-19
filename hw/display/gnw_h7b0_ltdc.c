@@ -180,6 +180,67 @@ static bool gnw_h7b0_ltdc_reload_is_structural_change(GnwH7B0LtdcState *s)
            s->active_l2wvpcr != s->regs[GNW_H7B0_LTDC_L2WVPCR >> 2];
 }
 
+/*
+ * True if any register gnw_h7b0_ltdc_reload_active() is about to commit
+ * actually differs from what's already active -- i.e. this reload has
+ * nothing new to contribute to the composited frame. Covers the exact
+ * same register set reload_active() copies (both layers' CR/CFBAR/
+ * CFBLR/CFBLNR/PFCR/CACR/CKCR/DCCR/BFCR/WHPCR/WVPCR plus GCR/BPCR/BCCR),
+ * so "unchanged here" really does mean "the next capture would produce a
+ * bit-identical frame to the last one," not just "the specific fields
+ * gnw_h7b0_ltdc_reload_is_structural_change() happens to check."
+ *
+ * Added per stm32h7b0-diag's docs/qemu-reports/ltdc.md: any SRCR.IMR
+ * write anywhere in the system -- including one that only touches an
+ * always-disabled scratch Layer 2, as case_ltdc_frame_composite.c/
+ * case_ltdc_clut_correct.c both deliberately do -- unconditionally
+ * triggered a full 320x240 Layer-1 framebuffer
+ * cpu_physical_memory_read() snapshot-and-dispatch, because the capture
+ * is gated on "is LTDC enabled" (Layer 1 always is, for the real menu)
+ * rather than "did anything that would change the composited frame
+ * actually happen." Measured ~22x QEMU-vs-hardware gap, ~18.7us/reload
+ * of real host work for a shadow-register latch that's near-instant on
+ * real silicon. Skipping the capture when nothing composition-relevant
+ * changed removes that cost for exactly this class of no-op reload
+ * without touching real gameplay: an ordinary game's IMR-triggered
+ * format/geometry reconfiguration (the case this reload path exists
+ * for) always changes at least one of these registers by definition, so
+ * the capture still fires for those, unchanged. If Layer 1's RAM
+ * content changes without any register write at all (direct-paint
+ * firmware), that's already independently covered by
+ * gnw_h7b0_ltdc_vblank_tick()'s separate RAM-dirty-bitmap fallback --
+ * this only skips the *register-triggered* capture, it doesn't disable
+ * or interact with that other path.
+ */
+static bool gnw_h7b0_ltdc_reload_is_composition_change(GnwH7B0LtdcState *s)
+{
+    return s->active_l1cr     != s->regs[GNW_H7B0_LTDC_L1CR >> 2] ||
+           s->active_l1cfbar  != s->regs[GNW_H7B0_LTDC_L1CFBAR >> 2] ||
+           s->active_l1cfblr  != s->regs[GNW_H7B0_LTDC_L1CFBLR >> 2] ||
+           s->active_l1cfblnr != s->regs[GNW_H7B0_LTDC_L1CFBLNR >> 2] ||
+           s->active_l1pfcr   != s->regs[GNW_H7B0_LTDC_L1PFCR >> 2] ||
+           s->active_l2cr     != s->regs[GNW_H7B0_LTDC_L2CR >> 2] ||
+           s->active_l2cfbar  != s->regs[GNW_H7B0_LTDC_L2CFBAR >> 2] ||
+           s->active_l2cfblr  != s->regs[GNW_H7B0_LTDC_L2CFBLR >> 2] ||
+           s->active_l2cfblnr != s->regs[GNW_H7B0_LTDC_L2CFBLNR >> 2] ||
+           s->active_l2pfcr   != s->regs[GNW_H7B0_LTDC_L2PFCR >> 2] ||
+           s->active_l2cacr   != s->regs[GNW_H7B0_LTDC_L2CACR >> 2] ||
+           s->active_l1ckcr   != s->regs[GNW_H7B0_LTDC_L1CKCR >> 2] ||
+           s->active_l2ckcr   != s->regs[GNW_H7B0_LTDC_L2CKCR >> 2] ||
+           s->active_l1dccr   != s->regs[GNW_H7B0_LTDC_L1DCCR >> 2] ||
+           s->active_l2dccr   != s->regs[GNW_H7B0_LTDC_L2DCCR >> 2] ||
+           s->active_bccr     != s->regs[GNW_H7B0_LTDC_BCCR >> 2] ||
+           s->active_l1cacr   != s->regs[GNW_H7B0_LTDC_L1CACR >> 2] ||
+           s->active_l1bfcr   != s->regs[GNW_H7B0_LTDC_L1BFCR >> 2] ||
+           s->active_l2bfcr   != s->regs[GNW_H7B0_LTDC_L2BFCR >> 2] ||
+           s->active_l1whpcr  != s->regs[GNW_H7B0_LTDC_L1WHPCR >> 2] ||
+           s->active_l1wvpcr  != s->regs[GNW_H7B0_LTDC_L1WVPCR >> 2] ||
+           s->active_l2whpcr  != s->regs[GNW_H7B0_LTDC_L2WHPCR >> 2] ||
+           s->active_l2wvpcr  != s->regs[GNW_H7B0_LTDC_L2WVPCR >> 2] ||
+           s->active_gcr      != s->regs[GNW_H7B0_LTDC_GCR >> 2] ||
+           s->active_bpcr     != s->regs[GNW_H7B0_LTDC_BPCR >> 2];
+}
+
 static void gnw_h7b0_ltdc_reload_active(GnwH7B0LtdcState *s)
 {
     /*
@@ -1564,6 +1625,7 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
              * vblank_tick() comment for why this isn't a permanent
              * latch or a timeout).
              */
+            bool composition_changed = gnw_h7b0_ltdc_reload_is_composition_change(s);
             s->vbr_active = false;
             gnw_h7b0_ltdc_reload_active(s);
             s->regs[GNW_H7B0_LTDC_ISR >> 2] |= LTDC_ISR_RRIF;
@@ -1578,6 +1640,18 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
              * calls SetPixelFormat/SetAddress then a separate VBR reload,
              * but intermediate IMR reloads from the HAL must still refresh).
              *
+             * Skip the (expensive, full-framebuffer) capture entirely when
+             * this reload didn't actually change anything composition-
+             * affecting (composition_changed, computed above BEFORE
+             * reload_active() overwrote the active_* fields) AND there
+             * isn't already a stale captured-but-unpublished frame
+             * pending (content_dirty) -- see
+             * gnw_h7b0_ltdc_reload_is_composition_change()'s doc comment.
+             * A real format/geometry change always flips at least one of
+             * the compared registers, so this only ever skips truly
+             * redundant reloads (e.g. an always-disabled scratch layer's
+             * own reload, which can't affect what's on screen).
+             *
              * If the compositor worker thread is still busy with a
              * previous frame, this dispatch is dropped (see
              * gnw_h7b0_ltdc_capture_if_enabled()'s doc comment) -- fall
@@ -1586,7 +1660,8 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
              * IMR-triggered geometry/format change is exactly the kind
              * of update that must not silently get lost.
              */
-            if (!gnw_h7b0_ltdc_capture_if_enabled(s)) {
+            if ((composition_changed || s->content_dirty) &&
+                !gnw_h7b0_ltdc_capture_if_enabled(s)) {
                 s->vbr_deferred_capture = true;
             }
         }
