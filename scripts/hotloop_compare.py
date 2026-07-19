@@ -34,13 +34,16 @@ Usage:
     ./scripts/hotloop_compare.py --samples 300 --top 20
 """
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 from collections import Counter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path.home() / "Nerd" / "git" / "gnwmanager"))
+GNWMANAGER_PATH = os.environ.get("GNWMANAGER_PATH")
+if GNWMANAGER_PATH:
+    sys.path.insert(0, GNWMANAGER_PATH)
 
 
 def sample_pc_qemu(backend):

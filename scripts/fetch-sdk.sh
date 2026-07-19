@@ -6,9 +6,8 @@
 # rm0455.pdf. Not a build dependency: this QEMU fork doesn't compile
 # against it, it's just ground truth to read.
 #
-# Version pins match ../../game-and-watch-retro-go-sd/Makefile.common
-# exactly, since that's the real toolchain G&W firmware builds against --
-# keep these in sync with that file if it bumps versions.
+# Version pins match the real toolchain Game & Watch firmware builds
+# against -- bump these if that toolchain's pins change.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

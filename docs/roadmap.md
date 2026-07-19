@@ -2,22 +2,21 @@
 
 ## Why
 
-`minicraft-gnw` (a GBA-to-Game & Watch port) tests pre-hardware via a QEMU
+Prior Game & Watch homebrew dev workflows tested pre-hardware via a QEMU
 harness running on QEMU's generic Cortex-M7 MPS2-AN500 target — not a real
-STM32H7B0 model, because none exists upstream. The harness works around
-this by fault-trapping accesses to the DMA2D peripheral (a BusFault handler
-decodes the faulting STR instruction and executes the operation against a
-software register shadow) and doesn't model flash/QSPI boot, RCC, or the
-real memory map at all. This got firmware booting and rendering correctly,
-but it's slow (~10+ faults per DMA2D call) and only covers the narrow slice
-of hardware behavior the GWHB test harness happens to exercise.
+STM32H7B0 model, because none exists upstream. One common workaround is
+fault-trapping accesses to the DMA2D peripheral (a BusFault handler decodes
+the faulting STR instruction and executes the operation against a software
+register shadow) instead of modeling flash/QSPI boot, RCC, or the real
+memory map at all. That gets firmware booting and rendering, but it's slow
+(~10+ faults per DMA2D call) and only covers the narrow slice of hardware
+behavior a given test harness happens to exercise.
 
-This project is the deferred "real correct answer" flagged in
-`../../minicraft-gnw/docs/qemu-testing.md`: a native STM32H7B0 device/
-machine model compiled into a maintained custom QEMU build, with DMA2D
-implemented as a real device rather than trapped. Modeled after how `xemu`
-gives Xbox homebrew/game devs a fast, accurate dev loop against real NV2A
-GPU behavior instead of a slow stand-in.
+This project is the real-machine-model answer to that: a native STM32H7B0
+device/machine model compiled into a maintained custom QEMU build, with
+DMA2D implemented as a real device rather than trapped. Modeled after how
+`xemu` gives Xbox homebrew/game devs a fast, accurate dev loop against real
+NV2A GPU behavior instead of a slow stand-in.
 
 ## Decisions
 
@@ -95,21 +94,13 @@ soft ordering, not a strict gate.
   the framebuffer is a native QEMU display device (likely not).
 
 ### Phase 4 — Remaining peripherals for real-firmware boot
-- GPIO (buttons), UART/USART, SysTick, and whatever else real retro-go/GWHB
-  firmware touches during boot that Phase 1's stubs don't cover — expand
-  incrementally, driven by "what does the firmware actually fault on next,"
-  same methodology already proven in minicraft-gnw's bring-up sessions.
+- GPIO (buttons), UART/USART, SysTick, and whatever else real firmware
+  touches during boot that Phase 1's stubs don't cover — expand
+  incrementally, driven by "what does the firmware actually fault on next."
 
 ## Key references
 
 - `STM32H7B0.svd` (repo root) — authoritative register map.
-- `../../minicraft-gnw/tools/retro-go-porting-toolkit/host/qemu/dma2d_emu.h`,
-  `bus_fault.c`, `fault_decode.c` — validated DMA2D operation semantics to
-  port into Phase 2's native device model.
-- `../../minicraft-gnw/tools/retro-go-porting-toolkit/host/qemu/startup.c`
-  — existing SysTick/vector-table handling understanding for Phase 4.
-- `../../minicraft-gnw/docs/qemu-testing.md` and `docs/real-hardware-testing.md`
-  — catalog of real STM32H7B0 behavior differences already discovered.
 - QEMU's existing `hw/arm/stm32f4*`-family boards as a structural template
   for SoC container objects.
 

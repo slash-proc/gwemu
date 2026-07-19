@@ -9,12 +9,21 @@ reads, to avoid the real-hardware standby-drop wedge risk a reset carries.
 Captures whatever state the device is currently in.
 """
 import json
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/home/doug/Nerd/git/gnwmanager")
-sys.path.insert(0, "/home/doug/Nerd/git/qemu-gnw/scripts")
-from gnwmanager.ocdbackend.openocd_backend import OpenOCDBackend  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+GNWMANAGER_PATH = os.environ.get("GNWMANAGER_PATH")
+if GNWMANAGER_PATH:
+    sys.path.insert(0, GNWMANAGER_PATH)
+try:
+    from gnwmanager.ocdbackend.openocd_backend import OpenOCDBackend  # noqa: E402
+except ImportError:
+    sys.exit(
+        "error: gnwmanager not importable. Install it (pip install gnwmanager) "
+        "or set GNWMANAGER_PATH to a local checkout."
+    )
 from state_transplant import REGIONS, REGISTERS, _read_memory_chunked, capture_peripherals  # noqa: E402
 
 

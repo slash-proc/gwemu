@@ -80,19 +80,27 @@ Snapshot format: a directory containing manifest.json (registers + region
 descriptors + peripheral register list) plus one <region>.bin raw dump per
 captured RAM region. Peripheral register values are stored inline in
 manifest.json (small enough -- a few KB of JSON for ~2100 registers across
-75 peripherals, per stm32h7b0-diag's own register-audit tooling's count of
-this same SVD).
+the ~75 peripherals in the SVD).
 """
 import argparse
 import json
+import os
 import re
 import struct
 import sys
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-sys.path.insert(0, "/home/doug/Nerd/git/gnwmanager")
-from gnwmanager.ocdbackend.gdb_backend import GDBBackend  # noqa: E402
+GNWMANAGER_PATH = os.environ.get("GNWMANAGER_PATH")
+if GNWMANAGER_PATH:
+    sys.path.insert(0, GNWMANAGER_PATH)
+try:
+    from gnwmanager.ocdbackend.gdb_backend import GDBBackend  # noqa: E402
+except ImportError:
+    sys.exit(
+        "error: gnwmanager not importable. Install it (pip install gnwmanager) "
+        "or set GNWMANAGER_PATH to a local checkout."
+    )
 
 # gnw-h7b0's memory map (include/hw/arm/gnw_h7b0_soc.h) -- the three RAM
 # regions worth transplanting. Peripheral MMIO ranges are handled
@@ -112,10 +120,8 @@ REGISTERS = [f"r{i}" for i in range(13)] + ["sp", "lr", "pc"]
 
 CHUNK_SIZE = 32 * 1024
 
-SVD_PATH = Path("/home/doug/Nerd/git/qemu-gnw/STM32H7B0.svd")
-MAX_PERIPHERAL_BLOCK_SIZE = 0x400  # cap per-peripheral read span, matches
-                                    # stm32h7b0-diag/host/register_audit.py's
-                                    # own MAX_BLOCK_SIZE convention.
+SVD_PATH = Path(__file__).resolve().parent.parent / "STM32H7B0.svd"
+MAX_PERIPHERAL_BLOCK_SIZE = 0x400  # cap per-peripheral read span.
 
 # Conservative denylist for injection (not capture) -- register NAME suffixes
 # that indicate write-1-to-clear/event-pulse semantics even when the SVD
@@ -144,7 +150,7 @@ def _write_memory_chunked(backend, addr, data):
 
 
 # ---------------------------------------------------------------------------
-# SVD-driven peripheral/register enumeration -- ported from stm32h7b0-diag's
+# SVD-driven peripheral/register enumeration.
 # host/register_audit.py::load_svd (same file, same parsing approach; not
 # imported directly since that's a separate repo/project, but the logic is
 # copied deliberately to stay consistent with that project's proven SVD
@@ -218,7 +224,7 @@ def _skip_inject(reg: SvdRegister) -> bool:
 
 def capture_peripherals(backend):
     """Read every peripheral register this SVD declares, via one whole-block
-    read per peripheral (matches stm32h7b0-diag/host/register_audit.py's own
+    read per peripheral (bounded by MAX_PERIPHERAL_BLOCK_SIZE
     approach -- far fewer round trips than one read per register, and this
     project's register-audit tooling already validated that pattern works
     cleanly against both QEMU's gdbstub and real hardware's OpenOCD).
