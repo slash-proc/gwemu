@@ -49,8 +49,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-
-typedef struct { const char *name; uint32_t addr; } GnwSymbolEntry;
+#include "gnw_symbol_entry.h"
 
 static const GnwSymbolEntry gnw_symbols_mario[] = {
     {"__EH_FRAME_BEGIN__", 0x0801a044},
