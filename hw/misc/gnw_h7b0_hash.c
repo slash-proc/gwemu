@@ -444,10 +444,12 @@ static void hash_trigger_dcal(GnwH7B0HashState *s)
 }
 
 /* Accumulate one 32-bit DIN write into whichever buffer the current
- * mode/phase directs it to, applying CR.DATATYPE's byte-swap (only
- * DATATYPE_8B/32B are handled with real semantics -- see
- * case_crypto_hash_swap_modes.c, which is the only test exercising
- * this, and deliberately doesn't cover 16B/1B). Every DIN write --
+ * mode/phase directs it to, applying CR.DATATYPE's byte-swap. All four
+ * DATATYPE values (32B/16B/8B/1B) are handled with real semantics,
+ * derived and verified via case_crypto_hash_swap_modes.c's
+ * self-consistency cross-check (each non-32B mode hashing buffer B must
+ * equal 32B mode hashing a software-pre-transformed copy of B -- see
+ * that file's header comment for the full derivation). Every DIN write --
  * full 4-byte-aligned bulk words and the final partial-word tail alike
  * -- is always a 32-bit register store from the HAL's perspective (see
  * HASH_WriteData(): even its 1/2/3-byte tail cases cast up to a
@@ -484,17 +486,47 @@ static void hash_din_write(GnwH7B0HashState *s, uint32_t value)
         return;
     }
 
-    if (datatype == 0) {
+    switch (datatype) {
+    case 0:
         /* DATATYPE_32B: "no swapping" -- the true stream order the
          * engine sees is the byte-reverse of the native-endian word
          * HASH_WriteData() loaded (see case_crypto_hash_swap_modes.c's
          * header comment for the derivation). */
         stl_be_p(dest + *lenp, value);
-    } else {
+        break;
+    case 2:
         /* DATATYPE_8B ("all bytes swapped", what gnwmanager/HAL's own
-         * usage always configures) and the unexercised 16B/1B cases:
-         * best-effort passthrough, matching true memory byte order. */
+         * usage always configures): plain passthrough in true memory
+         * byte order -- the byte-reversal HAL/hardware describes nets
+         * out to identity once combined with DATATYPE_32B's own
+         * byte-reverse (see derivation in case_crypto_hash_swap_modes.c). */
         stl_le_p(dest + *lenp, value);
+        break;
+    case 1: {
+        /* DATATYPE_16B ("each half word is swapped"): swap the two bytes
+         * within each 16-bit half, keeping the halves themselves in
+         * place -- i.e. (b0,b1,b2,b3) -> (b1,b0,b3,b2). Derived from
+         * case_crypto_hash_swap_modes.c's self-consistency check against
+         * DATATYPE_32B's own byte-reverse. */
+        uint32_t swapped = ((value & 0x00FF00FFu) << 8) | ((value >> 8) & 0x00FF00FFu);
+        stl_le_p(dest + *lenp, swapped);
+        break;
+    }
+    case 3:
+    default: {
+        /* DATATYPE_1B ("in the word all bits are swapped"): a full
+         * 32-bit bit-reversal of the native word, then stored in the
+         * same byte-reversed order DATATYPE_32B uses. Derived from
+         * case_crypto_hash_swap_modes.c's self-consistency check. */
+        uint32_t v = value;
+        v = ((v >> 1) & 0x55555555u) | ((v & 0x55555555u) << 1);
+        v = ((v >> 2) & 0x33333333u) | ((v & 0x33333333u) << 2);
+        v = ((v >> 4) & 0x0F0F0F0Fu) | ((v & 0x0F0F0F0Fu) << 4);
+        v = ((v >> 8) & 0x00FF00FFu) | ((v & 0x00FF00FFu) << 8);
+        v = (v >> 16) | (v << 16);
+        stl_be_p(dest + *lenp, v);
+        break;
+    }
     }
     *lenp += 4;
 }
