@@ -175,9 +175,20 @@ static void gnw_h7b0_mdma_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
 }
 
+static const VMStateDescription vmstate_gnw_h7b0_mdma = {
+    .name = TYPE_GNW_H7B0_MDMA,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(regs, GnwH7B0MdmaState, GNW_H7B0_MDMA_SIZE / 4),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void gnw_h7b0_mdma_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->vmsd = &vmstate_gnw_h7b0_mdma;
     device_class_set_legacy_reset(dc, gnw_h7b0_mdma_reset);
 }
 

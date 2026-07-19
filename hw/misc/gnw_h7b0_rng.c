@@ -103,9 +103,21 @@ static void gnw_h7b0_rng_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
 }
 
+static const VMStateDescription vmstate_gnw_h7b0_rng = {
+    .name = TYPE_GNW_H7B0_RNG,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(cr, GnwH7B0RngState),
+        VMSTATE_UINT32(sr, GnwH7B0RngState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void gnw_h7b0_rng_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->vmsd = &vmstate_gnw_h7b0_rng;
     device_class_set_legacy_reset(dc, gnw_h7b0_rng_reset);
 }
 
