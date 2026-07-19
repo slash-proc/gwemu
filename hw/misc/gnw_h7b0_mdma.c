@@ -86,6 +86,36 @@ static void gnw_h7b0_mdma_do_transfer(GnwH7B0MdmaState *s, int ch)
         return;
     }
 
+    /*
+     * Common case: both source and destination genuinely increment
+     * contiguously (step == element size), i.e. a real word-contiguous
+     * block copy -- exactly what every known firmware transfer here
+     * uses. That's just one contiguous byte range in, one contiguous
+     * byte range out; do it as a single bulk cpu_physical_memory_read()/
+     * write() pair instead of one call pair per element. Found via
+     * stm32h7b0-diag's mdma_m2m.md report: the old per-word loop paid
+     * QEMU's real AddressSpace-dispatch/RCU overhead per 4-byte element
+     * (1024 call pairs for a 4KB word-sized transfer), which -- being
+     * real host CPU time -- leaked into the guest's wall-clock-tied
+     * CYCCNT as ~11ms of apparent firmware time for a transfer that
+     * completes in zero elapsed guest instructions either way; a ~21x
+     * QEMU-vs-hardware gap driven entirely by this dispatch overhead,
+     * not anything guest-observable. Bulk-copying doesn't change any
+     * guest-visible behavior (same bytes end up in the same place,
+     * same completion flags), it just does it with 1 call pair instead
+     * of up to 32768 (CBNDTR.BNDT's 17-bit field allows up to 128KB).
+     * Any less-common pattern (fixed source/dest, or a stride that
+     * doesn't match the element size -- true striped/gather-scatter
+     * access) still falls through to the exact per-element loop this
+     * replaces, unchanged.
+     */
+    if (sinc && sstep == ssize && dinc && dstep == dsize) {
+        g_autofree uint8_t *buf = g_malloc(bndt);
+        cpu_physical_memory_read(csar, buf, bndt);
+        cpu_physical_memory_write(cdar, buf, bndt);
+        return;
+    }
+
     for (uint32_t off = 0; off < bndt; off += ssize) {
         uint8_t buf[8];
         hwaddr src = csar + (sinc ? (hwaddr)(off / ssize) * sstep : 0);
