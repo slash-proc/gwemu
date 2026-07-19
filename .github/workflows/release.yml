@@ -1,0 +1,253 @@
+name: Release build
+
+# Full Linux/Mac(arm64+x86_64)/Windows arm-softmmu build, packaged and
+# attached to a GitHub Release. Only runs on version tags or manual
+# dispatch -- NOT on every push (see build-check.yml for the cheap
+# per-push sanity build). This is a release pipeline, not CI.
+#
+# Packaging scope (deliberately kept simple for now -- the project owner
+# flagged this as still-TBD long-term, e.g. turning scripts/*.py into a
+# library the eventual GUI imports directly instead of shelling out; do
+# not build anything here that assumes today's zip-of-binary-plus-scripts
+# packaging is permanent): each platform's zip contains the built
+# qemu-system-arm binary (portable-ized per-OS, see each job) plus this
+# project's own scripts/*.py, scripts/*.sh, and scripts/requirements.txt.
+# Upstream QEMU's own scripts/ (the vast majority of the directory) are
+# NOT included -- only the gnw-specific ones this project actually added.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  # Keep this list in sync with what's actually in scripts/ -- see
+  # CLAUDE.md/STATUS.md for the current gnw-specific script inventory.
+  GNW_SCRIPTS: >-
+    boot_qemu.sh make_boot_images.py make_cfw_images.py make_sdcard_image.py
+    fetch-sdk.sh gen_regs.py gen_stub.py checkpoint.py halt_at_entry.py
+    lockstep_compare.py watch_write.py snapshot_registers.py
+    diff_snapshots.py triage_diffs.py hotloop_sample.py hotloop_compare.py
+    state_transplant.py state_transplant_hw_capture.py requirements.txt
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    # Build inside an older-LTS container for a lower glibc floor than
+    # ubuntu-latest's own base image would give us -- glibc's forward-only
+    # symbol versioning means a binary built against a newer glibc won't
+    # run against an older one on a user's machine, and there's no fully
+    # equivalent fix from the build-host side alone. 22.04 is a deliberate
+    # compatibility/toolchain-recency tradeoff, not verified against every
+    # possible target distro.
+    container: ubuntu:22.04
+    steps:
+      - name: Install git (container has none by default)
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev \
+            python3 python3-pip build-essential
+
+      - name: Install meson/ninja (pip, for a consistent recent version)
+        run: pip install meson ninja
+
+      - name: Configure
+        run: |
+          mkdir build
+          cd build
+          ../configure --target-list=arm-softmmu
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          OUT=gwemu-linux-x86_64
+          mkdir -p "$OUT/lib"
+          cp build/qemu-system-arm "$OUT/qemu-system-arm.bin"
+
+          # Bundle non-base-OS shared libs (SDL2/glib/pixman and their own
+          # transitive deps) next to the binary, since those aren't
+          # guaranteed present on an arbitrary target system the way
+          # libc/libpthread/etc. are. A wrapper script points
+          # LD_LIBRARY_PATH at them. This does NOT solve glibc-version
+          # skew on its own (see the container comment above) -- it only
+          # covers "SDL2/glib/pixman aren't installed at all" on the
+          # target machine.
+          for lib in $(ldd build/qemu-system-arm | awk '{print $3}' | grep -v '^$'); do
+            base=$(basename "$lib")
+            case "$base" in
+              libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-linux*|libresolv.so*|libutil.so*)
+                continue ;;
+            esac
+            cp -n "$lib" "$OUT/lib/" 2>/dev/null || true
+          done
+
+          cat > "$OUT/qemu-system-arm" <<'WRAPPER'
+          #!/bin/sh
+          # Portable launcher: point the loader at the bundled libs next
+          # to this script before exec'ing the real binary.
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          exec env LD_LIBRARY_PATH="$DIR/lib:${LD_LIBRARY_PATH:-}" "$DIR/qemu-system-arm.bin" "$@"
+          WRAPPER
+          chmod +x "$OUT/qemu-system-arm" "$OUT/qemu-system-arm.bin"
+
+          mkdir -p "$OUT/scripts"
+          for f in $GNW_SCRIPTS; do
+            cp "scripts/$f" "$OUT/scripts/"
+          done
+
+          zip -r "$OUT.zip" "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gwemu-linux-x86_64
+          path: gwemu-linux-x86_64.zip
+
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-13
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install ninja pkg-config glib pixman sdl2 meson dylibbundler
+
+      - name: Configure
+        run: |
+          mkdir build
+          cd build
+          ../configure --target-list=arm-softmmu
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          OUT=gwemu-macos-${{ matrix.arch }}
+          mkdir -p "$OUT"
+          cp build/qemu-system-arm "$OUT/qemu-system-arm"
+
+          # dylibbundler copies non-system dylibs alongside the binary and
+          # rewrites its load commands (@executable_path-relative) so it
+          # runs standalone without needing Homebrew installed on the
+          # target machine.
+          mkdir -p "$OUT/libs"
+          dylibbundler -od -b \
+            -x "$OUT/qemu-system-arm" \
+            -d "$OUT/libs/" \
+            -p "@executable_path/libs/"
+
+          mkdir -p "$OUT/scripts"
+          for f in $GNW_SCRIPTS; do
+            cp "scripts/$f" "$OUT/scripts/"
+          done
+
+          ditto -c -k --sequesterRsrc "$OUT" "$OUT.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gwemu-macos-${{ matrix.arch }}
+          path: gwemu-macos-${{ matrix.arch }}.zip
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # actions/checkout's default line-ending/path handling runs
+          # before msys2 is set up; fine as-is since we don't depend on
+          # CRLF conversion for this build.
+          fetch-depth: 1
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-pixman
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-python
+            git
+            zip
+
+      - name: Configure
+        run: |
+          mkdir build
+          cd build
+          ../configure --target-list=arm-softmmu
+
+      - name: Build
+        run: ninja -C build
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          OUT=gwemu-windows-x86_64
+          mkdir -p "$OUT"
+          cp build/qemu-system-arm.exe "$OUT/"
+
+          # PE binaries have no rpath -- every required mingw64 DLL has to
+          # sit next to the exe (or be on PATH, which we don't want to
+          # assume). ldd works under MSYS2 for PE files and reports the
+          # resolved DLL paths directly.
+          for dll in $(ldd "$OUT/qemu-system-arm.exe" | grep -i '/mingw64/' | awk '{print $3}'); do
+            cp -n "$dll" "$OUT/" 2>/dev/null || true
+          done
+
+          mkdir -p "$OUT/scripts"
+          for f in $GNW_SCRIPTS; do
+            cp "scripts/$f" "$OUT/scripts/"
+          done
+
+          zip -r "$OUT.zip" "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gwemu-windows-x86_64
+          path: gwemu-windows-x86_64.zip
+
+  publish-release:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          draft: true
+          generate_release_notes: true
