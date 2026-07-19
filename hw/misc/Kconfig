@@ -116,6 +116,9 @@ config GNW_H7B0_OSPI
 config GNW_H7B0_ADC
     bool
 
+config GNW_H7B0_LPTIM1
+    bool
+
 config GNW_H7B0_SPI
     bool
 

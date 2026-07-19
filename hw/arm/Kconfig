@@ -408,6 +408,7 @@ config GNW_H7B0_SOC
     select GNW_H7B0_PWR
     select GNW_H7B0_OSPI
     select GNW_H7B0_ADC
+    select GNW_H7B0_LPTIM1
     select GNW_H7B0_LTDC
     select GNW_H7B0_DMA2D
     select GNW_H7B0_SPI
