@@ -5,11 +5,34 @@
 #include "hw/misc/gnw_h7b0_tamp.h"
 #include "hw/misc/gnw_h7b0_regs_tamp.h"
 
+/*
+ * BKP0R..BKP31R (offsets 0x100-0x17c) are backup-domain registers: on real
+ * silicon they live in the always-on VBAT domain and survive a CPU-only
+ * reset (NVIC_SystemReset()/SYSRESETREQ) or any other non-power-on system
+ * reset -- only VBAT loss or an explicit RCC_BDCR.BDRST backup-domain
+ * reset clears them. QEMU's device reset() has no "cold power-on vs. warm
+ * system reset" distinction and was previously clearing the whole TAMP
+ * register file (including these) on every reset, which broke any
+ * firmware relying on a backup register surviving NVIC_SystemReset() (see
+ * stm32h7b0-diag's case_boot_reset_cause.c, which plants a marker in
+ * BKP0R across a deliberate self-reset -- confirmed empirically on real
+ * hardware to survive, per that case's own header comment). Excluding
+ * just this range keeps every other TAMP register's already-verified
+ * reset behavior unchanged.
+ */
+#define GNW_H7B0_TAMP_BKP_FIRST_OFFSET GNW_H7B0_TAMP_BKP0R_OFFSET
+#define GNW_H7B0_TAMP_BKP_LAST_OFFSET  GNW_H7B0_TAMP_BKP31R_OFFSET
+
 static void gnw_h7b0_tamp_reset(DeviceState *dev)
 {
     GnwH7B0TampState *s = GNW_H7B0_TAMP(dev);
     for (int i = 0; i < (GNW_H7B0_TAMP_SIZE / 4); i++) {
-        s->regs[i] = get_tamp_reset_value(i * 4);
+        uint32_t offset = i * 4;
+        if (offset >= GNW_H7B0_TAMP_BKP_FIRST_OFFSET &&
+            offset <= GNW_H7B0_TAMP_BKP_LAST_OFFSET) {
+            continue;
+        }
+        s->regs[i] = get_tamp_reset_value(offset);
     }
 }
 
