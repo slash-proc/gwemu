@@ -6,6 +6,13 @@
 /keycodemapdb
 /libvfio-user
 /slirp
+/SDL3-*
+/imgui
+/implot
+/genconfig
+/tomlplusplus
+/json-*
+/libepoxy-*
 /anyhow-*
 /arbitrary-int-*
 /attrs-*

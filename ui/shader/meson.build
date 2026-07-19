@@ -4,6 +4,11 @@ shaders = [
   ['texture-blit-flip', 'vert'],
 ]
 
+if sdl3.found()
+  # gnw-h7b0 GUI (Phase 1, ported from xemu).
+  shaders += [['xemu-logo', 'frag']]
+endif
+
 foreach e : shaders
   output = '@0@-@1@.h'.format(e[0], e[1])
   genh += custom_target(output,

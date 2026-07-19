@@ -41,6 +41,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
+#ifndef CONFIG_XEMU_GUI
 static void *qemu_default_main(void *opaque)
 {
     int status;
@@ -54,6 +55,7 @@ static void *qemu_default_main(void *opaque)
 
     exit(status);
 }
+#endif
 
 int (*qemu_main)(void);
 
@@ -66,6 +68,18 @@ static int os_darwin_cfrunloop_main(void)
 int (*qemu_main)(void) = os_darwin_cfrunloop_main;
 #endif
 
+#ifndef CONFIG_XEMU_GUI
+/*
+ * gnw-h7b0 GUI (Phase 1, ported from xemu): ui/xemu.c provides its own
+ * main() when the GUI is built in (matching upstream xemu's own approach --
+ * their system/meson.build never links this file's main() either), which
+ * would conflict with this one at link time. The rest of this file
+ * (qemu_main function pointer, qemu_default_main) stays available either
+ * way -- other display backends (e.g. ui/sdl2.c) reference qemu_main
+ * directly. Known limitation: a GUI-enabled build's plain -display
+ * sdl/gtk/etc. selection via this file's own main() isn't available in
+ * that build; not yet resolved to be fully runtime-selectable.
+ */
 int main(int argc, char **argv)
 {
     qemu_init(argc, argv);
@@ -94,3 +108,4 @@ int main(int argc, char **argv)
         g_assert_not_reached();
     }
 }
+#endif /* !CONFIG_XEMU_GUI */

@@ -5,6 +5,17 @@
 #include "hw/misc/gnw_h7b0_jpeg.h"
 #include "hw/misc/gnw_h7b0_regs_jpeg.h"
 
+/*
+ * STBI_STATIC: gnw-h7b0 GUI (Phase 1, ported from xemu) vendors its own,
+ * separate stb_image.h copy (ui/thirdparty/stb_image/) for PNG asset
+ * loading. Without STBI_STATIC here, both translation units export the
+ * same public stbi_* symbols -- a real ODR violation that let the linker
+ * silently pick THIS file's STBI_ONLY_JPEG-restricted implementation for
+ * calls made from the UI code, which then failed to decode any PNG at
+ * all ("unknown image type"). Nothing outside this file calls this
+ * copy's stbi_* functions, so static linkage is correct here regardless.
+ */
+#define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_LINEAR
 #define STBI_NO_HDR
@@ -14,7 +25,14 @@
 #pragma GCC diagnostic ignored "-Wmissing-prototypes"
 #pragma GCC diagnostic ignored "-Wunused-function"
 #include "stb_image.h"
-#pragma GCC diagnostic pop
+/*
+ * Deliberately never popped: with STB_IMAGE_STATIC (added for the
+ * gnw-h7b0 GUI's stb_image ODR fix, see above), GCC only finalizes
+ * "static function declared but never defined" for STBI_ONLY_JPEG's
+ * excluded decoders (zlib/PNG helpers) at end of translation unit, after
+ * an early pragma pop would have already re-enabled the warning as an
+ * error -- so it just stays ignored for the rest of this file.
+ */
 
 #include <math.h>
 

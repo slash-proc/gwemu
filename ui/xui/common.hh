@@ -1,0 +1,56 @@
+//
+// xemu User Interface
+//
+// Copyright (C) 2020-2022 Matt Borgerson
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 2 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+//
+#pragma once
+
+#include <SDL3/SDL.h>
+#include <epoxy/gl.h>
+#include "ui/xemu-settings.h"
+
+#define IMGUI_DEFINE_MATH_OPERATORS
+#include <imgui.h>
+#include <imgui_internal.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_opengl3.h>
+#include <implot.h>
+#include <misc/cpp/imgui_stdlib.h>
+#include <stb_image.h>
+
+#include "qemu/osdep.h"
+
+extern "C" {
+// Include necessary QEMU headers
+#include "qapi/error.h"
+#include "system/runstate.h"
+/*
+ * xemu includes hw/xbox/mcpx/apu/apu_debug.h and hw/xbox/nv2a/{debug,nv2a}.h
+ * here for its Xbox-specific APU/NV2A GPU debug panels (debug.cc, not
+ * ported -- see gnw's own docs/peripheral-coverage.md for what this board
+ * actually has instead).
+ */
+
+#undef typename
+#undef atomic_fetch_add
+#undef atomic_fetch_and
+#undef atomic_fetch_xor
+#undef atomic_fetch_or
+#undef atomic_fetch_sub
+}
+
+extern bool g_screenshot_pending;
+extern float g_main_menu_height;

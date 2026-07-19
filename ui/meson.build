@@ -28,6 +28,43 @@ if host_os == 'linux'
 endif
 system_ss.add(when: cocoa, if_true: files('cocoa.m'))
 
+# gnw-h7b0 GUI (Phase 1, ported from xemu). Additive alongside the
+# existing sdl2/gtk/cocoa display backends above, not a replacement.
+if sdl3.found()
+  subdir('thirdparty')
+
+  gnw_gui_ss = ss.source_set()
+  gnw_gui_ss.add(files(
+    'xemu-input.c',
+    'xemu-monitor.c',
+    'xemu-data.c',
+    'xemu-settings.cc',
+    'xemu.c',
+  ))
+  gnw_gui_ss.add(files('../xemu-version.c'))
+
+  if host_os == 'linux'
+    gnw_gui_ss.add([gtk, files('xemu-os-utils-linux.c')])
+  elif host_os == 'windows'
+    gnw_gui_ss.add(files('xemu-os-utils-windows.c'))
+  elif host_os == 'darwin'
+    gnw_gui_ss.add(files('xemu-os-utils-macos.m'))
+    gnw_gui_cocoa = dependency('appleframeworks', modules: 'Cocoa')
+    gnw_gui_ss.add(gnw_gui_cocoa)
+  endif
+
+  subdir('xui')
+
+  gnw_gui_ss.add(imgui, implot, stb_image_ui, sdl3, opengl, fa, fpng,
+                 xemu_json, tomlplusplus, genconfig)
+  packfile = find_program('../scripts/pack-file.py')
+  # data/meson.build (binary asset embedding, adds to gnw_gui_ss) and the
+  # final system_ss.add_all(gnw_gui_ss) both happen from the top-level
+  # meson.build, after this file -- meson's subdir() can't traverse into a
+  # parent/sibling directory from here, but variables assigned in this
+  # file remain visible there (subdir() shares scope with its caller).
+endif
+
 vnc_ss = ss.source_set()
 vnc_ss.add(files(
   'vnc.c',

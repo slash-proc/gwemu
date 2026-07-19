@@ -1615,6 +1615,45 @@ if not get_option('sdl').auto() or have_system
   sdl = dependency('sdl2', required: get_option('sdl'))
   sdl_image = not_found
 endif
+
+# gnw-h7b0 GUI (Phase 1, ported from xemu): SDL3 + Dear ImGui, additive
+# alongside the existing SDL2 backend above -- not a replacement. See
+# ui/xemu.c / ui/xui/ and CLAUDE.md for the porting rationale.
+#
+# Bare `dependency('sdl3', required: false)` never actually drives the
+# wrap's CMake subproject build (only probes for an already-installed
+# sdl3, pkg-config or cmake-package-config) -- need cmake.subproject()
+# explicitly, same as xemu's own meson.build, with SDL_X11_XTEST=OFF
+# (SDL3's CMake build otherwise hard-requires libxtst-dev, which most
+# dev machines -- CI included -- won't have installed).
+cmake = import('cmake')
+sdl3 = dependency('sdl3', required: false, method: 'pkg-config')
+if not sdl3.found()
+  sdl3_cmake_opts = cmake.subproject_options()
+  sdl3_cmake_opts.add_cmake_defines({
+    'SDL_CAMERA': 'OFF',
+    'SDL_DISKAUDIO': 'OFF',
+    'SDL_DUMMYVIDEO': 'OFF',
+    'SDL_FRIBIDI': 'OFF',
+    'SDL_GPU': 'OFF',
+    'SDL_HAPTIC': 'OFF',
+    'SDL_LIBTHAI': 'OFF',
+    'SDL_POWER': 'OFF',
+    'SDL_RENDER': 'OFF',
+    'SDL_SENSOR': 'OFF',
+    'SDL_SHARED': 'OFF',
+    'SDL_STATIC': 'ON',
+    'SDL_TEST_LIBRARY': 'OFF',
+    'SDL_TRAY': 'OFF',
+    'SDL_VIRTUAL_JOYSTICK': 'OFF',
+    'SDL_X11_XTEST': 'OFF',
+  })
+  sdl3_sp = cmake.subproject('sdl3', options: sdl3_cmake_opts, required: false)
+  if sdl3_sp.found()
+    sdl3 = sdl3_sp.dependency('SDL3-static')
+    meson.override_dependency('sdl3', sdl3)
+  endif
+endif
 if sdl.found()
   # Some versions of SDL have problems with -Wundef
   if not cc.compiles('''
@@ -1800,8 +1839,21 @@ endif
 opengl = not_found
 if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
   epoxy = dependency('epoxy', method: 'pkg-config',
-                      required: get_option('opengl'))
-  if cc.has_header('epoxy/egl.h', dependencies: epoxy)
+                      required: false)
+  epoxy_from_pkgconfig = epoxy.found()
+  if not epoxy.found()
+    # gnw-h7b0 GUI (Phase 1, ported from xemu): epoxy-dev isn't installed
+    # system-wide on every dev machine (this one included) -- fall back to
+    # building it from subprojects/epoxy.wrap rather than leaving
+    # CONFIG_OPENGL (and every core DisplaySurface GL field the new GUI
+    # code needs) off entirely.
+    epoxy = dependency('epoxy', required: true)
+  endif
+  # cc.has_header()'s `dependencies:` kwarg only accepts external
+  # (pkg-config-found) dependency objects, not subproject-provided ones --
+  # skip the redundant check when we just built epoxy from the wrap
+  # ourselves, since it's a real, known-good build either way.
+  if not epoxy_from_pkgconfig or cc.has_header('epoxy/egl.h', dependencies: epoxy)
     opengl = epoxy
   elif get_option('opengl').enabled()
     error('epoxy/egl.h not found')
@@ -2508,6 +2560,7 @@ config_host_data.set('CONFIG_RDMA', rdma.found())
 config_host_data.set('CONFIG_RELOCATABLE', get_option('relocatable'))
 config_host_data.set('CONFIG_SAFESTACK', get_option('safe_stack'))
 config_host_data.set('CONFIG_SDL', sdl.found())
+config_host_data.set('CONFIG_XEMU_GUI', sdl3.found())
 config_host_data.set('CONFIG_SDL_IMAGE', sdl_image.found())
 config_host_data.set('CONFIG_SECCOMP', seccomp.found())
 if seccomp.found()
@@ -3568,6 +3621,20 @@ qemu_version = custom_target('qemu-version.h',
                              build_always_stale: true)
 genh += qemu_version
 
+if sdl3.found()
+  xemu_version_cmd = [find_program('scripts/xemu-version.sh'),
+                       meson.current_source_dir()]
+  xemu_version_macro = custom_target('xemu-version-macro.h',
+                               output: 'xemu-version-macro.h',
+                               command: xemu_version_cmd,
+                               capture: true,
+                               build_by_default: true,
+                               build_always_stale: true)
+  genh += xemu_version_macro
+  # xemu_config (needs genconfig_proj) is added further below, right after
+  # genconfig_proj itself is declared -- meson evaluates top-to-bottom.
+endif
+
 hxdep = []
 hx_headers = [
   ['qemu-options.hx', 'qemu-options.def'],
@@ -3759,7 +3826,54 @@ subdir('util')
 subdir('qom')
 subdir('authz')
 subdir('crypto')
+
+# gnw-h7b0 GUI (Phase 1, ported from xemu) subproject deps.
+imgui = not_found
+implot = not_found
+genconfig = not_found
+tomlplusplus = not_found
+xemu_json = not_found
+if sdl3.found()
+  imgui_proj = subproject('imgui', required: true,
+                           default_options: [
+                             'default_library=static',
+                             'dx9=disabled', 'dx10=disabled', 'dx11=disabled',
+                             'dx12=disabled', 'metal=disabled',
+                             'opengl=enabled',
+                             'sdl2_renderer=disabled', 'sdl3_renderer=disabled',
+                             'vulkan=disabled', 'webgpu=disabled',
+                             'glfw=disabled', 'sdl2=disabled', 'sdl3=enabled',
+                             'osx=disabled', 'win=disabled', 'allegro5=disabled',
+                          ])
+  imgui = imgui_proj.get_variable('imgui_dep')
+
+  implot_proj = subproject('implot', required: true,
+                           default_options: ['default_library=static'])
+  implot = implot_proj.get_variable('implot_dep')
+
+  genconfig_proj = subproject('genconfig', required: true)
+  genconfig = genconfig_proj.get_variable('cnode_dep')
+
+  xemu_config = custom_target('xemu-config.h',
+                              output: 'xemu-config.h',
+                              input: [ files('config_spec.yml') ],
+                              command : [python, genconfig_proj.get_variable('gen_config_script_path'), '@INPUT@', '@OUTPUT@'],
+                              )
+  genh += xemu_config
+
+  tomlplusplus = dependency('tomlplusplus', required: true, fallback: ['tomlplusplus', 'tomlplusplus_dep'])
+  # tomlplusplus (as vendored) uses a C++20-legal literal-operator syntax
+  # that C++23 deprecates -- not our code to fix, just don't let -Werror
+  # on the newer compiler standard here (-std=gnu++23) treat it as fatal.
+  add_project_arguments('-Wno-error=deprecated-literal-operator', language: 'cpp')
+  xemu_json = dependency('nlohmann_json', required: true, fallback: ['json', 'nlohmann_json_dep'])
+endif
+
 subdir('ui')
+if sdl3.found()
+  subdir('data')
+  system_ss.add_all(gnw_gui_ss)
+endif
 subdir('semihosting')
 subdir('audio')
 subdir('io')
