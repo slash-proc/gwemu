@@ -385,6 +385,44 @@ void HELPER(wfi)(CPUARMState *env, uint32_t insn_len)
     uint32_t excp;
     int target_el = check_wfx_trap(env, false, &excp);
 
+    /*
+     * M-profile: WFI shares the Event Register with WFE (both are woken
+     * by it, per the ARMv7-M architecture -- see m_helper.c's exception
+     * entry/return handling, "Exception entry/return sets the event
+     * register (ARM ARM R_BPBR)") and *either* instruction consumes/
+     * clears it when observed set, not just WFE. HELPER(wfe) above
+     * already does this; this helper did not, which meant a single SEV
+     * (or a SEVONPEND-armed pending exception, or simply any exception
+     * entry/return at all) anywhere in a program's lifetime latched
+     * event_register permanently, since only WFE ever cleared it --
+     * every subsequent WFI, forever after, hit this early-return path
+     * and never actually halted at all, regardless of real interrupt
+     * timing. Confirmed live (2026-07-19) against stm32h7b0-diag's
+     * case_power_sleep_wfi: cpu_has_work() was returning true solely
+     * because of event_register=1 (interrupt_request=0x0, i.e. no real
+     * IRQ pending), reproducing exactly this -- WFI returning almost
+     * instantly instead of sleeping.
+     *
+     * NOTE for whoever revisits stm32h7b0-diag's case_power_sleep_wfi:
+     * this fix corrects a genuine WFI/WFE parity bug, but does NOT by
+     * itself make that specific case pass. Exception entry/return
+     * legitimately sets event_register (this is correct ARMv7-M
+     * architecture, not a QEMU bug) -- and that case deliberately
+     * synchronizes to the instant right after a fresh SysTick edge
+     * (spinning on CTRL.COUNTFLAG) before calling WFI, which is exactly
+     * the moment event_register is guaranteed freshly set by that same
+     * SysTick exception's own entry/return. So WFI correctly (per
+     * architecture) returns immediately every time, independent of this
+     * fix. This looks like a real test-design issue on the diag side
+     * (the sync-to-tick-edge approach and the "WFI should sleep a full
+     * period" assumption are in genuine tension), not a further qemu-gnw
+     * gap -- flagging for that project, not fixing here.
+     */
+    if (arm_feature(env, ARM_FEATURE_M) && env->event_register) {
+        env->event_register = false;
+        return;
+    }
+
     if (cpu_has_work(cs)) {
         /* Don't bother to go into our "low power state" if
          * we would just wake up immediately.
