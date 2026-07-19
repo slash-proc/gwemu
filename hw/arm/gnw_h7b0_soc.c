@@ -25,6 +25,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "system/address-spaces.h"
 #include "hw/arm/gnw_h7b0_soc.h"
 #include "hw/core/qdev-clock.h"
@@ -82,6 +83,40 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
 }
 
+/*
+ * Backs `field` directly by `image_path` (created/truncated to `size` if it
+ * doesn't already exist yet) when non-NULL/non-empty, so guest writes land
+ * in that file live instead of anonymous memory -- see the bank1_image/
+ * bank2_image/extflash_image doc comment in gnw_h7b0_soc.h. Falls back to
+ * plain anonymous RAM (today's behavior, seeded only via `-device loader`)
+ * otherwise.
+ *
+ * memory_region_init_ram_from_file() is CONFIG_POSIX-only in QEMU itself
+ * (it's mmap-based) -- genuinely unavailable on Windows, not just a missing
+ * include. On a non-POSIX host, always fall back to ephemeral RAM even when
+ * an image_path was given, but say so loudly (warn_report(), not silence):
+ * persistence quietly not working would be a much worse surprise than an
+ * explicit "this won't persist" at startup.
+ */
+static bool gnw_h7b0_init_ram_or_file(MemoryRegion *mr, Object *owner,
+                                       const char *name, uint64_t size,
+                                       const char *image_path, Error **errp)
+{
+    if (image_path != NULL && image_path[0] != '\0') {
+#ifdef CONFIG_POSIX
+        return memory_region_init_ram_from_file(mr, owner, name, size, 0,
+                                                 RAM_SHARED, image_path, 0,
+                                                 errp);
+#else
+        warn_report("persistent flash-image backing isn't supported on "
+                    "this host -- \"%s\" will NOT persist writes, falling "
+                    "back to ephemeral RAM for %s", image_path, name);
+#endif
+    }
+    memory_region_init_ram(mr, owner, name, size, errp);
+    return *errp == NULL;
+}
+
 static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
 {
     GnwH7B0State *s = GNW_H7B0_SOC(dev_soc);
@@ -104,29 +139,12 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         memory_region_add_subregion(system_memory, base, &s->field); \
     } while (0)
 
-    /*
-     * Like INIT_RAM_REGION, but backed directly by `image_path` (created/
-     * truncated to `size` if it doesn't already exist yet) when non-NULL/
-     * non-empty, so guest writes land in that file live instead of
-     * anonymous memory -- see the bank1_image/bank2_image/extflash_image
-     * doc comment in gnw_h7b0_soc.h. Falls back to plain anonymous RAM
-     * (today's behavior, seeded only via `-device loader`) otherwise.
-     */
 #define INIT_RAM_OR_FILE_REGION(field, name, base, size, image_path) \
     do { \
-        if ((image_path) != NULL && (image_path)[0] != '\0') { \
-            if (!memory_region_init_ram_from_file(&s->field, OBJECT(dev_soc), name, \
-                                                   size, 0, RAM_SHARED, (image_path), \
-                                                   0, &err)) { \
-                error_propagate(errp, err); \
-                return; \
-            } \
-        } else { \
-            memory_region_init_ram(&s->field, OBJECT(dev_soc), name, size, &err); \
-            if (err != NULL) { \
-                error_propagate(errp, err); \
-                return; \
-            } \
+        if (!gnw_h7b0_init_ram_or_file(&s->field, OBJECT(dev_soc), name, \
+                                        size, (image_path), &err)) { \
+            error_propagate(errp, err); \
+            return; \
         } \
         memory_region_add_subregion(system_memory, base, &s->field); \
     } while (0)
