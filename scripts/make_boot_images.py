@@ -68,9 +68,11 @@ def main():
     internal_src = backup_dir / f"internal_flash_backup_{game}.bin"
     extflash_src = backup_dir / f"flash_backup_{game}.bin"
     if not internal_src.exists():
-        sys.exit(f"missing {internal_src}")
+        sys.exit(f"missing {internal_src} -- dump it from real hardware first "
+                 f"(`gnwmanager dump`), then place it there")
     if not extflash_src.exists():
-        sys.exit(f"missing {extflash_src}")
+        sys.exit(f"missing {extflash_src} -- dump it from real hardware first "
+                 f"(`gnwmanager dump`), then place it there")
 
     bank1 = pad_with_ff(internal_src.read_bytes(), bank_size, "bank1")
     bank2 = b"\xff" * bank_size

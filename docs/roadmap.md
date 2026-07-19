@@ -49,7 +49,7 @@ NV2A GPU behavior instead of a slow stand-in.
 - **Done**: real memory regions modeled from RM0455 Table 6 (not just the
   SVD, which doesn't cover plain RAM/flash regions): ITCM, DTCM, AXI
   SRAM1/2/3, AHB SRAM1/2, SRD SRAM, backup SRAM, internal flash banks 1/2,
-  external OSPI flash placeholder. See `STATUS.md` for exact
+  external OSPI flash placeholder. See `docs/STATUS.md` for exact
   addresses/sizes and `docs/h7b0-flash-discrepancy.md` for the internal
   flash size override vs RM0455.
 - **Done**: boots a test kernel via ITCM (genuinely RAM at address `0x0`
@@ -57,7 +57,7 @@ NV2A GPU behavior instead of a slow stand-in.
 - **Done**: kernel now loads at flash bank 1 (`0x08000000`) with the
   ARMv7M CPU's `init-nsvtor` property pointed there, so reset reads SP/PC
   from flash's vector table — modeling real hardware's BOOT_ADD address-0
-  remap without a fake alias region. See `STATUS.md` for the
+  remap without a fake alias region. See `docs/STATUS.md` for the
   `init-nsvtor`-vs-`init-svtor` gotcha (Cortex-M7 has no TrustZone-M).
 - **Done**: minimal RCC stub — enough register read/write behavior that
   real firmware's clock-init code doesn't hang polling a permanently-zero
@@ -65,7 +65,7 @@ NV2A GPU behavior instead of a slow stand-in.
 - **Done**: goal achieved and then some. A real `gnw-chainloader` firmware
   image boots from flash, gets through clock/memory/power init, and
   reaches real LTDC init before stopping on a (currently) unbacked LTDC
-  register access. See `STATUS.md` for the full list of gaps found and
+  register access. See `docs/STATUS.md` for the full list of gaps found and
   fixed along the way (RCC LSI/LSE ready bits; new PWR, OCTOSPI1/2, ADC
   devices; several plain-RAM peripheral placeholders).
 

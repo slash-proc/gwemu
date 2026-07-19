@@ -1,0 +1,50 @@
+# Peripheral coverage
+
+What actually has a real device model in `hw/misc/`/`hw/display/` vs. a
+generic unimplemented-register stub, at a glance. For per-peripheral
+register-behavior detail, read the model's own file (each one documents
+its scope/rationale in its header comment) — this is an index, not a
+substitute for that.
+
+Regenerate this by hand when peripherals change; it's small enough not to
+need scripted upkeep.
+
+## Real device models (`hw/misc/`, `hw/display/`)
+
+| Peripheral | Status | Notes |
+|---|---|---|
+| RCC | Real | Full clock tree: HSI/HSE/PLL1-3, SYSCLK/HCLK/pixel-clock propagation, dynamic CPU-overclock support. |
+| LTDC | Real | Per-layer compositing, all pixel formats in use, color key, blend, dithering, CLUTs, real reload/vblank timing. |
+| DMA2D | Real | Per-pixel fetch for every format in use, blend/fixed-color modes. |
+| JPEG | Real | Polled output-register pipeline, correct chroma subsampling (decode via `stb_image.h`). |
+| CRYP | Real | AES ECB/CBC/CTR/GCM/CCM. |
+| HASH | Real | MD5/SHA-1/SHA-224/SHA-256, plain and HMAC, via QEMU's own `crypto/`. |
+| OTFDEC | Real | Real AES-128-CTR extflash decryption (RM0455 41.3.4), eager bulk-decrypt-to-RAM for performance. |
+| SAI1 | Real | Audio path: DMA1 Stream0 transfer-complete snoop → Fifo8 → QEMU audio timer, no per-sample FIFO modeling. |
+| GPIO | Real | Real pin state incl. the PA0/EXTI0 power-button release-timer edge. |
+| EXTI | Real | Real edge-triggered interrupt line tracking. |
+| DMA | Partial | Real per-stream transfer-completion (extended from a plain register shadow for retro-go's audio DMA path). |
+| MDMA | Partial | Real SW-triggered memory-to-memory transfer completion (was a full unimplemented-device stub). |
+| TIM1 | Partial | Real counter/UIF for `CR1.CEN` (was a plain register shadow). |
+| TIM2 | Partial | Block model with real counting/UIF (covers TIM2-TIM14's shared register layout). |
+| LPTIM1 | Partial | Free-running-counter model, mirrors TIM2's `CR1.CEN`/`EGR.UG` pattern. |
+| DAC | Partial | Real DHR→DOR transfer (LCD-backlight control path). |
+| RNG | Partial | Real `RNG_SR.DRDY` completion (was a full unimplemented-device stub). |
+| CRC | Partial | Real CRC-32 unit, correct reset value. |
+| DWT | Partial | Real `CYCCNT` only. |
+| RTC | Partial | Real IRQ wiring on `MISR & (ALRAF|ALRBF)`, backup-domain registers correctly survive CPU-only reset. |
+| FLASH_R | Partial | Real sector-erase side effect against actual flash memory; `OPTSR_CUR.RDP` seeded to real factory default. |
+| OSPI (x2) | Partial | Real command decoding, auto-polling, IRQ lines. |
+| SPI | Partial | Real `TXP`/`RXP` status-flag behavior. |
+| LPUART1 | Stub | Register-array shadow, correct reset values, no real UART behavior. |
+| ADC (1/2) | Stub+ | Register shadow, but decodes `SQR1.SQ1` and returns per-channel values (incl. VREFINT); DMA completion notify wired. |
+| PWR | Stub+ | Register shadow, but `CPUCR.SBF` correctly forced at reset (real boot-critical behavior, see the file's own comment for why). |
+| TAMP | Stub | Register-array shadow; backup registers correctly excluded from CPU-only reset (real hardware behavior). |
+| WWDG, IWDG | Stub | Register-array shadow, correct reset values. |
+| SYSCFG, OCTOSPIM, DBGMCU, CRS, FMC | Stub | Register-array shadow, correct reset values; unused for real side effects on this board (see `docs/peripheral-coverage.md`'s "not needed" note below). |
+
+"Stub" here always means: correct register layout and reset values (audited against the SVD/HAL source), plain read/write with no side effects — not a placeholder with wrong behavior. Several of these were previously plain `create_unimplemented_device()` log-only stubs and got promoted to real register-array models specifically because real firmware polls a status bit in them; see `CHANGELOG.md` for which.
+
+## Not modeled at all (`create_unimplemented_device()`, log-only)
+
+Everything else in the STM32H7B0's memory map: USART1/2/3/6/9/10, UART4/5/7/8, I2C1-4, SPI3/4/5/6, CAN (FDCAN/TT_FDCAN/CAN_CCU), USB OTG1_HS, SDMMC1/2 (+ their delay blocks), HRTIM, DFSDM1/2, DCMI, PSSI, COMP1, VREFBUF, OPAMP, SWPMI, MDIOS, CEC, SPDIFRX, HSEM, RAMECC, BDMA1/2, DMAMUX1/2, TIM8/15/16/17. None of these are exercised by any firmware this project boots (retro-go, stock/CFW Mario and Zelda) — confirmed by what actually gets configured/polled during real boot traces, not assumed. If a future firmware image touches one of these and hangs, that's the signal to promote it out of this list, not a standing TODO.

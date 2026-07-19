@@ -13,11 +13,11 @@ real NV2A GPU behavior — see `docs/roadmap.md` for the full phased plan.
 
 ## Doc map
 
-- `STATUS.md` — current snapshot only (what phase, what works, what's next).
+- `docs/STATUS.md` — current snapshot only (what phase, what works, what's next).
   Rewritten in place as state changes, not appended to. Keep under ~100
   lines.
 - `CHANGELOG.md` — dated one-line entries of what landed. This is where
-  "what happened" lives, not STATUS.md.
+  "what happened" lives, not docs/STATUS.md.
 - `docs/` — design rationale and reference material that doesn't fit as a
   code comment (e.g. clock-tree math, known hardware/datasheet
   discrepancies). Not a running diary: once an investigation's findings are
@@ -25,9 +25,9 @@ real NV2A GPU behavior — see `docs/roadmap.md` for the full phased plan.
   and the writeup gets deleted rather than accumulated. If you're about to
   write a dated `session-*.md` narrative doc, prefer a code comment or a
   CHANGELOG entry instead.
-- `docs/peripheral-register-audit/` — per-peripheral register-behavior notes
-  from cross-checking against the SVD/reference manual/HAL source. Reference
-  material, not narrative.
+- `docs/peripheral-coverage.md` — one-line-per-peripheral index of what has
+  a real device model vs. a register-shadow stub vs. nothing at all. Hand-
+  maintained, not a diary; update it when peripheral coverage changes.
 - `docs/h7b0-clock-tree-findings.md` — hard-won HSI-vs-HSE, PLL2 VCO/
   fractional-N formula, SAI1SEL mux, and TIM2/HCLK clock-tree facts;
   consult before adding real-clock-dependent behavior to any new peripheral
@@ -54,9 +54,15 @@ real NV2A GPU behavior — see `docs/roadmap.md` for the full phased plan.
 
 ## Source-of-truth rules
 
-- `STM32H7B0.svd` at repo root is the authoritative register/address map.
-  Use it for peripheral base addresses and register layouts instead of
-  hand-transcribing from the reference manual.
+- `STM32H7B0.svd` at repo root (5.2MB, gitignored — not tracked, won't
+  survive a fresh clone) is the authoritative register/address map. Use it
+  for peripheral base addresses and register layouts instead of
+  hand-transcribing from the reference manual. Re-fetch it yourself if
+  it's missing (ST distributes it via the CMSIS-Pack index / STM32CubeMX,
+  not a single stable download URL, so there's no `fetch-*.sh` for it —
+  same reasoning as `rm0455.pdf` below). `scripts/snapshot_registers.py`,
+  `triage_diffs.py`, and `state_transplant.py` parse it directly at this
+  repo-root path.
 - `rm0455.pdf` at repo root (STM32H7A3/7B3/7B0 reference manual) is
   expected to exist locally for memory-map/register lookups but is
   gitignored (58MB, copyrighted ST document) — not tracked, won't survive
@@ -94,5 +100,40 @@ mkdir build && cd build
 ../configure --target-list=arm-softmmu
 ninja
 ```
-(Board-specific build/run instructions will be added here once the
-`gnw-h7b0` board exists.)
+Needs the usual QEMU build prerequisites (`ninja`, `pkg-config`,
+`libglib2.0-dev`, `libpixman-1-dev` at minimum) plus a display backend
+dev package (`libsdl2-dev` or `libgtk-3-dev`) — without one, `configure`
+succeeds silently but produces a QEMU binary with no display backend at
+all, and the failure only surfaces later at `boot_qemu.sh` launch time
+("no usable display backend"), disconnected from its actual cause. This
+whole section is a placeholder for a real README once we write one (see
+"Outsider workflow" below) — not yet gnw-specific beyond the note above.
+
+## Outsider workflow (first-run, end to end)
+
+This is internal working notes for now; fold into a real README once we
+get to it (tracked, not forgotten).
+
+1. Build per "Build" above.
+2. Get your own stock firmware dumps from real hardware: `gnwmanager dump`
+   produces `internal_flash_backup_<game>.bin` and `flash_backup_<game>.bin`
+   — place both in `backup/`. This repo cannot ship copyrighted Nintendo
+   firmware, so there's no way around owning real hardware for this step.
+3. `./scripts/make_boot_images.py <game>` — builds
+   `backup/qemu-images/<game>-{bank1,bank2,extflash}.bin` from step 2's dumps.
+4. `./scripts/boot_qemu.sh <game>` — boots stock firmware.
+   **`boot_qemu.sh` is a bash script — Linux/Mac only, not Windows.**
+   No Windows-native launch path exists yet; this is exactly the kind of
+   gap the planned GUI (see roadmap) should paper over, not something to
+   hand-solve piecemeal in the meantime.
+5. Optional, CFW/dual-boot testing: `./scripts/make_cfw_images.py <game>`
+   needs `gnwmanager` importable (`pip install gnwmanager`, or point
+   `GNWMANAGER_PATH` at a local checkout) — then `boot_qemu.sh <game>
+   --patched`.
+6. Optional, homebrew/retro-go: needs a separately built
+   `game-and-watch-retro-go-sd` checkout (its own project, its own build
+   steps — out of scope to automate here) to produce an `sd_content/`
+   directory, then `./scripts/make_sdcard_image.py --content <that dir>`.
+7. `STM32H7B0.svd`/`sdk/`/`rm0455.pdf` are optional reference material for
+   device-model development or the diagnostic scripts — never required
+   just to boot something.

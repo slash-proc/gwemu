@@ -1,0 +1,8 @@
+# Python dependencies for this project's own gnw-specific scripts/ tools
+# (not upstream QEMU's scripts, which have no such dependency). Install
+# with: pip install -r scripts/requirements.txt
+#
+# pyfatfs: used by make_sdcard_image.py to build FAT32 SD card images
+# without needing mtools/sfdisk (not uniformly available across
+# Linux/Mac/Windows).
+pyfatfs

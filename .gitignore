@@ -1,6 +1,7 @@
 /GNUmakefile
 /build/
 /rm0455.pdf
+/STM32H7B0.svd
 /sdk/
 /.cache/
 /.vscode/
@@ -22,6 +23,11 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# gnw: Claude Code's own session state (worktrees, mailbox, scheduled
+# tasks, etc.) -- never part of the repo, but only excluded on this
+# machine via .git/info/exclude until now; make it travel with the repo.
+/.claude/
 
 # gnw: scratch firmware images for boot testing, not part of the repo
 /retro-go-temp/
