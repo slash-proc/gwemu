@@ -631,7 +631,15 @@ uint32_t gnw_device_move_to_compressed_memory(GnwDevice *d, uint32_t ext, size_t
     if (err && *err) return (uint32_t)-1;
 
     if (d->compressed_memory_pos + size > d->compressed_memory.len) {
-        return device_move_ext_external(d, ext, size, refs, n_refs, err);
+        /* Python: except NotEnoughSpaceError: return self.move_ext(ext, size, reference)
+         * -- the FULL move_ext (try move_to_int first, THEN move_ext_external),
+         * not move_ext_external directly. Confirmed by reading firmware.py's
+         * actual move_to_compressed_memory() source -- a real bug here diverged
+         * from the (correct) move_ext_external-direct call a few lines below,
+         * which really is what Python does for its own "diff > int_free_space"
+         * branch. Two similar-looking fallback branches, two different Python
+         * targets -- worth double-checking rather than assuming symmetry. */
+        return gnw_device_move_ext(d, ext, size, refs, n_refs, err);
     }
     memcpy(d->compressed_memory.data + d->compressed_memory_pos, d->external.data + ext, size);
 
