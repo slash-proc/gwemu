@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "migration/vmstate.h"
@@ -86,7 +87,7 @@ static void gnw_h7b0_rtc_reanchor_calendar(GnwH7B0RtcState *s)
     tm.tm_mon = rtc_unbcd((dr >> 8) & 0x1f) - 1;
     tm.tm_year = rtc_unbcd((dr >> 16) & 0xff) + 100;
 
-    s->rtc_base_epoch = timegm(&tm);
+    s->rtc_base_epoch = mktimegm(&tm);
     s->rtc_base_vclock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
