@@ -136,6 +136,14 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    // Lets the Settings/menu window (and any other ImGui window) be dragged
+    // out of the main game window into its own real OS-level window --
+    // requires the docking-branch ImGui build (see subprojects/imgui/,
+    // vendored directly rather than wrap-fetched: xemu's own upstream pin
+    // is NOT a docking build, so this project carries its own docking-branch
+    // vendor instead of tracking xemu's non-docking one).
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.IniFilename = NULL;
 
     // Setup Platform/Renderer bindings
@@ -176,6 +184,21 @@ void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
 {
     g_tex = tex;
     g_flip_req = flip;
+}
+
+bool xemu_hud_get_framebuffer_size(int *w, int *h)
+{
+    // Same technique RenderFramebuffer() already uses -- query the actual
+    // texture dims rather than assuming a compile-time panel resolution
+    // constant (none exists; LTDC's output size is register-configurable).
+    if (!g_tex) {
+        return false;
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_tex);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, h);
+    return *w > 0 && *h > 0;
 }
 
 void xemu_hud_update(void)
@@ -292,7 +315,6 @@ void xemu_hud_update(void)
     monitor_window.Draw();
     g_scene_mgr.Draw();
     if (!first_boot_window.is_open) notification_manager.Draw();
-    g_snapshot_mgr.Draw();
 
     // static bool show_demo = true;
     // if (show_demo) ImGui::ShowDemoWindow(&show_demo);
@@ -302,6 +324,21 @@ void xemu_hud_render()
 {
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+    // Update/render any ImGui windows (e.g. Settings) that got dragged out
+    // into their own real OS-level window -- see ImGuiConfigFlags_ViewportsEnable
+    // in xemu_hud_init(). RenderPlatformWindowsDefault() makes each platform
+    // window's own GL context current in turn as it goes, so the main
+    // window's context has to be restored afterward before our caller
+    // (ui/xemu.c) swaps the main window.
+    ImGuiIO &io_vp = ImGui::GetIO();
+    if (io_vp.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+        SDL_Window *backup_window = SDL_GL_GetCurrentWindow();
+        SDL_GLContext backup_context = SDL_GL_GetCurrentContext();
+        ImGui::UpdatePlatformWindows();
+        ImGui::RenderPlatformWindowsDefault();
+        SDL_GL_MakeCurrent(backup_window, backup_context);
+    }
 
     if (g_vsync != g_config.display.window.vsync) {
         g_vsync = g_config.display.window.vsync;

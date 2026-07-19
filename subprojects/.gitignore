@@ -7,7 +7,6 @@
 /libvfio-user
 /slirp
 /SDL3-*
-/imgui
 /implot
 /genconfig
 /tomlplusplus
