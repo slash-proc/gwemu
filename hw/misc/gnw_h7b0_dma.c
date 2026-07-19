@@ -285,6 +285,31 @@ static uint64_t gnw_h7b0_dma_half_delay_ns(GnwH7B0DmaState *s, int stream)
                     * half-then-full notification ordering. */
     }
 
+    /* Memory-to-memory streams (CR.DIR == M2M) have no DMAMUX request id
+     * at all (DMA_REQUEST_MEM2MEM) for a peripheral to register a
+     * low_latency/rate_fn notifier against, so they always fell through
+     * to the 48kHz-audio-pacing model below -- wrong by ~1000x for bulk
+     * M2M, whose real hardware transfer time is low-single-digit
+     * microseconds, not tens of milliseconds (found via
+     * stm32h7b0-diag's dma_m2m.md report: a 4KB/1024-item M2M transfer
+     * was taking ~21ms simulated per one-shot copy under the audio
+     * fallback, a ~395x QEMU-vs-hardware gap on case_dma1_m2m/
+     * case_dma2_m2m). Unlike the request-id-keyed low_latency
+     * registrations above, M2M mode is a per-stream CR bit firmware sets
+     * directly -- read it straight from the stream's own CR, no
+     * DMAMUX/notifier plumbing needed. */
+    {
+        int ctrl = stream / GNW_H7B0_DMA_STREAMS_PER_CTRL;
+        int local = stream % GNW_H7B0_DMA_STREAMS_PER_CTRL;
+        hwaddr cr_off = (hwaddr)ctrl * GNW_H7B0_DMA_CTRL_SIZE +
+                         GNW_H7B0_DMA_S0CR_OFFSET +
+                         (hwaddr)local * GNW_H7B0_DMA_STREAM_STRIDE;
+        uint32_t cr = s->regs[cr_off >> 2];
+        if ((cr & DMA_SxCR_DIR) == DMA_SxCR_DIR_M2M) {
+            return 1;
+        }
+    }
+
     int ctrl = stream / GNW_H7B0_DMA_STREAMS_PER_CTRL;
     int local = stream % GNW_H7B0_DMA_STREAMS_PER_CTRL;
     hwaddr ndtr_off = (hwaddr)ctrl * GNW_H7B0_DMA_CTRL_SIZE +
