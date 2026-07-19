@@ -42,6 +42,13 @@ jobs:
     # compatibility/toolchain-recency tradeoff, not verified against every
     # possible target distro.
     container: ubuntu:22.04
+    # Container jobs don't get bash as the default `run:` shell the way
+    # the standard ubuntu-latest runner does -- without this, `set -o
+    # pipefail` fails with "Illegal option" under whatever /bin/sh this
+    # image defaults to.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install git (container has none by default)
         run: |
@@ -149,7 +156,14 @@ jobs:
           ../configure --target-list=arm-softmmu
 
       - name: Build
-        run: ninja -C build
+        run: |
+          # On Darwin, meson defines qemu-system-arm as a custom_target
+          # that ad-hoc-codesigns/entitles the plain executable (built as
+          # qemu-system-arm-unsigned) via scripts/entitlement.sh -- but
+          # that custom_target isn't part of ninja's default "all" set, so
+          # a bare `ninja -C build` only produces the unsigned binary.
+          # Build the signed target explicitly.
+          ninja -C build qemu-system-arm
 
       - name: Package
         run: |
