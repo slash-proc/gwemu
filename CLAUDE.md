@@ -91,12 +91,78 @@ phased plan.
   firmware's own state-6 standby handler (not a tooling bug) and
   recorded the decision to use a patched-out-standby blob for future
   interactive hardware tracing sessions specifically.
-- **Never edit the `gnwmanager` package** to add capabilities needed for
-  a tracing/debugging script in this repo — write pure-consumer scripts
-  against its existing public `OCDBackend`/`GDBBackend`/`GnW` API
-  instead. It has independent development happening outside this repo
-  (confirmed mid-session: its `GDBBackend` changed under us from
-  someone else's concurrent work) and is not this repo's to modify.
+- **Default to not editing the `gnwmanager` package** to add capabilities
+  needed for a tracing/debugging script in this repo — write
+  pure-consumer scripts against its existing public
+  `OCDBackend`/`GDBBackend`/`GnW` API instead. It has independent
+  development happening outside this repo (confirmed mid-session: its
+  `GDBBackend` changed under us from someone else's concurrent work) and
+  isn't this repo's to modify by default. Exception, with explicit
+  go-ahead from the project owner (2026-07-13): small, targeted bugfixes
+  in its own code (e.g. `gdb_backend.py`'s missing `TCP_NODELAY`, which
+  caused a real ~12x slowdown talking to this repo's QEMU) are fine — the
+  "don't touch it" default is about not growing new capabilities into it
+  for this repo's convenience, not a blanket ban on ever fixing a real bug
+  there when asked.
+- `docs/session-2026-07-13-web-builder-integration-fixes.md` —
+  gnw-web-builder (browser/`gnwmanager --qemu`) integration debugging:
+  found and fixed a real HASH-peripheral stub that permanently hung
+  every internal-flash write (`HAL_HASHEx_SHA256_Start` polls with no
+  timeout), a `FLASH_R` sector-erase stub with no connection to actual
+  flash memory (erase finished instantly and silently did nothing), and
+  patched `gdbstub/gdbstub.c` so memory read/write no longer halts the
+  VM (only commands that genuinely need a stopped CPU still do). Also
+  landed optional/default persistent flash-image backing
+  (`gnw_h7b0_soc.c`'s `bank1-image`/`bank2-image`/`extflash-image`
+  properties, wired into `scripts/boot_qemu.sh` as the default with
+  `--ephemeral` to opt out) and a new `scripts/gdb_tap.py` logging
+  GDB-RSP proxy (Nagle/delayed-ACK fixes, single-client preemption). Read
+  before debugging any future "web builder can't talk to QEMU" or
+  "flash operation doesn't seem to do anything" report — it has the
+  full diagnostic trail and the specific fix for each failure mode.
+- `docs/session-2026-07-16-tcg-dispatch-overhead-investigation.md` — an
+  UNRESOLVED, deliberately parked perf investigation: a live profile
+  during real gameplay stutter found ~35% of all CPU cycles going to
+  QEMU's generic TCG block-dispatch helper (`helper_lookup_tb_ptr`/
+  `arm_get_tb_cpu_state`), not this project's device-model code.
+  Confirmed via a live `-trace enable=tb_flush` measurement that full
+  TB-cache flushes are NOT the cause (zero events over 90+ seconds of
+  load) and that no device model here calls `tb_flush`/`tlb_flush`
+  directly. Two live hypotheses, not yet distinguished: (1) inherent
+  cost of ordinary call/return C code under TCG (every function return
+  is a non-chainable indirect branch) — if true, not fixable short of
+  the already-rejected `-icount`; or (2) retro-go's RAM-resident game
+  cores sharing pages between executable code and mutable data, tripping
+  QEMU's self-modifying-code page-invalidation on ordinary data writes —
+  if true, the fix belongs in the `game-and-watch-retro-go-sd` sibling
+  repo's core-loading memory layout, NOT in this repo. Distinguishing
+  the two needs a live call-rate measurement that was blocked this
+  session by `ptrace_scope`/`perf_event_paranoid` restrictions (no root
+  available); the doc has the specific next command to run
+  (`-trace enable=exec_tb_exit` or `translate_block`, both confirmed
+  present in this build, neither needs elevated permissions) for
+  whoever picks this back up.
+- `docs/session-2026-07-16-perf-expert-panel-and-jpeg-encode.md` — a
+  multi-agent perf push (LTDC/JPEG/DMA2D/HASH-CRYP threading, SIMD, PGO,
+  a wildcard hot-path audit) plus a real JPEG encoder implementation.
+  Real, verified wins: LTDC compositor worker-thread and JPEG
+  async-decode worker-thread (both preserved on their own worktree
+  branches, not yet merged), a small SIMD RGB565-conversion win (already
+  applied to the main checkout). DMA2D threading built+correctness-fixed
+  but shows no measured win — parked per explicit instruction not to
+  discard it. PGO pipeline fully proven end-to-end but not yet a
+  demonstrated win (host contention noise swamped the signal; needs a
+  quiet-host re-run). Also surfaced two important side-findings: the
+  HASH device model was silently uncommitted this whole session (now
+  fixed, commit `7443ee6f96`), and a genuinely pre-existing LTDC
+  segfault (`gnw_h7b0_ltdc_capture_if_enabled()`), newly exposed by
+  `../stm32h7b0-diag`'s new JPEG test cases and confirmed independent of
+  every change made this session — **still UNRESOLVED**, read before
+  running the diag suite against JPEG-adjacent work. Has detailed
+  tool/workflow learnings (stale agent-worktree bases, shared-host QEMU
+  contention, ptrace/perf-probe permission limits, why independently
+  re-verifying every agent's claims mattered) worth reading before
+  dispatching another batch of worktree-isolated agents.
 
 ## Repo/remote conventions
 
