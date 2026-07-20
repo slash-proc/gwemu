@@ -59,6 +59,14 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates
+          # Container jobs check out as a different UID than the one git
+          # commands later run as -- without this, git refuses to touch
+          # the checkout ("detected dubious ownership") and every git
+          # command silently fails. Confirmed real: the packaged v0.0.2
+          # binary shipped with a blank gwemu_commit (scripts/
+          # gwemu-version.sh's `git rev-parse HEAD 2>/dev/null` was
+          # swallowing this exact failure).
+          git config --global --add safe.directory '*'
 
       - uses: actions/checkout@v4
 

@@ -1062,6 +1062,32 @@ static void display_very_early_init(DisplayOptions *o)
     m_window = SDL_CreateWindow(
         title, window_width, window_height,
         window_flags);
+#ifdef __linux__
+    if (m_window == NULL) {
+        // Wayland always creates GL contexts via EGL (no GLX equivalent
+        // exists there) -- on compositors/driver stacks where that EGL
+        // path is broken (confirmed real: "Could not get EGL display"
+        // on a real user's system), window creation fails outright even
+        // though SDL_Init(SDL_INIT_VIDEO) itself already succeeded under
+        // the wayland driver. X11 doesn't have this constraint (GLX is
+        // far more broadly supported), so retry once, forcing x11
+        // specifically, instead of leaving the user to discover the
+        // SDL_VIDEODRIVER=x11 workaround (already documented in
+        // CLAUDE.md for a different Wayland issue) manually.
+        const char *cur_driver = SDL_GetCurrentVideoDriver();
+        if (cur_driver && strcmp(cur_driver, "wayland") == 0) {
+            fprintf(stderr,
+                    "Failed to create main window under Wayland (%s) -- "
+                    "retrying with the x11 driver.\n", SDL_GetError());
+            SDL_QuitSubSystem(SDL_INIT_VIDEO);
+            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
+            if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+                m_window = SDL_CreateWindow(title, window_width,
+                                             window_height, window_flags);
+            }
+        }
+    }
+#endif
     if (m_window == NULL) {
         fprintf(stderr, "Failed to create main window: %s\n", SDL_GetError());
         SDL_Quit();
