@@ -1681,7 +1681,6 @@ if true
   sdl3_sp = cmake.subproject('sdl3', options: sdl3_cmake_opts, required: false)
   if sdl3_sp.found()
     sdl3 = sdl3_sp.dependency('SDL3-static')
-    meson.override_dependency('sdl3', sdl3)
     if host_os == 'darwin'
       # SDL3's own CMakeLists.txt attaches these as PUBLIC link deps via
       # $<LINK_LIBRARY:FRAMEWORK,X>/$<LINK_LIBRARY:WEAK_FRAMEWORK,X>
@@ -1699,8 +1698,8 @@ if true
         modules: ['AudioToolbox', 'CoreHaptics', 'ForceFeedback',
                    'GameController', 'Carbon'])
       sdl3 = declare_dependency(dependencies: [sdl3, sdl3_macos_frameworks])
-      meson.override_dependency('sdl3', sdl3)
     endif
+    meson.override_dependency('sdl3', sdl3)
   endif
 endif
 if sdl3.found() and host_os == 'windows'
