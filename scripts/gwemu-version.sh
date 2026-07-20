@@ -14,7 +14,7 @@ GWEMU_COMMIT=$( \
 GWEMU_VERSION=$( \
   cd "$dir"; \
   if test -e .git; then \
-    git describe --tags --match 'v*' | cut -c 2- | tr -d '\n'; \
+    git describe --tags --match 'v*' 2>/dev/null | cut -c 2- | tr -d '\n' || true; \
   elif test -e GWEMU_VERSION; then \
     cat GWEMU_VERSION; \
   fi)
