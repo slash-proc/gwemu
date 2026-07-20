@@ -1092,6 +1092,25 @@ static void display_very_early_init(DisplayOptions *o)
             SDL_QuitSubSystem(SDL_INIT_VIDEO);
             SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
             if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+                // GL attributes are subsystem-lifetime state -- quitting
+                // and reinitializing SDL_INIT_VIDEO can drop them back
+                // to defaults, so the retry needs them set again before
+                // the second SDL_CreateWindow() or GLX visual matching
+                // can fail for a completely different reason than the
+                // original EGL failure (real user report: "Couldn't
+                // find matching GLX visual" on the retry, X11/GLX
+                // otherwise works fine on that exact machine).
+                SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+                SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+                SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+                SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
+                SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+                SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                                     SDL_GL_CONTEXT_PROFILE_CORE);
+                SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
                 m_window = SDL_CreateWindow(title, window_width,
                                              window_height, window_flags);
             }

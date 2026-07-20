@@ -283,10 +283,20 @@ jobs:
               --cross-prefix= \
               --extra-cflags="-arch x86_64" \
               --extra-cxxflags="-arch x86_64" \
-              --extra-ldflags="-arch x86_64"
+              --extra-ldflags="-arch x86_64" \
+              --disable-sdl
           else
-            ../configure --target-list=arm-softmmu
+            ../configure --target-list=arm-softmmu --disable-sdl
           fi
+          # --disable-sdl: QEMU's own legacy `-display sdl` backend (SDL2,
+          # separate from our GUI's SDL3) -- our GUI (`-display gwemu`)
+          # supersedes it entirely, and a real user's crash report on a
+          # genuine Intel Mac (macOS 26.5, iMac20,2) showed the bundled
+          # libSDL2-2.0.0.dylib aborting inside its own dyld initializer
+          # (dllinit) before main() even ran -- SDL2 2.0.x's own
+          # compatibility with this new macOS version, not our code.
+          # Not needed for anything this product ships, so don't link it
+          # (or bundle it) at all rather than chase that compatibility gap.
 
       - name: Build
         run: |
