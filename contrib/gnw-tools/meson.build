@@ -1,5 +1,6 @@
 executable('gnw-make-boot-images',
            files('make_boot_images.c', 'gnw_boot_images.c'),
+           dependencies: [glib],
            install: false)
 
 # Thumb-2 assembler for the (in-progress) C port of the gnwmanager CFW patch
