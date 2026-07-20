@@ -3856,6 +3856,13 @@ if sdl3.found()
   imgui_proj = subproject('imgui', required: true,
                            default_options: [
                              'default_library=static',
+                             # configure sets werror=true project-wide, which
+                             # meson subprojects inherit by default -- this
+                             # vendored code isn't ours to fix for every new
+                             # compiler's own -Wextra-ish warnings (confirmed:
+                             # MinGW GCC 16's -Werror=array-bounds= on
+                             # imgui.cpp, absent on this dev machine's GCC).
+                             'werror=false',
                              'dx9=disabled', 'dx10=disabled', 'dx11=disabled',
                              'dx12=disabled', 'metal=disabled',
                              'opengl=enabled',

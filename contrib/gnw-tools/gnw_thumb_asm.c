@@ -314,7 +314,7 @@ static bool enc_mov_w(Token *ops, int nops, ByteBuf *out, char **error_msg)
     if (!parse_imm(ops[1].text, &imm)) {
         return fail(error_msg, "Invalid immediate '%s'", ops[1].text);
     }
-    int i, imm3, imm8;
+    int i = 0, imm3 = 0, imm8 = 0;
     if (!split_modified_immediate((uint32_t)imm, &i, &imm3, &imm8, error_msg)) {
         return false;
     }
@@ -345,7 +345,7 @@ static bool enc_addsub_w(Token *ops, int nops, uint16_t base_hw1, const char *na
     if (!parse_imm(ops[2].text, &imm)) {
         return fail(error_msg, "Invalid immediate '%s'", ops[2].text);
     }
-    int i, imm3, imm8;
+    int i = 0, imm3 = 0, imm8 = 0;
     if (!split_modified_immediate((uint32_t)imm, &i, &imm3, &imm8, error_msg)) {
         return false;
     }

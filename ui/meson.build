@@ -56,7 +56,13 @@ if sdl3.found()
 
   subdir('xui')
 
-  gnw_gui_ss.add(imgui, implot, stb_image_ui, sdl3, opengl, fa, fpng,
+  # epoxy, not opengl: opengl.found() requires real EGL (absent on
+  # macOS by design), but the GUI's own GL usage (ui/xui/gl-helpers.cc)
+  # calls epoxy functions directly via SDL3's own context, regardless
+  # of EGL -- linking against `opengl` here would silently drop epoxy
+  # from the link line on any platform where opengl.found() is false,
+  # producing "symbol(s) not found" at link time despite compiling fine.
+  gnw_gui_ss.add(imgui, implot, stb_image_ui, sdl3, epoxy, fa, fpng,
                  gwemu_json, tomlplusplus, genconfig)
   packfile = find_program('../scripts/pack-file.py')
   # data/meson.build (binary asset embedding, adds to gnw_gui_ss) and the
