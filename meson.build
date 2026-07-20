@@ -6,7 +6,7 @@ project('qemu', ['c'], meson_version: '>=1.5.0',
                           # support old meson anyway
                           (meson.version().version_compare('>= 1.9') ? ['rust_std=2021', 'build.rust_std=2021'] : []),
 
-        version: files('VERSION'))
+        version: files('VERSION.txt'))
 
 add_test_setup('quick', exclude_suites: ['slow', 'thorough'], is_default: true,
                env: ['RUST_BACKTRACE=1'])
@@ -1863,7 +1863,12 @@ if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
   # (pkg-config-found) dependency objects, not subproject-provided ones --
   # skip the redundant check when we just built epoxy from the wrap
   # ourselves, since it's a real, known-good build either way.
-  if not epoxy_from_pkgconfig or cc.has_header('epoxy/egl.h', dependencies: epoxy)
+  # epoxy/egl.h gates EGL-specific context creation (virtio-gpu's use
+  # case upstream) -- macOS has no EGL at all by design (CGL/CoreGL
+  # instead), so this check alone would leave CONFIG_OPENGL off on every
+  # macOS build. The gnw-h7b0 GUI's own GL usage goes through SDL3's own
+  # (non-EGL) context creation, so accept epoxy without egl.h on darwin.
+  if not epoxy_from_pkgconfig or host_os == 'darwin' or cc.has_header('epoxy/egl.h', dependencies: epoxy)
     opengl = epoxy
   elif get_option('opengl').enabled()
     error('epoxy/egl.h not found')

@@ -79,7 +79,7 @@ endif
 
 # 1. ensure config-host.mak is up-to-date
 config-host.mak: $(SRC_PATH)/configure $(SRC_PATH)/scripts/meson-buildoptions.sh \
-		$(SRC_PATH)/pythondeps.toml $(SRC_PATH)/VERSION
+		$(SRC_PATH)/pythondeps.toml $(SRC_PATH)/VERSION.txt
 	@echo config-host.mak is out-of-date, running configure
 	@if test -f meson-private/coredata.dat; then \
 	  ./config.status --skip-meson; \
@@ -207,7 +207,7 @@ clean: recurse-clean
 	rm -f TAGS cscope.* *~ */*~
 	@$(MAKE) -Ctests/qemu-iotests clean
 
-VERSION = $(shell cat $(SRC_PATH)/VERSION)
+VERSION = $(shell cat $(SRC_PATH)/VERSION.txt)
 
 dist: qemu-$(VERSION).tar.xz
 

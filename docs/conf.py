@@ -105,7 +105,7 @@ author = u'The QEMU Project Developers'
 # command line, which override this.
 try:
     extracted_version = None
-    with open(os.path.join(qemu_docdir, '../VERSION')) as f:
+    with open(os.path.join(qemu_docdir, '../VERSION.txt')) as f:
         extracted_version = f.readline().strip()
 except:
     pass
