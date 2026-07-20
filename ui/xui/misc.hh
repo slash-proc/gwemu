@@ -23,7 +23,12 @@
 #include <cstdio>
 #include <functional>
 #include <SDL3/SDL_dialog.h>
+// common.hh pulls in qemu/osdep.h, which sets GLIB_VERSION_MIN/MAX_REQUIRED
+// before any glib.h include -- glib/gstdio.h must come after it, not before,
+// or GLib's own headers set those macros first and osdep.h's redefinition
+// becomes a -Werror hard error.
 #include "common.hh"
+#include <glib/gstdio.h>
 #include "gwemu-hud.h"
 
 using FileDialogCallback = std::function<void(const char *path)>;

@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include <stdlib.h>
 #include <SDL3/SDL_filesystem.h>
 #include <string.h>
