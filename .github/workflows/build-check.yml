@@ -20,7 +20,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev
+            ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev liblzma-dev
 
       - uses: actions/setup-python@v5
         with:
