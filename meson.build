@@ -1627,8 +1627,17 @@ endif
 # (SDL3's CMake build otherwise hard-requires libxtst-dev, which most
 # dev machines -- CI included -- won't have installed).
 cmake = import('cmake')
-sdl3 = dependency('sdl3', required: false, method: 'pkg-config')
-if not sdl3.found()
+# Deliberately not trying dependency('sdl3', method: 'pkg-config') first:
+# confirmed real bug -- GitHub's macos-14 runner image ships a Homebrew
+# SDL3 at /opt/homebrew/opt/sdl3, and pkg-config found it and used it
+# directly, silently skipping our own static cmake.subproject() build
+# entirely (SDL_STATIC=ON never even got a chance to apply). Not
+# cross-compile-specific -- happened identically on the native arm64
+# leg too. Always build our own vendored, statically-linked SDL3 so
+# behavior can't silently depend on what happens to be preinstalled on
+# a given build host.
+sdl3 = not_found
+if true
   sdl3_cmake_opts = cmake.subproject_options()
   sdl3_cmake_opts.add_cmake_defines({
     'SDL_CAMERA': 'OFF',
