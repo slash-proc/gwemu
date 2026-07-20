@@ -1513,7 +1513,7 @@
 #
 # @dbus: Start a D-Bus service for the display.  (Since 7.0)
 #
-# @xemu: gnw-h7b0's ImGui-based GUI (ported from the xemu project).
+# @gwemu: gnw-h7b0's ImGui-based GUI (ported from the xemu project).
 #
 # Since: 2.12
 ##
@@ -1528,7 +1528,7 @@
     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
     { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
-    { 'name': 'xemu', 'if': 'CONFIG_XEMU_GUI' }
+    { 'name': 'gwemu', 'if': 'CONFIG_GWEMU_GUI' }
   ]
 }
 

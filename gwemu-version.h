@@ -1,11 +1,11 @@
-#ifndef XEMU_VERSION_H
-#define XEMU_VERSION_H
+#ifndef GWEMU_VERSION_H
+#define GWEMU_VERSION_H
 
-extern const int xemu_version_major;
-extern const int xemu_version_minor;
-extern const int xemu_version_patch;
-extern const char *xemu_version;
-extern const char *xemu_commit;
-extern const char *xemu_date;
+extern const int gwemu_version_major;
+extern const int gwemu_version_minor;
+extern const int gwemu_version_patch;
+extern const char *gwemu_version;
+extern const char *gwemu_commit;
+extern const char *gwemu_date;
 
 #endif

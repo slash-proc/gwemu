@@ -41,7 +41,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
-#ifndef CONFIG_XEMU_GUI
+#ifndef CONFIG_GWEMU_GUI
 static void *qemu_default_main(void *opaque)
 {
     int status;
@@ -68,7 +68,7 @@ static int os_darwin_cfrunloop_main(void)
 int (*qemu_main)(void) = os_darwin_cfrunloop_main;
 #endif
 
-#ifndef CONFIG_XEMU_GUI
+#ifndef CONFIG_GWEMU_GUI
 /*
  * gnw-h7b0 GUI (Phase 1, ported from xemu): ui/xemu.c provides its own
  * main() when the GUI is built in (matching upstream xemu's own approach --
@@ -108,4 +108,4 @@ int main(int argc, char **argv)
         g_assert_not_reached();
     }
 }
-#endif /* !CONFIG_XEMU_GUI */
+#endif /* !CONFIG_GWEMU_GUI */
