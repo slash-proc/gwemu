@@ -35,20 +35,21 @@ if sdl3.found()
 
   gnw_gui_ss = ss.source_set()
   gnw_gui_ss.add(files(
-    'xemu-input.c',
-    'xemu-monitor.c',
-    'xemu-data.c',
-    'xemu-settings.cc',
-    'xemu.c',
+    'gwemu-input.c',
+    'gwemu-gnw-input.c',
+    'gwemu-monitor.c',
+    'gwemu-data.c',
+    'gwemu-settings.cc',
+    'gwemu.c',
   ))
-  gnw_gui_ss.add(files('../xemu-version.c'))
+  gnw_gui_ss.add(files('../gwemu-version.c'))
 
   if host_os == 'linux'
-    gnw_gui_ss.add([gtk, files('xemu-os-utils-linux.c')])
+    gnw_gui_ss.add([gtk, files('gwemu-os-utils-linux.c')])
   elif host_os == 'windows'
-    gnw_gui_ss.add(files('xemu-os-utils-windows.c'))
+    gnw_gui_ss.add(files('gwemu-os-utils-windows.c'))
   elif host_os == 'darwin'
-    gnw_gui_ss.add(files('xemu-os-utils-macos.m'))
+    gnw_gui_ss.add(files('gwemu-os-utils-macos.m'))
     gnw_gui_cocoa = dependency('appleframeworks', modules: 'Cocoa')
     gnw_gui_ss.add(gnw_gui_cocoa)
   endif
@@ -56,7 +57,7 @@ if sdl3.found()
   subdir('xui')
 
   gnw_gui_ss.add(imgui, implot, stb_image_ui, sdl3, opengl, fa, fpng,
-                 xemu_json, tomlplusplus, genconfig)
+                 gwemu_json, tomlplusplus, genconfig)
   packfile = find_program('../scripts/pack-file.py')
   # data/meson.build (binary asset embedding, adds to gnw_gui_ss) and the
   # final system_ss.add_all(gnw_gui_ss) both happen from the top-level
