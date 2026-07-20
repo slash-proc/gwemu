@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //

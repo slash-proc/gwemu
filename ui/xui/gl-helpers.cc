@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -280,7 +280,7 @@ void main() {
     case ShaderType::Mask: frag_src = mask_frag_src; break;
     case ShaderType::Blit: frag_src = image_frag_src; break;
     case ShaderType::BlitGamma: frag_src = image_gamma_frag_src; break;
-    case ShaderType::Logo: frag_src = xemu_logo_frag_src; break;
+    case ShaderType::Logo: frag_src = xemu_logo_frag_src; break; // asset not yet renamed, see ui/shader/xemu-logo.frag
     default: assert(0);
     }
     GLuint frag = Shader(GL_FRAGMENT_SHADER, frag_src);
@@ -445,7 +445,7 @@ void InitCustomRendering(void)
      * xemu also loads controller_mask/controller_mask_s/xmu_mask textures
      * and an icon texture here, for the Xbox-controller-rendering and
      * window-icon code already dropped (see RenderController and friends,
-     * removed above; the window icon, in ui/xemu.c). Not loaded here
+     * removed above; the window icon, in ui/gwemu.c). Not loaded here
      * either -- nothing left references them.
      */
     g_logo_tex = LoadTextureFromMemory(logo_sdf_data, logo_sdf_size);
@@ -542,7 +542,7 @@ static float GetDisplayAspectRatio(int width, int height)
     default:
         /*
          * xemu's AUTO mode detects per-Xbox-game widescreen support
-         * (xemu_get_widescreen(), a guest-RAM game-binary patcher --
+         * (gwemu_get_widescreen(), a guest-RAM game-binary patcher --
          * genuinely game-specific, not applicable here). gnw-h7b0's
          * native display is a fixed real-hardware aspect ratio, so just
          * use it directly rather than porting that subsystem.
@@ -630,9 +630,9 @@ void SaveScreenshot(GLuint tex, bool flip)
         time_t t = time(NULL);
         struct tm *tmp = localtime(&t);
         if (tmp) {
-            strftime(fname, sizeof(fname), "xemu-%Y-%m-%d-%H-%M-%S.png", tmp);
+            strftime(fname, sizeof(fname), "gwemu-%Y-%m-%d-%H-%M-%S.png", tmp);
         } else {
-            strcpy(fname, "xemu.png");
+            strcpy(fname, "gwemu.png");
         }
 
         const char *output_dir = g_config.general.screenshot_dir;
@@ -657,11 +657,11 @@ void SaveScreenshot(GLuint tex, bool flip)
     }
 
     if (err) {
-        xemu_queue_error_message(error_get_pretty(err));
+        gwemu_queue_error_message(error_get_pretty(err));
         error_report_err(err);
     } else {
         char *msg = g_strdup_printf("Screenshot Saved: %s", fname);
-        xemu_queue_notification(msg);
+        gwemu_queue_notification(msg);
         free(msg);
     }
 }

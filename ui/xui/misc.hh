@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -24,7 +24,7 @@
 #include <functional>
 #include <SDL3/SDL_dialog.h>
 #include "common.hh"
-#include "xemu-hud.h"
+#include "gwemu-hud.h"
 
 using FileDialogCallback = std::function<void(const char *path)>;
 

@@ -1,5 +1,5 @@
 /*
- * xemu QEMU Monitor Interface
+ * GWemu QEMU Monitor Interface
  *
  * Copyright (c) 2020-2021 Matt Borgerson
  *
@@ -21,16 +21,16 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef XEMU_MONITOR_H
-#define XEMU_MONITOR_H
+#ifndef GWEMU_MONITOR_H
+#define GWEMU_MONITOR_H
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-void xemu_monitor_init(void);
-char *xemu_get_monitor_buffer(void);
-void xemu_run_monitor_command(const char *cmd);
+void gwemu_monitor_init(void);
+char *gwemu_get_monitor_buffer(void);
+void gwemu_run_monitor_command(const char *cmd);
 
 #ifdef __cplusplus
 }

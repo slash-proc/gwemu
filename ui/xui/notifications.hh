@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -20,7 +20,7 @@
 #include <stdint.h>
 #include <deque>
 
-#include "../xemu-notifications.h"
+#include "../gwemu-notifications.h"
 
 class NotificationManager
 {

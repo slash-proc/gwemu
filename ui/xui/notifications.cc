@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -19,7 +19,7 @@
 #include "notifications.hh"
 #include "common.hh"
 
-#include "../xemu-notifications.h"
+#include "../gwemu-notifications.h"
 
 NotificationManager notification_manager;
 
@@ -146,14 +146,14 @@ void NotificationManager::DrawNotification(float t, const char *msg)
     ImGui::End();
 }
 
-/* External interface, exposed via xemu-notifications.h */
+/* External interface, exposed via gwemu-notifications.h */
 
-void xemu_queue_notification(const char *msg)
+void gwemu_queue_notification(const char *msg)
 {
     notification_manager.QueueNotification(msg);
 }
 
-void xemu_queue_error_message(const char *msg)
+void gwemu_queue_error_message(const char *msg)
 {
     notification_manager.QueueError(msg);
 }

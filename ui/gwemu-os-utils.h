@@ -17,20 +17,20 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef XEMU_OS_UTILS_H
-#define XEMU_OS_UTILS_H
+#ifndef GWEMU_OS_UTILS_H
+#define GWEMU_OS_UTILS_H
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-const char *xemu_get_os_info(void);
+const char *gwemu_get_os_info(void);
 
 #ifdef CONFIG_CPUID_H
 #include <cpuid.h>
 #endif
 
-static inline const char *xemu_get_cpu_info(void)
+static inline const char *gwemu_get_cpu_info(void)
 {
     const char *cpu_info = "";
 #ifdef CONFIG_CPUID_H

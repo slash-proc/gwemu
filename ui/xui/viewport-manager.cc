@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -17,7 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 #include "viewport-manager.hh"
-#include "xemu-hud.h"
+#include "gwemu-hud.h"
 
 ViewportManager g_viewport_mgr;
 
@@ -64,7 +64,7 @@ void ViewportManager::Update()
 {
     ImGuiIO &io = ImGui::GetIO();
 
-    SDL_Window *window = xemu_get_window();
+    SDL_Window *window = gwemu_get_window();
     m_pixel_density = fmaxf(SDL_GetWindowPixelDensity(window), 1.0f);
 
     if (g_config.display.ui.auto_scale) {

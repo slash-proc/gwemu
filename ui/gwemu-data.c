@@ -1,5 +1,5 @@
 /*
- * xemu Data File and Path Helpers
+ * GWemu Data File and Path Helpers
  *
  * Copyright (C) 2020-2021 Matt Borgerson
  *
@@ -23,7 +23,7 @@
 #include <string.h>
 #include <assert.h>
 
-#include "xemu-data.h"
+#include "gwemu-data.h"
 
 static int path_exists(const char *path)
 {
@@ -33,7 +33,7 @@ static int path_exists(const char *path)
 	return 1;
 }
 
-const char *xemu_get_resource_path(const char *filename)
+const char *gwemu_get_resource_path(const char *filename)
 {
 	// Allocate an arbitrarily long buffer for resource path storage FIXME: This
 	// could be done better with a growing printf. Keep it simple for now.
@@ -67,8 +67,8 @@ const char *xemu_get_resource_path(const char *filename)
 	}
 
 #if defined(__linux__)
-	// /usr/share/xemu/data when installed
-	snprintf(resource_path, resource_path_buffer_len, "/usr/share/xemu/data/%s",
+	// /usr/share/gwemu/data when installed
+	snprintf(resource_path, resource_path_buffer_len, "/usr/share/gwemu/data/%s",
 		filename);
 
 	if (path_exists(resource_path)) {

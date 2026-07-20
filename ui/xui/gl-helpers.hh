@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -19,7 +19,7 @@
 #pragma once
 #include <vector>
 #include "common.hh"
-#include "../xemu-input.h"
+#include "../gwemu-input.h"
 
 class Fbo
 {

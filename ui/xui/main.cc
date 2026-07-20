@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -33,7 +33,7 @@
 
 #include "actions.hh"
 #include "common.hh"
-#include "xemu-hud.h"
+#include "gwemu-hud.h"
 #include "misc.hh"
 #include "gl-helpers.hh"
 #include "input-manager.hh"
@@ -48,6 +48,7 @@
 #include "monitor.hh"
 #include "welcome.hh"
 #include "menubar.hh"
+#include "titlebar.hh"
 
 bool g_screenshot_pending;
 const char *g_snapshot_pending_load_name;
@@ -123,9 +124,9 @@ static void InitializeStyle()
     g_base_style = s;
 }
 
-void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
+void gwemu_hud_init(SDL_Window* window, void* sdl_gl_context)
 {
-    xemu_monitor_init();
+    gwemu_monitor_init();
     g_vsync = g_config.display.window.vsync;
 
     InitCustomRendering();
@@ -136,13 +137,29 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-    // Lets the Settings/menu window (and any other ImGui window) be dragged
-    // out of the main game window into its own real OS-level window --
-    // requires the docking-branch ImGui build (see subprojects/imgui/,
-    // vendored directly rather than wrap-fetched: xemu's own upstream pin
-    // is NOT a docking build, so this project carries its own docking-branch
-    // vendor instead of tracking xemu's non-docking one).
-    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    // ImGuiConfigFlags_ViewportsEnable (lets a window like Settings drag out
+    // into its own real OS-level window) is DELIBERATELY NOT enabled here --
+    // real testing found it broken (mouse hover/click hit-testing offset
+    // from a dragged window's actual position, worsening the further the
+    // window moves from the main one). Root cause: imgui_impl_sdl3.cpp's
+    // own multi-viewport support requires SDL_GetGlobalMouseState() to be
+    // reliable, and it only sets ImGuiBackendFlags_PlatformHasViewports
+    // (the flag that actually wires up the cross-window coordinate-
+    // translation platform callbacks) for a driver on its own hardcoded
+    // whitelist: {"windows", "cocoa", "x11", "DIVE", "VMAN"} -- see that
+    // file's own ImGui_ImplSDL3_Init(). "wayland" is not on that list, and
+    // this project's real launch path (scripts/boot_qemu.sh) does not force
+    // SDL_VIDEODRIVER=x11 -- only ad hoc manual test invocations during
+    // development did. So on a real Wayland desktop (this project's actual
+    // dev/test environment, confirmed via $XDG_SESSION_TYPE), the platform
+    // interface never initializes correctly for genuine cross-window mouse
+    // math, which is a well-known, documented Wayland limitation (no
+    // reliable absolute/global window positioning) -- not something we can
+    // fix in our own code. DockingEnable alone (kept below) still gives
+    // real value -- floating/dockable panels within the single game window
+    // -- without needing the broken cross-window mouse-coordinate path.
+    // Revisit ViewportsEnable if this project ever forces SDL_VIDEODRIVER=x11
+    // (or ships on Windows/Mac, both on the real whitelist) by default.
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.IniFilename = NULL;
 
@@ -156,14 +173,14 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     first_boot_window.is_open = g_config.general.show_welcome;
 }
 
-void xemu_hud_cleanup(void)
+void gwemu_hud_cleanup(void)
 {
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
 }
 
-void xemu_hud_process_sdl_events(SDL_Event *event)
+void gwemu_hud_process_sdl_events(SDL_Event *event)
 {
     // Ignore inputs that are consumed by rebinding
     if (g_main_menu.ConsumeRebindEvent(event)) {
@@ -173,20 +190,20 @@ void xemu_hud_process_sdl_events(SDL_Event *event)
     ImGui_ImplSDL3_ProcessEvent(event);
 }
 
-void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse)
+void gwemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse)
 {
     ImGuiIO& io = ImGui::GetIO();
     if (kbd) *kbd = io.WantCaptureKeyboard;
     if (mouse) *mouse = io.WantCaptureMouse;
 }
 
-void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
+void gwemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
 {
     g_tex = tex;
     g_flip_req = flip;
 }
 
-bool xemu_hud_get_framebuffer_size(int *w, int *h)
+bool gwemu_hud_get_framebuffer_size(int *w, int *h)
 {
     // Same technique RenderFramebuffer() already uses -- query the actual
     // texture dims rather than assuming a compile-time panel resolution
@@ -201,7 +218,7 @@ bool xemu_hud_get_framebuffer_size(int *w, int *h)
     return *w > 0 && *h > 0;
 }
 
-void xemu_hud_update(void)
+void gwemu_hud_update(void)
 {
     ImGuiIO& io = ImGui::GetIO();
     uint32_t now = SDL_GetTicks();
@@ -217,7 +234,7 @@ void xemu_hud_update(void)
 
     if (!first_boot_window.is_open) {
         int ww, wh;
-        SDL_GetWindowSizeInPixels(xemu_get_window(), &ww, &wh);
+        SDL_GetWindowSizeInPixels(gwemu_get_window(), &ww, &wh);
         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
     }
 
@@ -230,6 +247,16 @@ void xemu_hud_update(void)
 
     ImGui::NewFrame();
     ProcessKeyboardShortcuts();
+
+    // Custom chrome (see titlebar.hh): window is always SDL_WINDOW_BORDERLESS,
+    // so draw our own titlebar and push the main viewport's work area down by
+    // its height -- BeginMainMenuBar() (and everything else anchored to the
+    // viewport) reads WorkPos/WorkSize, so this is the standard ImGui way to
+    // stack a menu bar under another top-of-screen bar.
+    float titlebar_height = DrawTitlebar();
+    ImGuiViewport *main_viewport = ImGui::GetMainViewport();
+    main_viewport->WorkPos.y += titlebar_height;
+    main_viewport->WorkSize.y -= titlebar_height;
 
 #if defined(CONFIG_RENDERDOC)
     if (g_capture_renderdoc_frame) {
@@ -306,7 +333,7 @@ void xemu_hud_update(void)
                     !ImGui::IsAnyItemFocused() && !ImGui::IsAnyItemHovered())) {
             g_scene_mgr.PushScene(g_popup_menu);
         } else if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            xemu_toggle_fullscreen();
+            gwemu_toggle_fullscreen();
         }
 
     }
@@ -320,17 +347,17 @@ void xemu_hud_update(void)
     // if (show_demo) ImGui::ShowDemoWindow(&show_demo);
 }
 
-void xemu_hud_render()
+void gwemu_hud_render()
 {
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
     // Update/render any ImGui windows (e.g. Settings) that got dragged out
     // into their own real OS-level window -- see ImGuiConfigFlags_ViewportsEnable
-    // in xemu_hud_init(). RenderPlatformWindowsDefault() makes each platform
+    // in gwemu_hud_init(). RenderPlatformWindowsDefault() makes each platform
     // window's own GL context current in turn as it goes, so the main
     // window's context has to be restored afterward before our caller
-    // (ui/xemu.c) swaps the main window.
+    // (ui/gwemu.c) swaps the main window.
     ImGuiIO &io_vp = ImGui::GetIO();
     if (io_vp.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
         SDL_Window *backup_window = SDL_GL_GetCurrentWindow();

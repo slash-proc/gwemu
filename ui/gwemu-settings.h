@@ -1,5 +1,5 @@
 /*
- * xemu Settings Management
+ * GWemu Settings Management
  *
  * Primary storage for non-volatile user configuration. Basic key-value storage
  * that gets saved to an INI file. All entries should be accessed through the
@@ -21,8 +21,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef XEMU_SETTINGS_H
-#define XEMU_SETTINGS_H
+#ifndef GWEMU_SETTINGS_H
+#define GWEMU_SETTINGS_H
 
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +32,7 @@
 extern "C" {
 #endif
 
-#include "xemu-config.h"
+#include "gwemu-config.h"
 
 #ifdef __cplusplus
 using GamepadMappings = struct config::input::gamepad_mappings;
@@ -43,27 +43,27 @@ typedef struct gamepad_mappings GamepadMappings;
 extern struct config g_config;
 
 // Override the default config file paths
-void xemu_settings_set_path(const char *path);
+void gwemu_settings_set_path(const char *path);
 
 // Get the path of the base settings dir
-const char *xemu_settings_get_base_path(void);
+const char *gwemu_settings_get_base_path(void);
 
 // Get path of the config file on disk
-const char *xemu_settings_get_path(void);
+const char *gwemu_settings_get_path(void);
 
 // Get path of the default generated eeprom file on disk
-const char *xemu_settings_get_default_eeprom_path(void);
+const char *gwemu_settings_get_default_eeprom_path(void);
 
 // Get error message on failure to parse settings
-const char *xemu_settings_get_error_message(void);
+const char *gwemu_settings_get_error_message(void);
 
 // Load config file from disk, or load defaults. Return true on success, false if an error occured.
-bool xemu_settings_load(void);
+bool gwemu_settings_load(void);
 
 // Save config file to disk
-void xemu_settings_save(void);
+void gwemu_settings_save(void);
 
-static inline void xemu_settings_set_string(const char **str, const char *new_str)
+static inline void gwemu_settings_set_string(const char **str, const char *new_str)
 {
     assert(new_str);
     free((char*)*str);
@@ -76,14 +76,14 @@ void remove_net_nat_forward_ports(unsigned int index);
 
 // Load gamepad mapping for controller with 'guid', setting the mapping pointer
 // to the config entry. Returns true if the mapping did not previously exist.
-bool xemu_settings_load_gamepad_mapping(const char *guid,
+bool gwemu_settings_load_gamepad_mapping(const char *guid,
                                         GamepadMappings **mapping);
 
 // Reset controller mapping to default settings.
-void xemu_settings_reset_controller_mapping(const char *guid);
+void gwemu_settings_reset_controller_mapping(const char *guid);
 
 // Reset keyboard mappings to default settings.
-void xemu_settings_reset_keyboard_mapping(void);
+void gwemu_settings_reset_keyboard_mapping(void);
 
 #ifdef __cplusplus
 }

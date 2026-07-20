@@ -17,7 +17,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "xemu-os-utils.h"
+#include "gwemu-os-utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -46,7 +46,7 @@ static char *read_file_if_possible(const char *path)
 	return buf;
 }
 
-const char *xemu_get_os_info(void)
+const char *gwemu_get_os_info(void)
 {
 	static const char *os_info = NULL;
 	static int attempted_init = 0;

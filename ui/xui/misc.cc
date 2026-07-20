@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2026 Matt Borgerson
 //
@@ -30,9 +30,9 @@ static void RunOnMainThread(std::function<void()> &&func)
             [](void *userdata) {
                 std::unique_ptr<std::function<void()>> f(
                     static_cast<std::function<void()> *>(userdata));
-                xemu_main_loop_lock();
+                gwemu_main_loop_lock();
                 (*f)();
-                xemu_main_loop_unlock();
+                gwemu_main_loop_unlock();
             },
             p, false)) {
         delete p;
@@ -87,7 +87,7 @@ void ShowOpenFileDialog(const SDL_DialogFileFilter *filters, int nfilters,
 {
     auto *cb = new FileDialogCallback(std::move(callback));
     std::string normalized = NormalizeDefaultLocation(default_location);
-    SDL_ShowOpenFileDialog(FileDialogCallbackWrapper, cb, xemu_get_window(),
+    SDL_ShowOpenFileDialog(FileDialogCallbackWrapper, cb, gwemu_get_window(),
                            filters, nfilters,
                            normalized.empty() ? nullptr : normalized.c_str(),
                            false);
@@ -98,7 +98,7 @@ void ShowSaveFileDialog(const SDL_DialogFileFilter *filters, int nfilters,
                         FileDialogCallback callback)
 {
     auto *cb = new FileDialogCallback(std::move(callback));
-    SDL_ShowSaveFileDialog(FileDialogCallbackWrapper, cb, xemu_get_window(),
+    SDL_ShowSaveFileDialog(FileDialogCallbackWrapper, cb, gwemu_get_window(),
                            filters, nfilters, default_location);
 }
 
@@ -107,5 +107,5 @@ void ShowOpenFolderDialog(const char *default_location,
 {
     auto *cb = new FileDialogCallback(std::move(callback));
     SDL_ShowOpenFolderDialog(FileDialogCallbackWrapper, cb,
-                             xemu_get_window(), default_location, false);
+                             gwemu_get_window(), default_location, false);
 }

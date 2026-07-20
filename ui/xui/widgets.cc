@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -20,7 +20,7 @@
 #include "misc.hh"
 #include "font-manager.hh"
 #include "viewport-manager.hh"
-#include "ui/xemu-os-utils.h"
+#include "ui/gwemu-os-utils.h"
 #include "gl-helpers.hh"
 
 void Separator()

@@ -15,12 +15,24 @@
 #include "scene.hh"
 #include "viewport-manager.hh"
 
+class GnwFlashStorageView; // flash-storage-view.hh, forward-declared to
+                            // avoid a circular include (it includes this
+                            // header for MainMenuTabView)
+class GnwSdCardView;       // sdcard-view.hh, same reason
+
 class MainMenuTabView
 {
 public:
     virtual ~MainMenuTabView() = default;
     virtual void Draw() = 0;
 };
+
+// display-view.hh/audio-view.hh inherit from MainMenuTabView above, so they
+// must be included after its definition, not before (same circular-include
+// hazard as GnwFlashStorageView, just resolved with include-order instead
+// of a forward-declared pointer since these two are small/self-contained).
+#include "display-view.hh"
+#include "audio-view.hh"
 
 class MainMenuGeneralView : public virtual MainMenuTabView
 {
@@ -34,7 +46,19 @@ public:
     void Draw() override;
 };
 
+class MainMenuInputView : public virtual MainMenuTabView
+{
+public:
+    void Draw() override;
+};
+
 class MainMenuAboutView : public virtual MainMenuTabView
+{
+public:
+    void Draw() override;
+};
+
+class MainMenuSnapshotsView : public virtual MainMenuTabView
 {
 public:
     void Draw() override;
@@ -57,7 +81,13 @@ protected:
     std::vector<MainMenuTabView*>   m_views;
     MainMenuGeneralView             m_general_view;
     MainMenuSystemView              m_system_view;
+    MainMenuInputView               m_input_view;
+    MainMenuDisplayView             m_display_view;
+    MainMenuAudioView               m_audio_view;
     MainMenuAboutView               m_about_view;
+    MainMenuSnapshotsView            m_snapshots_view;
+    GnwFlashStorageView            *m_flash_storage_view; // flash-storage-view.hh
+    GnwSdCardView                  *m_sdcard_view;         // sdcard-view.hh
 
 public:
     MainMenuScene();

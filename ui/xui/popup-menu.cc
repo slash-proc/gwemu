@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -16,7 +16,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
-#include "ui/xemu-notifications.h"
+#include "ui/gwemu-notifications.h"
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -28,7 +28,7 @@
 #include "scene-manager.hh"
 #include "popup-menu.hh"
 #include "input-manager.hh"
-#include "xemu-hud.h"
+#include "gwemu-hud.h"
 #include "IconsFontAwesome6.h"
 extern "C" {
 #include "migration/snapshot.h"
@@ -314,9 +314,9 @@ public:
             ImGui::SetKeyboardFocusHere();
         }
         PopupMenuSlider("Volume", ICON_FA_VOLUME_HIGH, &g_config.audio.volume_limit);
-        bool fs = xemu_is_fullscreen();
+        bool fs = gwemu_is_fullscreen();
         if (PopupMenuToggle("Fullscreen", ICON_FA_WINDOW_MAXIMIZE, &fs)) {
-            xemu_toggle_fullscreen();
+            gwemu_toggle_fullscreen();
         }
         if (PopupMenuSubmenuButton("Display Mode", ICON_FA_EXPAND)) {
             nav.PushFocus();
@@ -389,10 +389,10 @@ public:
             Error *err = NULL;
             save_snapshot(NULL, true, NULL, false, NULL, &err);
             if (err) {
-                xemu_queue_error_message(error_get_pretty(err));
+                gwemu_queue_error_message(error_get_pretty(err));
                 error_free(err);
             } else {
-                xemu_queue_notification("Created new snapshot");
+                gwemu_queue_notification("Created new snapshot");
             }
             pop = true;
         }

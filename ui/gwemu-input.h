@@ -10,8 +10,8 @@
  * (input-manager.cc).
  */
 
-#ifndef XEMU_INPUT_H
-#define XEMU_INPUT_H
+#ifndef GWEMU_INPUT_H
+#define GWEMU_INPUT_H
 
 #include <SDL3/SDL.h>
 #include <stdbool.h>
@@ -69,10 +69,10 @@ extern ControllerStateList available_controllers;
 extern "C" {
 #endif
 
-void xemu_input_init(void);
-void xemu_input_process_sdl_events(const SDL_Event *event);
-void xemu_input_update_controllers(void);
-void xemu_input_set_test_mode(bool enabled);
+void gwemu_input_init(void);
+void gwemu_input_process_sdl_events(const SDL_Event *event);
+void gwemu_input_update_controllers(void);
+void gwemu_input_set_test_mode(bool enabled);
 
 #ifdef __cplusplus
 }

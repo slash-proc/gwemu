@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -57,7 +57,7 @@ void MonitorWindow::Draw()
         // FIXME: Replace scroll to bottom hack when https://github.com/ocornut/imgui/issues/1972 is resolved.
         // ImGui does not provide any mechanism to adjust scrolling in an InputTextMultiline and does not
         // provide any other widget that allows for selectable text.
-        char *buffer = xemu_get_monitor_buffer();
+        char *buffer = gwemu_get_monitor_buffer();
         size_t buffer_len = strlen(buffer);
         // Calculating the precise size will cause an unnecessary vertical scrollbar in the InputTextMultiline.
         int num_newlines = 2;
@@ -120,7 +120,7 @@ void MonitorWindow::ToggleOpen(void)
 
 void MonitorWindow::ExecCommand(const char* command_line)
 {
-    xemu_run_monitor_command(command_line);
+    gwemu_run_monitor_command(command_line);
 
     // Insert into history. First find match and delete it so it can be pushed to the back. This isn't trying to be smart or optimal.
     HistoryPos = -1;

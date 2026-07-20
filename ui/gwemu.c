@@ -43,6 +43,7 @@
 #include "system/runstate-action.h"
 #include "system/system.h"
 #include "xui/gwemu-hud.h"
+#include "xui/titlebar.hh"
 #include "gwemu-gnw-input.h"
 #include "gwemu-input.h"
 #include "gwemu-settings.h"
@@ -968,6 +969,21 @@ static void display_very_early_init(DisplayOptions *o)
     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "wayland,x11");
 #endif
 
+    /* Some systems ship a libdecor Wayland client-side-decoration plugin
+     * (libdecor-gtk, cairo/pixman-based) that segfaults when SDL3 dispatches
+     * Wayland events through it -- confirmed via a real crash backtrace
+     * (pixman_image_composite32 -> cairo -> libdecor-gtk.so ->
+     * wl_display_dispatch_queue_pending -> SDL's Wayland_PumpEvents),
+     * happening unconditionally on plain "run gwemu with no flags" on such
+     * systems. Disable libdecor use; SDL3 then falls back to the
+     * xdg-decoration protocol (server-side decorations) where available,
+     * or an undecorated window otherwise -- either is preferable to a
+     * guaranteed crash. Must be set before SDL_Init().
+     */
+#ifdef SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR
+    SDL_SetHint(SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR, "0");
+#endif
+
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "Failed to initialize SDL video subsystem: %s\n",
                 SDL_GetError());
@@ -1036,7 +1052,10 @@ static void display_very_early_init(DisplayOptions *o)
         window_height = min_window_height;
     }
 
-    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    // Always borderless: draw our own titlebar/chrome via titlebar.cc rather
+    // than depend on the host's window-decoration library (unreliable across
+    // Linux compositors -- see titlebar.hh).
+    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_BORDERLESS);
 
     // Create main window
     m_window = SDL_CreateWindow(
@@ -1048,6 +1067,7 @@ static void display_very_early_init(DisplayOptions *o)
         exit(1);
     }
     g_free(title);
+    titlebar_install_hittest(m_window);
     SDL_SetWindowMinimumSize(m_window, min_window_width, min_window_height);
 
     const SDL_DisplayMode *disp_mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(m_window));

@@ -1,5 +1,5 @@
 /*
- * xemu QEMU Monitor Interface
+ * GWemu QEMU Monitor Interface
  *
  * Copyright (c) 2020-2021 Matt Borgerson
  *
@@ -28,49 +28,49 @@
 #include "monitor/monitor.h"
 #include "chardev/char.h"
 
-#include "xemu-monitor.h"
+#include "gwemu-monitor.h"
 
-#define TYPE_CHARDEV_XEMU_MONITOR "chardev-xemu-monitor"
+#define TYPE_CHARDEV_GWEMU_MONITOR "chardev-gwemu-monitor"
 
 static Chardev *mon_chr;
 static char mon_buffer[12*4096];
 static const size_t mon_buffer_size = sizeof(mon_buffer);
 static size_t offset;
 
-static bool xemu_monitor_open(Chardev *chr, ChardevBackend *backend,
+static bool gwemu_monitor_open(Chardev *chr, ChardevBackend *backend,
                               Error **errp);
-static int xemu_monitor_buffer_append(Chardev *chr, const uint8_t *buf, int len);
+static int gwemu_monitor_buffer_append(Chardev *chr, const uint8_t *buf, int len);
 
-static void char_xemu_class_init(ObjectClass *oc, const void *data)
+static void char_gwemu_class_init(ObjectClass *oc, const void *data)
 {
     ChardevClass *cc = CHARDEV_CLASS(oc);
 
     cc->internal = true;
-    cc->chr_open = xemu_monitor_open;
-    cc->chr_write = xemu_monitor_buffer_append;
+    cc->chr_open = gwemu_monitor_open;
+    cc->chr_write = gwemu_monitor_buffer_append;
 }
 
-static bool xemu_monitor_open(Chardev *chr, ChardevBackend *backend,
+static bool gwemu_monitor_open(Chardev *chr, ChardevBackend *backend,
                               Error **errp)
 {
     return true;
 }
 
-void xemu_monitor_init(void)
+void gwemu_monitor_init(void)
 {
     /* For simplicity, assume this is only created once */
     assert(mon_chr == NULL);
-    mon_chr = qemu_chardev_new(NULL, TYPE_CHARDEV_XEMU_MONITOR,
+    mon_chr = qemu_chardev_new(NULL, TYPE_CHARDEV_GWEMU_MONITOR,
                                NULL, NULL, &error_abort);
     monitor_init_hmp(mon_chr, false, &error_abort);
 }
 
-char *xemu_get_monitor_buffer(void)
+char *gwemu_get_monitor_buffer(void)
 {
     return mon_buffer;
 }
 
-static int xemu_monitor_buffer_append(Chardev *chr, const uint8_t *buf, int len)
+static int gwemu_monitor_buffer_append(Chardev *chr, const uint8_t *buf, int len)
 {
     if ((offset+len+1) >= mon_buffer_size) {
         /* Reached the end of the buffer. Keep it simple and
@@ -88,12 +88,12 @@ static int xemu_monitor_buffer_append(Chardev *chr, const uint8_t *buf, int len)
     return len;
 }
 
-void xemu_run_monitor_command(const char *cmd)
+void gwemu_run_monitor_command(const char *cmd)
 {
     /* Copy command into buffer */
-    xemu_monitor_buffer_append(mon_chr, (const uint8_t*)"# ", 2);
-    xemu_monitor_buffer_append(mon_chr, (const uint8_t*)cmd, strlen(cmd));
-    xemu_monitor_buffer_append(mon_chr, (const uint8_t*)"\n", 1);
+    gwemu_monitor_buffer_append(mon_chr, (const uint8_t*)"# ", 2);
+    gwemu_monitor_buffer_append(mon_chr, (const uint8_t*)cmd, strlen(cmd));
+    gwemu_monitor_buffer_append(mon_chr, (const uint8_t*)"\n", 1);
 
     /* Send command to monitor */
     int len = strlen(cmd)+1;
@@ -104,15 +104,15 @@ void xemu_run_monitor_command(const char *cmd)
     qemu_chr_be_write(mon_chr, (unsigned char*)cmd, len);
 }
 
-static const TypeInfo char_xemu_type_info = {
-    .name = TYPE_CHARDEV_XEMU_MONITOR,
+static const TypeInfo char_gwemu_type_info = {
+    .name = TYPE_CHARDEV_GWEMU_MONITOR,
     .parent = TYPE_CHARDEV,
-    .class_init = char_xemu_class_init,
+    .class_init = char_gwemu_class_init,
 };
 
 static void register_types(void)
 {
-    type_register_static(&char_xemu_type_info);
+    type_register_static(&char_gwemu_type_info);
 }
 
 type_init(register_types);

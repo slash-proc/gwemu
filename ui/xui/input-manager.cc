@@ -1,6 +1,6 @@
 #include "ui/xui/main-menu.hh"
 #include "input-manager.hh"
-#include "../xemu-input.h"
+#include "../gwemu-input.h"
 #include "common.hh"
 
 InputManager g_input_mgr;
@@ -56,7 +56,7 @@ void InputManager::Update()
 
     // Prevent controller events from going to the guest if they are being used
     // to navigate the HUD
-    xemu_input_set_test_mode(controller_focus_capture); // FIXME: Rename 'test mode'
+    gwemu_input_set_test_mode(controller_focus_capture); // FIXME: Rename 'test mode'
 
     // Update gamepad inputs
     #define IM_SATURATE(V)                      (V < 0.0f ? 0.0f : V > 1.0f ? 1.0f : V)

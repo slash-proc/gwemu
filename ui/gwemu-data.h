@@ -1,5 +1,5 @@
 /*
- * xemu Data File and Path Helpers
+ * GWemu Data File and Path Helpers
  *
  * Copyright (C) 2020-2021 Matt Borgerson
  *
@@ -17,15 +17,15 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef XEMU_DATA
-#define XEMU_DATA
+#ifndef GWEMU_DATA
+#define GWEMU_DATA
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // Note: Not thread safe. Returns a pointer to an internally allocated buffer.
-const char *xemu_get_resource_path(const char *filename);
+const char *gwemu_get_resource_path(const char *filename);
 
 #ifdef __cplusplus
 }

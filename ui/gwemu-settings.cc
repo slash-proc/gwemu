@@ -1,5 +1,5 @@
 /*
- * xemu Settings Management
+ * GWemu Settings Management
  *
  * Copyright (C) 2020-2022 Matt Borgerson
  *
@@ -31,23 +31,23 @@
 #include <iostream>
 #include <locale.h>
 
-#include "xemu-settings.h"
+#include "gwemu-settings.h"
 
 #define DEFINE_CONFIG_TREE
-#include "xemu-config.h"
+#include "gwemu-config.h"
 
 struct config g_config;
 
-static const char *filename = "xemu.toml";
+static const char *filename = "gwemu.toml";
 static const char *settings_path;
 static std::string error_msg;
 
-const char *xemu_settings_get_error_message(void)
+const char *gwemu_settings_get_error_message(void)
 {
     return error_msg.length() ? error_msg.c_str() : NULL;
 }
 
-static bool xemu_settings_detect_portable_mode(void)
+static bool gwemu_settings_detect_portable_mode(void)
 {
     bool val = false;
     char *portable_path = g_strdup_printf("%s%s", SDL_GetBasePath(), filename);
@@ -61,7 +61,7 @@ static bool xemu_settings_detect_portable_mode(void)
     return val;
 }
 
-void xemu_settings_set_path(const char *path)
+void gwemu_settings_set_path(const char *path)
 {
     assert(path != NULL);
     assert(settings_path == NULL);
@@ -69,19 +69,19 @@ void xemu_settings_set_path(const char *path)
     fprintf(stderr, "%s: config path: %s\n", __func__, settings_path);
 }
 
-const char *xemu_settings_get_base_path(void)
+const char *gwemu_settings_get_base_path(void)
 {
     static const char *base_path = NULL;
     if (base_path != NULL) {
         return base_path;
     }
 
-    if (xemu_settings_detect_portable_mode()) {
+    if (gwemu_settings_detect_portable_mode()) {
         const char *base = SDL_GetBasePath();
         assert(base != NULL);
         base_path = g_strdup(base);
     } else {
-        char *base = SDL_GetPrefPath("xemu", "xemu");
+        char *base = SDL_GetPrefPath("gwemu", "gwemu");
         assert(base != NULL);
         base_path = g_strdup(base);
         SDL_free(base);
@@ -90,27 +90,27 @@ const char *xemu_settings_get_base_path(void)
     return base_path;
 }
 
-const char *xemu_settings_get_path(void)
+const char *gwemu_settings_get_path(void)
 {
     if (settings_path != NULL) {
         return settings_path;
     }
 
-    const char *base = xemu_settings_get_base_path();
+    const char *base = gwemu_settings_get_base_path();
     assert(base != NULL);
     settings_path = g_strdup_printf("%s%s", base, filename);
     fprintf(stderr, "%s: config path: %s\n", __func__, settings_path);
     return settings_path;
 }
 
-const char *xemu_settings_get_default_eeprom_path(void)
+const char *gwemu_settings_get_default_eeprom_path(void)
 {
     static char *eeprom_path = NULL;
     if (eeprom_path != NULL) {
         return eeprom_path;
     }
 
-    const char *base = xemu_settings_get_base_path();
+    const char *base = gwemu_settings_get_base_path();
     assert(base != NULL);
     eeprom_path = g_strdup_printf("%s%s", base, "eeprom.bin");
     return eeprom_path;
@@ -154,9 +154,9 @@ static const char *read_file(FILE *fd)
     return buf;
 }
 
-bool xemu_settings_load(void)
+bool gwemu_settings_load(void)
 {
-    const char *settings_path = xemu_settings_get_path();
+    const char *settings_path = gwemu_settings_get_path();
     bool success = false;
 
     if (g_access(settings_path, F_OK) == -1) {
@@ -205,9 +205,9 @@ bool xemu_settings_load(void)
     return success;
 }
 
-void xemu_settings_save(void)
+void gwemu_settings_save(void)
 {
-    FILE *fd = g_fopen(xemu_settings_get_path(), "wb");
+    FILE *fd = g_fopen(gwemu_settings_get_path(), "wb");
     if (!fd) {
         fprintf(stderr, "Failed to open config file for writing. Check permissions.\n");
         return;
@@ -222,7 +222,7 @@ void xemu_settings_save(void)
     setlocale(LC_NUMERIC, "C");
 
     // The global controller vibration setting is replaced with a per-controller config.
-    // xemu_settings_load_gamepad_mapping should have migrated that setting to any connected
+    // gwemu_settings_load_gamepad_mapping should have migrated that setting to any connected
     // controller, so we can set it to true (default) now to remove it from the user config.
     g_config.input.allow_vibration = true;
 
@@ -264,7 +264,7 @@ void remove_net_nat_forward_ports(unsigned int index)
     cnode->store_to_struct(&g_config);
 }
 
-bool xemu_settings_load_gamepad_mapping(const char *guid,
+bool gwemu_settings_load_gamepad_mapping(const char *guid,
                                         GamepadMappings **mapping)
 {
     unsigned int i;
@@ -306,7 +306,7 @@ bool xemu_settings_load_gamepad_mapping(const char *guid,
     return true;
 }
 
-void xemu_settings_reset_controller_mapping(const char *guid)
+void gwemu_settings_reset_controller_mapping(const char *guid)
 {
     unsigned int gamepad_mappings_count = g_config.input.gamepad_mappings_count;
 
@@ -335,7 +335,7 @@ void xemu_settings_reset_controller_mapping(const char *guid)
     mapping_node->store_to_struct(mapping);
 }
 
-void xemu_settings_reset_keyboard_mapping(void)
+void gwemu_settings_reset_keyboard_mapping(void)
 {
   auto cnode = config_tree.child("input")->child("keyboard_controller_scancode_map");
   cnode->update_from_struct(&g_config);

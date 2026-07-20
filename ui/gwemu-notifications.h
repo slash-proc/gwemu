@@ -1,5 +1,5 @@
 /*
- * xemu Notification Management
+ * GWemu Notification Management
  *
  * Helper functions for other subsystems to queue a notification for the user,
  * which can be displayed by the HUD.
@@ -20,16 +20,16 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef XEMU_NOTIFICATION
-#define XEMU_NOTIFICATION
+#ifndef GWEMU_NOTIFICATION
+#define GWEMU_NOTIFICATION
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // Simple API to show a message on the screen when some event happens
-void xemu_queue_notification(const char *msg);
-void xemu_queue_error_message(const char *msg);
+void gwemu_queue_notification(const char *msg);
+void gwemu_queue_error_message(const char *msg);
 
 #ifdef __cplusplus
 }

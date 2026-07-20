@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -24,8 +24,10 @@
 #include "widgets.hh"
 #include "misc.hh"
 #include "gl-helpers.hh"
-#include "xemu-version.h"
+#include "gwemu-version.h"
 #include "main-menu.hh"
+#include "scene-manager.hh"
+#include "font-manager.hh"
 
 FirstBootWindow::FirstBootWindow()
 {
@@ -48,7 +50,19 @@ void FirstBootWindow::Draw()
         return;
     }
 
-    Logo();
+    // The interactive shader-rendered Logo() widget still renders xemu's
+    // own real logo artwork (ui/shader/xemu-logo.frag) -- swapping that
+    // asset for a real GWemu logo is a separate art task, not this rename
+    // pass. Showing another project's actual logo here would be genuinely
+    // misleading branding in the meantime, so just use plain text instead
+    // of calling Logo() until real artwork exists.
+    ImGui::Dummy(ImVec2(0, 20*g_viewport_mgr.m_scale));
+    ImGui::PushFont(g_font_mgr.m_menu_font_medium);
+    const char *title = "GWemu";
+    ImGui::SetCursorPosX((ImGui::GetWindowWidth()-ImGui::CalcTextSize(title).x)/2);
+    ImGui::TextUnformatted(title);
+    ImGui::PopFont();
+    ImGui::Dummy(ImVec2(0, 10*g_viewport_mgr.m_scale));
 
     const char *msg = "Configure machine settings to get started";
     ImGui::SetCursorPosX((ImGui::GetWindowWidth()-ImGui::CalcTextSize(msg).x)/2);
@@ -59,14 +73,15 @@ void FirstBootWindow::Draw()
     ImGui::SetCursorPosX((ImGui::GetWindowWidth()-120*g_viewport_mgr.m_scale)/2);
     if (ImGui::Button("Settings", ImVec2(120*g_viewport_mgr.m_scale, 0))) {
         g_main_menu.ShowSystem();
+        g_scene_mgr.PushScene(g_main_menu);
         g_config.general.show_welcome = false;
     }
 
     ImGui::Dummy(ImVec2(0,50*g_viewport_mgr.m_scale));
 
-    msg = "Visit https://xemu.app for more information";
+    msg = "Visit https://github.com/slash-proc/gwemu for more information";
     ImGui::SetCursorPosX((ImGui::GetWindowWidth()-ImGui::CalcTextSize(msg).x)/2);
-    Hyperlink(msg, "https://xemu.app");
+    Hyperlink(msg, "https://github.com/slash-proc/gwemu");
 
     ImGui::Dummy(ImVec2(400*g_viewport_mgr.m_scale,20*g_viewport_mgr.m_scale));
 

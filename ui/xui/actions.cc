@@ -2,14 +2,14 @@
 // gnw-h7b0 User Interface -- action dispatch (adapted from xemu)
 //
 // Xbox-specific actions (disc eject/load, F5-F8 bound-snapshot-shortcut
-// slots -- tied to xemu-snapshots.c's shortcut-key-map, not ported) have
+// slots -- tied to gwemu-snapshots.c's shortcut-key-map, not ported) have
 // been dropped. See CLAUDE.md for the porting rationale.
 //
 #include "common.hh"
 #include "actions.hh"
 #include "misc.hh"
-#include "xemu-hud.h"
-#include "../xemu-notifications.h"
+#include "gwemu-hud.h"
+#include "../gwemu-notifications.h"
 #include "snapshot-manager.hh"
 
 void ActionTogglePause(void)

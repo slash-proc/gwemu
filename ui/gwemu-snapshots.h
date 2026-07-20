@@ -1,5 +1,5 @@
 /*
- * xemu User Interface
+ * GWemu User Interface
  *
  * Copyright (C) 2020-2022 Matt Borgerson
  *
@@ -17,8 +17,8 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef XEMU_SNAPSHOTS_H
-#define XEMU_SNAPSHOTS_H
+#ifndef GWEMU_SNAPSHOTS_H
+#define GWEMU_SNAPSHOTS_H
 
 #include "qemu/osdep.h"
 
@@ -29,36 +29,36 @@ extern "C" {
 #include "block/snapshot.h"
 #include <epoxy/gl.h>
 
-#define XEMU_SNAPSHOT_DATA_MAGIC 0x78656d75 // 'xemu'
-#define XEMU_SNAPSHOT_DATA_VERSION 1
+#define GWEMU_SNAPSHOT_DATA_MAGIC 0x78656d75 // 'xemu'
+#define GWEMU_SNAPSHOT_DATA_VERSION 1
 
-#define XEMU_SNAPSHOT_THUMBNAIL_WIDTH 160
-#define XEMU_SNAPSHOT_THUMBNAIL_HEIGHT 120
+#define GWEMU_SNAPSHOT_THUMBNAIL_WIDTH 160
+#define GWEMU_SNAPSHOT_THUMBNAIL_HEIGHT 120
 
 extern const char **g_snapshot_shortcut_index_key_map[];
 
-typedef struct XemuSnapshotData {
+typedef struct GwemuSnapshotData {
     char *disc_path;
     char *xbe_title_name;
     GLuint gl_thumbnail;
-} XemuSnapshotData;
+} GwemuSnapshotData;
 
-// Implemented in xemu-snapshots.c
-char *xemu_get_currently_loaded_disc_path(void);
-int xemu_snapshots_list(QEMUSnapshotInfo **info, XemuSnapshotData **extra_data,
+// Implemented in gwemu-snapshots.c
+char *gwemu_get_currently_loaded_disc_path(void);
+int gwemu_snapshots_list(QEMUSnapshotInfo **info, GwemuSnapshotData **extra_data,
                         Error **err);
-void xemu_snapshots_load(const char *vm_name, Error **err);
-void xemu_snapshots_save(const char *vm_name, Error **err);
-void xemu_snapshots_delete(const char *vm_name, Error **err);
+void gwemu_snapshots_load(const char *vm_name, Error **err);
+void gwemu_snapshots_save(const char *vm_name, Error **err);
+void gwemu_snapshots_delete(const char *vm_name, Error **err);
 
-void xemu_snapshots_save_extra_data(QEMUFile *f);
-bool xemu_snapshots_offset_extra_data(QEMUFile *f);
-void xemu_snapshots_mark_dirty(void);
+void gwemu_snapshots_save_extra_data(QEMUFile *f);
+bool gwemu_snapshots_offset_extra_data(QEMUFile *f);
+void gwemu_snapshots_mark_dirty(void);
 
 // Implemented in xemu-thumbnail.cc
-void xemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip);
-bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size);
-void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size);
+void gwemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip);
+bool gwemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size);
+void *gwemu_snapshots_create_framebuffer_thumbnail_png(size_t *size);
 
 #ifdef __cplusplus
 }

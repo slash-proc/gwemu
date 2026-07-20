@@ -17,7 +17,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "xemu-os-utils.h"
+#include "gwemu-os-utils.h"
 #include <windows.h>
 #include <glib.h>
 #include <glib/gprintf.h>
@@ -49,7 +49,7 @@ static const char *get_windows_build_info(void)
     return g_strdup_printf("%ls", product_name);
 }
 
-const char *xemu_get_os_info(void)
+const char *gwemu_get_os_info(void)
 {
     static const char *buffer = NULL;
 

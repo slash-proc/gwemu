@@ -1,24 +1,24 @@
 /*
  * gnw-h7b0 User Interface -- minimal input state (Phase 1)
  *
- * See xemu-input.h for scope/rationale. Real host-gamepad polling (needed
+ * See gwemu-input.h for scope/rationale. Real host-gamepad polling (needed
  * for ImGui HUD navigation), no Xbox-USB-device binding.
  */
 
 #include "qemu/osdep.h"
-#include "xemu-input.h"
+#include "gwemu-input.h"
 
 ControllerStateList available_controllers =
     QTAILQ_HEAD_INITIALIZER(available_controllers);
 
 static bool g_test_mode;
 
-void xemu_input_init(void)
+void gwemu_input_init(void)
 {
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 }
 
-void xemu_input_set_test_mode(bool enabled)
+void gwemu_input_set_test_mode(bool enabled)
 {
     g_test_mode = enabled;
 }
@@ -42,7 +42,7 @@ static ControllerState *find_or_add(SDL_JoystickID id)
     return state;
 }
 
-void xemu_input_process_sdl_events(const SDL_Event *event)
+void gwemu_input_process_sdl_events(const SDL_Event *event)
 {
     if (event->type == SDL_EVENT_GAMEPAD_ADDED) {
         find_or_add(event->gdevice.which);
@@ -65,7 +65,7 @@ static int16_t axis_get(SDL_Gamepad *gp, SDL_GamepadAxis axis)
     return SDL_GetGamepadAxis(gp, axis);
 }
 
-void xemu_input_update_controllers(void)
+void gwemu_input_update_controllers(void)
 {
     ControllerState *state;
     QTAILQ_FOREACH (state, &available_controllers, entry) {

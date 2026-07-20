@@ -1,5 +1,5 @@
 //
-// xemu User Interface
+// GWemu User Interface
 //
 // Copyright (C) 2020-2022 Matt Borgerson
 //
@@ -17,7 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 #pragma once
-#include "../xemu-monitor.h"
+#include "../gwemu-monitor.h"
 #include "common.hh"
 
 class MonitorWindow

@@ -19,9 +19,9 @@
 
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
-#include "xemu-os-utils.h"
+#include "gwemu-os-utils.h"
 
-const char *xemu_get_os_info(void)
+const char *gwemu_get_os_info(void)
 {
 	return [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String];
 }
