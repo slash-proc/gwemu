@@ -1381,16 +1381,39 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
 static char **inject_default_args(int argc, char **argv, int *out_argc)
 {
     bool have_machine = false, have_display = false, have_flash_image = false;
+    bool is_query = false;
     for (int i = 1; i < argc; i++) {
         if (!argv[i]) continue;
         if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "-machine") == 0) {
             have_machine = true;
+            if (i + 1 < argc && argv[i + 1] && strcmp(argv[i + 1], "help") == 0) {
+                is_query = true;
+            }
         } else if (strcmp(argv[i], "-display") == 0) {
             have_display = true;
+            if (i + 1 < argc && argv[i + 1] && strcmp(argv[i + 1], "help") == 0) {
+                is_query = true;
+            }
+        } else if (strcmp(argv[i], "-version") == 0 ||
+                   strcmp(argv[i], "-h") == 0 ||
+                   strcmp(argv[i], "-help") == 0 ||
+                   strcmp(argv[i], "--help") == 0) {
+            is_query = true;
         } else if (strcmp(argv[i], "-global") == 0 && i + 1 < argc &&
                    argv[i + 1] && is_flash_image_global(argv[i + 1])) {
             have_flash_image = true;
         }
+    }
+
+    // A query invocation (-M help, -version, etc.) wants plain stdout
+    // output and a clean exit -- forcing a real SDL3 display/window
+    // to initialize for it is wrong even interactively, and outright
+    // breaks it on a headless host (CI runners, no display server),
+    // where display init failing silently eats the help text this is
+    // supposed to print. Pass such invocations through unmodified.
+    if (is_query) {
+        *out_argc = argc;
+        return argv;
     }
 
     GPtrArray *new_argv = g_ptr_array_new();
