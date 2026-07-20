@@ -1,6 +1,63 @@
 # Changelog
 
-## 2026-07-14 — IWDG/LPUART1 device models, CRC table-driven perf fix, DWT debug-print removal
+## 2026-07-19/20 — repo cleanup, CI/release pipeline, GUI foundation, C-ported asset tooling
+
+- Repo cleanup pass: deleted 17 dated `docs/session-*.md` investigation
+  diaries (~6900 lines, findings already live as code comments), rewrote
+  `docs/STATUS.md`/`CLAUDE.md`'s doc map as real snapshots instead of
+  growing narratives, squashed sibling-repo path references throughout,
+  audited every script for hardcoded-path portability, un-vendored
+  `STM32H7B0.svd` (5.2MB, now user-supplied like `rm0455.pdf`/`sdk/`
+  instead of committed), added `docs/peripheral-coverage.md` (hand-
+  maintained real-model/stub/unmodeled index, replacing a mechanically-
+  regeneratable per-register audit dir that had zero curated content).
+- Added `.github/workflows/build-check.yml` (Linux, every push/PR) and
+  `release.yml` (Linux/Mac-arm64/Mac-x86_64/Windows, tags + manual
+  dispatch). Confirmed actually green via real test-tag CI runs (not just
+  "should work") across several rounds of real, distinct failures: missing
+  `tomli`/`diffutils`/`zip` build deps, a `pipefail` bashism under a
+  container's default non-bash shell, macOS ad-hoc code-signing needing
+  the unsigned->signed rename step, and two real portability bugs in our
+  own device-model code — `hw/misc/gnw_h7b0_rtc.c` used libc `timegm()`
+  (unavailable on MinGW, fixed via QEMU's own `mktimegm()`), and
+  `hw/arm/gnw_h7b0_soc.c` called `memory_region_init_ram_from_file()`
+  unconditionally (CONFIG_POSIX-only upstream, genuinely unavailable on
+  Windows) — Windows now gets real persistent flash-image backing via a
+  from-scratch `CreateFileMapping`/`MapViewOfFile` implementation
+  (wrapped with `memory_region_init_ram_ptr()`, the same portable
+  host-pointer pattern `gnw_h7b0_otfdec.c` already used) rather than a
+  silent ephemeral-RAM fallback.
+- `contrib/gnw-tools/`: added `gnw-make-boot-images` (C port of
+  `make_boot_images.py`) and `gnw-make-cfw-images` (C port of
+  `make_cfw_images.py`, including a full from-scratch C port of
+  gnwmanager's Thumb-2 assembler, lz77 decompressor, LZMA1 compressor
+  (system `liblzma` — a vendored-LZMA-SDK-encoder attempt was tried and
+  rejected first: it's a genuinely different codebase from `liblzma` that
+  doesn't agree bit-for-bit on real data despite matching nominal
+  parameters), AES-128, pre-extracted ELF symbol tables, and the
+  `Firmware`/`Device` relocation engine). Both byte-exact verified against
+  their Python originals for both games — this is groundwork for the GUI
+  to call as real linked library functions instead of shelling out.
+- GUI Phase 1 (`58fd37cdcb`): ported xemu's SDL3+ImGui HUD foundation with
+  zero Xbox content — Xbox-domain files (disc/XBE UI, NV2A debug panels,
+  Xbox controller binding, snapshot-manager's Xbox-save assumptions) were
+  never copied in, not stripped after the fact; the safe, generic plumbing
+  (viewport/font/animation/scene management, widget helpers) was ported
+  close to as-is. Verified with real evidence (screenshot of actual LTDC
+  output with the new menu bar overlaid, process stable across checks),
+  not just a clean build.
+- Two real device-model perf fixes from the sibling `stm32h7b0-diag`
+  suite's reports (`87ba4be1d9`, `31fc4b479b`): memory-to-memory DMA
+  transfers were incorrectly falling through to a 48kHz-audio-pacing
+  timer built for SAI1 (~395x latency gap, fixed by reading `CR.DIR`
+  directly and treating M2M as low-latency like HASH already does); MDMA
+  did a per-word `cpu_physical_memory_read/write` loop for bulk transfers
+  (~21x gap from per-call dispatch overhead, fixed with a bulk-copy fast
+  path for the contiguous case). A third finding (LTDC's full-framebuffer
+  snapshot firing on any `SRCR.IMR` reload regardless of which layer
+  actually changed) was fixed too (`905376c344`), narrowly scoped (pure
+  register-equality check, no timing heuristics) given this file's history
+  of real flicker/stutter regressions from broader changes.
 
 - Added real minimal IWDG/LPUART1 device models replacing bare
   `create_unimplemented_device()` stubs, fixing wrong reset values

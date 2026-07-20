@@ -42,12 +42,30 @@ audio, gamepad input, SD card, save/flash persistence.
 
 ## Now / next
 
-- Repo cleanup pass: pruning historical investigation docs (their findings
-  now live as code comments and in CHANGELOG.md, not as standalone
-  narrative), auditing scripts for portability, automating first-run setup
-  (SD card image, etc.) for new users.
-- Next up after cleanup: a usable GUI (in the spirit of `xemu`), then CI +
-  cross-platform (Linux/Mac/Windows) release builds.
+- Repo cleanup pass (docs, sibling-repo references, script portability,
+  automated first-run/SD-card setup) — done.
+- CI is up: `.github/workflows/build-check.yml` (Linux, every push/PR) and
+  `release.yml` (Linux/Mac-arm64/Mac-x86_64/Windows, tags + manual dispatch).
+  Confirmed green end-to-end via real test-tag runs, including two real
+  cross-platform bugs this surfaced and fixed (`timegm()`/MinGW,
+  `memory_region_init_ram_from_file()` being POSIX-only — Windows now gets
+  genuine persistent flash-image backing via `CreateFileMapping`, not a
+  silent ephemeral-RAM fallback).
+- GUI (`gwemu`, see `CLAUDE.md`'s "GUI" section for build/workflow specifics):
+  Phase 1 (SDL3+ImGui foundation, ported from xemu with zero Xbox content)
+  is committed and verified. Phase 2 (real menu content — Flash/SD Card
+  presets and geometry-bar extflash editor, Input rebinding, Display/Audio,
+  Snapshots, Reset/Power buttons, an Apply-triggered restart flow) is built
+  and working through several real bug-fix rounds (async subprocess
+  handling, settings persistence, a Wayland-specific ImGui viewport
+  limitation) but **not yet committed** — sitting in the working tree
+  pending a consolidation/review pass.
+- `contrib/gnw-tools/`: C ports of `make_boot_images.py` and
+  `make_cfw_images.py` (including a from-scratch C port of gnwmanager's
+  Thumb-2 assembler/lz77/LZMA/relocation-engine patch pipeline), both
+  byte-exact verified against their Python originals, built specifically
+  so the GUI can call them as real library functions. `make_sdcard_image.py`
+  is not ported to C; the GUI shells it out on a background thread.
 
 ## Tooling notes worth keeping in mind
 

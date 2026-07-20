@@ -109,6 +109,75 @@ all, and the failure only surfaces later at `boot_qemu.sh` launch time
 whole section is a placeholder for a real README once we write one (see
 "Outsider workflow" below) — not yet gnw-specific beyond the note above.
 
+## GUI (`gwemu`, Item 5 of the cleanup/roadmap effort)
+
+A real ImGui-based GUI exists now, ported from xemu (github.com/xemu-project/xemu)
+and rebranded — this repo's own product identity is `gwemu`/`GWemu`; "xemu" is kept
+only where it's genuine attribution to the real upstream project (license headers,
+"ported from xemu" comments, the About tab's credits — never blindly renamed).
+
+- Build additions: SDL3, Dear ImGui (a committed docking-branch vendor tree at
+  `subprojects/imgui/` — NOT wrap-fetched, since no upstream URL hosts this
+  project's exact xemu-patches-on-docking-branch merge; see the commit that
+  landed it for provenance), ImPlot, `genconfig` (the `config_spec.yml` ->
+  generated-settings-struct pipeline), tomlplusplus, nlohmann/json, libepoxy.
+  Source lives in `ui/xui/` (the actual HUD: menu bar, tabs, widgets) and
+  `ui/gwemu*.{c,h,cc,m}` (SDL3 window/GL-context/event-loop glue).
+- `-display gwemu` is the GUI display backend (was `-display xemu` before the
+  rebrand — if you find an old invocation using the xemu name, it's stale).
+- **Always build with `ninja -j12`, not bare `ninja`** — bare `ninja` grabs
+  every core on the host and has caused real problems in this dev environment
+  when multiple things are building concurrently.
+- **Multi-viewport (detachable windows) is deliberately OFF** (`ImGuiConfigFlags_ViewportsEnable`
+  is not set, `DockingEnable` is). Dear ImGui's own SDL3 backend only wires up
+  cross-window mouse-coordinate translation on a hardcoded platform whitelist
+  (Windows/Mac/X11) — Wayland isn't on it, and this project's real dev/test
+  environment is Wayland, so enabling it produces broken, offset mouse
+  hit-testing on any detached window. Don't re-enable this without either
+  forcing `SDL_VIDEODRIVER=x11` permanently or confirming on a whitelisted
+  platform first.
+- **Testing in a Wayland dev environment**: launch with `SDL_VIDEODRIVER=x11`
+  as a workaround for an unrelated Wayland/libdecor crash in this sandbox
+  (`SDL_VIDEODRIVER=x11 ./build/qemu-system-arm -M gnw-h7b0 -display gwemu ...`).
+  Screen-capture tooling (`import`/ImageMagick) is blocked in this sandbox for
+  every agent that's tried it this session — don't assume you can screenshot;
+  fall back to process-stability checks (stays alive, clean log, correct GPU
+  detection) and say plainly when visual confirmation wasn't possible.
+- **Async discipline**: never run a slow operation (subprocess `popen()`,
+  file I/O over more than a few hundred KB) synchronously inside an ImGui
+  widget's click handler — it blocks the render/event loop and the whole
+  app appears hung (confirmed real-world: building an SD card image this way
+  froze the app for minutes). Use a background thread + an atomic/mutex-guarded
+  status struct the render loop polls each frame instead.
+- **`config_spec.yml` nesting matters** — e.g. `debug:` lives under `display:`,
+  not top-level, so the generated field is `g_config.display.debug.foo`, not
+  `g_config.debug.foo`. Check the actual YAML indentation before referencing a
+  new field; a wrong assumption here fails at compile time with a
+  `'struct config' has no member named ...` error, not a silent bug, but it's
+  cost real time more than once this session.
+- **`execv()`-based restart and settings**: the Flash tab's "Apply" flow
+  restarts the process (`execv()`) to pick up new flash-image bindings, since
+  QEMU can't hot-swap a RAM region's file backing after realize. `execv()`
+  does NOT run `atexit` handlers — anywhere that relies solely on an
+  atexit-registered settings save (rather than saving immediately on change)
+  will silently lose that change across an Apply-triggered restart. Save
+  explicitly before any `execv()` call.
+- **`contrib/gnw-tools/`**: C ports of this project's own Python asset-building
+  scripts, written specifically so the GUI can call them as real library
+  functions instead of shelling out to Python. `gnw-make-boot-images` (from
+  `make_boot_images.py`) and `gnw-make-cfw-images` (from `make_cfw_images.py`,
+  including a full from-scratch C port of gnwmanager's Thumb-2 assembler,
+  lz77 decompressor, LZMA1 compressor via system `liblzma`, and the
+  relocation/patch engine) are both byte-exact verified against their Python
+  originals for both games. `make_sdcard_image.py` (FAT32/qcow2 generation)
+  is NOT ported to C — the GUI shells out to it as a subprocess (on a
+  background thread, see the async rule above).
+- When multiple agents/sessions touch `ui/xui/main-menu.cc` (the shared tab
+  registration point) concurrently, keep each tab's actual content in its own
+  `.cc`/`.hh` file pair and only touch `main-menu.cc`/`.hh` for the minimal
+  registration lines — this held up well across several genuinely-concurrent
+  editing sessions this project has already gone through.
+
 ## Outsider workflow (first-run, end to end)
 
 This is internal working notes for now; fold into a real README once we
