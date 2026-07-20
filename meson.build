@@ -1618,7 +1618,7 @@ endif
 
 # gnw-h7b0 GUI (Phase 1, ported from xemu): SDL3 + Dear ImGui, additive
 # alongside the existing SDL2 backend above -- not a replacement. See
-# ui/xemu.c / ui/xui/ and CLAUDE.md for the porting rationale.
+# ui/gwemu.c / ui/xui/ and CLAUDE.md for the porting rationale.
 #
 # Bare `dependency('sdl3', required: false)` never actually drives the
 # wrap's CMake subproject build (only probes for an already-installed
@@ -2560,7 +2560,7 @@ config_host_data.set('CONFIG_RDMA', rdma.found())
 config_host_data.set('CONFIG_RELOCATABLE', get_option('relocatable'))
 config_host_data.set('CONFIG_SAFESTACK', get_option('safe_stack'))
 config_host_data.set('CONFIG_SDL', sdl.found())
-config_host_data.set('CONFIG_XEMU_GUI', sdl3.found())
+config_host_data.set('CONFIG_GWEMU_GUI', sdl3.found())
 config_host_data.set('CONFIG_SDL_IMAGE', sdl_image.found())
 config_host_data.set('CONFIG_SECCOMP', seccomp.found())
 if seccomp.found()
@@ -3622,16 +3622,16 @@ qemu_version = custom_target('qemu-version.h',
 genh += qemu_version
 
 if sdl3.found()
-  xemu_version_cmd = [find_program('scripts/xemu-version.sh'),
+  gwemu_version_cmd = [find_program('scripts/gwemu-version.sh'),
                        meson.current_source_dir()]
-  xemu_version_macro = custom_target('xemu-version-macro.h',
-                               output: 'xemu-version-macro.h',
-                               command: xemu_version_cmd,
+  gwemu_version_macro = custom_target('gwemu-version-macro.h',
+                               output: 'gwemu-version-macro.h',
+                               command: gwemu_version_cmd,
                                capture: true,
                                build_by_default: true,
                                build_always_stale: true)
-  genh += xemu_version_macro
-  # xemu_config (needs genconfig_proj) is added further below, right after
+  genh += gwemu_version_macro
+  # gwemu_config (needs genconfig_proj) is added further below, right after
   # genconfig_proj itself is declared -- meson evaluates top-to-bottom.
 endif
 
@@ -3832,7 +3832,7 @@ imgui = not_found
 implot = not_found
 genconfig = not_found
 tomlplusplus = not_found
-xemu_json = not_found
+gwemu_json = not_found
 if sdl3.found()
   imgui_proj = subproject('imgui', required: true,
                            default_options: [
@@ -3854,19 +3854,19 @@ if sdl3.found()
   genconfig_proj = subproject('genconfig', required: true)
   genconfig = genconfig_proj.get_variable('cnode_dep')
 
-  xemu_config = custom_target('xemu-config.h',
-                              output: 'xemu-config.h',
+  gwemu_config = custom_target('gwemu-config.h',
+                              output: 'gwemu-config.h',
                               input: [ files('config_spec.yml') ],
                               command : [python, genconfig_proj.get_variable('gen_config_script_path'), '@INPUT@', '@OUTPUT@'],
                               )
-  genh += xemu_config
+  genh += gwemu_config
 
   tomlplusplus = dependency('tomlplusplus', required: true, fallback: ['tomlplusplus', 'tomlplusplus_dep'])
   # tomlplusplus (as vendored) uses a C++20-legal literal-operator syntax
   # that C++23 deprecates -- not our code to fix, just don't let -Werror
   # on the newer compiler standard here (-std=gnu++23) treat it as fatal.
   add_project_arguments('-Wno-error=deprecated-literal-operator', language: 'cpp')
-  xemu_json = dependency('nlohmann_json', required: true, fallback: ['json', 'nlohmann_json_dep'])
+  gwemu_json = dependency('nlohmann_json', required: true, fallback: ['json', 'nlohmann_json_dep'])
 endif
 
 subdir('ui')
@@ -4602,6 +4602,24 @@ foreach target : target_dirs
 
   endforeach
 endforeach
+
+# gnw-h7b0: a real "gwemu" (gwemu.exe on Windows) named binary, not just
+# qemu-system-arm's generic upstream name -- a straight copy alongside it,
+# not a rename, so nothing that already references qemu-system-arm by name
+# (boot_qemu.sh, CI, docs) needs to change. Only produced when the actual
+# gnw-h7b0 arm-softmmu build is in the target list (this fork's only real
+# use case; harmless no-op otherwise).
+if 'qemu-system-arm' in emulators
+  gwemu_binary_name = host_os == 'windows' ? 'gwemu.exe' : 'gwemu'
+  custom_target('gwemu-binary-alias',
+                 input: emulators['qemu-system-arm'],
+                 output: gwemu_binary_name,
+                 command: [python, '-c',
+                           'import shutil, sys; shutil.copy2(sys.argv[1], sys.argv[2])',
+                           '@INPUT@', '@OUTPUT@'],
+                 build_by_default: true,
+                 install: false)
+endif
 
 # Other build targets
 

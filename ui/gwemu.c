@@ -1,5 +1,5 @@
 /*
- * xemu SDL display driver
+ * GWemu SDL display driver
  *
  * Copyright (c) 2020-2025 Matt Borgerson
  *
@@ -42,25 +42,26 @@
 #include "system/runstate.h"
 #include "system/runstate-action.h"
 #include "system/system.h"
-#include "xui/xemu-hud.h"
-#include "xemu-input.h"
-#include "xemu-settings.h"
-#include "xemu-snapshots.h"
-#include "xemu-version.h"
-#include "xemu-os-utils.h"
+#include "xui/gwemu-hud.h"
+#include "gwemu-gnw-input.h"
+#include "gwemu-input.h"
+#include "gwemu-settings.h"
+#include "gwemu-snapshots.h"
+#include "gwemu-version.h"
+#include "gwemu-os-utils.h"
 
-#include "ui/xemu-notifications.h"
+#include "ui/gwemu-notifications.h"
 
 #include <stb_image.h>
 #include <locale.h>
 #include <math.h>
 #include <SDL3/SDL.h>
 
-#ifndef DEBUG_XEMU_C
-#define DEBUG_XEMU_C 0
+#ifndef DEBUG_GWEMU_C
+#define DEBUG_GWEMU_C 0
 #endif
 
-#if DEBUG_XEMU_C
+#if DEBUG_GWEMU_C
 #define DPRINTF(...) fprintf(stderr, __VA_ARGS__)
 #else
 #define DPRINTF(...)
@@ -69,7 +70,7 @@
 uint64_t vblank_interval_ns = 16666666LL;
 bool use_vblank_timer_thread = true;
 
-struct xemu_console {
+struct gwemu_console {
     DisplayChangeListener dcl;
     DisplaySurface *surface;
     DisplayOptions *opts;
@@ -91,7 +92,7 @@ __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 #endif
 
 static int num_outputs;
-static struct xemu_console *scon_list;
+static struct gwemu_console *scon_list;
 static SDL_Surface *guest_sprite_surface;
 static int gui_grab; /* if true, all keyboard/mouse events are grabbed */
 static bool alt_grab;
@@ -116,33 +117,33 @@ static bool qemu_exiting;
 static int exit_status;
 
 
-#if DEBUG_XEMU_C
+#if DEBUG_GWEMU_C
 static uint64_t lock_held_acc;
 static uint64_t lock_start;
 #endif
 
-void xemu_main_loop_lock(void)
+void gwemu_main_loop_lock(void)
 {
     bql_lock();
-#if DEBUG_XEMU_C
+#if DEBUG_GWEMU_C
     lock_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 #endif
 }
 
-void xemu_main_loop_unlock(void)
+void gwemu_main_loop_unlock(void)
 {
-#if DEBUG_XEMU_C
+#if DEBUG_GWEMU_C
     lock_held_acc += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - lock_start;
 #endif
     bql_unlock();
 }
 
-SDL_Window *xemu_get_window(void)
+SDL_Window *gwemu_get_window(void)
 {
     return m_window;
 }
 
-static struct xemu_console *get_scon_from_window(uint32_t window_id)
+static struct gwemu_console *get_scon_from_window(uint32_t window_id)
 {
     int i;
     for (i = 0; i < num_outputs; i++) {
@@ -153,7 +154,7 @@ static struct xemu_console *get_scon_from_window(uint32_t window_id)
     return NULL;
 }
 
-static void window_resize(struct xemu_console *scon)
+static void window_resize(struct gwemu_console *scon)
 {
     if (!scon->real_window) {
         return;
@@ -164,7 +165,7 @@ static void window_resize(struct xemu_console *scon)
                       surface_height(scon->surface));
 }
 
-static void hide_cursor(struct xemu_console *scon)
+static void hide_cursor(struct gwemu_console *scon)
 {
     if (scon->opts->has_show_cursor && scon->opts->show_cursor) {
         return;
@@ -178,7 +179,7 @@ static void hide_cursor(struct xemu_console *scon)
     }
 }
 
-static void show_cursor(struct xemu_console *scon)
+static void show_cursor(struct gwemu_console *scon)
 {
     if (scon->opts->has_show_cursor && scon->opts->show_cursor) {
         return;
@@ -198,11 +199,11 @@ static void show_cursor(struct xemu_console *scon)
     SDL_ShowCursor();
 }
 
-static void grab_start(struct xemu_console *scon)
+static void grab_start(struct gwemu_console *scon)
 {
 }
 
-static void grab_end(struct xemu_console *scon)
+static void grab_end(struct gwemu_console *scon)
 {
     SDL_SetWindowKeyboardGrab(scon->real_window, false);
     SDL_SetWindowMouseGrab(scon->real_window, false);
@@ -210,7 +211,7 @@ static void grab_end(struct xemu_console *scon)
     show_cursor(scon);
 }
 
-static void absolute_mouse_grab(struct xemu_console *scon)
+static void absolute_mouse_grab(struct gwemu_console *scon)
 {
     float mouse_x, mouse_y;
     int scr_w, scr_h;
@@ -238,7 +239,7 @@ static void mouse_mode_change(Notifier *notify, void *data)
     }
 }
 
-static void send_mouse_event(struct xemu_console *scon, int dx, int dy,
+static void send_mouse_event(struct gwemu_console *scon, int dx, int dy,
                                  int x, int y, int state)
 {
     static uint32_t bmap[INPUT_BUTTON__MAX] = {
@@ -273,7 +274,7 @@ static void send_mouse_event(struct xemu_console *scon, int dx, int dy,
     qemu_input_event_sync();
 }
 
-static void set_full_screen(struct xemu_console *scon, bool set)
+static void set_full_screen(struct gwemu_console *scon, bool set)
 {
     gui_fullscreen = set;
 
@@ -309,17 +310,17 @@ static void set_full_screen(struct xemu_console *scon, bool set)
     }
 }
 
-static void toggle_full_screen(struct xemu_console *scon)
+static void toggle_full_screen(struct gwemu_console *scon)
 {
     set_full_screen(scon, !gui_fullscreen);
 }
 
-void xemu_toggle_fullscreen(void)
+void gwemu_toggle_fullscreen(void)
 {
     toggle_full_screen(&scon_list[0]);
 }
 
-int xemu_is_fullscreen(void)
+int gwemu_is_fullscreen(void)
 {
     return gui_fullscreen;
 }
@@ -338,7 +339,7 @@ static int get_mod_state(void)
     }
 }
 
-static void process_key(struct xemu_console *scon, SDL_KeyboardEvent *ev)
+static void process_key(struct gwemu_console *scon, SDL_KeyboardEvent *ev)
 {
     int qcode;
 
@@ -352,7 +353,7 @@ static void process_key(struct xemu_console *scon, SDL_KeyboardEvent *ev)
 static void handle_keydown(SDL_Event *ev)
 {
     int win;
-    struct xemu_console *scon = get_scon_from_window(ev->key.windowID);
+    struct gwemu_console *scon = get_scon_from_window(ev->key.windowID);
     if (scon == NULL) return;
     int gui_key_modifier_pressed = get_mod_state();
     int gui_keysym = 0;
@@ -411,7 +412,7 @@ static void handle_keydown(SDL_Event *ev)
 
 static void handle_keyup(SDL_Event *ev)
 {
-    struct xemu_console *scon = get_scon_from_window(ev->key.windowID);
+    struct gwemu_console *scon = get_scon_from_window(ev->key.windowID);
     if (!scon) return;
 
     scon->ignore_hotkeys = false;
@@ -421,7 +422,7 @@ static void handle_keyup(SDL_Event *ev)
 static void handle_mousemotion(SDL_Event *ev)
 {
     int max_x, max_y;
-    struct xemu_console *scon = get_scon_from_window(ev->motion.windowID);
+    struct gwemu_console *scon = get_scon_from_window(ev->motion.windowID);
 
     if (!scon || !qemu_console_is_graphic(scon->dcl.con)) {
         return;
@@ -453,7 +454,7 @@ static void handle_mousebutton(SDL_Event *ev)
 {
     int buttonstate = SDL_GetMouseState(NULL, NULL);
     SDL_MouseButtonEvent *bev;
-    struct xemu_console *scon = get_scon_from_window(ev->button.windowID);
+    struct gwemu_console *scon = get_scon_from_window(ev->button.windowID);
 
     if (!scon || !qemu_console_is_graphic(scon->dcl.con)) {
         return;
@@ -477,7 +478,7 @@ static void handle_mousebutton(SDL_Event *ev)
 
 static void handle_mousewheel(SDL_Event *ev)
 {
-    struct xemu_console *scon = get_scon_from_window(ev->wheel.windowID);
+    struct gwemu_console *scon = get_scon_from_window(ev->wheel.windowID);
     SDL_MouseWheelEvent *wev = &ev->wheel;
     InputButton btn;
 
@@ -501,7 +502,7 @@ static void handle_mousewheel(SDL_Event *ev)
 
 static void handle_windowevent(SDL_Event *ev)
 {
-    struct xemu_console *scon = get_scon_from_window(ev->window.windowID);
+    struct gwemu_console *scon = get_scon_from_window(ev->window.windowID);
     bool allow_close = true;
 
     if (!scon) {
@@ -568,7 +569,7 @@ static void handle_windowevent(SDL_Event *ev)
 static void mouse_warp(DisplayChangeListener *dcl,
                        int x, int y, bool on)
 {
-    struct xemu_console *scon = container_of(dcl, struct xemu_console, dcl);
+    struct gwemu_console *scon = container_of(dcl, struct gwemu_console, dcl);
 
     if (!qemu_console_is_graphic(scon->dcl.con)) {
         return;
@@ -695,7 +696,7 @@ static bool xb_console_gl_check_format(DisplayChangeListener *dcl,
 static void gl_switch(DisplayChangeListener *dcl,
                       DisplaySurface *new_surface)
 {
-    struct xemu_console *scon = container_of(dcl, struct xemu_console, dcl);
+    struct gwemu_console *scon = container_of(dcl, struct gwemu_console, dcl);
     scon->surface = new_surface;
 }
 
@@ -722,7 +723,7 @@ static void update_fps(void)
     fps = 1000.0/avg;
 }
 
-static void process_vblank(struct xemu_console *scon)
+static void process_vblank(struct gwemu_console *scon)
 {
     assert(bql_locked());
 
@@ -741,7 +742,7 @@ static void process_vblank(struct xemu_console *scon)
 
 static void vblank_timer_callback(void *opaque)
 {
-    struct xemu_console *scon = (struct xemu_console *)opaque;
+    struct gwemu_console *scon = (struct gwemu_console *)opaque;
 
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     process_vblank(scon);
@@ -750,7 +751,7 @@ static void vblank_timer_callback(void *opaque)
 
 static void *vblank_timer_thread(void *opaque)
 {
-    struct xemu_console *scon = (struct xemu_console *)opaque;
+    struct gwemu_console *scon = (struct gwemu_console *)opaque;
     int64_t next_vblank = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
     while (!qatomic_read(&qemu_exiting)) {
@@ -768,16 +769,16 @@ static void *vblank_timer_thread(void *opaque)
         }
 
         if (!qatomic_read(&qemu_exiting)) {
-            xemu_main_loop_lock();
+            gwemu_main_loop_lock();
             process_vblank(scon);
-            xemu_main_loop_unlock();
+            gwemu_main_loop_unlock();
         }
     }
 
     return NULL;
 }
 
-#if DEBUG_XEMU_C
+#if DEBUG_GWEMU_C
 static void report_stats(void)
 {
     uint64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -801,7 +802,7 @@ static void report_stats(void)
  * Renders the main interface. Usually called from the main thread,
  * but may sometimes be called from another thread.
  */
-static void gl_render_frame(struct xemu_console *scon)
+static void gl_render_frame(struct gwemu_console *scon)
 {
     static bool rendering;
     if (qatomic_xchg(&rendering, true) || qatomic_read(&qemu_exiting)) {
@@ -827,35 +828,35 @@ static void gl_render_frame(struct xemu_console *scon)
     assert(glGetError() == GL_NO_ERROR);
 
     if (tex == 0) {
-        xemu_main_loop_lock();
+        gwemu_main_loop_lock();
         // FIXME: Don't upload if notdirty
         xb_surface_gl_create_texture(scon->surface);
         tex = scon->surface->texture;
         flip_required = true;
         release_surface_texture = true;
-        xemu_main_loop_unlock();
+        gwemu_main_loop_unlock();
     }
 
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
-    xemu_hud_set_framebuffer_texture(tex, flip_required);
+    gwemu_hud_set_framebuffer_texture(tex, flip_required);
 
     /* FIXME: Finer locking. Event handlers in segments of the code expect
      * to be running on the main thread with the BQL. For now, acquire the
      * lock and perform rendering, but release before swap to avoid
      * possible lengthy blocking (for vsync).
      */
-    xemu_main_loop_lock();
-    xemu_hud_update();
-    xemu_main_loop_unlock();
+    gwemu_main_loop_lock();
+    gwemu_hud_update();
+    gwemu_main_loop_unlock();
 
-    xemu_hud_render();
+    gwemu_hud_render();
     glFinish();
 
     if (release_surface_texture) {
-        xemu_main_loop_lock();
+        gwemu_main_loop_lock();
         xb_surface_gl_destroy_texture(scon->surface);
-        xemu_main_loop_unlock();
+        gwemu_main_loop_unlock();
     }
 
     SDL_GL_SwapWindow(scon->real_window);
@@ -863,14 +864,14 @@ static void gl_render_frame(struct xemu_console *scon)
 
     qatomic_set(&rendering, false);
 
-#if DEBUG_XEMU_C
+#if DEBUG_GWEMU_C
     report_stats();
 #endif
 }
 
 static bool event_watch_callback(void *userdata, SDL_Event *event)
 {
-    struct xemu_console *scon = (struct xemu_console *)userdata;
+    struct gwemu_console *scon = (struct gwemu_console *)userdata;
 
     if (event->type == SDL_EVENT_WINDOW_EXPOSED ||
         event->type == SDL_EVENT_WINDOW_RESIZED) {
@@ -880,29 +881,42 @@ static bool event_watch_callback(void *userdata, SDL_Event *event)
     return true; // Ignored
 }
 
-static void poll_events(struct xemu_console *scon)
+static void poll_events(struct gwemu_console *scon)
 {
     SDL_Event ev1, *ev = &ev1;
     bool allow_close = true;
 
     int kbd = 0, mouse = 0;
-    xemu_hud_should_capture_kbd_mouse(&kbd, &mouse);
+    gwemu_hud_should_capture_kbd_mouse(&kbd, &mouse);
 
     while (SDL_PollEvent(ev)) {
-        xemu_main_loop_lock();
+        gwemu_main_loop_lock();
 
         // HUD must process events first so that if a controller is detached,
         // a latent rebind request can cancel before the state is freed
-        xemu_hud_process_sdl_events(ev);
-        xemu_input_process_sdl_events(ev);
+        gwemu_hud_process_sdl_events(ev);
+        gwemu_input_process_sdl_events(ev);
+
+        // GNW-button remap layer: consumes keyboard/gamepad events bound to
+        // a GNW button (synthesizing the emulated device's own fixed qcode
+        // for it) or a pending rebind capture -- see gwemu-gnw-input.h. This
+        // is the single call site for gnw_input_process_sdl_event();
+        // MainMenuScene::ConsumeRebindEvent() (called above via
+        // gwemu_hud_process_sdl_events) only reports whether a rebind is
+        // currently pending, it does not itself invoke this, so a given
+        // event is never processed by the GNW input layer twice. An event
+        // consumed here must not also fall through to the raw keyboard
+        // passthrough below, or a remapped key would double-fire (once as
+        // its own literal keypress, once as the synthesized GNW button).
+        bool gnw_consumed = gnw_input_process_sdl_event(ev);
 
         switch (ev->type) {
         case SDL_EVENT_KEY_DOWN:
-            if (kbd) break;
+            if (kbd || gnw_consumed) break;
             handle_keydown(ev);
             break;
         case SDL_EVENT_KEY_UP:
-            if (kbd) break;
+            if (kbd || gnw_consumed) break;
             handle_keyup(ev);
             break;
         case SDL_EVENT_QUIT:
@@ -934,12 +948,12 @@ static void poll_events(struct xemu_console *scon)
             break;
         }
 
-        xemu_main_loop_unlock();
+        gwemu_main_loop_unlock();
     }
 
-    xemu_main_loop_lock();
-    xemu_input_update_controllers();
-    xemu_main_loop_unlock();
+    gwemu_main_loop_lock();
+    gwemu_input_update_controllers();
+    gwemu_main_loop_unlock();
 }
 
 static void display_very_early_init(DisplayOptions *o)
@@ -979,38 +993,41 @@ static void display_very_early_init(DisplayOptions *o)
         SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
-    char *title = g_strdup_printf("xemu | v%s"
-#ifdef XEMU_DEBUG_BUILD
+    char *title = g_strdup_printf("GWemu | v%s"
+#ifdef GWEMU_DEBUG_BUILD
                                   " Debug"
 #endif
-                                  , xemu_version);
+                                  , gwemu_version);
 
-    // Decide window size
-    int min_window_width = 640;
-    int min_window_height = 480;
-    int window_width = min_window_width;
-    int window_height = min_window_height;
+    // Decide window size. The window's size follows the emulated screen's
+    // native resolution x an integer scale -- not the other way around
+    // (a window-size-drives-content-fit model was tried twice and was
+    // backwards per the user). GNW_NATIVE_WIDTH/HEIGHT match the real,
+    // fixed G&W LCD panel (hw/display/gnw_h7b0_ltdc.c's own documented
+    // 320x240 + its GNW_H7B0_LTDC_SCALE=2 "1:1 is uncomfortably small"
+    // precedent) -- a real hardware fact, not a guess, even though LTDC's
+    // registers are technically configurable (every real firmware image
+    // configures this same panel size in practice). xemu's old res_table
+    // here was a list of Xbox AV-pack output resolutions (720p, 1080p,
+    // etc.) -- meaningless for a fixed small G&W panel, dropped entirely.
+    #define GNW_NATIVE_WIDTH  320
+    #define GNW_NATIVE_HEIGHT 240
+    #define GNW_DEFAULT_SCALE 2
 
-    const int res_table[][2] = {
-        {640,  480},
-        {720,  480},
-        {1280, 720},
-        {1280, 800},
-        {1280, 960},
-        {1920, 1080},
-        {2560, 1440},
-        {2560, 1600},
-        {2560, 1920},
-        {3840, 2160}
-    };
+    int min_window_width = GNW_NATIVE_WIDTH;
+    int min_window_height = GNW_NATIVE_HEIGHT;
+    int window_width = GNW_NATIVE_WIDTH * GNW_DEFAULT_SCALE;
+    int window_height = GNW_NATIVE_HEIGHT * GNW_DEFAULT_SCALE;
 
-    if (g_config.display.window.startup_size == CONFIG_DISPLAY_WINDOW_STARTUP_SIZE_LAST_USED) {
+    if (g_config.display.window.startup_size == CONFIG_DISPLAY_WINDOW_STARTUP_SIZE_LAST_USED &&
+        g_config.display.window.last_width > 0 && g_config.display.window.last_height > 0) {
         window_width  = g_config.display.window.last_width;
         window_height = g_config.display.window.last_height;
-    } else {
-        window_width  = res_table[g_config.display.window.startup_size-1][0];
-        window_height = res_table[g_config.display.window.startup_size-1][1];
     }
+    // Other CONFIG_DISPLAY_WINDOW_STARTUP_SIZE_* enum values (xemu's old
+    // Xbox-resolution presets) are no longer meaningful here -- fall
+    // through to the native x GNW_DEFAULT_SCALE default above for any of
+    // them, same as "no saved size yet".
 
     if (window_width < min_window_width) {
         window_width = min_window_width;
@@ -1053,7 +1070,7 @@ static void display_very_early_init(DisplayOptions *o)
             "Unable to create OpenGL context. This usually means the\r\n"
             "graphics device on this system does not support OpenGL 4.0.\r\n"
             "\r\n"
-            "xemu cannot continue and will now exit.",
+            "GWemu cannot continue and will now exit.",
             m_window);
         SDL_DestroyWindow(m_window);
         SDL_Quit();
@@ -1064,8 +1081,8 @@ static void display_very_early_init(DisplayOptions *o)
     // appropriate for this fork -- no gnw-h7b0 icon asset exists yet,
     // leave the platform default rather than ship the wrong branding.
 
-    fprintf(stderr, "CPU: %s\n", xemu_get_cpu_info());
-    fprintf(stderr, "OS_Version: %s\n", xemu_get_os_info());
+    fprintf(stderr, "CPU: %s\n", gwemu_get_cpu_info());
+    fprintf(stderr, "OS_Version: %s\n", gwemu_get_os_info());
     fprintf(stderr, "GL_VENDOR: %s\n", glGetString(GL_VENDOR));
     fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
     fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
@@ -1076,16 +1093,16 @@ static void display_very_early_init(DisplayOptions *o)
 
 static void display_early_init(DisplayOptions *o)
 {
-    assert(o->type == DISPLAY_TYPE_XEMU);
+    assert(o->type == DISPLAY_TYPE_GWEMU);
     display_opengl = 1;
 
     SDL_GL_MakeCurrent(m_window, m_context);
     SDL_GL_SetSwapInterval(g_config.display.window.vsync ? 1 : 0);
-    xemu_hud_init(m_window, m_context);
+    gwemu_hud_init(m_window, m_context);
 }
 
 static const DisplayChangeListenerOps dcl_gl_ops = {
-    .dpy_name                = "xemu-gl",
+    .dpy_name                = "gwemu-gl",
     .dpy_gfx_switch          = gl_switch,
     .dpy_gfx_check_format    = xb_console_gl_check_format,
     .dpy_mouse_set           = mouse_warp,
@@ -1097,14 +1114,14 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     uint8_t data = 0;
     int i;
 
-    assert(o->type == DISPLAY_TYPE_XEMU);
+    assert(o->type == DISPLAY_TYPE_GWEMU);
     SDL_GL_MakeCurrent(m_window, m_context);
 
     gui_fullscreen = o->has_full_screen && o->full_screen;
     gui_fullscreen |= g_config.display.window.fullscreen_on_startup;
 
     num_outputs = 1;
-    scon_list = g_new0(struct xemu_console, num_outputs);
+    scon_list = g_new0(struct gwemu_console, num_outputs);
     for (i = 0; i < num_outputs; i++) {
         QemuConsole *con = qemu_console_lookup_by_index(i);
         assert(con != NULL);
@@ -1171,18 +1188,18 @@ static void display_finalize(void)
     SDL_Quit();
 }
 
-static QemuDisplay qemu_display_xemu = {
-    .type       = DISPLAY_TYPE_XEMU,
+static QemuDisplay qemu_display_gwemu = {
+    .type       = DISPLAY_TYPE_GWEMU,
     .early_init = display_early_init,
     .init       = display_init,
 };
 
-static void register_xemu_display(void)
+static void register_gwemu_display(void)
 {
-    qemu_display_register(&qemu_display_xemu);
+    qemu_display_register(&qemu_display_gwemu);
 }
 
-type_init(register_xemu_display);
+type_init(register_gwemu_display);
 
 int gArgc;
 char **gArgv;
@@ -1238,7 +1255,7 @@ static void setup_nvidia_profile(void)
 
     if (nvapi_init()) {
         nvapi_setup_profile((NvApiProfileOpts){
-            .profile_name = L"xemu",
+            .profile_name = L"gwemu",
             .executable_name = exe_name,
             .threaded_optimization = false,
             .present_method = OGL_CPL_PREFER_DXPRESENT_PREFER_DISABLED,
@@ -1250,18 +1267,142 @@ static void setup_nvidia_profile(void)
 
 static void init_sdl_app_metadata(void)
 {
-    SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "xemu");
+    SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "GWemu");
     SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_VERSION_STRING,
-                               xemu_version);
+                               gwemu_version);
     SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_IDENTIFIER_STRING,
-                               "app.xemu.xemu");
+                               "app.gwemu.gwemu");
     SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_URL_STRING,
-                               "https://xemu.app");
+                               "https://github.com/slash-proc/gwemu");
+}
+
+static int g_orig_argc;
+static char **g_orig_argv;
+
+// True for a -global gnw-h7b0-soc.{bank1,bank2,extflash}-image=... argument
+// (whole "-global x=y" pair, i.e. also skip the following argv entry).
+static bool is_flash_image_global(const char *arg)
+{
+    return strncmp(arg, "gnw-h7b0-soc.bank1-image=", 25) == 0 ||
+           strncmp(arg, "gnw-h7b0-soc.bank2-image=", 25) == 0 ||
+           strncmp(arg, "gnw-h7b0-soc.extflash-image=", 28) == 0;
+}
+
+void gwemu_relaunch_with_flash_images(const char *bank1_image,
+                                      const char *bank2_image,
+                                      const char *extflash_image)
+{
+    GPtrArray *new_argv = g_ptr_array_new();
+    g_ptr_array_add(new_argv, g_orig_argv[0]);
+    for (int i = 1; i < g_orig_argc; i++) {
+        if (strcmp(g_orig_argv[i], "-global") == 0 && i + 1 < g_orig_argc &&
+            is_flash_image_global(g_orig_argv[i + 1])) {
+            i++; // also skip the "gnw-h7b0-soc.*-image=..." argument itself
+            continue;
+        }
+        if (strcmp(g_orig_argv[i], "-S") == 0) {
+            // scripts/boot_qemu.sh --gui starts halted (-S) because a
+            // fully blank vector table is a real ARMv7-M lockup, not a
+            // safe idle state -- once real images are configured we want
+            // a normal running boot, so drop it on relaunch.
+            continue;
+        }
+        g_ptr_array_add(new_argv, g_orig_argv[i]);
+    }
+
+    char *b1 = NULL, *b2 = NULL, *ef = NULL;
+    if (bank1_image && bank1_image[0]) {
+        b1 = g_strdup_printf("gnw-h7b0-soc.bank1-image=%s", bank1_image);
+        g_ptr_array_add(new_argv, (char *)"-global");
+        g_ptr_array_add(new_argv, b1);
+    }
+    if (bank2_image && bank2_image[0]) {
+        b2 = g_strdup_printf("gnw-h7b0-soc.bank2-image=%s", bank2_image);
+        g_ptr_array_add(new_argv, (char *)"-global");
+        g_ptr_array_add(new_argv, b2);
+    }
+    if (extflash_image && extflash_image[0]) {
+        ef = g_strdup_printf("gnw-h7b0-soc.extflash-image=%s", extflash_image);
+        g_ptr_array_add(new_argv, (char *)"-global");
+        g_ptr_array_add(new_argv, ef);
+    }
+    g_ptr_array_add(new_argv, NULL);
+
+    // execv() replaces this process image and does NOT run atexit handlers
+    // -- gwemu_settings_save() is normally also registered via atexit() as
+    // a safety net, but that never fires here. Flush explicitly so any
+    // settings changed but not yet individually saved aren't silently lost
+    // on relaunch.
+    gwemu_settings_save();
+
+    execv(g_orig_argv[0], (char *const *)new_argv->pdata);
+    // execv only returns on failure -- nothing sane to do but report it and
+    // keep running with the old configuration rather than exit silently.
+    fprintf(stderr, "gwemu_relaunch_with_flash_images: execv failed: %s\n",
+            strerror(errno));
+    g_free(b1);
+    g_free(b2);
+    g_free(ef);
+    g_ptr_array_free(new_argv, TRUE);
+}
+
+// This fork only has one real machine (gnw-h7b0), unlike genuinely
+// multi-machine upstream QEMU -- there's no reason to force explicit
+// "-M gnw-h7b0 -display gwemu" on every invocation. If the user's own
+// argv doesn't already specify a machine/display, inject sensible
+// defaults; if it also doesn't configure any flash image, additionally
+// start halted (-S) for the same reason scripts/boot_qemu.sh --gui
+// already does: a fully blank vector table (SP=0, PC=0) is a genuine
+// ARMv7-M lockup the instant the CPU runs, not a safe idle state, and
+// QEMU treats that as fatal for the whole process. Returns a new,
+// intentionally-leaked (process-lifetime) NULL-terminated argv -- same
+// leak convention gwemu_relaunch_with_flash_images() already uses for
+// its own argv construction, since this only ever runs once at startup.
+static char **inject_default_args(int argc, char **argv, int *out_argc)
+{
+    bool have_machine = false, have_display = false, have_flash_image = false;
+    for (int i = 1; i < argc; i++) {
+        if (!argv[i]) continue;
+        if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "-machine") == 0) {
+            have_machine = true;
+        } else if (strcmp(argv[i], "-display") == 0) {
+            have_display = true;
+        } else if (strcmp(argv[i], "-global") == 0 && i + 1 < argc &&
+                   argv[i + 1] && is_flash_image_global(argv[i + 1])) {
+            have_flash_image = true;
+        }
+    }
+
+    GPtrArray *new_argv = g_ptr_array_new();
+    g_ptr_array_add(new_argv, argv[0]);
+    if (!have_machine) {
+        g_ptr_array_add(new_argv, (char *)"-M");
+        g_ptr_array_add(new_argv, (char *)"gnw-h7b0");
+    }
+    if (!have_display) {
+        g_ptr_array_add(new_argv, (char *)"-display");
+        g_ptr_array_add(new_argv, (char *)"gwemu");
+    }
+    for (int i = 1; i < argc; i++) {
+        g_ptr_array_add(new_argv, argv[i]);
+    }
+    if (!have_flash_image) {
+        g_ptr_array_add(new_argv, (char *)"-S");
+    }
+    g_ptr_array_add(new_argv, NULL);
+
+    *out_argc = (int)new_argv->len - 1;
+    return (char **)g_ptr_array_free(new_argv, FALSE);
 }
 
 int main(int argc, char **argv)
 {
     QemuThread thread;
+
+    argv = inject_default_args(argc, argv, &argc);
+
+    g_orig_argc = argc;
+    g_orig_argv = argv;
 
     setlocale(LC_NUMERIC, "C");
 
@@ -1277,21 +1418,21 @@ int main(int argc, char **argv)
         }
     } else {
         // Launched without a console. Redirect stdout and stderr to a log file.
-        HANDLE logfile = CreateFileA("xemu.log",
+        HANDLE logfile = CreateFileA("gwemu.log",
             GENERIC_WRITE, FILE_SHARE_WRITE|FILE_SHARE_READ,
             NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (logfile != INVALID_HANDLE_VALUE) {
-            freopen("xemu.log", "a", stdout);
-            freopen("xemu.log", "a", stderr);
+            freopen("gwemu.log", "a", stdout);
+            freopen("gwemu.log", "a", stderr);
         }
     }
 
     _set_error_mode(_OUT_TO_STDERR);
 #endif
 
-    fprintf(stderr, "xemu_version: %s\n", xemu_version);
-    fprintf(stderr, "xemu_commit: %s\n", xemu_commit);
-    fprintf(stderr, "xemu_date: %s\n", xemu_date);
+    fprintf(stderr, "gwemu_version: %s\n", gwemu_version);
+    fprintf(stderr, "gwemu_commit: %s\n", gwemu_commit);
+    fprintf(stderr, "gwemu_date: %s\n", gwemu_date);
 
     init_sdl_app_metadata();
 
@@ -1302,23 +1443,25 @@ int main(int argc, char **argv)
         if (argv[i] && strcmp(argv[i], "-config_path") == 0) {
             argv[i] = NULL;
             if (i < argc - 1 && argv[i+1]) {
-                xemu_settings_set_path(argv[i+1]);
+                gwemu_settings_set_path(argv[i+1]);
                 argv[i+1] = NULL;
             }
             break;
         }
     }
 
-    if (!xemu_settings_load()) {
-        const char *err_msg = xemu_settings_get_error_message();
+    if (!gwemu_settings_load()) {
+        const char *err_msg = gwemu_settings_get_error_message();
         fprintf(stderr, "%s", err_msg);
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-            "Failed to load xemu config file", err_msg,
+            "Failed to load gwemu config file", err_msg,
             m_window);
         SDL_Quit();
         exit(1);
     }
-    atexit(xemu_settings_save);
+    atexit(gwemu_settings_save);
+    gnw_input_load();
+    atexit(gnw_input_save);
 
 #ifdef _WIN32
     if (g_config.display.setup_nvidia_profile) {
@@ -1352,11 +1495,11 @@ int main(int argc, char **argv)
      */
     qemu_set_current_aio_context(qemu_get_aio_context());
 
-    xemu_main_loop_lock();
-    xemu_input_init();
-    xemu_main_loop_unlock();
+    gwemu_main_loop_lock();
+    gwemu_input_init();
+    gwemu_main_loop_unlock();
 
-    struct xemu_console *scon = &scon_list[0];
+    struct gwemu_console *scon = &scon_list[0];
     while (!qatomic_read(&qemu_exiting)) {
         poll_events(scon);
         gl_render_frame(scon);
