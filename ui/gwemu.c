@@ -57,6 +57,7 @@
 #include <locale.h>
 #include <math.h>
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 
 #ifndef DEBUG_GWEMU_C
 #define DEBUG_GWEMU_C 0
