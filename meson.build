@@ -1648,6 +1648,16 @@ if not sdl3.found()
     'SDL_VIRTUAL_JOYSTICK': 'OFF',
     'SDL_X11_XTEST': 'OFF',
   })
+  # macOS x86_64 leg cross-compiles from an arm64 runner (scarce/unreliable
+  # macos-13 Intel runners otherwise) -- QEMU's own configure gets the
+  # -arch x86_64 flags via --extra-cflags/--extra-ldflags, but SDL3's CMake
+  # subproject build doesn't see those, so it needs to be told the target
+  # arch directly via this env var (set by release.yml, unset/empty on a
+  # plain native build).
+  gnw_macos_cross_arch = run_command('sh', '-c', 'echo "$GNW_CMAKE_OSX_ARCHITECTURES"', check: false).stdout().strip()
+  if gnw_macos_cross_arch != ''
+    sdl3_cmake_opts.add_cmake_defines({'CMAKE_OSX_ARCHITECTURES': gnw_macos_cross_arch})
+  endif
   sdl3_sp = cmake.subproject('sdl3', options: sdl3_cmake_opts, required: false)
   if sdl3_sp.found()
     sdl3 = sdl3_sp.dependency('SDL3-static')

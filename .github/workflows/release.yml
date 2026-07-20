@@ -69,10 +69,17 @@ jobs:
           apt-get install -y --no-install-recommends \
             ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev \
             python3 python3-pip build-essential zip \
-            cmake libepoxy-dev \
+            cmake libepoxy-dev liblzma-dev \
             libx11-dev libxext-dev libxrandr-dev libxi-dev libxfixes-dev \
             libxcursor-dev libxss-dev libwayland-dev libxkbcommon-dev \
             wayland-protocols libdecor-0-dev libdbus-1-dev libudev-dev
+          # liblzma-dev: contrib/gnw-tools/gnw_lzma.c (part of the CFW
+          # patch-engine port, predates this GUI-wiring change but was
+          # apparently never added to this workflow before) links system
+          # liblzma directly -- required: true in that meson.build, so
+          # configure hard-fails without it. Found via a real local
+          # `docker run ubuntu:22.04` reproduction of this exact job,
+          # not guessed.
           # cmake: gnw-h7b0 GUI's SDL3 dependency is fetched+built via
           # meson's cmake.subproject() (see meson.build's sdl3 handling),
           # not pkg-config/system-package -- meson needs a real `cmake`
@@ -176,26 +183,60 @@ jobs:
         include:
           - runner: macos-14
             arch: arm64
-          - runner: macos-13
+          - runner: macos-14
             arch: x86_64
+        # Both legs run on macos-14 (arm64 host). The x86_64 leg used to
+        # run on a native macos-13 (Intel) runner, but those have been
+        # observed stuck queued for 6+ hours with no runner ever picking
+        # them up -- a known GH Actions scarcity issue with Intel macOS
+        # runners specifically. Apple Clang on arm64 can natively
+        # cross-compile to x86_64 via -arch, so we do that instead of
+        # waiting on a scarce runner at all.
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        run: brew install ninja pkg-config glib pixman sdl2 meson dylibbundler cmake libepoxy
-        # cmake: same reason as the Linux job -- meson's cmake.subproject()
-        # needs a real `cmake` binary to build SDL3 (static, see
-        # meson.build). libepoxy: same reason as Linux -- prefer the real
-        # system package over letting meson build subprojects/epoxy.wrap
-        # from source. X11/Wayland dev headers aren't a concern here --
-        # macOS SDL3 targets Cocoa natively, not X11/Wayland.
+      - name: Install build dependencies (arm64 leg)
+        if: matrix.arch == 'arm64'
+        run: brew install ninja pkg-config glib pixman sdl2 meson dylibbundler cmake libepoxy xz
+
+      - name: Install build dependencies (x86_64 cross leg)
+        if: matrix.arch == 'x86_64'
+        run: |
+          set -euo pipefail
+          # arm64 Homebrew (/opt/homebrew) formulae are arm64-only --
+          # their .dylibs can't link into an x86_64 binary. macos-14
+          # runners have Rosetta 2, so install a SEPARATE x86_64 Homebrew
+          # under /usr/local (the classic Intel prefix) via `arch -x86_64`
+          # and get real x86_64 glib/pixman/sdl2/libepoxy/liblzma from it.
+          # meson/ninja/cmake/pkg-config/dylibbundler stay arm64 (host
+          # tools, never linked into the target binary).
+          brew install ninja meson cmake dylibbundler pkg-config
+          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
+          arch -x86_64 /usr/local/bin/brew install pkg-config glib pixman sdl2 libepoxy xz
 
       - name: Configure
+        env:
+          GNW_CMAKE_OSX_ARCHITECTURES: ${{ matrix.arch == 'x86_64' && 'x86_64' || '' }}
         run: |
           mkdir build
           cd build
-          ../configure --target-list=arm-softmmu
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            # Cross-compile from this arm64 runner: -arch x86_64 tells
+            # Apple Clang to emit x86_64 code/link an x86_64 binary
+            # directly, no separate cross-toolchain needed. Point
+            # pkg-config at the x86_64 Homebrew prefix (/usr/local) so it
+            # resolves glib/pixman/sdl2/libepoxy/liblzma to real x86_64
+            # libs instead of the arm64 ones under /opt/homebrew.
+            export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig"
+            export PKG_CONFIG_LIBDIR="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig"
+            ../configure --target-list=arm-softmmu --cpu=x86_64 \
+              --extra-cflags="-arch x86_64" \
+              --extra-cxxflags="-arch x86_64" \
+              --extra-ldflags="-arch x86_64"
+          else
+            ../configure --target-list=arm-softmmu
+          fi
 
       - name: Build
         run: |
@@ -211,6 +252,18 @@ jobs:
           # fall back to build_by_default for anything else, so gwemu
           # needs to be requested too or it won't get built at all.
           ninja -C build qemu-system-arm gwemu
+
+      - name: Verify binary architecture
+        run: |
+          set -euo pipefail
+          for bin in build/qemu-system-arm build/gwemu; do
+            got="$(lipo -archs "$bin" 2>/dev/null || file -b "$bin")"
+            echo "$bin: $got"
+            case "$got" in
+              *${{ matrix.arch }}*) ;;
+              *) echo "ERROR: $bin is not ${{ matrix.arch }} (got: $got)" >&2; exit 1 ;;
+            esac
+          done
 
       - name: Package
         run: |
@@ -280,6 +333,7 @@ jobs:
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-libepoxy
+            mingw-w64-x86_64-xz
             diffutils
             mingw-w64-x86_64-python
             git
