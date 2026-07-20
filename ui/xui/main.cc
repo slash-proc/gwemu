@@ -48,7 +48,6 @@
 #include "monitor.hh"
 #include "welcome.hh"
 #include "menubar.hh"
-#include "titlebar.hh"
 
 bool g_screenshot_pending;
 const char *g_snapshot_pending_load_name;
@@ -247,16 +246,6 @@ void gwemu_hud_update(void)
 
     ImGui::NewFrame();
     ProcessKeyboardShortcuts();
-
-    // Custom chrome (see titlebar.hh): window is always SDL_WINDOW_BORDERLESS,
-    // so draw our own titlebar and push the main viewport's work area down by
-    // its height -- BeginMainMenuBar() (and everything else anchored to the
-    // viewport) reads WorkPos/WorkSize, so this is the standard ImGui way to
-    // stack a menu bar under another top-of-screen bar.
-    float titlebar_height = DrawTitlebar();
-    ImGuiViewport *main_viewport = ImGui::GetMainViewport();
-    main_viewport->WorkPos.y += titlebar_height;
-    main_viewport->WorkSize.y -= titlebar_height;
 
 #if defined(CONFIG_RENDERDOC)
     if (g_capture_renderdoc_frame) {

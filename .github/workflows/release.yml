@@ -136,6 +136,13 @@ jobs:
               exit 1
             fi
             cp "$src" "$OUT/$dst_name.bin"
+            # Linux embeds full DWARF debug info directly in the ELF
+            # binary (unlike macOS, where it lives in a separate .dSYM
+            # bundle we never package) -- confirmed real difference:
+            # unstripped qemu-system-arm here is ~138MB vs the macOS
+            # build's much smaller packaged binary. Strip it; end users
+            # of a release build don't need debug symbols.
+            strip "$OUT/$dst_name.bin"
             # Bundle non-base-OS shared libs (SDL2/glib/pixman/epoxy and
             # their own transitive deps) next to the binary, since those
             # aren't guaranteed present on an arbitrary target system the
@@ -174,12 +181,16 @@ jobs:
             cp "scripts/$f" "$OUT/scripts/"
           done
 
-          zip -r "$OUT.zip" "$OUT"
-
       - uses: actions/upload-artifact@v4
         with:
           name: gwemu-linux-x86_64
-          path: gwemu-linux-x86_64.zip
+          path: gwemu-linux-x86_64/
+          # Uploading a pre-made .zip here and re-zipping in publish-release
+          # produced a real, confirmed zip-inside-a-zip in the actual
+          # release asset a user downloaded (v0.0.1) -- upload-artifact's
+          # own storage wrapping doesn't compose cleanly with an
+          # already-zipped single file feeding into action-gh-release.
+          # Upload the raw directory; publish-release zips it exactly once.
 
   build-macos:
     strategy:
@@ -330,12 +341,12 @@ jobs:
             cp "scripts/$f" "$OUT/scripts/"
           done
 
-          ditto -c -k --sequesterRsrc "$OUT" "$OUT.zip"
-
       - uses: actions/upload-artifact@v4
         with:
           name: gwemu-macos-${{ matrix.arch }}
-          path: gwemu-macos-${{ matrix.arch }}.zip
+          path: gwemu-macos-${{ matrix.arch }}/
+          # See build-linux's identical comment: upload the raw directory,
+          # not a pre-made zip -- publish-release does the one real zip.
 
   build-windows:
     runs-on: windows-latest
@@ -405,6 +416,10 @@ jobs:
               exit 1
             fi
             cp "$src" "$OUT/"
+            # Strip debug info before packaging -- same reasoning as the
+            # Linux job's strip call. strip.exe here is MSYS2's own,
+            # works fine on PE binaries.
+            strip "$OUT/$(basename "$src")"
             # PE binaries have no rpath -- every required mingw64 DLL has
             # to sit next to the exe (or be on PATH, which we don't want
             # to assume). ldd works under MSYS2 for PE files and reports
@@ -424,12 +439,12 @@ jobs:
             cp "scripts/$f" "$OUT/scripts/"
           done
 
-          zip -r "$OUT.zip" "$OUT"
-
       - uses: actions/upload-artifact@v4
         with:
           name: gwemu-windows-x86_64
-          path: gwemu-windows-x86_64.zip
+          path: gwemu-windows-x86_64/
+          # See build-linux's identical comment: upload the raw directory,
+          # not a pre-made zip -- publish-release does the one real zip.
 
   publish-release:
     needs: [build-linux, build-macos, build-windows]
@@ -442,9 +457,18 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Zip each platform's directory (exactly once)
+        run: |
+          set -euo pipefail
+          cd artifacts
+          for d in */; do
+            d="${d%/}"
+            zip -r "../$d.zip" "$d"
+          done
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.zip
+          files: '*.zip'
           draft: true
           generate_release_notes: true

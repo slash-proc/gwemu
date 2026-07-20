@@ -19,7 +19,6 @@ gnw_gui_ss.add(files(
   'scene.cc',
   'sdcard-view.cc',
   'snapshot-manager.cc',
-  'titlebar.cc',
   'viewport-manager.cc',
   'welcome.cc',
   'widgets.cc',
