@@ -242,7 +242,20 @@ jobs:
             # libs instead of the arm64 ones under /opt/homebrew.
             export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig"
             export PKG_CONFIG_LIBDIR="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig"
+            # --cross-prefix= (even empty) is what actually flips
+            # configure's own cross_compile flag to "yes" -- without it,
+            # --cpu=x86_64 alone never triggers writing a real
+            # [host_machine] section into config-meson.cross, so meson
+            # still believed the host was aarch64 despite the -arch
+            # flags, and QEMU's own host-arch-conditional code (e.g.
+            # crypto/aes-round.h's separate NEON vs x86_64 accel paths)
+            # picked the wrong (ARM NEON) implementation entirely --
+            # confirmed via real build failures, not a hypothetical.
+            # With this, configure also emits config-meson.native so
+            # build-time tools (code generators, meson's own machinery)
+            # correctly still run as native arm64, not under Rosetta.
             ../configure --target-list=arm-softmmu --cpu=x86_64 \
+              --cross-prefix= \
               --extra-cflags="-arch x86_64" \
               --extra-cxxflags="-arch x86_64" \
               --extra-ldflags="-arch x86_64"
