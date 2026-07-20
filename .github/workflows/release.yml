@@ -102,7 +102,11 @@ jobs:
           # tomllib only exists on Python 3.11+, and ubuntu:22.04 ships
           # 3.10 -- without this, configure fails with "found no usable
           # tomli, please install it" before meson even starts.
-          pip install tomli meson ninja
+          # pyyaml: subprojects/genconfig/gen_config.py (config_spec.yml ->
+          # gwemu-config.h pipeline, needed by the GUI build) imports yaml
+          # directly -- mkvenv's venv is non-isolated (inherits system
+          # site-packages), so installing it here is enough.
+          pip install tomli meson ninja pyyaml
 
       - name: Configure
         run: |
@@ -198,7 +202,11 @@ jobs:
 
       - name: Install build dependencies (arm64 leg)
         if: matrix.arch == 'arm64'
-        run: brew install ninja pkg-config glib pixman sdl2 meson dylibbundler cmake libepoxy xz
+        run: |
+          brew install ninja pkg-config glib pixman sdl2 meson dylibbundler cmake libepoxy xz
+          # pyyaml: subprojects/genconfig/gen_config.py needs it; mkvenv's
+          # venv is non-isolated so a system/user install is enough.
+          pip3 install --user --break-system-packages pyyaml || pip3 install --user pyyaml
 
       - name: Install build dependencies (x86_64 cross leg)
         if: matrix.arch == 'x86_64'
@@ -214,6 +222,10 @@ jobs:
           brew install ninja meson cmake dylibbundler pkg-config
           arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
           arch -x86_64 /usr/local/bin/brew install pkg-config glib pixman sdl2 libepoxy xz
+          # pyyaml: subprojects/genconfig/gen_config.py needs it; mkvenv's
+          # venv is non-isolated so a system/user install is enough. This
+          # leg still runs meson/mkvenv under the arm64 (host) Python.
+          pip3 install --user --break-system-packages pyyaml || pip3 install --user pyyaml
 
       - name: Configure
         env:
@@ -336,6 +348,7 @@ jobs:
             mingw-w64-x86_64-xz
             diffutils
             mingw-w64-x86_64-python
+            mingw-w64-x86_64-python-yaml
             git
             zip
           # diffutils (provides `diff`): upstream QEMU's own

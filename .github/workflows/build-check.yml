@@ -27,7 +27,7 @@ jobs:
           python-version: '3.x'
 
       - name: Install meson/ninja (pip, for a consistent recent version)
-        run: pip install meson ninja
+        run: pip install meson ninja pyyaml
 
       - name: Configure
         run: |
