@@ -1682,6 +1682,25 @@ if true
   if sdl3_sp.found()
     sdl3 = sdl3_sp.dependency('SDL3-static')
     meson.override_dependency('sdl3', sdl3)
+    if host_os == 'darwin'
+      # SDL3's own CMakeLists.txt attaches these as PUBLIC link deps via
+      # $<LINK_LIBRARY:FRAMEWORK,X>/$<LINK_LIBRARY:WEAK_FRAMEWORK,X>
+      # generator expressions -- meson's cmake.subproject() bridge
+      # doesn't propagate those into the dependency object it hands
+      # back (confirmed real: a clean CI build linked genuinely static
+      # libSDL3_static.a but failed at final link with dozens of
+      # undefined symbols -- AudioQueue* (AudioToolbox), CHHaptic*
+      # (CoreHaptics), FF* (ForceFeedback), GC* (GameController),
+      # TIS*/KBGetLayoutType/LMGetKbdType (Carbon) -- all real SDL3
+      # macOS backends it statically compiled in, just not linked).
+      # Declare them explicitly and fold into the sdl3 dependency object
+      # so every consumer picks them up automatically.
+      sdl3_macos_frameworks = dependency('appleframeworks',
+        modules: ['AudioToolbox', 'CoreHaptics', 'ForceFeedback',
+                   'GameController', 'Carbon'])
+      sdl3 = declare_dependency(dependencies: [sdl3, sdl3_macos_frameworks])
+      meson.override_dependency('sdl3', sdl3)
+    endif
   endif
 endif
 if sdl3.found() and host_os == 'windows'
