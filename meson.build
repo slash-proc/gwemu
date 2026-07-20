@@ -28,6 +28,16 @@ ss = import('sourceset')
 fs = import('fs')
 
 host_os = host_machine.system()
+# macOS x86_64 leg cross-compiles from an arm64 runner (scarce/unreliable
+# macos-13 Intel runners otherwise) -- set by release.yml, unset/empty on
+# a plain native build. Read once at top level (not inside a conditional
+# block) so it's reliably available wherever needed, e.g. the final
+# qemu-system-arm executable() link step, which -- confirmed real bug --
+# does NOT pick up -arch from configure's own EXTRA_LDFLAGS/cross-file
+# built-in c_link_args (that only reliably reaches individual compiles,
+# not this specific final link), producing "Undefined symbols for
+# architecture arm64" on the supposedly-x86_64 leg.
+gnw_macos_cross_arch = run_command('sh', '-c', 'echo "$GNW_CMAKE_OSX_ARCHITECTURES"', check: false).stdout().strip()
 config_host = keyval.load(meson.current_build_dir() / 'config-host.mak')
 
 # Temporary directory used for files created while
@@ -1674,7 +1684,6 @@ if true
   # subproject build doesn't see those, so it needs to be told the target
   # arch directly via this env var (set by release.yml, unset/empty on a
   # plain native build).
-  gnw_macos_cross_arch = run_command('sh', '-c', 'echo "$GNW_CMAKE_OSX_ARCHITECTURES"', check: false).stdout().strip()
   if gnw_macos_cross_arch != ''
     sdl3_cmake_opts.add_cmake_defines({'CMAKE_OSX_ARCHITECTURES': gnw_macos_cross_arch})
   endif
@@ -4644,8 +4653,18 @@ foreach target : target_dirs
   endif
   foreach exe: execs
     exe_name = exe['name']
+    exe_link_args = link_args
     if host_os == 'darwin'
       exe_name += '-unsigned'
+      if gnw_macos_cross_arch != ''
+        # Confirmed real bug: this final executable() link step doesn't
+        # reliably pick up -arch from configure's own EXTRA_LDFLAGS/
+        # cross-file built-in c_link_args on the cross-compiled x86_64
+        # leg, producing "Undefined symbols for architecture arm64" even
+        # though every individual compile was correctly x86_64. Force it
+        # explicitly here rather than rely on that propagation.
+        exe_link_args += ['-arch', gnw_macos_cross_arch]
+      endif
     endif
 
     emulator = executable(exe_name, exe['sources'],
@@ -4654,7 +4673,7 @@ foreach target : target_dirs
                dependencies: arch_deps + exe['dependencies'],
                objects: lib.extract_all_objects(recursive: true),
                link_depends: [block_syms, qemu_syms],
-               link_args: link_args,
+               link_args: exe_link_args,
                win_subsystem: exe['win_subsystem'])
 
     if host_os == 'darwin'
