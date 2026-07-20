@@ -3875,7 +3875,10 @@ if sdl3.found()
   # tomlplusplus (as vendored) uses a C++20-legal literal-operator syntax
   # that C++23 deprecates -- not our code to fix, just don't let -Werror
   # on the newer compiler standard here (-std=gnu++23) treat it as fatal.
-  add_project_arguments('-Wno-error=deprecated-literal-operator', language: 'cpp')
+  # Clang recognizes -Wdeprecated-literal-operator; GCC doesn't and treats
+  # an unknown -Wno-error=X as a hard error rather than a warning, so only
+  # add this when the compiler actually supports it.
+  add_project_arguments(cxx.get_supported_arguments('-Wno-error=deprecated-literal-operator'), language: 'cpp')
   gwemu_json = dependency('nlohmann_json', required: true, fallback: ['json', 'nlohmann_json_dep'])
 endif
 
