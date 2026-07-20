@@ -29,7 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static char *errdup(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static char *errdup(const char *fmt, ...) __attribute__((format(gnu_printf, 1, 2)));
 static char *errdup(const char *fmt, ...)
 {
     char buf[256];

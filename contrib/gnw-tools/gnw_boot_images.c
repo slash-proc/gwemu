@@ -28,9 +28,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <glib/gstdio.h>
 
 static char *xstrdup_printf(const char *fmt, ...)
-    __attribute__((format(printf, 1, 2)));
+    __attribute__((format(gnu_printf, 1, 2)));
 
 static char *xstrdup_printf(const char *fmt, ...)
 {
@@ -254,7 +255,7 @@ static bool write_padded_ff(const char *out_path, const unsigned char *data,
 
 static bool ensure_dir(const char *path, char **error_msg)
 {
-    if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+    if (g_mkdir(path, 0755) != 0 && errno != EEXIST) {
         if (error_msg) {
             *error_msg = xstrdup_printf("could not create directory %s: %s",
                                         path, strerror(errno));

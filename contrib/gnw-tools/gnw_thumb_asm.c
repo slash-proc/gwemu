@@ -74,7 +74,7 @@ static void bb_free(ByteBuf *b)
 /* ---- error helper ----------------------------------------------------- */
 
 static bool fail(char **error_msg, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+    __attribute__((format(gnu_printf, 2, 3)));
 
 static bool fail(char **error_msg, const char *fmt, ...)
 {
