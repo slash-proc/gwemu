@@ -234,26 +234,6 @@ void main() {
 }
 )";
 
-    const char *image_gamma_frag_src = R"(
-#version 400 core
-uniform sampler2D tex;
-uniform uint palette[256];
-float gamma_ch(int ch, float col)
-{
-    return float(bitfieldExtract(palette[uint(col * 255.0)], ch*8, 8)) / 255.0;
-}
-
-vec4 gamma(vec4 col)
-{
-    return vec4(gamma_ch(0, col.r), gamma_ch(1, col.g), gamma_ch(2, col.b), col.a);
-}
-in  vec2 Texcoord;
-out vec4 out_Color;
-void main() {
-    out_Color.rgba = gamma(texture(tex, Texcoord));
-}
-)";
-
     // Simple 2-color decal shader
     // - in_ColorFill is first pass
     // - Red channel of the texture is used as primary color, mixed with 1-Red for
@@ -280,8 +260,10 @@ void main() {
     switch (type) {
     case ShaderType::Mask: frag_src = mask_frag_src; break;
     case ShaderType::Blit: frag_src = image_frag_src; break;
-    case ShaderType::BlitGamma: frag_src = image_gamma_frag_src; break;
     case ShaderType::Logo: frag_src = xemu_logo_frag_src; break; // asset not yet renamed, see ui/shader/xemu-logo.frag
+    // ShaderType::BlitGamma intentionally has no case here -- see its
+    // declaration comment. Never instantiated; would need a real GLSL
+    // 4.00 shader we no longer require the context to support.
     default: assert(0);
     }
     GLuint frag = Shader(GL_FRAGMENT_SHADER, frag_src);

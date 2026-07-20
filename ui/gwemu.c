@@ -1001,8 +1001,18 @@ static void display_very_early_init(DisplayOptions *o)
     SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    // GL 4.0 was inherited straight from xemu, which needs it for real
+    // Xbox/NV2A framebuffer features (see ShaderType::BlitGamma in
+    // gl-helpers.cc, its own "FIXME: Move to nv2a_get_framebuffer_surface"
+    // comment). We don't use that shader anywhere reachable -- every
+    // shader this GUI actually instantiates (Mask/Blit/Logo) is
+    // "#version 150 core" (GLSL 1.50 = GL 3.2), matching what ImGui's
+    // own OpenGL3 backend is initialized with ("#version 150" in
+    // main.cc). GL 4.0 Core was needlessly failing to create a context
+    // at all on real hardware that only supports GL 3.2/3.3 (confirmed:
+    // "Unable to create OpenGL context" on a real Windows machine).
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
     SDL_GL_SetAttribute(
         SDL_GL_CONTEXT_PROFILE_MASK,
         SDL_GL_CONTEXT_PROFILE_CORE);
@@ -1104,7 +1114,7 @@ static void display_very_early_init(DisplayOptions *o)
 
     m_context = SDL_GL_CreateContext(m_window);
 
-    if (m_context != NULL && epoxy_gl_version() < 40) {
+    if (m_context != NULL && epoxy_gl_version() < 32) {
         SDL_GL_MakeCurrent(NULL, NULL);
         SDL_GL_DestroyContext(m_context);
         m_context = NULL;
@@ -1114,7 +1124,7 @@ static void display_very_early_init(DisplayOptions *o)
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
             "Unable to create OpenGL context",
             "Unable to create OpenGL context. This usually means the\r\n"
-            "graphics device on this system does not support OpenGL 4.0.\r\n"
+            "graphics device on this system does not support OpenGL 3.2.\r\n"
             "\r\n"
             "GWemu cannot continue and will now exit.",
             m_window);
