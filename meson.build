@@ -1672,8 +1672,11 @@ if sdl3.found() and host_os == 'windows'
   # include SDL3 headers (e.g. ui/gwemu-input.c), not while building the
   # SDL3 subproject itself, so a werror=false default_option on the sdl3
   # subproject (as done for imgui) wouldn't reach it -- needs to be
-  # suppressed for our own project's C compiles instead.
+  # suppressed for our own project's compiles instead -- both C (e.g.
+  # ui/gwemu-input.c) and C++ (e.g. ui/xui/actions.cc via common.hh)
+  # translation units include SDL3 headers and hit this.
   add_project_arguments(cc.get_supported_arguments('-Wno-error=redundant-decls'), language: 'c')
+  add_project_arguments(cxx.get_supported_arguments('-Wno-error=redundant-decls'), language: 'cpp')
 endif
 if sdl.found()
   # Some versions of SDL have problems with -Wundef
