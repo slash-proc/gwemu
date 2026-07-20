@@ -183,6 +183,12 @@ jobs:
 
   build-macos:
     strategy:
+      # Default fail-fast cancels the arm64 leg the instant x86_64 fails
+      # (or vice versa) even though they're fully independent builds --
+      # masked real signal during CI debugging (arm64 showed "cancelled"
+      # instead of its own real pass/fail). Independent legs, no reason
+      # to couple their outcomes.
+      fail-fast: false
       matrix:
         include:
           - runner: macos-14
