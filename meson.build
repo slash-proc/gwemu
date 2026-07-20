@@ -1643,6 +1643,17 @@ if not sdl3.found()
     'SDL_SENSOR': 'OFF',
     'SDL_SHARED': 'OFF',
     'SDL_STATIC': 'ON',
+    # SDL3's own CMakeLists.txt treats BUILD_SHARED_LIBS as a default
+    # for SDL_SHARED/SDL_STATIC when the former is *defined* (even
+    # empty/unset by us doesn't mean "not defined" once meson's cmake
+    # module starts threading a toolchain file through for a real cross
+    # build) -- a real user hit "Failed loading SDL3 library" on the
+    # macOS x86_64 leg (the first genuinely cross-compiled leg this
+    # project has), consistent with SDL3 ending up shared there despite
+    # SDL_SHARED=OFF above. Pin this explicitly too so there's no
+    # ambiguity left for CMake to resolve differently under cross vs.
+    # native configuration.
+    'BUILD_SHARED_LIBS': 'OFF',
     'SDL_TEST_LIBRARY': 'OFF',
     'SDL_TRAY': 'OFF',
     'SDL_VIRTUAL_JOYSTICK': 'OFF',

@@ -315,6 +315,24 @@ jobs:
             esac
           done
 
+      - name: Verify SDL3 is actually statically linked
+        run: |
+          set -euo pipefail
+          # meson.build builds SDL3 with SDL_STATIC=ON/SDL_SHARED=OFF
+          # specifically so no separate libSDL3 dylib is ever needed at
+          # runtime -- a real user hit "Failed loading SDL3 library" on
+          # the x86_64 build, which would make sense if this leg's
+          # cross-compiled SDL3 build ended up dynamic instead (untested
+          # hypothesis, can't reproduce locally). Print the full
+          # dependency list either way so this is visible in the log,
+          # and fail loudly if SDL3 shows up as a dynamic dependency.
+          echo "--- gwemu dependencies ---"
+          otool -L build/gwemu
+          if otool -L build/gwemu | grep -qi 'libSDL3'; then
+            echo "ERROR: gwemu dynamically links libSDL3 -- meson.build's SDL_STATIC=ON isn't taking effect on this leg" >&2
+            exit 1
+          fi
+
       - name: Package
         run: |
           set -euo pipefail
