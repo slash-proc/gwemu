@@ -1664,6 +1664,17 @@ if not sdl3.found()
     meson.override_dependency('sdl3', sdl3)
   endif
 endif
+if sdl3.found() and host_os == 'windows'
+  # SDL3-3.4.10's SDL_assert.h redeclares __debugbreak(), which MinGW
+  # GCC 16.1's own _mingw.h already declares -- real, confirmed conflict
+  # ("redundant redeclaration of '__debugbreak'"), not reproduced on
+  # older MinGW GCC. This fires while compiling OUR OWN .c files that
+  # include SDL3 headers (e.g. ui/gwemu-input.c), not while building the
+  # SDL3 subproject itself, so a werror=false default_option on the sdl3
+  # subproject (as done for imgui) wouldn't reach it -- needs to be
+  # suppressed for our own project's C compiles instead.
+  add_project_arguments(cc.get_supported_arguments('-Wno-error=redundant-decls'), language: 'c')
+endif
 if sdl.found()
   # Some versions of SDL have problems with -Wundef
   if not cc.compiles('''
@@ -3887,7 +3898,14 @@ if sdl3.found()
                               )
   genh += gwemu_config
 
-  tomlplusplus = dependency('tomlplusplus', required: true, fallback: ['tomlplusplus', 'tomlplusplus_dep'])
+  # default_library=static: tomlplusplus builds shared by default, which
+  # on macOS means an actual libtomlplusplus.3.dylib that the packaging
+  # step's dylibbundler pass then needs to find and bundle -- it doesn't
+  # (real failure: "libtomlplusplus.3.dylib does not exist"). Static
+  # avoids the runtime dependency entirely, matching how imgui/genconfig
+  # are already built in this project.
+  tomlplusplus = dependency('tomlplusplus', required: true, fallback: ['tomlplusplus', 'tomlplusplus_dep'],
+                             default_options: ['default_library=static'])
   # tomlplusplus (as vendored) uses a C++20-legal literal-operator syntax
   # that C++23 deprecates -- not our code to fix, just don't let -Werror
   # on the newer compiler standard here (-std=gnu++23) treat it as fatal.
