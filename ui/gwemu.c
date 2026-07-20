@@ -1378,6 +1378,8 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
 // intentionally-leaked (process-lifetime) NULL-terminated argv -- same
 // leak convention gwemu_relaunch_with_flash_images() already uses for
 // its own argv construction, since this only ever runs once at startup.
+static bool g_is_query_invocation = false;
+
 static char **inject_default_args(int argc, char **argv, int *out_argc)
 {
     bool have_machine = false, have_display = false, have_flash_image = false;
@@ -1412,6 +1414,7 @@ static char **inject_default_args(int argc, char **argv, int *out_argc)
     // where display init failing silently eats the help text this is
     // supposed to print. Pass such invocations through unmodified.
     if (is_query) {
+        g_is_query_invocation = true;
         *out_argc = argc;
         return argv;
     }
@@ -1443,6 +1446,19 @@ int main(int argc, char **argv)
     QemuThread thread;
 
     argv = inject_default_args(argc, argv, &argc);
+
+    // A query invocation (-M help, -version, etc.) doesn't need any of
+    // gwemu's own GUI bootstrap (SDL/display init, settings/config load)
+    // -- qemu_init() handles these itself (prints and exit()s before
+    // ever reaching display setup), same as the plain !CONFIG_GWEMU_GUI
+    // build's qemu_default_main(). Skipping this bootstrap here matters
+    // in practice: forcing a real SDL video init for these breaks on any
+    // headless host (no display server), e.g. `-M help` in CI.
+    if (g_is_query_invocation) {
+        setlocale(LC_NUMERIC, "C");
+        qemu_init(argc, argv);
+        exit(0);
+    }
 
     g_orig_argc = argc;
     g_orig_argv = argv;
