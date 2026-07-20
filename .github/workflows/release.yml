@@ -8,12 +8,16 @@ name: Release build
 # Packaging scope (deliberately kept simple for now -- the project owner
 # flagged this as still-TBD long-term, e.g. turning scripts/*.py into a
 # library the eventual GUI imports directly instead of shelling out; do
-# not build anything here that assumes today's zip-of-binary-plus-scripts
-# packaging is permanent): each platform's zip contains the built
-# qemu-system-arm binary (portable-ized per-OS, see each job) plus this
-# project's own scripts/*.py, scripts/*.sh, and scripts/requirements.txt.
-# Upstream QEMU's own scripts/ (the vast majority of the directory) are
-# NOT included -- only the gnw-specific ones this project actually added.
+# not build anything here that assumes today's zip-of-binaries-plus-scripts
+# packaging is permanent): each platform's zip contains gwemu (gwemu.exe on
+# Windows -- the standalone, zero-argument GUI binary, see meson.build's
+# gwemu-binary-alias target and ui/gwemu.c) plus qemu-system-arm (the
+# same binary under its generic upstream name, still useful for anyone
+# scripting explicit -M/-display invocations), both portable-ized per-OS
+# (see each job), plus this project's own scripts/*.py, scripts/*.sh, and
+# scripts/requirements.txt. Upstream QEMU's own scripts/ (the vast
+# majority of the directory) are NOT included -- only the gnw-specific
+# ones this project actually added.
 
 on:
   push:
@@ -64,7 +68,26 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev \
-            python3 python3-pip build-essential zip
+            python3 python3-pip build-essential zip \
+            cmake libepoxy-dev \
+            libx11-dev libxext-dev libxrandr-dev libxi-dev libxfixes-dev \
+            libxcursor-dev libxss-dev libwayland-dev libxkbcommon-dev \
+            wayland-protocols libdecor-0-dev libdbus-1-dev libudev-dev
+          # cmake: gnw-h7b0 GUI's SDL3 dependency is fetched+built via
+          # meson's cmake.subproject() (see meson.build's sdl3 handling),
+          # not pkg-config/system-package -- meson needs a real `cmake`
+          # binary on PATH to drive that.
+          # libepoxy-dev: the GUI's GL dispatch library; without it meson
+          # falls back to building subprojects/epoxy.wrap from source,
+          # which works but is slower and an extra thing to go wrong --
+          # prefer the real system package.
+          # libx11-dev..libudev-dev: SDL3 is built STATIC (see
+          # meson.build's SDL_STATIC/SDL_SHARED cmake defines) specifically
+          # so gwemu doesn't need a separate libSDL3.so bundled -- but that
+          # means whatever windowing backends (X11, Wayland) SDL3 can see
+          # dev headers for AT BUILD TIME get compiled in permanently.
+          # Skipping these would silently produce a gwemu binary with no
+          # working Linux display backend at all on some end-user systems.
 
       - name: Install meson/ninja (pip, for a consistent recent version)
         run: |
@@ -82,45 +105,58 @@ jobs:
 
       - name: Build
         run: ninja -C build
+        # Bare `ninja -C build` (no explicit target) is enough to also
+        # produce `gwemu` here: its custom_target has build_by_default:
+        # true (see meson.build's gwemu-binary-alias), unlike macOS's
+        # signed qemu-system-arm custom_target below, which needs naming
+        # explicitly.
 
       - name: Package
         run: |
           set -euo pipefail
-          BIN="$(find build -maxdepth 1 -type f -name qemu-system-arm)"
-          if [ -z "$BIN" ]; then
-            echo "qemu-system-arm not found under build/ -- build tree:" >&2
-            find build -maxdepth 2 >&2
-            exit 1
-          fi
           OUT=gwemu-linux-x86_64
           mkdir -p "$OUT/lib"
-          cp "$BIN" "$OUT/qemu-system-arm.bin"
 
-          # Bundle non-base-OS shared libs (SDL2/glib/pixman and their own
-          # transitive deps) next to the binary, since those aren't
-          # guaranteed present on an arbitrary target system the way
-          # libc/libpthread/etc. are. A wrapper script points
-          # LD_LIBRARY_PATH at them. This does NOT solve glibc-version
-          # skew on its own (see the container comment above) -- it only
-          # covers "SDL2/glib/pixman aren't installed at all" on the
-          # target machine.
-          for lib in $(ldd "$BIN" | awk '{print $3}' | grep -v '^$'); do
-            base=$(basename "$lib")
-            case "$base" in
-              libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-linux*|libresolv.so*|libutil.so*)
-                continue ;;
-            esac
-            cp -n "$lib" "$OUT/lib/" 2>/dev/null || true
-          done
+          package_bin() {
+            local src="$1" dst_name="$2"
+            if [ ! -f "$src" ]; then
+              echo "$src not found under build/ -- build tree:" >&2
+              find build -maxdepth 2 >&2
+              exit 1
+            fi
+            cp "$src" "$OUT/$dst_name.bin"
+            # Bundle non-base-OS shared libs (SDL2/glib/pixman/epoxy and
+            # their own transitive deps) next to the binary, since those
+            # aren't guaranteed present on an arbitrary target system the
+            # way libc/libpthread/etc. are. A wrapper script points
+            # LD_LIBRARY_PATH at them. This does NOT solve glibc-version
+            # skew on its own (see the container comment above) -- it
+            # only covers "these libs aren't installed at all" on the
+            # target machine. SDL3 itself is built static (see meson.build)
+            # so it never shows up here for either binary.
+            for lib in $(ldd "$src" | awk '{print $3}' | grep -v '^$'); do
+              base=$(basename "$lib")
+              case "$base" in
+                libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-linux*|libresolv.so*|libutil.so*)
+                  continue ;;
+              esac
+              cp -n "$lib" "$OUT/lib/" 2>/dev/null || true
+            done
+            # (printf, not a heredoc: a heredoc body would inherit this
+            # YAML block's own indentation literally, breaking the
+            # shebang -- printf sidesteps that entirely.)
+            printf '%s\n' \
+              '#!/bin/sh' \
+              '# Portable launcher: point the loader at the bundled libs next' \
+              '# to this script before exec'"'"'ing the real binary.' \
+              'DIR="$(cd "$(dirname "$0")" && pwd)"' \
+              "exec env LD_LIBRARY_PATH=\"\$DIR/lib:\${LD_LIBRARY_PATH:-}\" \"\$DIR/$dst_name.bin\" \"\$@\"" \
+              > "$OUT/$dst_name"
+            chmod +x "$OUT/$dst_name" "$OUT/$dst_name.bin"
+          }
 
-          cat > "$OUT/qemu-system-arm" <<'WRAPPER'
-          #!/bin/sh
-          # Portable launcher: point the loader at the bundled libs next
-          # to this script before exec'ing the real binary.
-          DIR="$(cd "$(dirname "$0")" && pwd)"
-          exec env LD_LIBRARY_PATH="$DIR/lib:${LD_LIBRARY_PATH:-}" "$DIR/qemu-system-arm.bin" "$@"
-          WRAPPER
-          chmod +x "$OUT/qemu-system-arm" "$OUT/qemu-system-arm.bin"
+          package_bin "$(find build -maxdepth 1 -type f -name qemu-system-arm)" qemu-system-arm
+          package_bin "$(find build -maxdepth 1 -type f -name gwemu)" gwemu
 
           mkdir -p "$OUT/scripts"
           for f in $GNW_SCRIPTS; do
@@ -147,7 +183,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
-        run: brew install ninja pkg-config glib pixman sdl2 meson dylibbundler
+        run: brew install ninja pkg-config glib pixman sdl2 meson dylibbundler cmake libepoxy
+        # cmake: same reason as the Linux job -- meson's cmake.subproject()
+        # needs a real `cmake` binary to build SDL3 (static, see
+        # meson.build). libepoxy: same reason as Linux -- prefer the real
+        # system package over letting meson build subprojects/epoxy.wrap
+        # from source. X11/Wayland dev headers aren't a concern here --
+        # macOS SDL3 targets Cocoa natively, not X11/Wayland.
 
       - name: Configure
         run: |
@@ -162,31 +204,42 @@ jobs:
           # qemu-system-arm-unsigned) via scripts/entitlement.sh -- but
           # that custom_target isn't part of ninja's default "all" set, so
           # a bare `ninja -C build` only produces the unsigned binary.
-          # Build the signed target explicitly.
-          ninja -C build qemu-system-arm
+          # Build the signed target explicitly, and gwemu (its own
+          # custom_target, copies whichever qemu-system-arm this same
+          # invocation just produced) alongside it in the same command --
+          # naming qemu-system-arm explicitly here means ninja does NOT
+          # fall back to build_by_default for anything else, so gwemu
+          # needs to be requested too or it won't get built at all.
+          ninja -C build qemu-system-arm gwemu
 
       - name: Package
         run: |
           set -euo pipefail
-          BIN="$(find build -maxdepth 1 -type f -name qemu-system-arm)"
-          if [ -z "$BIN" ]; then
-            echo "qemu-system-arm not found under build/ -- build tree:" >&2
-            find build -maxdepth 2 >&2
-            exit 1
-          fi
           OUT=gwemu-macos-${{ matrix.arch }}
-          mkdir -p "$OUT"
-          cp "$BIN" "$OUT/qemu-system-arm"
-
-          # dylibbundler copies non-system dylibs alongside the binary and
-          # rewrites its load commands (@executable_path-relative) so it
-          # runs standalone without needing Homebrew installed on the
-          # target machine.
           mkdir -p "$OUT/libs"
-          dylibbundler -od -b \
-            -x "$OUT/qemu-system-arm" \
-            -d "$OUT/libs/" \
-            -p "@executable_path/libs/"
+
+          package_bin() {
+            local src="$1" dst_name="$2"
+            if [ ! -f "$src" ]; then
+              echo "$src not found under build/ -- build tree:" >&2
+              find build -maxdepth 2 >&2
+              exit 1
+            fi
+            cp "$src" "$OUT/$dst_name"
+            # dylibbundler copies non-system dylibs alongside the binary
+            # and rewrites its load commands (@executable_path-relative)
+            # so it runs standalone without needing Homebrew installed on
+            # the target machine. Shared libs/ dir between both binaries
+            # (dylibbundler is safe to call twice against the same -d, it
+            # just skips libs already copied).
+            dylibbundler -od -b \
+              -x "$OUT/$dst_name" \
+              -d "$OUT/libs/" \
+              -p "@executable_path/libs/"
+          }
+
+          package_bin "$(find build -maxdepth 1 -type f -name qemu-system-arm)" qemu-system-arm
+          package_bin "$(find build -maxdepth 1 -type f -name gwemu)" gwemu
 
           mkdir -p "$OUT/scripts"
           for f in $GNW_SCRIPTS; do
@@ -225,6 +278,8 @@ jobs:
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-meson
             mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-libepoxy
             diffutils
             mingw-w64-x86_64-python
             git
@@ -233,6 +288,11 @@ jobs:
           # tests/qapi-schema/meson.build checks for it unconditionally at
           # configure time, even though this project doesn't run tests --
           # without it, configure fails with "Program 'diff' not found".
+          # cmake: meson's cmake.subproject() needs it to build SDL3
+          # (static -- see meson.build). libepoxy: the GUI's GL dispatch
+          # library, prefer the real mingw64 package over meson building
+          # subprojects/epoxy.wrap from source. No X11/Wayland dev
+          # packages needed -- SDL3 targets native Win32 here.
 
       - name: Configure
         run: |
@@ -242,21 +302,36 @@ jobs:
 
       - name: Build
         run: ninja -C build
+        # Bare `ninja -C build` is enough here too -- gwemu.exe has
+        # build_by_default: true, same reasoning as the Linux job.
 
       - name: Package
         run: |
           set -euo pipefail
           OUT=gwemu-windows-x86_64
           mkdir -p "$OUT"
-          cp build/qemu-system-arm.exe "$OUT/"
 
-          # PE binaries have no rpath -- every required mingw64 DLL has to
-          # sit next to the exe (or be on PATH, which we don't want to
-          # assume). ldd works under MSYS2 for PE files and reports the
-          # resolved DLL paths directly.
-          for dll in $(ldd "$OUT/qemu-system-arm.exe" | grep -i '/mingw64/' | awk '{print $3}'); do
-            cp -n "$dll" "$OUT/" 2>/dev/null || true
-          done
+          package_bin() {
+            local src="$1"
+            if [ ! -f "$src" ]; then
+              echo "$src not found under build/ -- build tree:" >&2
+              find build -maxdepth 2 >&2
+              exit 1
+            fi
+            cp "$src" "$OUT/"
+            # PE binaries have no rpath -- every required mingw64 DLL has
+            # to sit next to the exe (or be on PATH, which we don't want
+            # to assume). ldd works under MSYS2 for PE files and reports
+            # the resolved DLL paths directly. SDL3 itself is static (see
+            # meson.build) so it never shows up here.
+            local name; name="$(basename "$src")"
+            for dll in $(ldd "$OUT/$name" | grep -i '/mingw64/' | awk '{print $3}'); do
+              cp -n "$dll" "$OUT/" 2>/dev/null || true
+            done
+          }
+
+          package_bin build/qemu-system-arm.exe
+          package_bin build/gwemu.exe
 
           mkdir -p "$OUT/scripts"
           for f in $GNW_SCRIPTS; do
