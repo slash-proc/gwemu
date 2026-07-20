@@ -1696,7 +1696,7 @@ if true
       # so every consumer picks them up automatically.
       sdl3_macos_frameworks = dependency('appleframeworks',
         modules: ['AudioToolbox', 'CoreHaptics', 'ForceFeedback',
-                   'GameController', 'Carbon'])
+                   'GameController', 'Carbon', 'UniformTypeIdentifiers'])
       sdl3 = declare_dependency(dependencies: [sdl3, sdl3_macos_frameworks])
     endif
     meson.override_dependency('sdl3', sdl3)
