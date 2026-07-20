@@ -1847,6 +1847,7 @@ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
 endif
 
 opengl = not_found
+epoxy = not_found
 if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
   epoxy = dependency('epoxy', method: 'pkg-config',
                       required: false)
@@ -1863,12 +1864,7 @@ if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
   # (pkg-config-found) dependency objects, not subproject-provided ones --
   # skip the redundant check when we just built epoxy from the wrap
   # ourselves, since it's a real, known-good build either way.
-  # epoxy/egl.h gates EGL-specific context creation (virtio-gpu's use
-  # case upstream) -- macOS has no EGL at all by design (CGL/CoreGL
-  # instead), so this check alone would leave CONFIG_OPENGL off on every
-  # macOS build. The gnw-h7b0 GUI's own GL usage goes through SDL3's own
-  # (non-EGL) context creation, so accept epoxy without egl.h on darwin.
-  if not epoxy_from_pkgconfig or host_os == 'darwin' or cc.has_header('epoxy/egl.h', dependencies: epoxy)
+  if not epoxy_from_pkgconfig or cc.has_header('epoxy/egl.h', dependencies: epoxy)
     opengl = epoxy
   elif get_option('opengl').enabled()
     error('epoxy/egl.h not found')
@@ -2569,6 +2565,14 @@ if numa.found()
                                        dependencies: numa))
 endif
 config_host_data.set('CONFIG_OPENGL', opengl.found())
+# CONFIG_OPENGL above requires real EGL (epoxy/egl.h) -- correct for its
+# actual upstream purpose (egl-helpers.c, virtio-gpu's EGL context), but
+# macOS has no EGL at all by design (CGL/CoreGL instead) so it's always
+# false there. The gnw-h7b0 GUI needs epoxy for its own desktop-GL usage
+# (SDL3's own, non-EGL, context creation) regardless of EGL -- separate
+# flag so DisplaySurface's `texture` field (include/ui/surface.h) exists
+# for it without also pulling in genuinely-EGL-only upstream code paths.
+config_host_data.set('CONFIG_GWEMU_DESKTOP_GL', sdl3.found() and epoxy.found())
 config_host_data.set('CONFIG_PLUGIN', get_option('plugins'))
 config_host_data.set('CONFIG_RBD', rbd.found())
 config_host_data.set('CONFIG_RDMA', rdma.found())

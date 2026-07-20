@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 set -eu
 
@@ -19,7 +19,7 @@ GWEMU_VERSION=$( \
     cat GWEMU_VERSION; \
   fi)
 
-if [[ "${GWEMU_VERSION}" == "" ]]; then
+if [ "${GWEMU_VERSION}" = "" ]; then
   GWEMU_VERSION="0.0.0"
 fi
 

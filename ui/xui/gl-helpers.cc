@@ -18,6 +18,7 @@
 //
 #include "gl-helpers.hh"
 #include "common.hh"
+#include <glib/gstdio.h>
 #include "data/controller_mask.png.h"
 #include "data/controller_mask_s.png.h"
 #include "data/logo_sdf.png.h"

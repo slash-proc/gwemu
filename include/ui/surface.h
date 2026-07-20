@@ -17,7 +17,7 @@
 typedef struct DisplaySurface {
     pixman_image_t *image;
     uint8_t flags;
-#ifdef CONFIG_OPENGL
+#if defined(CONFIG_OPENGL) || defined(CONFIG_GWEMU_DESKTOP_GL)
     uint32_t texture;
 #endif
     qemu_pixman_shareable share_handle;
