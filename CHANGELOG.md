@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-07-22 — FIX: stock-firmware "crunchy audio" root-caused and fixed (LTDC vblank re-phasing)
+
+- Root cause of the long-open stock Mario audio-corruption bug (see the
+  "what is ruled out" entry below): `gnw_h7b0_ltdc.c` re-anchored the
+  vblank timer at "now + frame_ns" from `recalc_timers()`, which the
+  SRCR write handler calls on **every** per-frame VBR reload request.
+  Since firmware writes VBR ~1.4ms after taking the vblank IRQ, every
+  frame became (guest work + one full period) ≈ 18.1ms — a rock-steady
+  55.15fps instead of 60.05. Stock's NES-emulator audio producer is
+  paced by this vsync chain while its SAI DMA drains at a metronomic
+  48kHz, so the guest structurally under-produced by ~8%: measured ~20%
+  of DMA half-buffers handed off as ring-underrun **silence** (zero-
+  filled, 2-chunk bursts ~13x/s) — the audible crunch. Not a synthesis,
+  rate-decode, or DMA-model bug: the guest's own bytes contained the
+  gaps (verified by tapping the DMA buffer and listening offline).
+- Fix: `recalc_timers()` is now phase-preserving (keeps the free-running
+  vblank deadline grid unless it is stale/unarmed/wedged), the per-tick
+  re-arm advances on the deadline grid instead of dispatch time (same
+  discipline as `gnw_h7b0_dma_schedule_next()`), and the frame period is
+  computed as an exact fractional muldiv64 period rather than a
+  truncated integer Hz. Verified: 60.07fps, silent chunks 20%→0 (all
+  remaining zero-runs are legitimate musical rests), confirmed clean by
+  ear.
+- Investigation tooling that made this findable, all env-gated and inert
+  by default: `GNW_AUTO_INPUT` scripted button presses
+  (`gnw_h7b0_gpio.c`; Mario has no START button — use A),
+  `GNW_AUDIO_TAP=<file>` raw dump of the exact guest DMA audio bytes
+  (`gnw_h7b0_sai1.c`), and `GNW_AUDIO_TRACE=1` stderr traces of DMA
+  notifies / TIM5 CNT reads / fifo drops / VBR writes.
+- Ruled out along the way (measured, for the record): TIM5 vs SAI rate
+  mismatch (matched to 0.006%), a +0.5% producer-clock bias A/B (no
+  change), integer-truncated 60Hz vblank alone (0.08%, too small), fifo
+  drop path (zero drops), DMA2D latency (model is synchronous), DWT
+  CYCCNT (stock never touches DWT).
+
 ## 2026-07-19/20 — repo cleanup, CI/release pipeline, GUI foundation, C-ported asset tooling
 
 - Repo cleanup pass: deleted 17 dated `docs/session-*.md` investigation

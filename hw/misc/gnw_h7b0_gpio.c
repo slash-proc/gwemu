@@ -412,9 +412,76 @@ static const char *const gnw_h7b0_button_names[GNW_BTN__COUNT] = {
     [GNW_BTN_SELECT] = "select",
 };
 
+/*
+ * Env-gated scripted input for automated testing: GNW_AUTO_INPUT=
+ * "10:time,14:game,22:a" presses each named button at t seconds
+ * (virtual clock) for 200ms. Lets an unattended run drive stock
+ * firmware from the "PRESS TIME BUTTON" splash into gameplay (note:
+ * the Mario unit has no START button -- use "a" to start a game).
+ * Inert unless the env var is set.
+ */
+typedef struct GnwAutoEvent {
+    int64_t ns;
+    int btn;
+    bool down;
+} GnwAutoEvent;
+
+static GnwAutoEvent auto_events[64];
+static int auto_nevents, auto_next;
+static QEMUTimer *auto_timer;
+static void *auto_gpio;
+
+static void gnw_h7b0_gpio_auto_cb(void *opaque)
+{
+    GnwH7B0GpioState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    while (auto_next < auto_nevents && auto_events[auto_next].ns <= now) {
+        fprintf(stderr, "AUTOBTN %d %d %" PRId64 "\n",
+                auto_events[auto_next].btn, auto_events[auto_next].down, now);
+        gnw_h7b0_gpio_set_button(s, auto_events[auto_next].btn,
+                                  auto_events[auto_next].down);
+        auto_next++;
+    }
+    if (auto_next < auto_nevents) {
+        timer_mod(auto_timer, auto_events[auto_next].ns);
+    }
+}
+
 static void gnw_h7b0_gpio_realize(DeviceState *dev, Error **errp)
 {
     GnwH7B0GpioState *s = GNW_H7B0_GPIO(dev);
+
+    const char *auto_input = getenv("GNW_AUTO_INPUT");
+    if (auto_input && !auto_timer) {
+        g_auto(GStrv) evs = g_strsplit(auto_input, ",", -1);
+        for (char **p = evs; *p && auto_nevents < 62; p++) {
+            double t;
+            char name[16];
+            if (sscanf(*p, "%lf:%15s", &t, name) == 2) {
+                int btn = -1;
+                static const char *const names[GNW_BTN__COUNT] = {
+                    "pause", "game", "time", "a", "b", "left",
+                    "down", "right", "up", "pwr", "start", "select",
+                };
+                for (int i = 0; i < GNW_BTN__COUNT; i++) {
+                    if (!strcmp(name, names[i])) { btn = i; break; }
+                }
+                if (btn >= 0) {
+                    auto_events[auto_nevents++] = (GnwAutoEvent){
+                        (int64_t)(t * 1e9), btn, true };
+                    auto_events[auto_nevents++] = (GnwAutoEvent){
+                        (int64_t)(t * 1e9) + 200 * 1000000LL, btn, false };
+                }
+            }
+        }
+        if (auto_nevents) {
+            auto_gpio = s;
+            auto_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       gnw_h7b0_gpio_auto_cb, s);
+            timer_mod(auto_timer, auto_events[0].ns);
+        }
+    }
 
     for (int i = 0; i < GNW_BTN__COUNT; i++) {
         s->key_map[i] = gnw_h7b0_key_map[i];

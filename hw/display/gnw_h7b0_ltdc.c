@@ -284,7 +284,59 @@ static void gnw_h7b0_ltdc_reload_active(GnwH7B0LtdcState *s)
     s->active_bpcr = s->regs[GNW_H7B0_LTDC_BPCR >> 2];
 }
 
+static void gnw_h7b0_ltdc_timing(GnwH7B0LtdcState *s, int64_t *frame_ns_out,
+                                  int64_t *line_ns_out, uint32_t *lipcr_out,
+                                  uint32_t *totalh_out);
+
+/*
+ * Re-derives the frame period from live clock/timing registers and
+ * re-arms the timers -- PHASE-PRESERVING. The vblank deadline grid is
+ * kept if it is still sane (strictly in the future, no further than one
+ * freshly computed frame away) and only re-anchored at "now" when it is
+ * stale, unarmed, or wedged against a transiently-huge period (the
+ * mid-PLL3-programming case the SRCR-write call site exists for).
+ *
+ * Phase preservation is load-bearing for audio, not cosmetic: firmware
+ * writes SRCR.VBR once per frame ~1.4ms after taking the vblank IRQ,
+ * and the previous unconditional "deadline = now + frame_ns" here moved
+ * the next vblank a full period past *that write* -- stretching every
+ * frame to (guest work + 16.65ms) ~= 18.1ms. Stock Mario's NES-emulator
+ * audio producer is paced by this exact vsync chain while its audio DMA
+ * drains at a metronomic 48kHz, so those stretched frames were a
+ * structural ~8% sample shortfall: the long-standing "crunchy audio"
+ * bug (measured: 55.15fps, ~20% of DMA chunks handed off as ring-
+ * underrun silence; see CHANGELOG 2026-07-22).
+ */
 static void gnw_h7b0_ltdc_recalc_timers(GnwH7B0LtdcState *s, int64_t now)
+{
+    int64_t frame_ns, line_ns;
+    uint32_t lipcr, totalh;
+    int64_t next;
+
+    gnw_h7b0_ltdc_timing(s, &frame_ns, &line_ns, &lipcr, &totalh);
+
+    next = s->vblank_deadline_ns;
+    if (next <= now || next > now + frame_ns) {
+        next = now + frame_ns;
+    }
+    s->vblank_deadline_ns = next;
+    timer_mod(s->vblank_timer, next);
+
+    if (lipcr < totalh) {
+        /* The line event belongs to the in-flight frame (start = next -
+         * frame_ns); if that moment already passed, arm it for the next
+         * frame instead of firing a stale one immediately. */
+        int64_t line_t = next - frame_ns + lipcr * line_ns;
+        timer_mod(s->line_timer, line_t > now ? line_t
+                                               : next + lipcr * line_ns);
+    } else {
+        timer_del(s->line_timer);
+    }
+}
+
+static void gnw_h7b0_ltdc_timing(GnwH7B0LtdcState *s, int64_t *frame_ns_out,
+                                  int64_t *line_ns_out, uint32_t *lipcr_out,
+                                  uint32_t *totalh_out)
 {
     uint32_t twcr = s->regs[GNW_H7B0_LTDC_TWCR >> 2];
     /* TWCR packs both fields: TOTALH bits[10:0], TOTALW bits[27:16] --
@@ -310,27 +362,32 @@ static void gnw_h7b0_ltdc_recalc_timers(GnwH7B0LtdcState *s, int64_t now)
      * clamping philosophy used for TIM2/DMA/SPI timing elsewhere in this
      * device family.
      */
-    uint32_t vblank_hz = GNW_H7B0_LTDC_VBLANK_HZ;
+    /*
+     * Exact fractional frame period, not a truncated-to-integer-Hz one:
+     * stock Mario's real rate is 60.05Hz (pll3r 6.042MHz / 393x256), and
+     * even the 0.08% loss from rounding that down to a flat 60Hz is a
+     * systematic production shortfall for the vsync-paced audio producer
+     * (see vblank_deadline_ns's doc comment).
+     */
+    int64_t frame_ns = NANOSECONDS_PER_SECOND / GNW_H7B0_LTDC_VBLANK_HZ;
     if (s->rcc && totalw > 0 && totalh > 0) {
         uint32_t pll3r_hz = gnw_h7b0_rcc_get_pll3r_hz(s->rcc);
         uint64_t pixels = (uint64_t)totalw * totalh;
-        uint32_t real_hz = pixels > 0 ? (uint32_t)(pll3r_hz / pixels) : 0;
 
-        if (real_hz >= 1 && real_hz <= 1000) {
-            vblank_hz = real_hz;
+        if (pll3r_hz > 0 && pixels > 0) {
+            int64_t real_ns = muldiv64(pixels, NANOSECONDS_PER_SECOND,
+                                        pll3r_hz);
+            /* Same 1..1000Hz sanity window as before, in period form. */
+            if (real_ns >= 1000000 && real_ns <= 1000000000) {
+                frame_ns = real_ns;
+            }
         }
     }
 
-    int64_t frame_ns = NANOSECONDS_PER_SECOND / vblank_hz;
-    int64_t line_ns = frame_ns / totalh;
-
-    timer_mod(s->vblank_timer, now + frame_ns);
-
-    if (lipcr < totalh) {
-        timer_mod(s->line_timer, now + lipcr * line_ns);
-    } else {
-        timer_del(s->line_timer);
-    }
+    *frame_ns_out = frame_ns;
+    *line_ns_out = frame_ns / totalh;
+    *lipcr_out = lipcr;
+    *totalh_out = totalh;
 }
 
 void gnw_h7b0_ltdc_set_rcc(GnwH7B0LtdcState *s, GnwH7B0RccState *rcc)
@@ -458,7 +515,33 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
         }
     }
 
-    gnw_h7b0_ltdc_recalc_timers(s, now);
+    /*
+     * Re-arm on the deadline grid, not at "now + frame_ns" -- see
+     * vblank_deadline_ns's doc comment (and gnw_h7b0_dma_schedule_next(),
+     * which this mirrors). Clamp only when more than a full frame
+     * behind (host stall, debugger attach), so ordinary dispatch
+     * latency never shifts the grid.
+     */
+    {
+        int64_t frame_ns, line_ns;
+        uint32_t lipcr, totalh;
+        int64_t frame_start;
+
+        gnw_h7b0_ltdc_timing(s, &frame_ns, &line_ns, &lipcr, &totalh);
+
+        frame_start = s->vblank_deadline_ns;
+        if (frame_start < now - frame_ns) {
+            frame_start = now;
+        }
+        s->vblank_deadline_ns = frame_start + frame_ns;
+        timer_mod(s->vblank_timer, s->vblank_deadline_ns);
+
+        if (lipcr < totalh) {
+            timer_mod(s->line_timer, frame_start + lipcr * line_ns);
+        } else {
+            timer_del(s->line_timer);
+        }
+    }
 }
 
 static void gnw_h7b0_ltdc_line_tick(void *opaque)
@@ -1666,6 +1749,10 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
             }
         }
         if (value & LTDC_SRCR_VBR) {
+            if (getenv("GNW_AUDIO_TRACE")) {
+                fprintf(stderr, "VBR %" PRId64 "\n",
+                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            }
             s->vbr_reload_pending = true;
             s->vbr_active = true;
 

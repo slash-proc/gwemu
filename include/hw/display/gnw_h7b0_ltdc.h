@@ -272,6 +272,18 @@ struct GnwH7B0LtdcState {
     qemu_irq irq;
     QEMUTimer *vblank_timer;
     QEMUTimer *line_timer;
+    /*
+     * Grid deadline the vblank timer is armed against. Re-arming at
+     * "dispatch time + frame_ns" instead (the old behavior) bakes every
+     * tick's host-scheduling lateness into the next frame permanently,
+     * which under load ran the guest-visible vsync several percent below
+     * 60Hz -- and stock Mario paces its NES-emulator audio producer off
+     * vsync while the audio DMA drains at a metronomic 48kHz, so that
+     * deficit surfaced as ~13 ring-underrun silence gaps per second
+     * (measured): the long-standing "crunchy audio" bug. Same
+     * deadline-grid discipline as gnw_h7b0_dma_schedule_next().
+     */
+    int64_t vblank_deadline_ns;
     int invalidate;
     bool pf_warned;
 

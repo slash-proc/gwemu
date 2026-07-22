@@ -167,11 +167,34 @@ static void gnw_h7b0_sai1_dma_notify(void *opaque, bool half,
          * oldest queued audio to make room rather than growing latency
          * unboundedly or overflowing fifo8_push_all().
          */
+        if (getenv("GNW_AUDIO_TRACE")) {
+            fprintf(stderr, "DROP %u %" PRId64 "\n",
+                    half_bytes - fifo8_num_free(&s->fifo),
+                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        }
         fifo8_drop(&s->fifo, half_bytes - fifo8_num_free(&s->fifo));
+    }
+
+    if (getenv("GNW_AUDIO_TRACE")) {
+        fprintf(stderr, "DN %d %" PRId64 "\n", half,
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
 
     g_autofree uint8_t *buf = g_malloc(half_bytes);
     cpu_physical_memory_read(addr, buf, half_bytes);
+    {
+        const char *tap = getenv("GNW_AUDIO_TAP");
+        if (tap) {
+            static FILE *tapf;
+            if (!tapf) {
+                tapf = fopen(tap, "wb");
+            }
+            if (tapf) {
+                fwrite(buf, 1, half_bytes, tapf);
+                fflush(tapf);
+            }
+        }
+    }
     fifo8_push_all(&s->fifo, buf, half_bytes);
 }
 
