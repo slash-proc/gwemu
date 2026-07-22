@@ -82,7 +82,20 @@ struct GnwH7B0JpegState {
     int pending_chroma_height;
     int pending_comp;
     uint32_t pending_confrn1;
-    uint32_t job_epoch;       /* current device epoch, bumped on reset */
+    /*
+     * BQL-only: a decode job for the current operation has been posted to
+     * the worker and its result not yet published. While set, further DIR
+     * writes are ignored (real codec: input FIFO stops requesting data
+     * after EOI -- SR.IFTF/IFNFF are cleared when the job is posted), so
+     * a HAL feed loop that keeps polling can neither walk its source
+     * pointer off the end of RAM nor have leftover bytes EOI-scanned into
+     * a spurious second job. Cleared by poll_worker() on publish/discard
+     * and by a new CONFR0.START.
+     */
+    bool decode_busy;
+    uint32_t job_epoch;       /* current device epoch, bumped on reset (and
+                               * on CONFR0.START, to discard any stale
+                               * in-flight job from a previous operation) */
     uint32_t job_input_epoch; /* epoch the currently-queued job was posted under */
     uint32_t pending_epoch;   /* epoch the finished pending_* result belongs to */
 };

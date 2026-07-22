@@ -459,6 +459,22 @@ struct GnwH7B0LtdcState {
     bool job_busy;
     GnwH7B0LtdcCaptureJob compositor_job;
 
+    /*
+     * Staged capture slot (BQL-only). When a reload-triggered capture
+     * arrives while the compositor worker is still busy, the frame is
+     * snapshotted HERE at the reload instant and dispatched later
+     * (vblank tick, or displaced by a newer capture). The old behavior
+     * -- deferring the whole capture and re-reading guest RAM up to a
+     * vblank later -- was a confirmed source of visible mid-redraw
+     * flicker: retro-go's menu draws into the displayed buffer on
+     * alternating frames (its ReloadEventCallback re-stages CFBAR via
+     * an immediate IMR reload), so a late re-read snapshots a
+     * half-drawn carousel. Snapshot timing must follow the guest's
+     * reload, not the worker's availability.
+     */
+    GnwH7B0LtdcCaptureJob staged_job;
+    bool staged_valid;
+
     QemuThread compositor_thread;
     bool compositor_running;
     bool compositor_stop;
@@ -502,6 +518,23 @@ struct GnwH7B0LtdcState {
      * changes the RAM-dirty check structurally cannot see.
      */
     bool fb_reg_dirty;
+
+    /*
+     * Draw-quiescence debounce for the non-VBR fallback capture. Direct-
+     * paint firmware (retro-go's menu) redraws its visible framebuffer
+     * in place; on real hardware a full redraw (JPEG cover decodes
+     * included) finishes in a couple of ms and intermediate states are
+     * never visible, but under TCG the same redraw spans many vblank
+     * ticks, so capturing at the first dirty tick publishes half-drawn
+     * frames (seen live: a side cover composited on top of the center
+     * cover, and a periodic menu flicker). Instead, a dirty tick only
+     * arms fb_quiesce_pending; the capture happens on the first later
+     * tick whose dirty check comes back clean (draw burst over), or
+     * unconditionally after GNW_H7B0_LTDC_QUIESCE_TICKS_MAX ticks so a
+     * continuously-animating screen still updates.
+     */
+    bool fb_quiesce_pending;
+    int fb_quiesce_ticks;
 
     /*
      * Counts consecutive gnw_h7b0_ltdc_vblank_tick() calls since the last

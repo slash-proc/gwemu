@@ -1288,6 +1288,18 @@ static void gnw_h7b0_jpeg_poll_worker(GnwH7B0JpegState *s)
         return;
     }
     s->decode_done = false;
+    s->decode_busy = false;
+    if (getenv("GNW_JPEG_TRACE")) {
+        uint32_t sum = 0;
+        if (s->pending_y) {
+            for (int i = 0; i < 64; i++) {
+                sum = sum * 31 + s->pending_y[i];
+            }
+        }
+        fprintf(stderr, "JPT publish epoch=%u/%u dims=%dx%d ysum=%08x\n",
+                s->pending_epoch, s->job_epoch, s->pending_width,
+                s->pending_height, sum);
+    }
     if (s->pending_epoch != s->job_epoch) {
         /* A reset happened after this job was queued -- discard the
          * stale result instead of publishing decoded content from before
@@ -1359,6 +1371,7 @@ static void gnw_h7b0_jpeg_reset(DeviceState *dev)
         g_byte_array_set_size(s->encode_out, 0);
     }
     s->enc_dor_cursor = 0;
+    s->decode_busy = false;
 
     /* Bump the epoch so any in-flight worker job from before this reset
      * gets its result discarded by gnw_h7b0_jpeg_poll_worker() instead of
@@ -1414,6 +1427,14 @@ static uint64_t gnw_h7b0_jpeg_read(void *opaque, hwaddr addr, unsigned int size)
                 s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &= ~JPEG_SR_OFNEF;
             }
             return v;
+        }
+        if (getenv("GNW_JPEG_TRACE") && s->dor_cursor == 0 && s->y_plane) {
+            uint32_t sum = 0;
+            for (int i = 0; i < 64; i++) {
+                sum = sum * 31 + s->y_plane[i];
+            }
+            fprintf(stderr, "JPT drain0 dims=%dx%d ysum=%08x\n",
+                    s->plane_width, s->plane_height, sum);
         }
         /* Real DOR: pop the next 4 bytes from a flat cursor over
          * y_plane||cb_plane||cr_plane, little-endian-packed like the
@@ -1549,6 +1570,25 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
             ~(JPEG_SR_EOCF | JPEG_SR_OFNEF | JPEG_SR_OFTF | JPEG_SR_COF);
         s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] |= (JPEG_SR_IFTF | JPEG_SR_IFNFF);
         s->dor_cursor = 0;
+        /*
+         * A fresh START must also orphan any decode job still queued or
+         * in flight from a previous operation -- otherwise its planes
+         * publish into THIS decode and firmware reads the previous
+         * image's content out of DOR (seen live as retro-go coverflow
+         * drawing a cover that belongs two positions back). Same epoch
+         * mechanism device reset uses.
+         */
+        s->decode_busy = false;
+        if (s->thread_started) {
+            qemu_mutex_lock(&s->thread_lock);
+            s->job_epoch++;
+            qemu_mutex_unlock(&s->thread_lock);
+        } else {
+            s->job_epoch++;
+        }
+        if (getenv("GNW_JPEG_TRACE")) {
+            fprintf(stderr, "JPT start epoch=%u\n", s->job_epoch);
+        }
     } else if (addr == GNW_H7B0_JPEG_CR_OFFSET) {
         /* IFF/OFF (input/output FIFO flush) are real pulse bits -- the SVD
          * documents them as "always read as 0". Mirror the self-clearing
@@ -1627,6 +1667,18 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
             }
         }
     } else if (addr == GNW_H7B0_JPEG_DIR_OFFSET) {
+        /*
+         * A decode job is already posted for this operation: the real
+         * codec's input FIFO stops requesting data after EOI, so any
+         * further DIR writes are excess bytes from a HAL feed loop that
+         * raced the (async) decode. Accepting them would EOI-scan
+         * whatever garbage follows the real bitstream in guest RAM and
+         * could post a spurious second job (whose failed decode then
+         * publishes black planes over the real result). Drop them.
+         */
+        if (s->decode_busy) {
+            return;
+        }
         if (s->inbuf) {
             uint32_t v = (uint32_t)val64;
             g_byte_array_append(s->inbuf, (const guint8 *)&v, 4);
@@ -1729,6 +1781,24 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
                     s->job_pending = true;
                     qemu_cond_signal(&s->thread_cond);
                     qemu_mutex_unlock(&s->thread_lock);
+                    /*
+                     * Input is complete: real hardware's FIFO stops
+                     * requesting data now (and HAL's JPEG_ReadInputData()
+                     * checks IFTF before every refill). Leaving these set
+                     * while the worker runs let the feed loop pump its
+                     * source pointer right off the end of AXISRAM --
+                     * firmware passes its full buffer SIZE as InDataLength
+                     * and relies on this backpressure + EOC to stop early
+                     * (seen live as a BusFault/BSOD in JPEG_ReadInputData
+                     * during retro-go coverflow).
+                     */
+                    s->decode_busy = true;
+                    s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &=
+                        ~(JPEG_SR_IFTF | JPEG_SR_IFNFF);
+                    if (getenv("GNW_JPEG_TRACE")) {
+                        fprintf(stderr, "JPT post len=%u epoch=%u\n",
+                                s->job_input ? s->job_input->len : 0, s->job_epoch);
+                    }
                 }
             }
         }

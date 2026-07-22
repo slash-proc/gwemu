@@ -54,6 +54,9 @@ static bool gnw_h7b0_ltdc_enabled(GnwH7B0LtdcState *s)
 }
 
 static void gnw_h7b0_ltdc_snapshot_and_dispatch(GnwH7B0LtdcState *s, int rows);
+static void gnw_h7b0_ltdc_snapshot_into(GnwH7B0LtdcState *s,
+                                         GnwH7B0LtdcCaptureJob *job, int rows);
+static void gnw_h7b0_ltdc_promote_staged(GnwH7B0LtdcState *s);
 
 /*
  * Cheap peek at job_busy, used by vblank_tick()'s non-VBR fallback to
@@ -111,8 +114,28 @@ static bool gnw_h7b0_ltdc_capture_if_enabled(GnwH7B0LtdcState *s)
      */
     qemu_mutex_lock(&s->job_lock);
     if (s->job_busy) {
+        uint32_t pfcr = s->active_l1pfcr & LTDC_LxPFCR_PF_MASK;
+        int src_width = gnw_h7b0_ltdc_layer_stride_bytes(s->active_l1cfblr);
+        int cols = src_width / (pfcr == LTDC_PF_L8 ? 1 : 2);
+        int brows = (int)(s->active_l1cfblnr & 0x7FFU);
         qemu_mutex_unlock(&s->job_lock);
-        return false;
+
+        /*
+         * Worker still busy: snapshot NOW into the staged slot (guest
+         * RAM must be read at the reload instant -- see staged_job's
+         * doc comment), dispatch later. Only possible while the frame
+         * geometry matches the current shadow buffer: a resize needs
+         * the worker provably idle, so geometry changes keep the old
+         * defer-and-retry behavior (rare: screen/mode transitions).
+         */
+        if (cols != s->shadow_width || brows != s->shadow_height ||
+            (pfcr != LTDC_PF_RGB565 && pfcr != LTDC_PF_L8) ||
+            !(s->active_l1cr & LTDC_LxCR_LEN)) {
+            return false;
+        }
+        gnw_h7b0_ltdc_snapshot_into(s, &s->staged_job, brows);
+        s->staged_valid = true;
+        return true;
     }
     qemu_mutex_unlock(&s->job_lock);
 
@@ -121,6 +144,8 @@ static bool gnw_h7b0_ltdc_capture_if_enabled(GnwH7B0LtdcState *s)
         return false;
     }
 
+    /* A fresh capture supersedes any older staged frame. */
+    s->staged_valid = false;
     gnw_h7b0_ltdc_snapshot_and_dispatch(s, rows);
     return true;
 }
@@ -146,6 +171,28 @@ static bool gnw_h7b0_ltdc_capture_if_enabled(GnwH7B0LtdcState *s)
  * it can't silently wrap on a long-running static screen.
  */
 #define GNW_H7B0_LTDC_SRCR_IDLE_TICKS_THRESHOLD 8
+
+/*
+ * Bounded wait (in vblank ticks) for the non-VBR fallback's draw-
+ * quiescence debounce -- see fb_quiesce_pending in gnw_h7b0_ltdc.h.
+ * Large enough to ride out a multi-tick menu redraw (JPEG cover decodes
+ * included), small enough that a continuously-dirty animation still
+ * refreshes at a live (if reduced) rate (60/16 = ~4fps floor). Raised
+ * from 4 after live testing: a full carousel redraw (5 JPEG cover
+ * decodes) exceeds 4 ticks, so the bounded capture still published
+ * mid-redraw frames on every periodic menu refresh.
+ */
+#define GNW_H7B0_LTDC_QUIESCE_TICKS_MAX 16
+
+/* Env-gated capture-path tracing (GNW_LTDC_TRACE) -- which code path
+ * published each frame, with the virtual timestamp and active CFBAR. */
+#define GNW_LTDC_TRACE_CAP(s, tag) do { \
+    if (getenv("GNW_LTDC_TRACE")) { \
+        fprintf(stderr, "LTC cap %s %" PRId64 " cfbar=%08x\n", (tag), \
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), \
+                (s)->regs[GNW_H7B0_LTDC_L1CFBAR >> 2]); \
+    } \
+} while (0)
 #define GNW_H7B0_LTDC_SRCR_IDLE_TICKS_MAX 1000000
 
 static void gnw_h7b0_ltdc_update_irq(GnwH7B0LtdcState *s)
@@ -480,10 +527,30 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
          */
         bool vbr_idle = s->srcr_idle_ticks >= GNW_H7B0_LTDC_SRCR_IDLE_TICKS_THRESHOLD &&
                          s->structural_transition_pending;
-        if ((!s->vbr_active || vbr_idle) && !s->content_dirty &&
+        bool fallback_armed = (!s->vbr_active || vbr_idle) && !s->content_dirty &&
             gnw_h7b0_ltdc_enabled(s) &&
-            !gnw_h7b0_ltdc_compositor_busy(s) &&
-            gnw_h7b0_ltdc_fb_dirty_check_and_clear(s)) {
+            !gnw_h7b0_ltdc_compositor_busy(s);
+        bool fb_dirty = fallback_armed &&
+            gnw_h7b0_ltdc_fb_dirty_check_and_clear(s);
+
+        /*
+         * Draw-quiescence debounce -- see fb_quiesce_pending's doc
+         * comment in gnw_h7b0_ltdc.h. A dirty tick arms the capture; it
+         * fires on the first clean tick after the draw burst ends (or
+         * after the bounded wait expires, so continuous animation still
+         * gets through at a reduced-but-live rate).
+         */
+        if (fb_dirty) {
+            if (getenv("GNW_LTDC_TRACE")) {
+                fprintf(stderr, "LTC dirty %" PRId64 "\n", now);
+            }
+            s->fb_quiesce_pending = true;
+            s->fb_quiesce_ticks++;
+        } else if (s->fb_quiesce_pending) {
+            s->fb_quiesce_ticks = GNW_H7B0_LTDC_QUIESCE_TICKS_MAX;
+        }
+        if (fallback_armed && s->fb_quiesce_pending &&
+            s->fb_quiesce_ticks >= GNW_H7B0_LTDC_QUIESCE_TICKS_MAX) {
             /*
              * Only clear fb_reg_dirty if the dispatch actually happened
              * (it always should here, given the !compositor_busy() check
@@ -493,9 +560,16 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
              * nothing to redo next tick and leaving fb_reg_dirty set
              * would just harmlessly re-check RAM dirtiness again).
              */
+            if (getenv("GNW_LTDC_TRACE")) {
+                fprintf(stderr, "LTC capture %" PRId64 " ticks=%d\n", now,
+                        s->fb_quiesce_ticks);
+            }
             if (gnw_h7b0_ltdc_capture_if_enabled(s)) {
+                GNW_LTDC_TRACE_CAP(s, "fallback");
                 s->fb_reg_dirty = false;
             }
+            s->fb_quiesce_pending = false;
+            s->fb_quiesce_ticks = 0;
         }
     }
 
@@ -509,8 +583,13 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
      * to worker-thread backpressure the way it could be if this only
      * fired once inside the vbr_reload_pending branch above.
      */
+    /* Dispatch a staged reload-instant snapshot once the worker is free
+     * -- see staged_job's doc comment in gnw_h7b0_ltdc.h. */
+    gnw_h7b0_ltdc_promote_staged(s);
+
     if (s->vbr_deferred_capture) {
         if (gnw_h7b0_ltdc_capture_if_enabled(s)) {
+            GNW_LTDC_TRACE_CAP(s, "deferred");
             s->vbr_deferred_capture = false;
         }
     }
@@ -579,6 +658,9 @@ static void gnw_h7b0_ltdc_reset(DeviceState *dev)
     s->vbr_active = false;
     s->srcr_idle_ticks = 0;
     s->structural_transition_pending = false;
+    s->fb_quiesce_pending = false;
+    s->fb_quiesce_ticks = 0;
+    s->staged_valid = false;
 
     g_free(s->shadow_buffer);
     s->shadow_buffer = NULL;
@@ -1196,9 +1278,9 @@ static inline uint32_t gnw_h7b0_ltdc_dither_pixel(uint32_t px, int x, int y)
  * function's git history for the perf rationale -- one read per capture
  * instead of one per scanline).
  */
-static void gnw_h7b0_ltdc_snapshot_and_dispatch(GnwH7B0LtdcState *s, int rows)
+static void gnw_h7b0_ltdc_snapshot_into(GnwH7B0LtdcState *s,
+                                         GnwH7B0LtdcCaptureJob *job, int rows)
 {
-    GnwH7B0LtdcCaptureJob *job = &s->compositor_job;
     int cols = s->shadow_width;
     uint32_t pfcr = s->active_l1pfcr & LTDC_LxPFCR_PF_MASK;
     bool l1_l8 = (pfcr == LTDC_PF_L8);
@@ -1304,6 +1386,40 @@ static void gnw_h7b0_ltdc_snapshot_and_dispatch(GnwH7B0LtdcState *s, int rows)
 
     memcpy(job->clut, s->clut, sizeof(job->clut));
     memcpy(job->clut2, s->clut2, sizeof(job->clut2));
+}
+
+static void gnw_h7b0_ltdc_snapshot_and_dispatch(GnwH7B0LtdcState *s, int rows)
+{
+    gnw_h7b0_ltdc_snapshot_into(s, &s->compositor_job, rows);
+
+    qemu_mutex_lock(&s->job_lock);
+    s->job_busy = true;
+    s->job_pending = true;
+    qemu_cond_signal(&s->job_cond);
+    qemu_mutex_unlock(&s->job_lock);
+}
+
+/*
+ * Promote a staged snapshot (see staged_job's doc comment in
+ * gnw_h7b0_ltdc.h) into the compositor job now that the worker is free.
+ * Swaps the two job structs wholesale so the raw-buffer allocations
+ * simply change owners -- no copying, no leaks.
+ */
+static void gnw_h7b0_ltdc_promote_staged(GnwH7B0LtdcState *s)
+{
+    GnwH7B0LtdcCaptureJob tmp;
+
+    qemu_mutex_lock(&s->job_lock);
+    if (!s->staged_valid || s->job_busy) {
+        qemu_mutex_unlock(&s->job_lock);
+        return;
+    }
+    qemu_mutex_unlock(&s->job_lock);
+
+    tmp = s->compositor_job;
+    s->compositor_job = s->staged_job;
+    s->staged_job = tmp;
+    s->staged_valid = false;
 
     qemu_mutex_lock(&s->job_lock);
     s->job_busy = true;
@@ -1743,9 +1859,12 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
              * IMR-triggered geometry/format change is exactly the kind
              * of update that must not silently get lost.
              */
-            if ((composition_changed || s->content_dirty) &&
-                !gnw_h7b0_ltdc_capture_if_enabled(s)) {
-                s->vbr_deferred_capture = true;
+            if (composition_changed || s->content_dirty) {
+                if (gnw_h7b0_ltdc_capture_if_enabled(s)) {
+                    GNW_LTDC_TRACE_CAP(s, "imr");
+                } else {
+                    s->vbr_deferred_capture = true;
+                }
             }
         }
         if (value & LTDC_SRCR_VBR) {
@@ -1787,6 +1906,7 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
              * gnw_h7b0_ltdc_capture_if_enabled()'s doc comment) -- not just
              * when content_dirty was already true. */
             if (!s->content_dirty && gnw_h7b0_ltdc_capture_if_enabled(s)) {
+                GNW_LTDC_TRACE_CAP(s, "vbr");
                 s->vbr_deferred_capture = false;
             } else {
                 s->vbr_deferred_capture = true;
@@ -1925,6 +2045,10 @@ static void gnw_h7b0_ltdc_unrealize(DeviceState *dev)
     s->compositor_job.l1_raw = NULL;
     g_free(s->compositor_job.l2_raw);
     s->compositor_job.l2_raw = NULL;
+    g_free(s->staged_job.l1_raw);
+    s->staged_job.l1_raw = NULL;
+    g_free(s->staged_job.l2_raw);
+    s->staged_job.l2_raw = NULL;
 
     gnw_h7b0_ltdc_fb_track_range(&s->fb_l1_section, &s->fb_l1_track_base,
                                   &s->fb_l1_track_len, 0, 0);

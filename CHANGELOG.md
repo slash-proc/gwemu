@@ -1,3 +1,26 @@
+2026-07-23  FIX: retro-go menu flicker + black-screen/BSOD on quit-to-menu, all
+            rooted in the async JPEG/LTDC work. (1) JPEG model now models input
+            backpressure: IFTF/IFNFF clear when a decode job is posted and DIR
+            writes are ignored while it runs -- the HAL feed loop (which passes
+            its full buffer SIZE as InDataLength and relies on EOC to stop)
+            could pump its source pointer off the end of AXISRAM (BusFault ->
+            retro-go BSOD) and stray FF D9 bytes in over-pumped garbage posted
+            bogus decode jobs that trampled real results (black covers, stuck
+            first decode -> black screen on return to menu). (2) CONFR0.START
+            bumps the job epoch so a stale in-flight decode can't publish into
+            a new operation (wrong cover flashing). (3) LTDC captures are now
+            snapshotted at the reload instant even when the compositor worker
+            is busy (staged_job slot, promoted when the worker frees) -- the
+            old defer-and-reread-next-vblank path captured retro-go's menu
+            mid-redraw (it draws into the displayed buffer on alternating
+            frames), the confirmed cause of the periodic carousel flicker.
+            Plus a draw-quiescence debounce for the non-VBR fallback, and
+            GNW_AUTO_INPUT now takes an optional hold duration (t:btn:secs,
+            for boot-time bank-select combos). Confirmed by ear/eye by the
+            project owner; the remaining "Celeste over SMW" cover overlap was
+            verified on real hardware to be retro-go's own layout quirk
+            (mixed-width covers), i.e. faithful emulation, not a bug here.
+
 # Changelog
 
 ## 2026-07-22 — FIX: stock-firmware "crunchy audio" root-caused and fixed (LTDC vblank re-phasing)

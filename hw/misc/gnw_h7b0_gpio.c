@@ -415,7 +415,9 @@ static const char *const gnw_h7b0_button_names[GNW_BTN__COUNT] = {
 /*
  * Env-gated scripted input for automated testing: GNW_AUTO_INPUT=
  * "10:time,14:game,22:a" presses each named button at t seconds
- * (virtual clock) for 200ms. Lets an unattended run drive stock
+ * (virtual clock) for 200ms; an optional third field ("0:game:3")
+ * overrides the hold duration in seconds (for boot-time bank-select
+ * combos that need a button held down through early firmware polls). Lets an unattended run drive stock
  * firmware from the "PRESS TIME BUTTON" splash into gameplay (note:
  * the Mario unit has no START button -- use "a" to start a game).
  * Inert unless the env var is set.
@@ -457,8 +459,9 @@ static void gnw_h7b0_gpio_realize(DeviceState *dev, Error **errp)
         g_auto(GStrv) evs = g_strsplit(auto_input, ",", -1);
         for (char **p = evs; *p && auto_nevents < 62; p++) {
             double t;
+            double hold = 0.2;
             char name[16];
-            if (sscanf(*p, "%lf:%15s", &t, name) == 2) {
+            if (sscanf(*p, "%lf:%15[^:]:%lf", &t, name, &hold) >= 2) {
                 int btn = -1;
                 static const char *const names[GNW_BTN__COUNT] = {
                     "pause", "game", "time", "a", "b", "left",
@@ -471,11 +474,22 @@ static void gnw_h7b0_gpio_realize(DeviceState *dev, Error **errp)
                     auto_events[auto_nevents++] = (GnwAutoEvent){
                         (int64_t)(t * 1e9), btn, true };
                     auto_events[auto_nevents++] = (GnwAutoEvent){
-                        (int64_t)(t * 1e9) + 200 * 1000000LL, btn, false };
+                        (int64_t)((t + hold) * 1e9), btn, false };
                 }
             }
         }
         if (auto_nevents) {
+            /* Long holds can make press/release events interleave out of
+             * order across buttons; the dispatch walk needs ascending ns. */
+            for (int i = 1; i < auto_nevents; i++) {
+                GnwAutoEvent e = auto_events[i];
+                int j = i - 1;
+                while (j >= 0 && auto_events[j].ns > e.ns) {
+                    auto_events[j + 1] = auto_events[j];
+                    j--;
+                }
+                auto_events[j + 1] = e;
+            }
             auto_gpio = s;
             auto_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        gnw_h7b0_gpio_auto_cb, s);
