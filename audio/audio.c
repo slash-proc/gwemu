@@ -213,6 +213,9 @@ static void audio_create_pdos(Audiodev *dev)
 #ifdef CONFIG_AUDIO_SDL
         CASE(SDL, sdl, Sdl);
 #endif
+#ifdef CONFIG_AUDIO_SDL3
+        CASE(SDL3, sdl3, Sdl);
+#endif
 #ifdef CONFIG_AUDIO_SNDIO
         CASE(SNDIO, sndio, );
 #endif
@@ -308,6 +311,10 @@ static AudiodevPerDirectionOptions *audio_get_pdo_out(Audiodev *dev)
     case AUDIODEV_DRIVER_SDL:
         return qapi_AudiodevSdlPerDirectionOptions_base(dev->u.sdl.out);
 #endif
+#ifdef CONFIG_AUDIO_SDL3
+    case AUDIODEV_DRIVER_SDL3:
+        return qapi_AudiodevSdlPerDirectionOptions_base(dev->u.sdl3.out);
+#endif
 #ifdef CONFIG_AUDIO_SNDIO
     case AUDIODEV_DRIVER_SNDIO:
         return dev->u.sndio.out;
@@ -366,6 +373,10 @@ static AudiodevPerDirectionOptions *audio_get_pdo_in(Audiodev *dev)
 #ifdef CONFIG_AUDIO_SDL
     case AUDIODEV_DRIVER_SDL:
         return qapi_AudiodevSdlPerDirectionOptions_base(dev->u.sdl.in);
+#endif
+#ifdef CONFIG_AUDIO_SDL3
+    case AUDIODEV_DRIVER_SDL3:
+        return qapi_AudiodevSdlPerDirectionOptions_base(dev->u.sdl3.in);
 #endif
 #ifdef CONFIG_AUDIO_SNDIO
     case AUDIODEV_DRIVER_SNDIO:

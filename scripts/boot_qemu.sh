@@ -12,6 +12,20 @@
 #
 # Usage: ./scripts/boot_qemu.sh <game> [--patched] [--ephemeral]
 #        ./scripts/boot_qemu.sh --diag [path/to/diag.bin]
+#        ./scripts/boot_qemu.sh --gui
+#   --gui: boot with no bank1-image/bank2-image/extflash-image at all --
+#   gnw_h7b0_init_ram_or_file() already falls back to blank RAM when a
+#   property is unset, so nothing crashes on the QEMU-device side, but a
+#   fully blank vector table (SP=0, PC=0) makes the ARMv7-M CPU itself hit
+#   a genuine, correctly-detected lockup ("can't escalate 3 to HardFault")
+#   the instant it starts running -- QEMU treats that as fatal and aborts
+#   the whole process, GUI included, not just the guest. So this mode
+#   starts the CPU halted (-S) instead of running -- the GUI itself
+#   doesn't depend on the guest CPU executing, only on Flash being
+#   configured before you'd ever want it to. Configure Flash from inside
+#   the GUI (Flash tab, Apply), which restarts the process via
+#   xemu_relaunch_with_flash_images() with real images -- normal boot
+#   from there.
 #   --diag: boot the sibling `../stm32h7b0-diag` project's benchmark/test
 #   firmware instead of a game image -- a single raw binary loaded at
 #   0x08000000 (Cortex-M reset vector), no bank2/extflash involved. Defaults
@@ -43,10 +57,14 @@
 #   without re-copying it after every run.
 set -euo pipefail
 
-GAME="${1:?usage: $0 <game> [--patched] [--ephemeral]  |  $0 --diag [path/to/diag.bin]}"
+GAME="${1:?usage: $0 <game> [--patched] [--ephemeral]  |  $0 --diag [path/to/diag.bin]  |  $0 --gui}"
 shift
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QEMU="$REPO_ROOT/build/qemu-system-arm"
+
+if [ "$GAME" = "--gui" ]; then
+    exec "$QEMU" -M gnw-h7b0 -display gwemu -S
+fi
 
 if [ "$GAME" = "--diag" ]; then
     DIAG_ROOT="${DIAG_ROOT:-$REPO_ROOT/../stm32h7b0-diag}"
@@ -116,7 +134,7 @@ pick_backend() {
     return 1
 }
 
-AUDIODEV="${GNW_AUDIODEV:-$(pick_backend audiodev GNW_AUDIODEV coreaudio pa sdl none)}"
+AUDIODEV="${GNW_AUDIODEV:-$(pick_backend audiodev GNW_AUDIODEV sdl3 coreaudio pa sdl none)}"
 DISPLAY_BACKEND="${GNW_DISPLAY:-$(pick_backend display GNW_DISPLAY cocoa sdl gtk none)}"
 
 # A host with no default output device (CoreAudio enumerating zero devices --

@@ -378,6 +378,10 @@ AudiodevPerDirectionOptions *glue(audio_get_pdo_, TYPE)(Audiodev *dev)
     case AUDIODEV_DRIVER_SDL:
         return qapi_AudiodevSdlPerDirectionOptions_base(dev->u.sdl.TYPE);
 #endif
+#ifdef CONFIG_AUDIO_SDL3
+    case AUDIODEV_DRIVER_SDL3:
+        return qapi_AudiodevSdlPerDirectionOptions_base(dev->u.sdl3.TYPE);
+#endif
 #ifdef CONFIG_AUDIO_SNDIO
     case AUDIODEV_DRIVER_SNDIO:
         return dev->u.sndio.TYPE;
