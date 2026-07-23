@@ -26,6 +26,17 @@
 #include "hw/misc/gnw_h7b0_regs_sai1.h"
 #include "exec/cpu-common.h"
 
+/* getenv() is a locked linear scan on Windows (msvcrt) -- never call it
+ * per-event in emulation-hot paths; resolve once and cache. */
+static bool gnw_audio_trace_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("GNW_AUDIO_TRACE") != NULL;
+    }
+    return v;
+}
+
 #define SAI_xCR1_SAIEN  (1U << 16)
 #define SAI_xCR1_DMAEN  (1U << 17)
 #define SAI_xCR1_MCKDIV_SHIFT 20
@@ -167,7 +178,7 @@ static void gnw_h7b0_sai1_dma_notify(void *opaque, bool half,
          * oldest queued audio to make room rather than growing latency
          * unboundedly or overflowing fifo8_push_all().
          */
-        if (getenv("GNW_AUDIO_TRACE")) {
+        if (gnw_audio_trace_enabled()) {
             fprintf(stderr, "DROP %u %" PRId64 "\n",
                     half_bytes - fifo8_num_free(&s->fifo),
                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
@@ -175,7 +186,7 @@ static void gnw_h7b0_sai1_dma_notify(void *opaque, bool half,
         fifo8_drop(&s->fifo, half_bytes - fifo8_num_free(&s->fifo));
     }
 
-    if (getenv("GNW_AUDIO_TRACE")) {
+    if (gnw_audio_trace_enabled()) {
         fprintf(stderr, "DN %d %" PRId64 "\n", half,
                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }

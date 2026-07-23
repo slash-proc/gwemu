@@ -155,11 +155,46 @@ static void gnw_h7b0_tim2_start_counting(GnwH7B0Tim2State *s, int idx)
               gnw_h7b0_tim2_period_ns(s, idx));
 }
 
+/* Env-gated (GNW_TIMER_LATE): per-instance update-expiry counter,
+ * reported once per virtual second. The 2026-07-22 perf bug was exactly
+ * an expiry flood here; this makes any recurrence measurable at a
+ * glance instead of needing a host profiler. */
+static void gnw_h7b0_tim2_count_expiry(int idx)
+{
+    static int enabled = -1;
+    static int64_t window_start;
+    static uint32_t counts[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+
+    if (enabled < 0) {
+        enabled = getenv("GNW_TIMER_LATE") != NULL;
+    }
+    if (!enabled) {
+        return;
+    }
+    counts[idx]++;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (now - window_start >= NANOSECONDS_PER_SECOND) {
+        if (window_start) {
+            fprintf(stderr, "TIMEXP");
+            for (int i = 0; i < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; i++) {
+                if (counts[i]) {
+                    fprintf(stderr, " tim[%d]=%u/s", i, counts[i]);
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+        memset(counts, 0, sizeof(counts));
+        window_start = now;
+    }
+}
+
 static void gnw_h7b0_tim2_timer_tick(void *opaque)
 {
     GnwH7B0Tim2TimerCtx *ctx = opaque;
     GnwH7B0Tim2State *s = ctx->s;
     int idx = ctx->idx;
+
+    gnw_h7b0_tim2_count_expiry(idx);
     hwaddr base = (hwaddr)idx * 0x400;
     uint32_t cr1 = s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2];
 
@@ -215,7 +250,14 @@ static uint64_t gnw_h7b0_tim2_read(void *opaque, hwaddr addr, unsigned int size)
         int idx = gnw_h7b0_tim2_instance_index(addr);
         if (idx >= 0) {
             uint32_t v = gnw_h7b0_tim2_live_cnt(s, idx);
-            if (getenv("GNW_AUDIO_TRACE")) {
+            /* Cached: firmware polls CNT at busy-wait rates, and
+             * msvcrt's getenv() is a locked linear scan -- calling it
+             * per-read measurably slowed the whole guest on Windows. */
+            static int trace_env = -1;
+            if (trace_env < 0) {
+                trace_env = getenv("GNW_AUDIO_TRACE") != NULL;
+            }
+            if (trace_env) {
                 fprintf(stderr, "TR %d %" PRId64 " %u\n", idx,
                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), v);
             }

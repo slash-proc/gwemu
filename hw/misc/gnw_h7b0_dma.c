@@ -50,6 +50,17 @@
 #include "hw/misc/gnw_h7b0_dma.h"
 #include "hw/misc/gnw_h7b0_regs_dma.h"
 
+/* getenv() is a locked linear scan on Windows (msvcrt) -- never call it
+ * per-event in emulation-hot paths; resolve once and cache. */
+static bool gnw_timer_late_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("GNW_TIMER_LATE") != NULL;
+    }
+    return v;
+}
+
 #define GNW_H7B0_DMA_CTRL_SIZE      0x400
 #define GNW_H7B0_DMA_STREAM_STRIDE  0x18
 #define GNW_H7B0_DMA_S0CR_OFFSET    GNW_H7B0_DMA1_S0CR_OFFSET
@@ -364,6 +375,12 @@ static void gnw_h7b0_dma_stream_tick(void *opaque)
     GnwH7B0DmaStreamCtx *ctx = opaque;
     GnwH7B0DmaState *s = ctx->s;
     int stream = ctx->stream;
+
+    if (gnw_timer_late_enabled()) {
+        fprintf(stderr, "DMA%d late=%0.2fms\n", stream,
+                (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                 s->stream_deadline_ns[stream]) / 1e6);
+    }
     int ctrl = stream / GNW_H7B0_DMA_STREAMS_PER_CTRL;
     int local = stream % GNW_H7B0_DMA_STREAMS_PER_CTRL;
     hwaddr ctrl_base = (hwaddr)ctrl * GNW_H7B0_DMA_CTRL_SIZE;

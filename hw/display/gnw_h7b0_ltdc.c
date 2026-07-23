@@ -37,6 +37,28 @@
 #include "framebuffer.h"
 #include "system/address-spaces.h"
 
+/* getenv() is a locked linear scan on Windows (msvcrt) -- never call it
+ * per-event in emulation-hot paths; resolve once and cache. */
+static bool gnw_ltdc_trace_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("GNW_LTDC_TRACE") != NULL;
+    }
+    return v;
+}
+
+/* getenv() is a locked linear scan on Windows (msvcrt) -- never call it
+ * per-event in emulation-hot paths; resolve once and cache. */
+static bool gnw_timer_late_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("GNW_TIMER_LATE") != NULL;
+    }
+    return v;
+}
+
 static int gnw_h7b0_ltdc_capture_setup(GnwH7B0LtdcState *s);
 static void gnw_h7b0_ltdc_composite_from_job(GnwH7B0LtdcState *s,
                                               GnwH7B0LtdcCaptureJob *job,
@@ -189,7 +211,7 @@ static bool gnw_h7b0_ltdc_capture_if_enabled(GnwH7B0LtdcState *s)
 /* Env-gated capture-path tracing (GNW_LTDC_TRACE) -- which code path
  * published each frame, with the virtual timestamp and active CFBAR. */
 #define GNW_LTDC_TRACE_CAP(s, tag) do { \
-    if (getenv("GNW_LTDC_TRACE")) { \
+    if (gnw_ltdc_trace_enabled()) { \
         fprintf(stderr, "LTC cap %s %" PRId64 " cfbar=%08x\n", (tag), \
                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), \
                 (s)->regs[GNW_H7B0_LTDC_L1CFBAR >> 2]); \
@@ -449,6 +471,15 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
     GnwH7B0LtdcState *s = GNW_H7B0_LTDC(opaque);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    if (gnw_timer_late_enabled()) {
+        int64_t host_now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        static int64_t last_host;
+        fprintf(stderr, "VBL late=%0.2fms host_dt=%0.2fms\n",
+                (now - s->vblank_deadline_ns) / 1e6,
+                last_host ? (host_now - last_host) / 1e6 : 0.0);
+        last_host = host_now;
+    }
+
     /* Headless timeline engine's @frame addressing counts these ticks
      * (no-op when GNW_TIMELINE has no frame-addressed entries). */
     gnw_timeline_notify_vblank();
@@ -547,7 +578,7 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
          * gets through at a reduced-but-live rate).
          */
         if (fb_dirty) {
-            if (getenv("GNW_LTDC_TRACE")) {
+            if (gnw_ltdc_trace_enabled()) {
                 fprintf(stderr, "LTC dirty %" PRId64 "\n", now);
             }
             s->fb_quiesce_pending = true;
@@ -566,7 +597,7 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
              * nothing to redo next tick and leaving fb_reg_dirty set
              * would just harmlessly re-check RAM dirtiness again).
              */
-            if (getenv("GNW_LTDC_TRACE")) {
+            if (gnw_ltdc_trace_enabled()) {
                 fprintf(stderr, "LTC capture %" PRId64 " ticks=%d\n", now,
                         s->fb_quiesce_ticks);
             }
@@ -1112,6 +1143,8 @@ static uint32_t gnw_h7b0_ltdc_resolve_layer(uint32_t raw_px, bool in_window,
  */
 #if defined(__SSE2__)
 #include <emmintrin.h>
+
+
 #define GNW_H7B0_LTDC_HAVE_SSE2_ROW_CONVERT 1
 #endif
 
