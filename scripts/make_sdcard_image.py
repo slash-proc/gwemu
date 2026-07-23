@@ -59,6 +59,7 @@ import argparse
 import os
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -72,7 +73,7 @@ except ImportError:
     )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_OUT = REPO_ROOT / "backup" / "qemu-images" / "sdcard.img"
+DEFAULT_OUT = REPO_ROOT / "backup" / "qemu-images" / "sdcard.qcow2"
 
 SECTOR_SIZE = 512
 PARTITION_START_LBA = 2048  # matches the real dumped card exactly
@@ -175,6 +176,9 @@ def main():
     with tempfile.NamedTemporaryFile(dir=args.out.parent, prefix="gnw-sdcard-vol-",
                                       suffix=".img", delete=False) as tf:
         vol_path = Path(tf.name)
+    with tempfile.NamedTemporaryFile(dir=args.out.parent, prefix="gnw-sdcard-raw-",
+                                      suffix=".img", delete=False) as tf:
+        raw_path = Path(tf.name)
     try:
         print("[make_sdcard_image] formatting standalone FAT32 volume...")
         pf = PyFat(offset=0)
@@ -190,14 +194,36 @@ def main():
         finally:
             fs.close()
 
-        print("[make_sdcard_image] assembling final image (MBR + volume)...")
-        with open(args.out, "wb") as out_f:
+        print("[make_sdcard_image] assembling raw image (MBR + volume)...")
+        with open(raw_path, "wb") as out_f:
             write_mbr(out_f, partition_sectors)
             out_f.write(b"\x00" * (PARTITION_OFFSET - SECTOR_SIZE))
             with open(vol_path, "rb") as vol_f:
                 shutil.copyfileobj(vol_f, out_f)
+
+        # qcow2, not raw: a freshly-built image is mostly empty (a real
+        # 8GiB build with ~230KB of actual content still consumed the full
+        # 8.1GB on disk as raw -- zero sparseness), and qcow2's thin
+        # allocation only stores the blocks actually written. The old
+        # qcow2-*overlay* trick (from real physical SD card testing, to
+        # round an odd real-card size up to a QEMU-friendly power of 2)
+        # doesn't apply here -- we already generate exact power-of-2 sizes
+        # -- but qcow2's sparseness is independently worth having.
+        print("[make_sdcard_image] converting to qcow2...")
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        # Prefer this repo's own built qemu-img (build/qemu-img) over
+        # whatever's on PATH, if it exists -- consistent with how
+        # scripts/boot_qemu.sh and the GUI invoke this project's own build
+        # output explicitly rather than assuming a system install.
+        qemu_img = REPO_ROOT / "build" / "qemu-img"
+        qemu_img_cmd = str(qemu_img) if qemu_img.is_file() else "qemu-img"
+        subprocess.run(
+            [qemu_img_cmd, "convert", "-O", "qcow2", str(raw_path), str(args.out)],
+            check=True,
+        )
     finally:
         vol_path.unlink(missing_ok=True)
+        raw_path.unlink(missing_ok=True)
 
     print(f"[make_sdcard_image] done: {args.out}")
 

@@ -18,7 +18,14 @@
 
 #define GNW_H7B0_SAI1_SAI_AFRCR_OFFSET 0xc
 #define GNW_H7B0_SAI1_SAI_AFRCR_RESET  0x00000007
-#define GNW_H7B0_SAI1_SAI_AFRCR_WMASK  0x00067fff
+/*
+ * SVD-derived mask was 0x00067fff, which dropped bit 16 (FSDEF). Confirmed
+ * against physical hardware: real H7B0 running stock Mario firmware reads
+ * AFRCR = 0x00051f3f, our model read 0x00041f3f for the identical write.
+ * Writable fields per CMSIS (SAI_xFRCR_* in sdk/cmsis-device-h7/Include/
+ * stm32h7b0xx.h): FRL[7:0], FSALL[14:8], FSDEF(16), FSPOL(17), FSOFF(18).
+ */
+#define GNW_H7B0_SAI1_SAI_AFRCR_WMASK  0x00077fff
 
 #define GNW_H7B0_SAI1_SAI_ASLOTR_OFFSET 0x10
 #define GNW_H7B0_SAI1_SAI_ASLOTR_RESET  0x00000000
@@ -50,7 +57,8 @@
 
 #define GNW_H7B0_SAI1_SAI_BFRCR_OFFSET 0x2c
 #define GNW_H7B0_SAI1_SAI_BFRCR_RESET  0x00000007
-#define GNW_H7B0_SAI1_SAI_BFRCR_WMASK  0x00067fff
+/* Same SVD FSDEF(bit 16) omission as AFRCR above; blocks A/B are identical. */
+#define GNW_H7B0_SAI1_SAI_BFRCR_WMASK  0x00077fff
 
 #define GNW_H7B0_SAI1_SAI_BSLOTR_OFFSET 0x30
 #define GNW_H7B0_SAI1_SAI_BSLOTR_RESET  0x00000000

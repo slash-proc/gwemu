@@ -57,18 +57,95 @@ static uint64_t gnw_h7b0_tim2_period_ns(GnwH7B0Tim2State *s, int idx)
     uint64_t period_ns;
 
     if (s->rcc) {
-        uint32_t live_hz = gnw_h7b0_rcc_get_hclk_hz(s->rcc);
+        uint32_t live_hz = gnw_h7b0_rcc_get_timer_ker_hz(s->rcc);
         if (live_hz != 0) {
             clk_hz = live_hz;
         }
     }
 
-    period_ns = (uint64_t)(arr + 1) * (psc + 1)
-                * NANOSECONDS_PER_SECOND / clk_hz;
+    /*
+     * Widen BEFORE incrementing. `arr` is uint32_t, so a plain (arr + 1)
+     * is evaluated in 32-bit and wraps to 0 for the single most important
+     * case there is: ARR = 0xffffffff, which is both the reset value and
+     * exactly how firmware sets up a free-running 32-bit microsecond time
+     * base (real example, stock Mario: CR1=1, PSC=0x15, ARR=0xffffffff).
+     * The old (uint64_t)(arr + 1) cast the *already-wrapped* result, making
+     * period_ns 0, which the MIN clamp below then turned into 1us -- a
+     * ~277-second update event modelled as a 1MHz one. The timer re-armed
+     * itself as fast as the main loop could dispatch it (~130-180k times a
+     * second, measured), and that flood of virtual-clock expiries, not any
+     * per-instruction emulation cost, was what saturated QEMU's main loop.
+     *
+     * The product needs a 128-bit intermediate too: (2^32) * 22 * 1e9
+     * overflows uint64_t, so muldiv64() rather than a bare multiply.
+     */
+    period_ns = muldiv64(((uint64_t)arr + 1) * ((uint64_t)psc + 1),
+                         NANOSECONDS_PER_SECOND, clk_hz);
 
     period_ns = MAX(period_ns, GNW_H7B0_TIM2_MIN_PERIOD_NS);
     period_ns = MIN(period_ns, GNW_H7B0_TIM2_MAX_PERIOD_NS);
     return period_ns;
+}
+
+/*
+ * Counter tick rate for this instance: kernel clock after the prescaler.
+ * Same clock source gnw_h7b0_tim2_period_ns() uses, kept separate so the
+ * CNT extrapolation below doesn't have to re-derive the update period.
+ */
+static uint64_t gnw_h7b0_tim2_tick_hz(GnwH7B0Tim2State *s, int idx)
+{
+    hwaddr base = (hwaddr)idx * 0x400;
+    uint32_t psc = s->regs[(base + GNW_H7B0_TIM2_PSC_OFFSET) >> 2];
+    uint64_t clk_hz = GNW_H7B0_TIM2_APPROX_CLK_HZ;
+
+    if (s->rcc) {
+        uint32_t live_hz = gnw_h7b0_rcc_get_timer_ker_hz(s->rcc);
+        if (live_hz != 0) {
+            clk_hz = live_hz;
+        }
+    }
+    return clk_hz / ((uint64_t)psc + 1);
+}
+
+/*
+ * CNT as it would read *right now*: cnt_base plus however many ticks have
+ * elapsed since cnt_ref_ns, wrapped at ARR+1. While CR1.CEN is clear the
+ * counter is frozen, so cnt_base is the answer verbatim.
+ */
+static uint32_t gnw_h7b0_tim2_live_cnt(GnwH7B0Tim2State *s, int idx)
+{
+    hwaddr base = (hwaddr)idx * 0x400;
+    uint32_t cr1 = s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2];
+    uint32_t arr = s->regs[(base + GNW_H7B0_TIM2_ARR_OFFSET) >> 2];
+    uint64_t modulus = (uint64_t)arr + 1;
+    uint64_t now, elapsed_ns, ticks;
+
+    if (!(cr1 & 0x1u) || modulus == 0) {
+        return s->cnt_base[idx];
+    }
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (now <= s->cnt_ref_ns[idx]) {
+        return s->cnt_base[idx];
+    }
+    elapsed_ns = now - s->cnt_ref_ns[idx];
+
+    /* ticks = elapsed_ns * tick_hz / 1e9, in 128-bit to avoid overflow. */
+    ticks = muldiv64(elapsed_ns, gnw_h7b0_tim2_tick_hz(s, idx),
+                     NANOSECONDS_PER_SECOND);
+
+    return (uint32_t)(((uint64_t)s->cnt_base[idx] + ticks) % modulus);
+}
+
+/*
+ * Pin CNT's extrapolation to "now". Must be called BEFORE changing
+ * anything the extrapolation depends on (PSC, ARR, CEN, CNT itself),
+ * so the elapsed time so far is accounted against the old parameters.
+ */
+static void gnw_h7b0_tim2_latch_cnt(GnwH7B0Tim2State *s, int idx)
+{
+    s->cnt_base[idx] = gnw_h7b0_tim2_live_cnt(s, idx);
+    s->cnt_ref_ns[idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
 static void gnw_h7b0_tim2_start_counting(GnwH7B0Tim2State *s, int idx)
@@ -113,6 +190,8 @@ static void gnw_h7b0_tim2_reset(DeviceState *dev)
     }
     for (int i = 0; i < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; i++) {
         timer_del(s->count_timer[i]);
+        s->cnt_base[i] = 0;
+        s->cnt_ref_ns[i] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     }
 }
 
@@ -123,6 +202,27 @@ static uint64_t gnw_h7b0_tim2_read(void *opaque, hwaddr addr, unsigned int size)
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%"HWADDR_PRIx"\n", __func__, addr);
         return 0;
     }
+
+    /*
+     * CNT must be derived from elapsed time, not read back as a shadow.
+     * Firmware uses a free-running instance (ARR=0xffffffff) as its
+     * microsecond time base and polls this register hundreds of times a
+     * second; a shadow answers "no time has passed" every time. See
+     * gnw_h7b0_tim2.h's cnt_base/cnt_ref_ns comment for the measured
+     * audio symptom this caused.
+     */
+    if ((addr & 0x3ffu) == GNW_H7B0_TIM2_CNT_OFFSET) {
+        int idx = gnw_h7b0_tim2_instance_index(addr);
+        if (idx >= 0) {
+            uint32_t v = gnw_h7b0_tim2_live_cnt(s, idx);
+            if (getenv("GNW_AUDIO_TRACE")) {
+                fprintf(stderr, "TR %d %" PRId64 " %u\n", idx,
+                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), v);
+            }
+            return v;
+        }
+    }
+
     return s->regs[addr >> 2];
 }
 
@@ -153,7 +253,27 @@ static void gnw_h7b0_tim2_write(void *opaque, hwaddr addr, uint64_t val64, unsig
     uint32_t local_addr = addr & 0x3ffu;
     uint32_t mask = get_tim2_write_mask(local_addr);
     uint32_t old_value = s->regs[addr >> 2];
+    int cnt_idx = gnw_h7b0_tim2_instance_index(addr);
+
+    /*
+     * Anything that changes how CNT extrapolates (its own value, the
+     * prescaler, or the wrap point) has to settle the elapsed time so far
+     * against the OLD parameters first -- hence latching before the store
+     * below, not after.
+     */
+    if (cnt_idx >= 0 && (local_addr == GNW_H7B0_TIM2_CNT_OFFSET ||
+                         local_addr == GNW_H7B0_TIM2_PSC_OFFSET ||
+                         local_addr == GNW_H7B0_TIM2_ARR_OFFSET)) {
+        gnw_h7b0_tim2_latch_cnt(s, cnt_idx);
+    }
+
     s->regs[addr >> 2] = (old_value & ~mask) | ((uint32_t)val64 & mask);
+
+    /* A write to CNT sets the counter outright. */
+    if (cnt_idx >= 0 && local_addr == GNW_H7B0_TIM2_CNT_OFFSET) {
+        s->cnt_base[cnt_idx] = s->regs[addr >> 2];
+        s->cnt_ref_ns[cnt_idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
 
     /*
      * This device models the whole TIM2-TIM14 block (see soc.h's
@@ -176,6 +296,12 @@ static void gnw_h7b0_tim2_write(void *opaque, hwaddr addr, uint64_t val64, unsig
     if ((addr & 0x3ffu) == GNW_H7B0_TIM2_EGR_OFFSET && (val64 & 0x1u)) {
         uint32_t sr_addr = (addr & ~0x3ffu) + GNW_H7B0_TIM2_SR_OFFSET;
         s->regs[sr_addr >> 2] |= 0x1u; /* UIF */
+        /* UG re-initializes the counter (and reloads the prescaler) on
+         * real hardware, so restart the extrapolation from zero. */
+        if (cnt_idx >= 0) {
+            s->cnt_base[cnt_idx] = 0;
+            s->cnt_ref_ns[cnt_idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
     }
 
     /*
@@ -196,8 +322,14 @@ static void gnw_h7b0_tim2_write(void *opaque, hwaddr addr, uint64_t val64, unsig
 
         if (idx >= 0) {
             if ((new_cr1 & 0x1u) && !(old_value & 0x1u)) {
+                /* Counting resumes from the frozen value, as of now. */
+                s->cnt_ref_ns[idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
                 gnw_h7b0_tim2_start_counting(s, idx);
             } else if (!(new_cr1 & 0x1u)) {
+                if (old_value & 0x1u) {
+                    /* Freeze CNT where it had got to. */
+                    gnw_h7b0_tim2_latch_cnt(s, idx);
+                }
                 timer_del(s->count_timer[idx]);
             }
         }
@@ -229,10 +361,16 @@ static void gnw_h7b0_tim2_init(Object *obj)
 
 static const VMStateDescription vmstate_gnw_h7b0_tim2 = {
     .name = TYPE_GNW_H7B0_TIM2,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, GnwH7B0Tim2State, GNW_H7B0_TIM2_SIZE / 4),
+        /* CNT is derived, so its reference point has to travel with the
+         * snapshot or the counter jumps on restore. */
+        VMSTATE_UINT64_ARRAY(cnt_ref_ns, GnwH7B0Tim2State,
+                             GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT),
+        VMSTATE_UINT32_ARRAY(cnt_base, GnwH7B0Tim2State,
+                             GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT),
         VMSTATE_END_OF_LIST()
     }
 };

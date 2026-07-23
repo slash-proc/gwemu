@@ -81,7 +81,9 @@
 
 #define GNW_H7B0_OCTOSPI2_WPCCR_OFFSET 0x140
 #define GNW_H7B0_OCTOSPI2_WPCCR_RESET  0x00000000
-#define GNW_H7B0_OCTOSPI2_WPCCR_WMASK  0x2f3f3f3f
+/* Dropped bit 31 (SIOO) that the identically-laid-out CCR mask above does
+ * retain -- OCTOSPI_CCR_SIOO_Pos = 31 per CMSIS. */
+#define GNW_H7B0_OCTOSPI2_WPCCR_WMASK  0xaf3f3f3f
 
 #define GNW_H7B0_OCTOSPI2_WPTCR_OFFSET 0x148
 #define GNW_H7B0_OCTOSPI2_WPTCR_RESET  0x00000000
@@ -97,7 +99,14 @@
 
 #define GNW_H7B0_OCTOSPI2_WCCR_OFFSET 0x180
 #define GNW_H7B0_OCTOSPI2_WCCR_RESET  0x00000000
-#define GNW_H7B0_OCTOSPI2_WCCR_WMASK  0x2f3f3f0f
+/*
+ * Dropped bit 31 (SIOO) and bits 5:4 (ISIZE) that the identically-laid-out
+ * CCR mask above retains (CMSIS: OCTOSPI_CCR_SIOO_Pos = 31,
+ * OCTOSPI_CCR_ISIZE_Msk = 0x30). HAL_OSPI_MemoryMapped() writes DQS/SIOO
+ * into the write-config register (stm32h7xx_hal_ospi.c:2977), and this SoC
+ * runs its external flash memory-mapped, so this path is live.
+ */
+#define GNW_H7B0_OCTOSPI2_WCCR_WMASK  0xaf3f3f3f
 
 #define GNW_H7B0_OCTOSPI2_WTCR_OFFSET 0x188
 #define GNW_H7B0_OCTOSPI2_WTCR_RESET  0x00000000

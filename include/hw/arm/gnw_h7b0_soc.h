@@ -64,6 +64,7 @@
 #include "hw/misc/gnw_h7b0_tim2.h"
 #include "hw/misc/gnw_h7b0_iwdg.h"
 #include "hw/misc/gnw_h7b0_lpuart1.h"
+#include "hw/misc/gnw_h7b0_usart1.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_SOC "gnw-h7b0-soc"
@@ -312,6 +313,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  */
 #define IWDG_BASE_ADDRESS 0x58004800
 #define LPUART1_BASE_ADDRESS 0x58000c00
+#define USART1_BASE_ADDRESS 0x40011000
 
 /*
  * CRC (hardware CRC-32 unit), per STM32H7B0.svd baseAddress
@@ -551,6 +553,7 @@ struct GnwH7B0State {
     GnwH7B0Tim2State tim2;
     GnwH7B0IwdgState iwdg;
     GnwH7B0Lpuart1State lpuart1;
+    GnwH7B0Usart1State usart1;
 
     MemoryRegion itcm;
     MemoryRegion dtcm;

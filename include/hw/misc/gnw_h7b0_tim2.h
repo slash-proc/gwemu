@@ -48,6 +48,28 @@ struct GnwH7B0Tim2State {
     QEMUTimer *count_timer[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
     GnwH7B0Tim2TimerCtx timer_ctx[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
 
+    /*
+     * Reference point for deriving a LIVE CNT on read, rather than
+     * returning whatever the guest last wrote.
+     *
+     * cnt_base is CNT's value at cnt_ref_ns (virtual-clock ns); a read
+     * extrapolates from there using the instance's current PSC and
+     * kernel clock, wrapping at ARR+1. Re-latched whenever anything
+     * that invalidates the extrapolation changes (CNT/PSC/ARR written,
+     * CEN toggled, EGR.UG issued, reset).
+     *
+     * Stock Mario polls TIM5's CNT 540 times a second (measured) as a
+     * free-running microsecond time base -- ARR=0xffffffff, PSC=0x15,
+     * never reading any other timer register. With a shadow-only CNT it
+     * asked "what time is it?" 540 times a second and always got the
+     * same answer, so every timing decision it made was wrong; audible
+     * as crunchy/echoing audio, because its mixer emits chunks whose
+     * phase no longer lines up (measured: 1.70x larger sample-to-sample
+     * discontinuity exactly at DMA half-buffer seams vs mid-chunk).
+     */
+    uint64_t cnt_ref_ns[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+    uint32_t cnt_base[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+
     /* Not owned; set by the board via gnw_h7b0_tim2_set_rcc() once both
      * TIM2 and RCC are realized, same pattern as gnw_h7b0_sai1_set_rcc()
      * -- lets period computation track the real, currently-configured

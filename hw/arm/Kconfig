@@ -439,6 +439,7 @@ config GNW_H7B0_SOC
     select GNW_H7B0_TIM2
     select GNW_H7B0_IWDG
     select GNW_H7B0_LPUART1
+    select GNW_H7B0_USART1
 
 config B_L475E_IOT01A
     bool

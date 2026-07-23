@@ -37,6 +37,7 @@ need scripted upkeep.
 | OSPI (x2) | Partial | Real command decoding, auto-polling, IRQ lines. |
 | SPI | Partial | Real `TXP`/`RXP` status-flag behavior. |
 | LPUART1 | Stub | Register-array shadow, correct reset values, no real UART behavior. |
+| USART1 | Partial | Transmit only: ISR reports the transmitter always ready, TDR writes go to serial port 0. No RX. Homebrew printf console. |
 | ADC (1/2) | Stub+ | Register shadow, but decodes `SQR1.SQ1` and returns per-channel values (incl. VREFINT); DMA completion notify wired. |
 | PWR | Stub+ | Register shadow, but `CPUCR.SBF` correctly forced at reset (real boot-critical behavior, see the file's own comment for why). |
 | TAMP | Stub | Register-array shadow; backup registers correctly excluded from CPU-only reset (real hardware behavior). |
@@ -47,4 +48,4 @@ need scripted upkeep.
 
 ## Not modeled at all (`create_unimplemented_device()`, log-only)
 
-Everything else in the STM32H7B0's memory map: USART1/2/3/6/9/10, UART4/5/7/8, I2C1-4, SPI3/4/5/6, CAN (FDCAN/TT_FDCAN/CAN_CCU), USB OTG1_HS, SDMMC1/2 (+ their delay blocks), HRTIM, DFSDM1/2, DCMI, PSSI, COMP1, VREFBUF, OPAMP, SWPMI, MDIOS, CEC, SPDIFRX, HSEM, RAMECC, BDMA1/2, DMAMUX1/2, TIM8/15/16/17. None of these are exercised by any firmware this project boots (retro-go, stock/CFW Mario and Zelda) — confirmed by what actually gets configured/polled during real boot traces, not assumed. If a future firmware image touches one of these and hangs, that's the signal to promote it out of this list, not a standing TODO.
+Everything else in the STM32H7B0's memory map: USART2/3/6/9/10, UART4/5/7/8, I2C1-4, SPI3/4/5/6, CAN (FDCAN/TT_FDCAN/CAN_CCU), USB OTG1_HS, SDMMC1/2 (+ their delay blocks), HRTIM, DFSDM1/2, DCMI, PSSI, COMP1, VREFBUF, OPAMP, SWPMI, MDIOS, CEC, SPDIFRX, HSEM, RAMECC, BDMA1/2, DMAMUX1/2, TIM8/15/16/17. None of these are exercised by any firmware this project boots (retro-go, stock/CFW Mario and Zelda) — confirmed by what actually gets configured/polled during real boot traces, not assumed. If a future firmware image touches one of these and hangs, that's the signal to promote it out of this list, not a standing TODO.

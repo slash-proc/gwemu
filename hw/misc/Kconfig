@@ -357,5 +357,8 @@ config GNW_H7B0_IWDG
 config GNW_H7B0_LPUART1
     bool
 
+config GNW_H7B0_USART1
+    bool
+
 config GNW_H7B0_TIM2
     bool

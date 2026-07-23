@@ -33,6 +33,8 @@
 #include "hw/arm/gnw_h7b0_soc.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
+#include "system/system.h"
 #include "hw/misc/unimp.h"
 
 static void gnw_h7b0_soc_initfn(Object *obj)
@@ -81,6 +83,7 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     object_initialize_child(obj, "tim2", &s->tim2, TYPE_GNW_H7B0_TIM2);
     object_initialize_child(obj, "iwdg", &s->iwdg, TYPE_GNW_H7B0_IWDG);
     object_initialize_child(obj, "lpuart1", &s->lpuart1, TYPE_GNW_H7B0_LPUART1);
+    object_initialize_child(obj, "usart1", &s->usart1, TYPE_GNW_H7B0_USART1);
 
 
     s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
@@ -294,7 +297,6 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     create_unimplemented_device("FDCAN", 0x4000a400, 0x400);
     create_unimplemented_device("CAN_CCU", 0x4000a800, 0x400);
     create_unimplemented_device("TIM8", 0x40010400, 0x400);
-    create_unimplemented_device("USART1", 0x40011000, 0x400);
     create_unimplemented_device("USART6", 0x40011400, 0x400);
     create_unimplemented_device("USART9", 0x40011800, 0x400);
     create_unimplemented_device("USART10", 0x40011c00, 0x400);
@@ -716,6 +718,14 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->lpuart1), 0, LPUART1_BASE_ADDRESS);
+
+    /* Homebrew firmware uses USART1 as its printf console; bind it to
+     * serial port 0 so -serial stdio/file: just works. */
+    qdev_prop_set_chr(DEVICE(&s->usart1), "chardev", serial_hd(0));
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->usart1), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->usart1), 0, USART1_BASE_ADDRESS);
 
     /*
      * Remaining peripherals (DMA2D, GPIO, USART, real flash/QSPI boot)

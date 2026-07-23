@@ -392,6 +392,53 @@ uint32_t gnw_h7b0_rcc_get_hclk_hz(GnwH7B0RccState *s)
     return gnw_h7b0_rcc_get_sysclk_hz(s);
 }
 
+/*
+ * TIM2-TIM7's kernel clock, decoded from the APB1 prescaler rather than
+ * assumed equal to HCLK.
+ *
+ * STM32H7 timers do NOT simply run at PCLK: with CFGR.TIMPRE=0 the kernel
+ * clock is PCLK1 when the APB1 prescaler is /1, and 2 x PCLK1 for any
+ * larger prescaler; with TIMPRE=1 it is PCLK1 for /1 and /2, and 4 x PCLK1
+ * above that (RM0455 "Timer clock prescaler selection").
+ *
+ * This used to be hardcoded as "timer_clk == HCLK", which is only correct
+ * for retro-go's config (APB1 /2, where the x2 rule exactly cancels the
+ * /2). Stock Nintendo firmware runs APB1 /8 with TIMPRE=0, so its real
+ * timer clock is 2 x HCLK/8 = HCLK/4 -- and measuring the physical device
+ * confirmed it: TIM5's CNT advances at 1.003MHz there (PSC=0x15, so a
+ * 22MHz kernel clock), while this model produced 3.998MHz, exactly 4x too
+ * fast.
+ *
+ * That mattered far beyond timer accuracy: stock firmware polls TIM5's CNT
+ * ~540 times a second as its microsecond time base and synthesises audio
+ * for however much time it believes has elapsed. Running the counter 4x
+ * fast made it generate ~4x too much audio per DMA buffer -- audible as
+ * the "crunchy, echoing, playing more than it should" corruption that this
+ * whole investigation started from. Retro-go was unaffected precisely
+ * because its /2 prescaler is the one case the old assumption got right.
+ */
+uint32_t gnw_h7b0_rcc_get_timer_ker_hz(GnwH7B0RccState *s)
+{
+    uint32_t cfgr = s->regs[GNW_H7B0_RCC_CFGR_OFFSET >> 2];
+    uint32_t cdcfgr2 = s->regs[GNW_H7B0_RCC_CDCFGR2_OFFSET >> 2];
+    uint32_t ppre1 = (cdcfgr2 >> 4) & 0x7;
+    bool timpre = (cfgr >> 15) & 0x1;
+    uint32_t hclk = gnw_h7b0_rcc_get_hclk_hz(s);
+    uint32_t div;
+
+    /* PPRE encoding: 0xx = /1, 100 = /2, 101 = /4, 110 = /8, 111 = /16. */
+    if (!(ppre1 & 0x4)) {
+        div = 1;
+    } else {
+        div = 2u << (ppre1 & 0x3);
+    }
+
+    if (!timpre) {
+        return div == 1 ? hclk : (hclk / div) * 2;
+    }
+    return div <= 2 ? hclk / div : (hclk / div) * 4;
+}
+
 void gnw_h7b0_rcc_set_sysclk(GnwH7B0RccState *s, Clock *sysclk)
 {
     s->sysclk = sysclk;

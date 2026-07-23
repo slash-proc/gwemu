@@ -237,6 +237,10 @@ uint32_t gnw_h7b0_rcc_get_pll1p_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_pll3r_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_sysclk_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_hclk_hz(GnwH7B0RccState *s);
+/* TIM2-TIM7 kernel clock (APB1 prescaler + the x2/x4 timer rule applied,
+ * NOT simply HCLK) -- see the definition for why this distinction is
+ * load-bearing for stock-firmware audio. */
+uint32_t gnw_h7b0_rcc_get_timer_ker_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_sai1_kernel_hz(GnwH7B0RccState *s);
 void gnw_h7b0_rcc_set_sysclk(GnwH7B0RccState *s, Clock *sysclk);
 

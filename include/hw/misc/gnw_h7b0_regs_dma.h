@@ -22,7 +22,16 @@
 
 #define GNW_H7B0_DMA1_S0CR_OFFSET 0x10
 #define GNW_H7B0_DMA1_S0CR_RESET  0x00000000
-#define GNW_H7B0_DMA1_S0CR_WMASK  0x01efffff
+/*
+ * SVD-derived mask dropped bit 20 (TRBUFF, "bufferable transfers") on
+ * stream 0 ONLY -- S1CR..S7CR in this same header are 0x01ffffff. The
+ * generator narrowed one stream and not its seven identical siblings, so
+ * this is provably a generator artefact rather than a real difference.
+ * HAL_DMA_Init() sets TRBUFF unconditionally for UART/USART DMA requests
+ * (sdk/stm32h7xx-hal-driver/Src/stm32h7xx_hal_dma.c:307); bit position per
+ * CMSIS DMA_SxCR_TRBUFF_Pos = 20.
+ */
+#define GNW_H7B0_DMA1_S0CR_WMASK  0x01ffffff
 
 #define GNW_H7B0_DMA1_S0NDTR_OFFSET 0x14
 #define GNW_H7B0_DMA1_S0NDTR_RESET  0x00000000
