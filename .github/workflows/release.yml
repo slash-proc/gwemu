@@ -385,90 +385,91 @@ jobs:
           # not a pre-made zip -- publish-release does the one real zip.
 
   build-windows:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
+    # Cross-compiled from Linux via Docker -- the SAME workflow used
+    # locally (docs/cross-platform-builds.md "Windows"): QEMU's own
+    # fedora-win64-cross CI image plus mingw64-xz (liblzma for
+    # contrib/gnw-tools' LZMA compressor), cmake and ninja. This replaced
+    # an earlier MSYS2 windows-latest job so CI and the local workflow
+    # can't drift apart, and because the mingw SDL2.dll shipped by that
+    # toolchain fails DllMain initialization (status c0000142) before
+    # main() runs -- hence --disable-sdl/--disable-sdl-image below being
+    # REQUIRED, not cosmetic. SDL3 (our GUI's actual backend) is
+    # statically linked and unaffected.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          # actions/checkout's default line-ending/path handling runs
-          # before msys2 is set up; fine as-is since we don't depend on
-          # CRLF conversion for this build.
-          fetch-depth: 1
 
-      - uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-glib2
-            mingw-w64-x86_64-pixman
-            mingw-w64-x86_64-SDL2
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-meson
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-libepoxy
-            mingw-w64-x86_64-xz
-            diffutils
-            mingw-w64-x86_64-python
-            mingw-w64-x86_64-python-yaml
-            git
-            zip
-          # diffutils (provides `diff`): upstream QEMU's own
-          # tests/qapi-schema/meson.build checks for it unconditionally at
-          # configure time, even though this project doesn't run tests --
-          # without it, configure fails with "Program 'diff' not found".
-          # cmake: meson's cmake.subproject() needs it to build SDL3
-          # (static -- see meson.build). libepoxy: the GUI's GL dispatch
-          # library, prefer the real mingw64 package over meson building
-          # subprojects/epoxy.wrap from source. No X11/Wayland dev
-          # packages needed -- SDL3 targets native Win32 here.
-
-      - name: Configure
+      - name: Build gwemu-win-cross image
         run: |
-          mkdir build
-          cd build
-          ../configure --target-list=arm-softmmu
+          set -euo pipefail
+          cat > /tmp/gwemu-win-cross.dockerfile <<'EOF'
+          FROM registry.gitlab.com/qemu-project/qemu/qemu/fedora-win64-cross:latest
+          RUN dnf -y install mingw64-xz mingw64-xz-libs cmake ninja-build && dnf clean all
+          EOF
+          docker build -t gwemu-win-cross -f /tmp/gwemu-win-cross.dockerfile /tmp
 
-      - name: Build
-        run: ninja -C build
-        # Bare `ninja -C build` is enough here too -- gwemu.exe has
-        # build_by_default: true, same reasoning as the Linux job.
+      - name: Configure and build (inside cross container)
+        run: |
+          set -euo pipefail
+          mkdir -p build-win
+          docker run --rm -v "$PWD":/src -w /src/build-win gwemu-win-cross \
+            sh -c 'git config --global --add safe.directory "*" \
+                   && ../configure --target-list=arm-softmmu \
+                        --cross-prefix=x86_64-w64-mingw32- \
+                        --disable-sdl --disable-sdl-image --disable-gtk \
+                   && ninja qemu-system-arm.exe gwemu.exe'
+          # safe.directory: the container runs as root against a checkout
+          # owned by the runner user -- same "dubious ownership" trap the
+          # Linux container job documents (it silently blanked
+          # gwemu_commit in a shipped binary once).
+          # Naming qemu-system-arm.exe explicitly means ninja does NOT
+          # fall back to build_by_default, so gwemu.exe must be requested
+          # too (same reasoning as the macOS job's explicit target list).
 
-      - name: Package
+      - name: Package (dist folder, inside cross container)
+        run: |
+          set -euo pipefail
+          # PE binaries have no rpath -- every required mingw DLL must sit
+          # next to the exe. Recursively resolve `objdump -p | grep 'DLL
+          # Name'` against the mingw sysroot's bin dir (DLLs not found
+          # there are Windows system DLLs and are skipped), then strip
+          # everything. This runs inside the container because that's
+          # where the sysroot and the mingw binutils live. Result lands at
+          # build-win/dist/ (~31 files / ~55MB locally). SDL3 is static,
+          # so it never appears here.
+          docker run --rm -v "$PWD":/src -w /src/build-win gwemu-win-cross \
+            bash -c '
+              set -euo pipefail
+              SYSROOT_BIN=/usr/x86_64-w64-mingw32/sys-root/mingw/bin
+              rm -rf dist && mkdir dist
+              cp qemu-system-arm.exe gwemu.exe dist/
+              queue="dist/qemu-system-arm.exe dist/gwemu.exe"
+              while [ -n "$queue" ]; do
+                next=""
+                for f in $queue; do
+                  for dll in $(x86_64-w64-mingw32-objdump -p "$f" \
+                                 | grep "DLL Name" | awk "{print \$3}"); do
+                    if [ -f "$SYSROOT_BIN/$dll" ] && [ ! -f "dist/$dll" ]; then
+                      cp "$SYSROOT_BIN/$dll" dist/
+                      next="$next dist/$dll"
+                    fi
+                  done
+                done
+                queue="$next"
+              done
+              x86_64-w64-mingw32-strip dist/*.exe dist/*.dll
+              ls -l dist
+            '
+
+      - name: Assemble artifact directory
         run: |
           set -euo pipefail
           OUT=gwemu-windows-x86_64
           mkdir -p "$OUT"
-
-          package_bin() {
-            local src="$1"
-            if [ ! -f "$src" ]; then
-              echo "$src not found under build/ -- build tree:" >&2
-              find build -maxdepth 2 >&2
-              exit 1
-            fi
-            cp "$src" "$OUT/"
-            # Strip debug info before packaging -- same reasoning as the
-            # Linux job's strip call. strip.exe here is MSYS2's own,
-            # works fine on PE binaries.
-            strip "$OUT/$(basename "$src")"
-            # PE binaries have no rpath -- every required mingw64 DLL has
-            # to sit next to the exe (or be on PATH, which we don't want
-            # to assume). ldd works under MSYS2 for PE files and reports
-            # the resolved DLL paths directly. SDL3 itself is static (see
-            # meson.build) so it never shows up here.
-            local name; name="$(basename "$src")"
-            for dll in $(ldd "$OUT/$name" | grep -i '/mingw64/' | awk '{print $3}'); do
-              cp -n "$dll" "$OUT/" 2>/dev/null || true
-            done
-          }
-
-          package_bin build/qemu-system-arm.exe
-          package_bin build/gwemu.exe
+          # The container ran as root; the dist tree is root-owned on the
+          # host side of the bind mount -- cp works fine, we just never
+          # try to modify build-win/ from here.
+          cp build-win/dist/* "$OUT/"
 
           mkdir -p "$OUT/scripts"
           for f in $GNW_SCRIPTS; do
@@ -481,6 +482,44 @@ jobs:
           path: gwemu-windows-x86_64/
           # See build-linux's identical comment: upload the raw directory,
           # not a pre-made zip -- publish-release does the one real zip.
+
+  # Fifth platform build: the headless capture appliance image
+  # (contrib/docker-headless/, see docs/headless-capture.md), published to
+  # Docker Hub as slashproc/gwemu-headless. Tag cascade per release vX.Y.Z:
+  # X, X.Y, and X.Y.Z -- so ":X" always tracks the highest minor.patch of
+  # that major, ":X.Y" the highest patch of that minor. ":latest" is also
+  # pushed (owner's call: convenient, if a bit shitty -- prefer pinning).
+  build-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          # Build FROM THE REPO ROOT (the Dockerfile requires it: its
+          # build stage COPYs the source tree, fenced by .dockerignore).
+          docker build -t gwemu-headless -f contrib/docker-headless/Dockerfile .
+
+      - name: Push semver tag cascade
+        # Tag-triggered runs only: workflow_dispatch has no version to
+        # derive, so it stops after the build (still a useful smoke test).
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"           # v1.2.3 -> 1.2.3
+          case "$VER" in
+            *.*.*) : ;;
+            *) echo "tag '$GITHUB_REF_NAME' is not vMAJOR.MINOR.PATCH" >&2; exit 1 ;;
+          esac
+          MAJ="${VER%%.*}"
+          MIN="${VER%.*}"                       # 1.2.3 -> 1.2
+          echo "${{ secrets.REGISTRY_TOKEN }}" | \
+            docker login -u slashproc --password-stdin
+          for tag in "$MAJ" "$MIN" "$VER" latest; do
+            docker tag gwemu-headless "slashproc/gwemu-headless:$tag"
+            docker push "slashproc/gwemu-headless:$tag"
+          done
 
   publish-release:
     needs: [build-linux, build-macos, build-windows]
