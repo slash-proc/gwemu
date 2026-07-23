@@ -1,3 +1,53 @@
+2026-07-23  FEATURE: headless capture appliance (Docker/CI) -- true
+            `-display none` support (windowless upstream-main path in
+            ui/gwemu.c; previously every "headless" run still opened a dead
+            SDL window and ran ~16x slow), a virtual-clock timeline script
+            engine (hw/misc/gnw_timeline.c, GNW_TIMELINE=<file>: press/hold/
+            release/screenshot/quit at [MM:]SS[.fff] guest time or @N vblank
+            frames), a virtual-clock session recorder (hw/display/
+            gnw_h7b0_recorder.c, GNW_RECORD/<fps>, raw frames + wav audiodev,
+            ffmpeg-muxed to mp4/mkv/flac by the standalone
+            contrib/docker-headless/ entrypoint+Dockerfile), and a
+            synchronous PNG screendump helper (gwemu_screendump_png).
+            Verified: byte-identical screenshots across independent runs at
+            plain realtime (the repeatability headline), 1:1 wall/virtual
+            pacing, GUI path unaffected. Measured and documented: -icount is
+            NOT a speed-up button (fixed shift changes apparent guest CPU
+            speed and results; shift=auto paces to realtime) -- see
+            docs/headless-capture.md. Also fixed: the host had silently lost
+            libpixman-1-dev, so CONFIG_PIXMAN (and QMP screendump with it)
+            had been compiled out -- reinstalled and now load-bearing.
+
+2026-07-23  PORT: OpenGL removed from the GUI entirely; SDL3 unifies rendering
+            and audio on all three platforms. (1) Rendering now goes through
+            SDL_Renderer -- D3D11 on Windows, Metal on macOS, Vulkan (then GL,
+            then software) on Linux, with SDL's CPU rasterizer as universal
+            fallback -- replacing the hard GL 3.2 Core context requirement
+            inherited from xemu (which cost a real "Unable to create OpenGL
+            context" fatal on a Windows 11 VM with QXL graphics). ImGui runs
+            on imgui_impl_sdlrenderer3; the framebuffer is a streaming
+            SDL_Texture; screenshots/thumbnails encode from guest pixels (no
+            GPU readback); the GL SDF logo animation became a static image.
+            (2) New "sdl3" audiodev (audio/sdl3audio.c, ported from the SDL2
+            driver to SDL3's stream API): WASAPI/CoreAudio/PipeWire via the
+            statically-linked SDL3 the GUI already ships, now the default-
+            priority driver on every host. Replaces dsound (failed outright on
+            a real Win11 VM) and QEMU's aging coreaudio backend (audibly
+            better on the project's real Hackintosh). (3) Linux now defaults
+            to the x11 video driver (XWayland) -- third real Wayland breakage
+            (fractional-scale UI mis-sizing) joined the libdecor crash and the
+            ImGui viewport whitelist; SDL_VIDEODRIVER=wayland still overrides.
+            (4) Local Windows cross-build from Linux via Docker (QEMU's
+            fedora-win64-cross image + mingw64-xz; see
+            docs/cross-platform-builds.md) with a portable dist/ folder and a
+            repo-root start.bat; requires --disable-sdl --disable-sdl-image
+            --disable-gtk (SDL2.dll aborted process startup on Windows).
+            (5) macOS: fixed epoxy wrap wrongly enabling CONFIG_OPENGL/EGL
+            code (fatal missing egl_generated.h), completed SDL3's framework
+            list (Metal, QuartzCore, IOKit, Cocoa, CoreVideo). Verified live
+            on all three platforms (Linux Vulkan+PipeWire, Windows-VM
+            software-render+WASAPI, macOS Metal+CoreAudio).
+
 2026-07-23  FIX: retro-go menu flicker + black-screen/BSOD on quit-to-menu, all
             rooted in the async JPEG/LTDC work. (1) JPEG model now models input
             backpressure: IFTF/IFNFF clear when a decode job is posted and DIR
@@ -22,6 +72,8 @@
             (mixed-width covers), i.e. faithful emulation, not a bug here.
 
 # Changelog
+
+## # Changelog
 
 ## 2026-07-22 — FIX: stock-firmware "crunchy audio" root-caused and fixed (LTDC vblank re-phasing)
 
@@ -57,6 +109,238 @@
   change), integer-truncated 60Hz vblank alone (0.08%, too small), fifo
   drop path (zero drops), DMA2D latency (model is synchronous), DWT
   CYCCNT (stock never touches DWT).
+
+## 2026-07-22 — fix: TIM2-TIM7 kernel clock was 4x too fast (APB1 prescaler ignored)
+
+- `hw/misc/gnw_h7b0_rcc.c` gains `gnw_h7b0_rcc_get_timer_ker_hz()`, and
+  `hw/misc/gnw_h7b0_tim2.c` now uses it for both the update period and the
+  `CNT` tick rate, instead of using `gnw_h7b0_rcc_get_hclk_hz()` directly.
+- STM32H7 timers do not run at PCLK: with `CFGR.TIMPRE=0` the kernel clock
+  is PCLK1 for an APB1 prescaler of /1 and **2 x PCLK1** for anything
+  larger (4 x above /2 when TIMPRE=1). The old code hardcoded
+  `timer_clk == HCLK`, which is correct *only* for retro-go's config
+  (APB1 /2, where the x2 rule exactly cancels the /2) — and that is
+  precisely why retro-go never showed a symptom.
+- Stock Nintendo firmware runs **APB1 /8 with TIMPRE=0** (`CDCFGR2 =
+  0x00000660`, `CFGR = 0x0000001b`, read off the physical device), so its
+  real timer clock is `2 x HCLK/8 = HCLK/4`.
+- Verified against real hardware rather than derived: TIM5's `CNT`
+  advances at **1.003MHz** on a physical H7B0 running stock Mario
+  (`PSC=0x15`, i.e. a 22MHz kernel clock — the intended 1us time base).
+  This model produced **3.998MHz**, exactly 4x fast; after the fix,
+  **0.997MHz** (-0.5%, the residue being HCLK estimation).
+- Note for future timing work: this did **not** change stock's audio
+  corruption, despite that firmware polling this exact counter 540x/sec.
+  Getting it right was still necessary, and it eliminates the time base
+  as a suspect (see the audio entry below).
+
+## 2026-07-22 — fix: register write masks silently dropped writable bits
+
+Auto-generated `*_WMASK` tables (`include/hw/misc/gnw_h7b0_regs_*.h`)
+narrower than the hardware's real writable field set, so firmware writes
+were silently discarded and read back wrong. Found by diffing our register
+state against a physical device running identical firmware, then audited
+across every generated header against the vendor CMSIS definitions in
+`sdk/cmsis-device-h7/Include/stm32h7b0xx.h`.
+
+Fixed:
+
+| register | was | now | dropped |
+|---|---|---|---|
+| `SAI1 AFRCR` / `BFRCR` | `0x00067fff` | `0x00077fff` | bit 16 `FSDEF` |
+| `DMA1 S0CR` | `0x01efffff` | `0x01ffffff` | bit 20 `TRBUFF` |
+| `OCTOSPI2 WCCR` | `0x2f3f3f0f` | `0xaf3f3f3f` | bit 31 `SIOO`, bits 5:4 `ISIZE` |
+| `OCTOSPI2 WPCCR` | `0x2f3f3f3f` | `0xaf3f3f3f` | bit 31 `SIOO` |
+
+`AFRCR` is hardware-confirmed: the device reads `0x00051f3f` where this
+model read `0x00041f3f` for the same firmware write; it now reads
+`0x00051f3f` too. The other three are provable from internal contradiction
+without any hardware — `S0CR` was narrower than the seven identical
+sibling streams in its own header, and `WCCR`/`WPCCR` were narrower than
+the identically-laid-out `CCR` beside them.
+
+Audited and deliberately NOT changed (real gaps, but no firmware this
+project boots writes those bits — recorded so the audit isn't repeated):
+`OCTOSPI2 DCR4` REFRESH modelled 16-bit not 32; `DAC1 CR` TSEL top bit;
+`WWDG CFR` `WDGTB_2`; `SYSCFG CCCR`/`CCCSR`; `TAMP ATCR1` `ATOSEL4`;
+`LTDC SSCR` HSW modelled 10-bit not 12 (the panel's HSW is far below the
+10-bit limit); `SAI xCR1` bit 27 `MCKEN` (stock leaves it clear, and our
+`ACR1` matches the device exactly). RCC, TIM2/TIM1, PWR, CRS, FMC, RTC,
+GPIO, EXTI, CRC, IWDG, DBGMCU, JPEG, SPI, FLASH and OCTOSPIM audited
+clean. `regs_adc.h` has gaps but is dead code — `gnw_h7b0_adc.c` does not
+include it.
+
+## 2026-07-22 — TIM2-TIM7: CNT is now a real, live counter
+
+- `hw/misc/gnw_h7b0_tim2.c`: `CNT` reads were a plain register shadow,
+  returning whatever the guest last wrote. Stock Mario configures TIM5 as
+  a free-running 32-bit microsecond time base (`CR1=1, PSC=0x15,
+  ARR=0xffffffff`) and polls its `CNT` **540 times a second** — measured,
+  and it is the only timer register stock reads at all. Every one of
+  those reads answered "no time has passed".
+- `CNT` now extrapolates from a latched reference: `cnt_base +
+  elapsed_ns * tick_hz / 1e9`, wrapped at `ARR+1`, against the live HCLK
+  and prescaler. The reference re-latches on anything that invalidates
+  it (`CNT`/`PSC`/`ARR` writes, `CEN` start/stop, `EGR.UG`, reset), and
+  travels in vmstate (bumped to v2) so snapshots don't make the counter
+  jump.
+- Found while chasing stock-firmware audio corruption. It is a real bug
+  independent of that, but **did not fix the audio** — the measured
+  symptom (see below) was unchanged, so it is recorded here as its own
+  fix, not as the audio fix.
+
+## 2026-07-22 — stock-firmware audio corruption: what is ruled out
+
+Not fixed. Recording the evidence so the next attempt doesn't re-tread
+it. Symptom: stock Mario audio sounds "crunchy/thuddy", like something is
+"echoing" and "playing more than it should". Retro-go audio is unaffected.
+
+**What the audio actually is**, because it frames everything: the stock
+Game & Watch Mario firmware runs the real NES Super Mario Bros through its
+own embedded NES emulator. So the guest is emulating an **NES APU** —
+square/triangle/noise channels — and then feeding the result to SAI1 via
+DMA. The same music sounds crisp in a desktop NES emulator. Whatever is
+wrong is happening to (or inside) that guest-side synthesis, not to a
+sampled audio stream.
+
+Recorded captures are preserved in `backup/audio-investigation/` (that
+path is gitignored; see the README there). They include 0.65s of PCM read
+off the **physical device**, which needs hardware and a debug probe to
+reproduce.
+
+Measured, on the exact byte stream handed to the audio backend:
+
+- Audio is clean *inside* each 120-sample DMA half-buffer and breaks at
+  the joins: sample-to-sample discontinuity at half-buffer seams is
+  **1.70x** the mid-chunk value, and **90%** of all large discontinuities
+  land exactly on a seam.
+- Chunk ordering is already optimal: A,B,A,B scores 308 at the joins vs
+  1734 for B,A and ~2230 for either half alone (interior ideal: 181).
+- No duplicate emission: zero stale (byte-identical) halves, zero
+  repeated source addresses, zero FIFO drops; exact 96000 B/s, and
+  half/full notifications alternate perfectly at 200+200 per second.
+- The dumped stream sounds wrong when played directly as a WAV outside
+  QEMU, so the guest genuinely generates this audio — the SAI path
+  reproduces it faithfully.
+
+Also measured against a **physical H7B0 running the same stock Mario
+firmware** (via `gnwmanager gdbserver` + OpenOCD `monitor mdw`, which
+reads without halting): every clock and SAI register matches this model
+exactly — `PLLCKSELR`, `PLLCFGR`, `PLL2DIVR` (`0x01013017`), `PLL2FRACR`,
+`CDCCIP1R` (SAI1SEL=PLL2), `ACR1` (`0x004b1280`), `ACR2`, `ASLOTR`. So the
+48kHz rate and the whole clock-decode path are confirmed correct, not
+merely plausible.
+
+Ruled out with evidence: stereo/mono misconfiguration (stock sets
+`MONO=1`, and lag-1 < lag-2 correlation confirms true mono); DMA snoop
+duplication (`ndtr` is the configured count and never varies); firmware
+polling `NDTR` (zero reads); sample-rate/resampler error (kernel clock is
+12.289MHz ~= the canonical 12.288MHz for 48kHz, confirmed identical on
+hardware, stable, never reprogrammed after voice open); DMA double-buffer
+mode (modelled correctly, and stock does not enable it, `CR=0x00062d57`
+with `DBM=0`); frozen `TIM5.CNT` (fixed above, symptom unchanged); the
+timer kernel clock being 4x fast (fixed above and verified against
+hardware to 0.5%, symptom unchanged).
+
+Two more dead ends worth not repeating:
+
+- **The corruption is not a reinterpretation of the captured bytes.**
+  Eleven transforms of the captured stream were generated and listened to
+  (playback at 24k/22.05k, decimate-by-2, even/odd de-interleave, treat as
+  stereo pairs, byte-swap, crossfade the seams away, drop alternate
+  chunks). The untouched baseline was closest to what the emulator plays;
+  every transform was worse.
+- **`-icount shift=2` made it worse**, not better — slower and with the
+  artifacts accentuated. Pacing the guest to a fixed instruction rate is
+  not the answer.
+
+Claims made during this investigation that did **not** survive, retracted
+here so they are not re-derived: "real hardware holds sample values while
+ours drifts by ±1" came from a single 5ms device snapshot and collapsed
+once 12 live snapshots were taken (held-sample fraction is 74.4% on
+hardware vs 74.5% here — effectively identical). Related step-size
+comparisons were invalid because the device's output is ~14x quieter
+(its volume setting), so the two were never on the same scale.
+
+Still unexplained and worth picking up next:
+
+- Our output is **duller** than the device's: 2.36% of energy above 5kHz
+  vs 4.78%, spectral centroid 358Hz vs 418Hz (different musical passages,
+  so suggestive rather than conclusive).
+- Our audio carries strong broadband **amplitude modulation** that a
+  known-good reference recording does not — modulation energy at 56Hz,
+  75Hz and 371Hz at 0.3-0.34 relative, where the reference has
+  essentially nothing above ~20Hz. Roughness of exactly this kind is what
+  "crunchy" sounds like.
+- Our DMA half/full interrupt cadence **jitters**: mean 2499.8us against
+  an ideal 2500us, but sd 0.2% with periodic excursions to 1414us/3586us
+  (43% early/late). Real DMA hardware is metronomic. This is the leading
+  remaining suspect.
+
+Technique note for whoever resumes this: `sendkey` via the QEMU monitor
+does not reach this guest, so audio captures need a human playing. Dump
+the buffer in `gnw_h7b0_sai1_dma_notify()` right after
+`cpu_physical_memory_read()` and analyse offline. On the device side,
+breakpointing the DMA2_Stream6 ISR (vector at `0x08000154`) and dumping
+`M0AR` per hit yields consecutive blocks, but stretches wall-clock time
+~10x between blocks, which visibly garbles what the firmware synthesises
+— itself evidence that stock's audio generation is time-based.
+
+## 2026-07-22 — fix: TIM2 ARR overflow flooded the main loop (the perf bug)
+
+- `hw/misc/gnw_h7b0_tim2.c`: `gnw_h7b0_tim2_period_ns()` computed
+  `(uint64_t)(arr + 1)`, evaluating `arr + 1` in 32-bit first. For
+  `ARR = 0xffffffff` — both the reset value and how firmware sets up a
+  free-running 32-bit microsecond time base — that wraps to 0, so the
+  period collapsed to 0, hit the 1us MIN clamp, and a ~277-second update
+  event was modelled as a 1MHz one. The timer re-armed itself as fast as
+  the main loop could dispatch it: **130,000-180,000 virtual-clock
+  expiries per second**, measured, on stock Mario (TIM5: CR1=1, PSC=0x15,
+  ARR=0xffffffff). Widened before incrementing, and switched to
+  `muldiv64()` since `(2^32) * 22 * 1e9` overflows `uint64_t` too.
+- This was the long-standing "emulator feels slow" bug, and it was never
+  about CPU emulation cost. Stock Mario, measured before/after:
+
+  |                     | before | after |
+  |---------------------|--------|-------|
+  | main loop thread    | 86.8%  | 2.5%  |
+  | guest vCPU (TCG)    | 4.4%   | 7.5%  |
+  | whole process       | ~100%  | ~15%  |
+
+  The profile that found it was dominated by `g_source_ref`,
+  `g_mutex_lock/unlock`, `qemu_lockcnt_cmpxchg_or_wait` and `aio_bh_poll`
+  — glib main-loop churn — while the guest sat at 1.5% busy. Any firmware
+  using a free-running 32-bit timer (stock, retro-go) tripped it; gnw-doom
+  does not, which is why it always "ran like a dream" by comparison.
+
+## 2026-07-22 — fix: `-device loader,file=` boots came up halted
+
+- `ui/gwemu.c`: `inject_default_args()` appends `-S` when it detects no
+  firmware image, so the GUI can come up with nothing loaded (`--gui`).
+  Its detection only recognized `-global gnw-h7b0-soc.*-image=`, so every
+  `-device loader,file=...` invocation — `boot_qemu.sh --ephemeral`,
+  `boot_qemu.sh --diag`, and hand-written command lines following them —
+  was classified as imageless and silently had `-S` appended. Those boots
+  sat in `paused (prelaunch)` with the vCPU thread accumulating zero
+  ticks: a black window that had to be un-paused by hand from the GUI,
+  with nothing on stderr explaining why. A generic-loader device with a
+  backing `file=` now counts as a real image.
+- Worth knowing for anything performance-related: this invalidates
+  informal speed comparisons made against `--ephemeral`/`--diag` boots.
+  Attaching a debugger to such a run resumes it (a gdbstub attach calls
+  `vm_start()`), so a VM could look like it was running normally while
+  actually having been started by the measurement itself.
+
+## 2026-07-22 — USART1 transmit model
+
+- `hw/misc/gnw_h7b0_usart1.c`: minimal transmit-only USART1, promoted out
+  of `create_unimplemented_device()`. ISR always reports the transmitter-
+  ready/idle flags; TDR writes go to a chardev (bound to serial port 0, so
+  `-serial stdio`/`-serial file:` gives guest printf output). RX is not
+  modeled. Trigger was the retro-go porting toolkit's test firmware (used
+  by the gnw-doom homebrew port), which makes USART1 its printf console and
+  hung forever at `while (!(USART1->ISR & TXE));` against the log-only stub.
+  With this, that firmware + gnw-doom boot to a rendering, running game.
 
 ## 2026-07-19/20 — repo cleanup, CI/release pipeline, GUI foundation, C-ported asset tooling
 

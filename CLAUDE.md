@@ -116,6 +116,31 @@ and rebranded — this repo's own product identity is `gwemu`/`GWemu`; "xemu" is
 only where it's genuine attribution to the real upstream project (license headers,
 "ported from xemu" comments, the About tab's credits — never blindly renamed).
 
+- **No OpenGL anywhere (2026-07-23)**: the GUI renders via SDL_Renderer
+  (D3D11/Metal/Vulkan per platform, software fallback) and ImGui's
+  imgui_impl_sdlrenderer3 backend. Don't reintroduce direct GL calls, GL
+  context creation, or epoxy usage into `ui/` -- the hard GL requirement was
+  removed deliberately after a real "Unable to create OpenGL context" failure
+  on Windows. Audio likewise: the fork's own `sdl3` audiodev
+  (`audio/sdl3audio.c`) is the default on every host; prefer
+  `-audiodev sdl3,id=snd0` over pa/coreaudio/dsound in new invocations.
+- **Linux video driver defaults to x11** (XWayland) in `ui/gwemu.c` -- three
+  confirmed native-Wayland breakages (libdecor crash, ImGui viewport
+  whitelist, fractional-scale UI mis-sizing). `SDL_VIDEODRIVER=wayland`
+  overrides for testing. The old "launch with SDL_VIDEODRIVER=x11" advice
+  below is now automatic.
+- **Headless capture** (CI/test-suite use): `-display none` is genuinely
+  windowless; `GNW_TIMELINE=<script>` drives virtual-clock-repeatable
+  button/screenshot sequences and `GNW_RECORD` captures A/V -- see
+  `docs/headless-capture.md` and `contrib/docker-headless/`. Scripting is
+  deliberately the ONLY headless control surface (no QMP commands/CLI/REST
+  -- shelved by explicit decision; wall-clock input is unrepeatable).
+- **Windows**: cross-built from Linux via Docker -- see
+  `docs/cross-platform-builds.md` for the exact workflow (image, configure
+  flags, dist packaging). `start.bat` at the repo root is the Windows launch
+  path. Windows flash persistence uses the CreateFileMapping path in
+  `hw/arm/gnw_h7b0_soc.c` -- the `-global gnw-h7b0-soc.*-image=` properties
+  work there; `-device loader,...` remains the ephemeral alternative.
 - Build additions: SDL3, Dear ImGui (a committed docking-branch vendor tree at
   `subprojects/imgui/` — NOT wrap-fetched, since no upstream URL hosts this
   project's exact xemu-patches-on-docking-branch merge; see the commit that
@@ -136,9 +161,9 @@ only where it's genuine attribution to the real upstream project (license header
   hit-testing on any detached window. Don't re-enable this without either
   forcing `SDL_VIDEODRIVER=x11` permanently or confirming on a whitelisted
   platform first.
-- **Testing in a Wayland dev environment**: launch with `SDL_VIDEODRIVER=x11`
-  as a workaround for an unrelated Wayland/libdecor crash in this sandbox
-  (`SDL_VIDEODRIVER=x11 ./build/qemu-system-arm -M gnw-h7b0 -display gwemu ...`).
+- **Testing in a Wayland dev environment**: no longer needs manual
+  `SDL_VIDEODRIVER=x11` -- gwemu defaults to the x11 driver on Linux itself
+  (see the "Linux video driver defaults to x11" bullet above).
   Screen-capture tooling (`import`/ImageMagick) is blocked in this sandbox for
   every agent that's tried it this session — don't assume you can screenshot;
   fall back to process-stability checks (stays alive, clean log, correct GPU

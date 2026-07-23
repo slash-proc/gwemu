@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-07-19
+Last updated: 2026-07-23
 
 Fork of upstream QEMU (`qemu/qemu`), pinned to tag `v11.0.2`. Working
 branch `gnw-h7b0`.
@@ -28,10 +28,24 @@ audio, gamepad input, SD card, save/flash persistence.
   blend/fixed-color modes.
 - JPEG: real polled output-register pipeline with correct chroma
   subsampling.
-- Audio: confirmed solid across every core tested.
+- Audio: confirmed solid across every core tested. Backend is the fork's
+  own `sdl3` audiodev (default on every host; WASAPI/CoreAudio/PipeWire).
+- Cross-platform: one rendering+audio stack (SDL_Renderer + sdl3
+  audiodev, no OpenGL requirement) verified live on Linux (Vulkan),
+  Windows (D3D11/software; VM-tested incl. sound) and macOS Intel
+  (Metal). Local Windows cross-build via Docker and Mac-over-SSH
+  workflows in `docs/cross-platform-builds.md`; `start.bat` is the
+  Windows launch path.
+- Headless capture appliance for CI/test suites: truly windowless
+  `-display none`, virtual-clock timeline scripts (repeatable to the
+  byte), whole-session A/V recording, Docker packaging — see
+  `docs/headless-capture.md` and `contrib/docker-headless/`.
 
 ## Known issues (open)
 
+- Native Wayland disabled by default on Linux (x11/XWayland instead) --
+  three real breakages documented in `ui/gwemu.c`; revisit when SDL3's
+  Wayland fractional-scale handling stabilizes.
 - QEMU/TCG instruction-interpretation overhead means gameplay is not
   perfectly real-time-matched to real hardware in every scenario; most of
   the addressable overhead (per-pixel MMIO translation calls) has already
