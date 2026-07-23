@@ -42,7 +42,14 @@ void MainMenuDisplayView::Draw()
         snprintf(label, sizeof(label), "%dx", mult);
         ImGui::BeginDisabled(!have_size);
         if (ImGui::Button(label)) {
-            SDL_SetWindowSize(gwemu_get_window(), tw * mult, th * mult);
+            /* tw/th are guest-texture PIXELS; SetWindowSize takes POINTS --
+             * snap so points*scale is integral, keeping fractional-scale
+             * Wayland presentation 1:1 (sharp) at the nearest size to
+             * N x native pixels. */
+            int pw, ph;
+            gwemu_snap_window_points(gwemu_get_window(), tw * mult,
+                                     th * mult, &pw, &ph);
+            SDL_SetWindowSize(gwemu_get_window(), pw, ph);
         }
         ImGui::EndDisabled();
     }

@@ -76,6 +76,23 @@ void ViewportManager::Update()
 
     m_scale = fmaxf(m_scale, 1.0);
 
+    if (getenv("GNW_SCALE_DEBUG")) {
+        static float last_scale, last_density;
+        if (m_scale != last_scale || m_pixel_density != last_density) {
+            last_scale = m_scale;
+            last_density = m_pixel_density;
+            int pw, ph, ww, wh;
+            SDL_GetWindowSizeInPixels(window, &pw, &ph);
+            SDL_GetWindowSize(window, &ww, &wh);
+            fprintf(stderr,
+                    "SCALE_DEBUG driver=%s win=%dx%dpt %dx%dpx density=%.3f "
+                    "display_scale=%.3f ui_scale=%.3f imgui_fbscale=%.3f\n",
+                    SDL_GetCurrentVideoDriver(), ww, wh, pw, ph,
+                    m_pixel_density, SDL_GetWindowDisplayScale(window),
+                    m_scale, io.DisplayFramebufferScale.x);
+        }
+    }
+
     if (io.DisplaySize.x > 640*m_scale) {
         m_extents.x = 25 * m_scale; // Distance from Left
         m_extents.y = 25 * m_scale; // '' Top

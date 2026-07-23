@@ -73,7 +73,7 @@ void FirstBootWindow::Draw()
     ImGui::SetCursorPosX((ImGui::GetWindowWidth()-120*g_viewport_mgr.m_scale)/2);
     if (ImGui::Button("Settings", ImVec2(120*g_viewport_mgr.m_scale, 0))) {
         g_main_menu.ShowSystem();
-        g_scene_mgr.PushScene(g_main_menu);
+        gwemu_settings_hud_show();
         g_config.general.show_welcome = false;
     }
 

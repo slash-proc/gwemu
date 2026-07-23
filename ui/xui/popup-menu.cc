@@ -328,12 +328,12 @@ public:
         }
         if (PopupMenuButton("Snapshots...", ICON_FA_CLOCK_ROTATE_LEFT)) {
             nav.ClearMenuStack();
-            g_scene_mgr.PushScene(g_main_menu);
+            gwemu_settings_hud_show();
             g_main_menu.ShowSnapshots();
         }
         if (PopupMenuButton("All settings...", ICON_FA_SLIDERS)) {
             nav.ClearMenuStack();
-            g_scene_mgr.PushScene(g_main_menu);
+            gwemu_settings_hud_show();
         }
         if (m_pop_focus) {
             nav.PopFocus();

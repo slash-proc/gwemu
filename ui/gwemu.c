@@ -28,6 +28,9 @@
 /* Ported SDL 1.2 code to 2.0 by Dave Airlie. */
 
 #include "qemu/osdep.h"
+#ifdef __linux__
+#include <libgen.h>
+#endif
 #include "qemu/module.h"
 #include "qemu/thread.h"
 #include "qemu/main-loop.h"
@@ -108,6 +111,8 @@ static int guest_x, guest_y;
 static SDL_Cursor *guest_sprite;
 static Notifier mouse_mode_notifier;
 static SDL_Window *m_window;
+static SDL_Window *m_settings_window;
+static SDL_Renderer *m_settings_renderer;
 static SDL_Renderer *m_renderer;
 /* Streaming texture holding the guest framebuffer, sized to the current
  * DisplaySurface. Replaces the GL surface-texture upload path. */
@@ -147,6 +152,41 @@ SDL_Window *gwemu_get_window(void)
     return m_window;
 }
 
+
+static uint32_t get_window_id_from_event(SDL_Event *ev) {
+    switch (ev->type) {
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP: return ev->key.windowID;
+        case SDL_EVENT_TEXT_EDITING: return ev->edit.windowID;
+        case SDL_EVENT_TEXT_INPUT: return ev->text.windowID;
+        case SDL_EVENT_MOUSE_MOTION: return ev->motion.windowID;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP: return ev->button.windowID;
+        case SDL_EVENT_MOUSE_WHEEL: return ev->wheel.windowID;
+        case SDL_EVENT_WINDOW_SHOWN:
+        case SDL_EVENT_WINDOW_HIDDEN:
+        case SDL_EVENT_WINDOW_EXPOSED:
+        case SDL_EVENT_WINDOW_MOVED:
+        case SDL_EVENT_WINDOW_RESIZED:
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        case SDL_EVENT_WINDOW_MINIMIZED:
+        case SDL_EVENT_WINDOW_MAXIMIZED:
+        case SDL_EVENT_WINDOW_RESTORED:
+        case SDL_EVENT_WINDOW_MOUSE_ENTER:
+        case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+        case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        case SDL_EVENT_WINDOW_FOCUS_LOST:
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                case SDL_EVENT_WINDOW_HIT_TEST: return ev->window.windowID;
+        case SDL_EVENT_DROP_FILE:
+        case SDL_EVENT_DROP_TEXT:
+        case SDL_EVENT_DROP_BEGIN:
+        case SDL_EVENT_DROP_COMPLETE:
+        case SDL_EVENT_DROP_POSITION: return ev->drop.windowID;
+        default: return 0;
+    }
+}
+
 static struct gwemu_console *get_scon_from_window(uint32_t window_id)
 {
     int i;
@@ -158,15 +198,82 @@ static struct gwemu_console *get_scon_from_window(uint32_t window_id)
     return NULL;
 }
 
+/*
+ * Convert a desired PHYSICAL pixel size into an SDL window size in
+ * POINTS, snapped so that points * fractional-scale is (near-)integral.
+ *
+ * Why snapping matters (confirmed via WAYLAND_DEBUG protocol traces on
+ * GNOME at 1.75x fractional scale): SDL3 does use wp_fractional_scale_v1
+ * + wp_viewporter, committing a buffer of round(points * scale) pixels
+ * with wp_viewport.set_destination(points). If points * scale is not an
+ * integer (e.g. 366pt * 1.75 = 640.5), the buffer (641px) cannot map
+ * 1:1 onto the destination (640.5 device px) and the compositor
+ * resamples the whole surface -- visibly blurry. Snapping to the
+ * nearest point size whose product with the scale is integral (with
+ * 1.75 = 7/4, any multiple of 4pt) restores exact 1:1 presentation.
+ * On density-1 hosts (x11/Windows) scale is 1.0 and this reduces to a
+ * pass-through of px_w/px_h.
+ */
+void gwemu_snap_window_points(SDL_Window *win, int px_w, int px_h,
+                              int *pt_w, int *pt_h)
+{
+    float scale = fmaxf(SDL_GetWindowDisplayScale(win), 1.0f);
+    float density = fmaxf(SDL_GetWindowPixelDensity(win), 1.0f);
+    /* The buffer size follows the pixel density (== fractional scale on
+     * Wayland); prefer the display scale when the two agree, since it
+     * comes straight from preferred_scale/120 and is exact. */
+    float d = (fabsf(scale - density) < 0.05f) ? scale : density;
+    /*
+     * Snap UP, not to nearest: the smallest integral-product point size
+     * whose pixel size is >= the requested one. The requested size is
+     * typically an exact integer multiple of the guest resolution (e.g.
+     * 640x480 = 2x native), which is usually unreachable exactly at a
+     * fractional scale (needs 365.71pt at 7/4) -- a slightly LARGER
+     * window lets the blit path draw the guest at the exact integer
+     * multiple, pixel-sharp, with a few pixels of letterbox, instead of
+     * resampling the guest at a non-integer factor.
+     */
+    int dims_px[2] = { px_w, px_h };
+    int *dims_pt[2] = { pt_w, pt_h };
+    for (int i = 0; i < 2; i++) {
+        int base = (int)ceilf(dims_px[i] / d - 0.001f);
+        if (base < 1) {
+            base = 1;
+        }
+        int best = base;
+        for (int c = base; c <= base + 7; c++) {
+            float prod = c * d;
+            if (fabsf(prod - lroundf(prod)) > 0.01f &&
+                d > 1.0f) {
+                continue; /* not integral: compositor would resample */
+            }
+            if (lroundf(prod) < dims_px[i]) {
+                continue;
+            }
+            best = c;
+            break;
+        }
+        *dims_pt[i] = best;
+    }
+}
+
 static void window_resize(struct gwemu_console *scon)
 {
     if (!scon->real_window) {
         return;
     }
 
-    SDL_SetWindowSize(scon->real_window,
-                      surface_width(scon->surface),
-                      surface_height(scon->surface));
+    /*
+     * surface dims are PIXELS; SDL_SetWindowSize takes POINTS. Equal on
+     * x11/Windows, but on Wayland with display scaling points*density =
+     * pixels, so dividing keeps the physical size right (previously the
+     * window ballooned by the scale factor).
+     */
+    int rw_pt, rh_pt;
+    gwemu_snap_window_points(scon->real_window,
+                             surface_width(scon->surface),
+                             surface_height(scon->surface), &rw_pt, &rh_pt);
+    SDL_SetWindowSize(scon->real_window, rw_pt, rh_pt);
 }
 
 static void hide_cursor(struct gwemu_console *scon)
@@ -523,8 +630,21 @@ static void handle_windowevent(SDL_Event *ev)
             dpy_set_ui_info(scon->dcl.con, &info, true);
 
             if (!gui_fullscreen) {
-                g_config.display.window.last_width = ev->window.data1;
-                g_config.display.window.last_height = ev->window.data2;
+                /*
+                 * Store PHYSICAL pixels, not points: everywhere that
+                 * consumes window sizes (startup creation below, the xN
+                 * presets, window_resize()) treats configured sizes as
+                 * pixels and divides by the pixel density when calling
+                 * point-based SDL window APIs. SDL_EVENT_WINDOW_RESIZED
+                 * reports points, so convert here; on x11/Windows
+                 * density == 1 and this is a no-op.
+                 */
+                float wr_d = fmaxf(
+                    SDL_GetWindowPixelDensity(scon->real_window), 1.0f);
+                g_config.display.window.last_width =
+                    (int)lroundf(ev->window.data1 * wr_d);
+                g_config.display.window.last_height =
+                    (int)lroundf(ev->window.data2 * wr_d);
             }
         }
         break;
@@ -819,11 +939,21 @@ static void gl_render_frame(struct gwemu_console *scon)
      * possible lengthy blocking (for vsync).
      */
     gwemu_main_loop_lock();
+    
     gwemu_hud_update();
+    gwemu_settings_hud_update();
+
     gwemu_main_loop_unlock();
 
+    
     gwemu_hud_render();
     SDL_RenderPresent(m_renderer);
+    
+    gwemu_settings_hud_render();
+    if (m_settings_renderer) {
+        SDL_RenderPresent(m_settings_renderer);
+    }
+
 
     qatomic_set(&rendering, false);
 
@@ -853,6 +983,14 @@ static void poll_events(struct gwemu_console *scon)
     gwemu_hud_should_capture_kbd_mouse(&kbd, &mouse);
 
     while (SDL_PollEvent(ev)) {
+
+        if (m_settings_window && get_window_id_from_event(ev) == SDL_GetWindowID(m_settings_window)) {
+            gwemu_settings_hud_process_sdl_events(ev);
+            if (ev->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+                SDL_HideWindow(m_settings_window);
+            }
+            continue;
+        }
         gwemu_main_loop_lock();
 
         // HUD must process events first so that if a controller is detached,
@@ -943,7 +1081,54 @@ static void display_very_early_init(DisplayOptions *o)
      * guaranteed crash. Must be set before SDL_Init().
      */
 #ifdef SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR
-    SDL_SetHint(SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR, "0");
+    /*
+     * Native-Wayland decorations (only relevant when SDL picks the
+     * wayland driver, e.g. SDL_VIDEODRIVER=wayland). Facts, all
+     * re-verified 2026-07-23 against libdecor 0.2.2 on GNOME:
+     *
+     * - libdecor's GTK plugin (the only plugin distros ship) crashes
+     *   inside this process: GTK3 gets dlopen'd into QEMU's heavily
+     *   multi-threaded GLib environment, GObject assertions fire and
+     *   the heap corrupts ("malloc(): unaligned tcache chunk
+     *   detected") within seconds of window creation.
+     * - libdecor's built-in fallback plugin draws NOTHING: its
+     *   frame_commit is an empty stub (src/libdecor-fallback.c). It is
+     *   not a "plain titlebar" -- pointing LIBDECOR_PLUGIN_DIR at an
+     *   empty/nonexistent path guarantees an undecorated window on
+     *   GNOME, which never implemented server-side xdg-decoration.
+     * - libdecor's CAIRO plugin (not GTK-based, not packaged by
+     *   Ubuntu) is stable in-process and draws a real titlebar.
+     *
+     * So: keep libdecor enabled and point its search path (a
+     * colon-separated dir list) at a gwemu-local plugin dir next to
+     * the executable, where a build of libdecor's cairo plugin can be
+     * dropped ("libdecor-plugins/libdecor-cairo.so"). The system
+     * plugin dir is deliberately NOT on the path, so the crashing GTK
+     * plugin can never load. If the local dir is absent, libdecor
+     * falls back to its built-in no-op plugin: undecorated but
+     * stable. Both knobs respect pre-set user overrides (setenv
+     * overwrite=0 / hint only set if unset).
+     */
+#ifdef __linux__
+    if (getenv("LIBDECOR_PLUGIN_DIR") == NULL) {
+        char exe_path[PATH_MAX];
+        ssize_t len = readlink("/proc/self/exe", exe_path,
+                               sizeof(exe_path) - 1);
+        if (len > 0) {
+            char plugin_dir[PATH_MAX + 32];
+            exe_path[len] = '\0';
+            snprintf(plugin_dir, sizeof(plugin_dir), "%s/libdecor-plugins",
+                     dirname(exe_path));
+            setenv("LIBDECOR_PLUGIN_DIR", plugin_dir, 0);
+        } else {
+            setenv("LIBDECOR_PLUGIN_DIR",
+                   "/nonexistent-gwemu-no-libdecor-plugins", 0);
+        }
+    }
+#endif
+    if (SDL_GetHint(SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR) == NULL) {
+        SDL_SetHint(SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR, "1");
+    }
 #endif
 
 #ifdef __linux__
@@ -1069,6 +1254,28 @@ static void display_very_early_init(DisplayOptions *o)
         exit(1);
     }
     g_free(title);
+
+    /*
+     * window_width/height (and the saved last_width/last_height) are
+     * PHYSICAL pixels, but SDL_CreateWindow/SDL_SetWindowSize take
+     * POINTS. On Wayland with fractional scaling (density > 1, e.g.
+     * 1.75x GNOME) the window just created is density-times too large
+     * physically compared to the same numbers under x11 (where density
+     * is 1 and points == pixels) -- the guest viewport then fills that
+     * oversized window and looks ~2x too big while the HUD (which
+     * scales by display_scale/density) still looks right. The density
+     * is only queryable once a window exists, so correct the size
+     * immediately after creation. No-op when density == 1.
+     */
+    float win_density = fmaxf(SDL_GetWindowPixelDensity(m_window), 1.0f);
+    if (win_density > 1.0f) {
+        gwemu_snap_window_points(m_window, window_width, window_height,
+                                 &window_width, &window_height);
+        gwemu_snap_window_points(m_window, min_window_width,
+                                 min_window_height, &min_window_width,
+                                 &min_window_height);
+        SDL_SetWindowSize(m_window, window_width, window_height);
+    }
     SDL_SetWindowMinimumSize(m_window, min_window_width, min_window_height);
 
     const SDL_DisplayMode *disp_mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(m_window));
@@ -1083,7 +1290,23 @@ static void display_very_early_init(DisplayOptions *o)
      * back to GL and ultimately the software renderer below. */
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "vulkan");
 #endif
+    
     m_renderer = SDL_CreateRenderer(m_window, NULL);
+    
+    /* Comfortable default, but never larger than the desktop's usable
+     * area -- a window that opens bigger than the screen leaves no
+     * reachable edge to resize it with. */
+    int set_w = 900, set_h = 700;
+    SDL_Rect usable;
+    if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable)) {
+        set_w = MIN(set_w, usable.w * 9 / 10);
+        set_h = MIN(set_h, usable.h * 9 / 10);
+    }
+    m_settings_window = SDL_CreateWindow("Settings", set_w, set_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (m_settings_window) {
+        m_settings_renderer = SDL_CreateRenderer(m_settings_window, NULL);
+    }
+
     if (m_renderer == NULL) {
         SDL_ResetHint(SDL_HINT_RENDER_DRIVER);
         m_renderer = SDL_CreateRenderer(m_window, NULL);
@@ -1177,7 +1400,12 @@ static void display_early_init(DisplayOptions *o)
     assert(o->type == DISPLAY_TYPE_GWEMU);
     SDL_SetRenderVSync(m_renderer, g_config.display.window.vsync ?
                        1 : SDL_RENDERER_VSYNC_DISABLED);
+    
     gwemu_hud_init(m_window, m_renderer);
+    if (m_settings_window && m_settings_renderer) {
+        gwemu_settings_hud_init(m_settings_window, m_settings_renderer);
+    }
+
 }
 
 static const DisplayChangeListenerOps dcl_gl_ops = {

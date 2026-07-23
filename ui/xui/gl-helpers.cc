@@ -122,7 +122,60 @@ void RenderFramebuffer(SDL_Texture *tex, int width, int height, bool flip)
                            dw, dh };
     }
 
+    /*
+     * Integer-multiple snap: window sizes are snapped UP a few pixels
+     * past N x native (fractional-scale Wayland can't hit N x native
+     * exactly in whole points -- see gwemu_snap_window_points()), so
+     * when the fit lands within a few pixels of an exact integer
+     * multiple of the guest resolution, draw at EXACTLY that multiple,
+     * centered, nearest-neighbor: pixel-sharp at the intended size with
+     * an imperceptible letterbox. Free-form window sizes far from a
+     * multiple keep the plain fit (and configured filtering) above.
+     */
+    if (g_config.display.ui.fit != CONFIG_DISPLAY_UI_FIT_STRETCH) {
+        const float snap_thresh = 6.0f;
+        int mult = (int)lroundf(dst.w / tw);
+        if (mult >= 1 &&
+            fabsf(dst.w - (float)(mult * tw)) <= snap_thresh &&
+            fabsf(dst.h - (float)(mult * th)) <= snap_thresh &&
+            mult * tw <= width && mult * th <= height) {
+            dst.w = mult * tw;
+            dst.h = mult * th;
+            dst.x = floorf((width - dst.w) / 2.0f);
+            dst.y = floorf((height - dst.h) / 2.0f);
+            SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+        }
+    }
+
     SDL_Renderer *r = gwemu_get_renderer();
+
+    if (getenv("GNW_SCALE_DEBUG")) {
+        static SDL_FRect last_dst;
+        static int last_ow, last_oh;
+        int ow = 0, oh = 0, cow = 0, coh = 0, wpt = 0, hpt = 0, wpx = 0,
+            hpx = 0;
+        float sx = 1, sy = 1;
+        SDL_GetRenderOutputSize(r, &ow, &oh);
+        SDL_GetCurrentRenderOutputSize(r, &cow, &coh);
+        SDL_GetRenderScale(r, &sx, &sy);
+        SDL_Window *win = gwemu_get_window();
+        SDL_GetWindowSize(win, &wpt, &hpt);
+        SDL_GetWindowSizeInPixels(win, &wpx, &hpx);
+        if (memcmp(&dst, &last_dst, sizeof(dst)) != 0 || ow != last_ow ||
+            oh != last_oh) {
+            last_dst = dst;
+            last_ow = ow;
+            last_oh = oh;
+            fprintf(stderr,
+                    "SCALE_DEBUG blit driver=%s in=%dx%d win=%dx%dpt "
+                    "%dx%dpx out=%dx%d curout=%dx%d rscale=%.3fx%.3f "
+                    "dst=(%.1f,%.1f %.1fx%.1f)\n",
+                    SDL_GetCurrentVideoDriver(), width, height, wpt, hpt,
+                    wpx, hpx, ow, oh, cow, coh, sx, sy, dst.x, dst.y, dst.w,
+                    dst.h);
+        }
+    }
+
     if (flip) {
         SDL_RenderTextureRotated(r, tex, NULL, &dst, 0, NULL,
                                  SDL_FLIP_VERTICAL);

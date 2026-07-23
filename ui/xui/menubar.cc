@@ -80,7 +80,14 @@ void ShowMainMenu()
                 snprintf(label, sizeof(label), "%dx", mult);
                 if (!have_size) ImGui::BeginDisabled();
                 if (ImGui::MenuItem(label)) {
-                    SDL_SetWindowSize(gwemu_get_window(), tw * mult, th * mult);
+                    /* tw/th are guest-texture PIXELS; SetWindowSize takes
+                     * POINTS -- snap so points*scale is integral, keeping
+                     * fractional-scale Wayland presentation 1:1 (sharp) at
+                     * the nearest size to N x native pixels. */
+                    int pw, ph;
+                    gwemu_snap_window_points(gwemu_get_window(), tw * mult,
+                                             th * mult, &pw, &ph);
+                    SDL_SetWindowSize(gwemu_get_window(), pw, ph);
                 }
                 if (!have_size) ImGui::EndDisabled();
             }
@@ -113,14 +120,14 @@ void ShowMainMenu()
         if (ImGui::BeginMenu("Settings")) {
             if (ImGui::MenuItem("System")) {
                 g_main_menu.ShowSystem();
-                g_scene_mgr.PushScene(g_main_menu);
+                gwemu_settings_hud_show();
             }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
             if (ImGui::MenuItem("About")) {
                 g_main_menu.ShowAbout();
-                g_scene_mgr.PushScene(g_main_menu);
+                gwemu_settings_hud_show();
             }
             ImGui::EndMenu();
         }

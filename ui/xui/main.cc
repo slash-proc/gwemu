@@ -25,6 +25,10 @@
 #include <assert.h>
 #include <fpng.h>
 
+extern "C" {
+void gnw_h7b0_rtc_set_sync_host(bool sync_host);
+}
+
 #include <deque>
 #include <vector>
 #include <string>
@@ -53,8 +57,15 @@ const char *g_snapshot_pending_load_name;
 
 float g_main_menu_height;
 
+
+static ImGuiContext *g_ctx_main = nullptr;
+static ImGuiContext *g_ctx_settings = nullptr;
+static SDL_Window *g_settings_window = nullptr;
+static SDL_Renderer *g_settings_renderer = nullptr;
+
 static ImGuiStyle g_base_style;
 static float g_last_scale;
+static float g_last_scale_settings;
 static int g_vsync;
 static SDL_Texture *g_tex;
 static SDL_Renderer *g_renderer;
@@ -132,33 +143,11 @@ void gwemu_hud_init(SDL_Window* window, SDL_Renderer* renderer)
 
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    g_ctx_main = ImGui::CreateContext();
+    ImGui::SetCurrentContext(g_ctx_main);
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-    // ImGuiConfigFlags_ViewportsEnable (lets a window like Settings drag out
-    // into its own real OS-level window) is DELIBERATELY NOT enabled here --
-    // real testing found it broken (mouse hover/click hit-testing offset
-    // from a dragged window's actual position, worsening the further the
-    // window moves from the main one). Root cause: imgui_impl_sdl3.cpp's
-    // own multi-viewport support requires SDL_GetGlobalMouseState() to be
-    // reliable, and it only sets ImGuiBackendFlags_PlatformHasViewports
-    // (the flag that actually wires up the cross-window coordinate-
-    // translation platform callbacks) for a driver on its own hardcoded
-    // whitelist: {"windows", "cocoa", "x11", "DIVE", "VMAN"} -- see that
-    // file's own ImGui_ImplSDL3_Init(). "wayland" is not on that list, and
-    // this project's real launch path (scripts/boot_qemu.sh) does not force
-    // SDL_VIDEODRIVER=x11 -- only ad hoc manual test invocations during
-    // development did. So on a real Wayland desktop (this project's actual
-    // dev/test environment, confirmed via $XDG_SESSION_TYPE), the platform
-    // interface never initializes correctly for genuine cross-window mouse
-    // math, which is a well-known, documented Wayland limitation (no
-    // reliable absolute/global window positioning) -- not something we can
-    // fix in our own code. DockingEnable alone (kept below) still gives
-    // real value -- floating/dockable panels within the single game window
-    // -- without needing the broken cross-window mouse-coordinate path.
-    // Revisit ViewportsEnable if this project ever forces SDL_VIDEODRIVER=x11
-    // (or ships on Windows/Mac, both on the real whitelist) by default.
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.IniFilename = NULL;
 
@@ -171,6 +160,7 @@ void gwemu_hud_init(SDL_Window* window, SDL_Renderer* renderer)
     g_last_scale = g_viewport_mgr.m_scale;
     InitializeStyle();
     first_boot_window.is_open = g_config.general.show_welcome;
+    gnw_h7b0_rtc_set_sync_host(g_config.sys.rtc_sync_host);
 }
 
 void gwemu_hud_cleanup(void)
@@ -294,7 +284,8 @@ void gwemu_hud_update(void)
     }
 
     // FIXME: Handle time wrap around
-    if (g_config.display.ui.hide_cursor && (now - last_mouse_move) > 3000) {
+    bool settings_visible = g_settings_window && !(SDL_GetWindowFlags(g_settings_window) & SDL_WINDOW_HIDDEN);
+    if (g_config.display.ui.hide_cursor && !settings_visible && (now - last_mouse_move) > 3000) {
         ImGui::SetMouseCursor(ImGuiMouseCursor_None);
     }
 
@@ -315,7 +306,7 @@ void gwemu_hud_update(void)
         }
 
         if (ImGui::IsKeyPressed(ImGuiKey_F1)) {
-            g_scene_mgr.PushScene(g_main_menu);
+            gwemu_settings_hud_show();
         } else if (ImGui::IsKeyPressed(ImGuiKey_F2)) {
             g_scene_mgr.PushScene(g_popup_menu);
         } else if (menu_button ||
@@ -340,7 +331,24 @@ void gwemu_hud_update(void)
 void gwemu_hud_render()
 {
     ImGui::Render();
+    /*
+     * imgui_impl_sdlrenderer3 does NOT scale vertex geometry itself: it
+     * expects the app to map ImGui's point coordinate space to the
+     * renderer's pixel space via SDL_SetRenderScale (it only pre-scales
+     * CLIP rects, and only when the renderer scale is 1). Without this,
+     * any backend where window points != pixels (Wayland with
+     * fractional/HiDPI scale; FramebufferScale != 1) draws the UI at
+     * points-into-pixels size (too small, top-left) with clip rects
+     * scaled separately (chopped/invisible text) -- confirmed live on a
+     * 1.5x-fractional Wayland desktop while x11 (scale 1) was fine.
+     * Scale during ImGui rendering only; the guest-framebuffer blit
+     * (RenderFramebuffer) deliberately works in raw pixels.
+     */
+    ImGuiIO &io_r = ImGui::GetIO();
+    SDL_SetRenderScale(g_renderer, io_r.DisplayFramebufferScale.x,
+                       io_r.DisplayFramebufferScale.y);
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_renderer);
+    SDL_SetRenderScale(g_renderer, 1.0f, 1.0f);
 
     // Update/render any ImGui windows (e.g. Settings) that got dragged out
     // into their own real OS-level window -- see ImGuiConfigFlags_ViewportsEnable
@@ -363,5 +371,109 @@ void gwemu_hud_render()
     if (g_screenshot_pending) {
         SaveScreenshot(g_tex, g_flip_req);
         g_screenshot_pending = false;
+    }
+}
+
+void gwemu_settings_hud_init(SDL_Window *window, SDL_Renderer *renderer)
+{
+    g_settings_window = window;
+    g_settings_renderer = renderer;
+
+    g_ctx_settings = ImGui::CreateContext();
+    ImGui::SetCurrentContext(g_ctx_settings);
+    
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    io.IniFilename = NULL;
+
+    ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+    ImGui_ImplSDLRenderer3_Init(renderer);
+    
+    ImGuiStyle &s = ImGui::GetStyle();
+    s = g_base_style;
+    
+    if (g_ctx_main) ImGui::SetCurrentContext(g_ctx_main);
+}
+
+void gwemu_settings_hud_cleanup(void)
+{
+    if (g_ctx_settings) {
+        ImGui::SetCurrentContext(g_ctx_settings);
+        ImGui_ImplSDLRenderer3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext(g_ctx_settings);
+        g_ctx_settings = nullptr;
+    }
+}
+
+void gwemu_settings_hud_show(void)
+{
+    if (g_settings_window) {
+        SDL_ShowWindow(g_settings_window);
+        SDL_RaiseWindow(g_settings_window);
+    }
+}
+
+void gwemu_settings_hud_process_sdl_events(SDL_Event *event)
+{
+    if (g_ctx_settings) {
+        ImGui::SetCurrentContext(g_ctx_settings);
+        // Ignore inputs that are consumed by rebinding
+        if (g_main_menu.ConsumeRebindEvent(event)) {
+            ImGui::SetCurrentContext(g_ctx_main);
+            return;
+        }
+        ImGui_ImplSDL3_ProcessEvent(event);
+        ImGui::SetCurrentContext(g_ctx_main);
+    }
+}
+
+void gwemu_settings_hud_update(void)
+{
+    if (!g_ctx_settings || !g_settings_window) return;
+    
+    // Only update if visible
+    if (!(SDL_GetWindowFlags(g_settings_window) & SDL_WINDOW_HIDDEN)) {
+        ImGui::SetCurrentContext(g_ctx_settings);
+
+        if (g_last_scale_settings != g_viewport_mgr.m_scale) {
+            g_font_mgr.Rebuild();
+            ImGuiStyle &style = ImGui::GetStyle();
+            style = g_base_style;
+            style.ScaleAllSizes(g_viewport_mgr.m_scale);
+            g_last_scale_settings = g_viewport_mgr.m_scale;
+        }
+
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+        
+        bool is_open = g_main_menu.Draw();
+
+        if (!is_open) {
+            SDL_HideWindow(g_settings_window);
+        }
+        
+        if (g_ctx_main) ImGui::SetCurrentContext(g_ctx_main);
+    }
+}
+
+void gwemu_settings_hud_render(void)
+{
+    if (!g_ctx_settings || !g_settings_window) return;
+    
+    if (!(SDL_GetWindowFlags(g_settings_window) & SDL_WINDOW_HIDDEN)) {
+        ImGui::SetCurrentContext(g_ctx_settings);
+        ImGui::Render();
+        
+        ImGuiIO &io_r = ImGui::GetIO();
+        SDL_SetRenderScale(g_settings_renderer, io_r.DisplayFramebufferScale.x, io_r.DisplayFramebufferScale.y);
+        SDL_SetRenderDrawColor(g_settings_renderer, 0, 0, 0, 255);
+        SDL_RenderClear(g_settings_renderer);
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_settings_renderer);
+        SDL_SetRenderScale(g_settings_renderer, 1.0f, 1.0f);
+        
+        if (g_ctx_main) ImGui::SetCurrentContext(g_ctx_main);
     }
 }
