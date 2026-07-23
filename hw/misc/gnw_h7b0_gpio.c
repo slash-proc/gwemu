@@ -32,6 +32,7 @@
 #include "ui/console.h"
 #include "ui/input.h"
 #include "hw/misc/gnw_h7b0_gpio.h"
+#include "hw/misc/gnw_timeline.h"
 #include "hw/misc/gnw_h7b0_regs_gpio.h"
 #include "hw/misc/gnw_h7b0_exti.h"
 #include "hw/misc/gnw_h7b0_syscfg.h"
@@ -160,6 +161,18 @@ static void gnw_h7b0_gpio_set_pin(GnwH7B0GpioState *s, int port,
     }
 }
 
+static const char *const gnw_h7b0_button_names[GNW_BTN__COUNT];
+
+int gnw_h7b0_gpio_button_from_name(const char *name)
+{
+    for (int i = 0; i < GNW_BTN__COUNT; i++) {
+        if (!g_ascii_strcasecmp(name, gnw_h7b0_button_names[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static void gnw_h7b0_gpio_set_button(GnwH7B0GpioState *s, int button,
                                       bool pressed)
 {
@@ -168,6 +181,15 @@ static void gnw_h7b0_gpio_set_button(GnwH7B0GpioState *s, int button,
     gnw_h7b0_gpio_set_pin(s, bp->port, bp->pin, pressed);
     if (bp->pin2) {
         gnw_h7b0_gpio_set_pin(s, bp->port2, bp->pin2, pressed);
+    }
+}
+
+/* Non-static entry point for the timeline engine (gnw_timeline.c). */
+void gnw_h7b0_gpio_inject_button(GnwH7B0GpioState *s, int button,
+                                 bool pressed)
+{
+    if (button >= 0 && button < GNW_BTN__COUNT) {
+        gnw_h7b0_gpio_set_button(s, button, pressed);
     }
 }
 
@@ -462,14 +484,7 @@ static void gnw_h7b0_gpio_realize(DeviceState *dev, Error **errp)
             double hold = 0.2;
             char name[16];
             if (sscanf(*p, "%lf:%15[^:]:%lf", &t, name, &hold) >= 2) {
-                int btn = -1;
-                static const char *const names[GNW_BTN__COUNT] = {
-                    "pause", "game", "time", "a", "b", "left",
-                    "down", "right", "up", "pwr", "start", "select",
-                };
-                for (int i = 0; i < GNW_BTN__COUNT; i++) {
-                    if (!strcmp(name, names[i])) { btn = i; break; }
-                }
+                int btn = gnw_h7b0_gpio_button_from_name(name);
                 if (btn >= 0) {
                     auto_events[auto_nevents++] = (GnwAutoEvent){
                         (int64_t)(t * 1e9), btn, true };
@@ -535,6 +550,8 @@ static void gnw_h7b0_gpio_realize(DeviceState *dev, Error **errp)
     }
 
     qemu_input_handler_register(dev, &gnw_h7b0_gpio_input_handler);
+
+    gnw_timeline_init(s);
 }
 
 static const VMStateDescription vmstate_gnw_h7b0_gpio = {

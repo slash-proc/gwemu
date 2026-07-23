@@ -319,6 +319,45 @@ static bool ppm_save(int fd, pixman_image_t *image, Error **errp)
     return true;
 }
 
+/*
+ * Non-coroutine screendump for in-process consumers (the gnw-h7b0
+ * timeline engine's `screenshot` action, hw/misc/gnw_timeline.c).
+ * qmp_screendump() below is a coroutine command because some display
+ * devices (virtio-gpu) need async GL fencing in graphic_hw_update();
+ * the gnw-h7b0 LTDC's gfx_update is fully synchronous, so a plain
+ * graphic_hw_update() suffices here and this can be called from any
+ * BQL context (e.g. a virtual-clock timer). Always PNG.
+ */
+bool gwemu_screendump_png(const char *filename, Error **errp)
+{
+    g_autoptr(pixman_image_t) image = NULL;
+    QemuConsole *con = qemu_console_lookup_by_index(0);
+    DisplaySurface *surface;
+    int fd;
+
+    if (!con) {
+        error_setg(errp, "no console");
+        return false;
+    }
+    graphic_hw_update(con);
+    surface = qemu_console_surface(con);
+    if (!surface) {
+        error_setg(errp, "no surface");
+        return false;
+    }
+    image = pixman_image_ref(surface->image);
+
+    fd = qemu_create(filename, O_WRONLY | O_TRUNC | O_BINARY, 0666, errp);
+    if (fd == -1) {
+        return false;
+    }
+    if (!png_save(fd, image, errp)) {
+        qemu_unlink(filename);
+        return false;
+    }
+    return true;
+}
+
 /* Safety: coroutine-only, concurrent-coroutine safe, main thread only */
 void coroutine_fn
 qmp_screendump(const char *filename, const char *device,

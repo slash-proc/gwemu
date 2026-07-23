@@ -107,4 +107,11 @@ struct GnwH7B0GpioState {
     int key_map[16];
 };
 
+/* Timeline-engine entry points (hw/misc/gnw_timeline.c): resolve a
+ * button name ("a", "game", ... -- case-insensitive) to its GNW_BTN_*
+ * index (-1 if unknown), and set that button's pin state. */
+int gnw_h7b0_gpio_button_from_name(const char *name);
+void gnw_h7b0_gpio_inject_button(GnwH7B0GpioState *s, int button,
+                                 bool pressed);
+
 #endif

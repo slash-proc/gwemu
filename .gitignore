@@ -42,3 +42,7 @@ GTAGS
 *.mp3
 *.qcow2
 *.7z
+# local build trees / logs (gwemu)
+build-win/
+build-docker/
+gwemu.log

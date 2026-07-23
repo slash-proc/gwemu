@@ -1,0 +1,16 @@
+# Keep the docker build context lean -- without this, COPY . . drags the
+# 8GB sdcard image, firmware backups, reference PDFs/SDK and both build
+# trees into every layer (real incident: 100GB of build cache, host disk
+# at 97%).
+backup/
+build/
+build-win/
+build-docker/
+sdk/
+retro-go-temp/
+*.img
+*.qcow2
+*.pdf
+STM32H7B0.svd
+mac_report.log
+.git/

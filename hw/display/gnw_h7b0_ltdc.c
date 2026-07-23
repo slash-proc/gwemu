@@ -31,6 +31,8 @@
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
 #include "hw/display/gnw_h7b0_ltdc.h"
+#include "hw/misc/gnw_timeline.h"
+#include "hw/display/gnw_h7b0_recorder.h"
 #include "hw/display/gnw_h7b0_regs_ltdc.h"
 #include "framebuffer.h"
 #include "system/address-spaces.h"
@@ -446,6 +448,10 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
 {
     GnwH7B0LtdcState *s = GNW_H7B0_LTDC(opaque);
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    /* Headless timeline engine's @frame addressing counts these ticks
+     * (no-op when GNW_TIMELINE has no frame-addressed entries). */
+    gnw_timeline_notify_vblank();
 
     /*
      * Capture the fully composed frame just before VBR reload takes
@@ -2000,6 +2006,7 @@ static void gnw_h7b0_ltdc_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->mmio);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
     s->con = graphic_console_init(dev, 0, &gnw_h7b0_ltdc_gfx_ops, s);
+    gnw_h7b0_recorder_init(s->con);
     s->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                     gnw_h7b0_ltdc_vblank_tick, s);
     s->line_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,

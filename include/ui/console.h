@@ -478,4 +478,7 @@ bool qemu_console_fill_device_address(QemuConsole *con,
                                       size_t size,
                                       Error **errp);
 
+/* gwemu: synchronous PNG screendump of console 0 (see ui-qmp-cmds.c) */
+bool gwemu_screendump_png(const char *filename, Error **errp);
+
 #endif
