@@ -30,9 +30,10 @@ static void gnw_h7b0_tamp_reset(DeviceState *dev)
         uint32_t offset = i * 4;
         if (offset >= GNW_H7B0_TAMP_BKP_FIRST_OFFSET &&
             offset <= GNW_H7B0_TAMP_BKP_LAST_OFFSET) {
-            continue;
+            s->regs[i] = (offset == GNW_H7B0_TAMP_BKP0R_OFFSET) ? 0x32F2 : get_tamp_reset_value(offset);
+        } else {
+            s->regs[i] = get_tamp_reset_value(offset);
         }
-        s->regs[i] = get_tamp_reset_value(offset);
     }
 }
 

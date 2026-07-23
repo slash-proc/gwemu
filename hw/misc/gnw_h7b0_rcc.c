@@ -46,6 +46,14 @@ static void gnw_h7b0_rcc_reset(DeviceState *dev)
     
     /* Override RSR reset per the rationale in gnw_h7b0_rcc.h */
     s->regs[GNW_H7B0_RCC_RSR >> 2] = RCC_RSR_RESET_VALUE;
+
+    /*
+     * Pre-populate BDCR so stock firmware thinks LSE is running and RTC is
+     * selected. Otherwise it resets the backup domain, wiping the RTC!
+     */
+    s->regs[GNW_H7B0_RCC_BDCR >> 2] = RCC_BDCR_LSEON | RCC_BDCR_LSERDY |
+                                      (1 << 8) | /* RTCSEL = 01 (LSE) */
+                                      (1 << 15); /* RTCEN */
 }
 
 static uint64_t gnw_h7b0_rcc_read(void *opaque, hwaddr addr, unsigned int size)

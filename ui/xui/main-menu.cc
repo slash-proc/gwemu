@@ -11,6 +11,7 @@
 #include "../gwemu-gnw-input.h"
 extern "C" {
 #include "qemu-version.h"
+void gnw_h7b0_rtc_set_sync_host(bool sync_host);
 }
 
 void MainMenuGeneralView::Draw()
@@ -77,6 +78,17 @@ void MainMenuInputView::Draw()
 void MainMenuSystemView::Draw()
 {
     ImGui::TextWrapped("System settings placeholder.");
+
+    ImGui::Spacing();
+    SectionTitle("Time & Clock");
+    if (Toggle("Sync RTC to Host Time", &g_config.sys.rtc_sync_host,
+                "When enabled, the RTC becomes read-only to perfectly mirror "
+                "the host PC's time (prevents stock firmware from resetting it "
+                "to 12:00 on boot). Disable this to manually set the time "
+                "using the Game & Watch UI.")) {
+        gwemu_settings_save();
+        gnw_h7b0_rtc_set_sync_host(g_config.sys.rtc_sync_host);
+    }
 
     ImGui::Spacing();
     SectionTitle("Debug");
@@ -177,15 +189,14 @@ bool MainMenuScene::IsAnimating()
 bool MainMenuScene::Draw()
 {
     ImGuiIO &io = ImGui::GetIO();
-    ImVec2 size(500 * g_viewport_mgr.m_scale, 350 * g_viewport_mgr.m_scale);
-    ImVec2 pos((io.DisplaySize.x - size.x) / 2,
-               (io.DisplaySize.y - size.y) / 2);
-    ImGui::SetNextWindowPos(pos, ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
+    ImVec2 size = io.DisplaySize;
+    ImVec2 pos(0, 0);
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
 
     bool is_open = true;
     if (!ImGui::Begin("Menu", &is_open,
-                       ImGuiWindowFlags_NoCollapse)) {
+                       ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
         ImGui::End();
         return is_open;
     }

@@ -354,6 +354,9 @@ sys:
     type: enum
     values: ['64', '128']
     default: '64'
+  rtc_sync_host:
+    type: bool
+    default: true
   avpack:
     type: enum
     values: [scart, hdtv, vga, rfu, svideo, composite, none]

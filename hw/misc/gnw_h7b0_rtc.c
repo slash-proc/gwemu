@@ -28,6 +28,7 @@
 #include "qemu/timer.h"
 #include "migration/vmstate.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/gnw_h7b0_rtc.h"
 #include "hw/misc/gnw_h7b0_regs_rtc.h"
 
@@ -54,17 +55,18 @@ static void gnw_h7b0_rtc_sync_calendar(GnwH7B0RtcState *s)
     uint32_t tr, dr;
     unsigned int rtc_wday;
 
-    gmtime_r(&now, &tm);
+    localtime_r(&now, &tm);
 
     tr = (rtc_bcd(tm.tm_sec) & 0x7f)
        | ((rtc_bcd(tm.tm_min) & 0x7f) << 8)
        | ((rtc_bcd(tm.tm_hour) & 0x3f) << 16);
 
     rtc_wday = tm.tm_wday == 0 ? 7 : (unsigned int)tm.tm_wday;
+    unsigned int year = tm.tm_year % 100;
     dr = (rtc_bcd(tm.tm_mday) & 0x3f)
        | ((rtc_bcd(tm.tm_mon + 1) & 0x1f) << 8)
        | ((rtc_wday & 0x7) << 13)
-       | ((rtc_bcd((tm.tm_year + 1900) % 100) & 0xff) << 16);
+       | ((rtc_bcd(year) & 0xff) << 16);
 
     s->regs[GNW_H7B0_RTC_TR_OFFSET >> 2] = tr;
     s->regs[GNW_H7B0_RTC_DR_OFFSET >> 2] = dr;
@@ -87,7 +89,7 @@ static void gnw_h7b0_rtc_reanchor_calendar(GnwH7B0RtcState *s)
     tm.tm_mon = rtc_unbcd((dr >> 8) & 0x1f) - 1;
     tm.tm_year = rtc_unbcd((dr >> 16) & 0xff) + 100;
 
-    s->rtc_base_epoch = mktimegm(&tm);
+    s->rtc_base_epoch = mktime(&tm);
     s->rtc_base_vclock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 }
 
@@ -162,6 +164,7 @@ static void gnw_h7b0_rtc_write(void *opaque, hwaddr addr,
 {
     GnwH7B0RtcState *s = GNW_H7B0_RTC(opaque);
     uint32_t value = val64;
+
 
     if (addr >= GNW_H7B0_RTC_SIZE) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%"HWADDR_PRIx"\n",
@@ -251,6 +254,14 @@ static void gnw_h7b0_rtc_write(void *opaque, hwaddr addr,
         return;
     case GNW_H7B0_RTC_TR_OFFSET:
     case GNW_H7B0_RTC_DR_OFFSET:
+        if (s->sync_host) {
+            /*
+             * Ignore writes to TR and DR to prevent the stock firmware from
+             * resetting the clock to 12:00:00 on every cold boot. By doing this,
+             * the RTC will always perfectly mirror the host PC's time.
+             */
+            return;
+        }
         s->regs[addr >> 2] = value;
         gnw_h7b0_rtc_reanchor_calendar(s);
         return;
@@ -277,9 +288,19 @@ static const MemoryRegionOps gnw_h7b0_rtc_ops = {
     },
 };
 
+static GnwH7B0RtcState *g_gnw_rtc = NULL;
+
+void gnw_h7b0_rtc_set_sync_host(bool sync_host)
+{
+    if (g_gnw_rtc) {
+        g_gnw_rtc->sync_host = sync_host;
+    }
+}
+
 static void gnw_h7b0_rtc_init(Object *obj)
 {
     GnwH7B0RtcState *s = GNW_H7B0_RTC(obj);
+    g_gnw_rtc = s;
 
     memory_region_init_io(&s->mmio, obj, &gnw_h7b0_rtc_ops, s,
                            TYPE_GNW_H7B0_RTC, GNW_H7B0_RTC_SIZE);
@@ -297,12 +318,17 @@ static const VMStateDescription vmstate_gnw_h7b0_rtc = {
     }
 };
 
+static const Property gnw_h7b0_rtc_properties[] = {
+    DEFINE_PROP_BOOL("sync-host", GnwH7B0RtcState, sync_host, true),
+};
+
 static void gnw_h7b0_rtc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->vmsd = &vmstate_gnw_h7b0_rtc;
     device_class_set_legacy_reset(dc, gnw_h7b0_rtc_reset);
+    device_class_set_props(dc, gnw_h7b0_rtc_properties);
 }
 
 static const TypeInfo gnw_h7b0_rtc_info = {

@@ -128,6 +128,10 @@ struct GnwH7B0RtcState {
      */
     time_t rtc_base_epoch;
     int64_t rtc_base_vclock_ns;
+
+    bool sync_host;
 };
+
+void gnw_h7b0_rtc_set_sync_host(bool sync_host);
 
 #endif
