@@ -79,7 +79,7 @@ struct gwemu_console {
     int idx;
     int hidden;
     int ignore_hotkeys;
-    SDL_GLContext winctx;
+    SDL_Renderer *renderer;
     QKbdState *kbd;
 };
 
@@ -108,7 +108,11 @@ static int guest_x, guest_y;
 static SDL_Cursor *guest_sprite;
 static Notifier mouse_mode_notifier;
 static SDL_Window *m_window;
-static SDL_GLContext m_context;
+static SDL_Renderer *m_renderer;
+/* Streaming texture holding the guest framebuffer, sized to the current
+ * DisplaySurface. Replaces the GL surface-texture upload path. */
+static SDL_Texture *m_fb_tex;
+static int m_fb_w, m_fb_h;
 static QemuSemaphore display_init_sem;
 static QemuSemaphore display_shutdown_sem;
 static QEMUTimer *vblank_timer;
@@ -630,54 +634,41 @@ static void mouse_define(DisplayChangeListener *dcl,
  * ui/console-gl.c's own surface_gl_create_texture() already does this for
  * every other display backend in this tree).
  */
-static void xb_surface_gl_create_texture(DisplaySurface *surface)
+static SDL_Texture *gwemu_update_fb_texture(DisplaySurface *surface)
 {
-    assert(QEMU_IS_ALIGNED(surface_stride(surface), surface_bytes_per_pixel(surface)));
-
-    GLenum glformat, gltype;
+    SDL_PixelFormat fmt;
     switch (surface_format(surface)) {
     case PIXMAN_BE_b8g8r8x8:
     case PIXMAN_BE_b8g8r8a8:
-        glformat = GL_BGRA_EXT;
-        gltype = GL_UNSIGNED_BYTE;
+        fmt = SDL_PIXELFORMAT_BGRA32;
         break;
     case PIXMAN_BE_x8r8g8b8:
     case PIXMAN_BE_a8r8g8b8:
-        glformat = GL_RGBA;
-        gltype = GL_UNSIGNED_BYTE;
+        fmt = SDL_PIXELFORMAT_RGBA32;
         break;
     case PIXMAN_r5g6b5:
-        glformat = GL_RGB;
-        gltype = GL_UNSIGNED_SHORT_5_6_5;
+        fmt = SDL_PIXELFORMAT_RGB565;
         break;
     default:
         g_assert_not_reached();
     }
 
-    if (!surface->texture) {
-        glGenTextures(1, &surface->texture);
+    int w = surface_width(surface), h = surface_height(surface);
+    if (m_fb_tex && (m_fb_w != w || m_fb_h != h)) {
+        SDL_DestroyTexture(m_fb_tex);
+        m_fb_tex = NULL;
     }
-    glBindTexture(GL_TEXTURE_2D, surface->texture);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT,
-                  surface_stride(surface) / surface_bytes_per_pixel(surface));
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
-                 surface_width(surface),
-                 surface_height(surface),
-                 0, glformat, gltype,
-                 surface_data(surface));
-    glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
-
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-}
-
-static void xb_surface_gl_destroy_texture(DisplaySurface *surface)
-{
-    if (!surface || !surface->texture) {
-        return;
+    if (!m_fb_tex) {
+        m_fb_tex = SDL_CreateTexture(m_renderer, fmt,
+                                     SDL_TEXTUREACCESS_STREAMING, w, h);
+        m_fb_w = w;
+        m_fb_h = h;
     }
-    glDeleteTextures(1, &surface->texture);
-    surface->texture = 0;
+    if (m_fb_tex) {
+        SDL_UpdateTexture(m_fb_tex, NULL, surface_data(surface),
+                          surface_stride(surface));
+    }
+    return m_fb_tex;
 }
 
 static bool xb_console_gl_check_format(DisplayChangeListener *dcl,
@@ -809,41 +800,22 @@ static void gl_render_frame(struct gwemu_console *scon)
         return;
     }
 
-    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+    SDL_Texture *tex;
 
-    bool flip_required = false;
-    bool release_surface_texture = false;
+    SDL_SetRenderDrawColor(m_renderer, 0, 0, 0, 255);
+    SDL_RenderClear(m_renderer);
 
-    /*
-     * xemu has an NV2A-GPU fast path here (nv2a_get_framebuffer_surface())
-     * to grab an already-GPU-side texture directly, falling back to this
-     * generic console-surface upload otherwise. gnw-h7b0 has no such GPU
-     * device -- LTDC renders through the ordinary QemuConsole/DisplaySurface
-     * path like any other QEMU display device, so always take the generic
-     * path (this is exactly what every non-accelerated xemu guest already
-     * exercises, not a new/untested path).
-     */
-    GLuint tex = 0;
+    gwemu_main_loop_lock();
+    // FIXME: Don't upload if notdirty
+    tex = gwemu_update_fb_texture(scon->surface);
+    gwemu_main_loop_unlock();
 
-    assert(glGetError() == GL_NO_ERROR);
-
-    if (tex == 0) {
-        gwemu_main_loop_lock();
-        // FIXME: Don't upload if notdirty
-        xb_surface_gl_create_texture(scon->surface);
-        tex = scon->surface->texture;
-        flip_required = true;
-        release_surface_texture = true;
-        gwemu_main_loop_unlock();
-    }
-
-    glClearColor(0, 0, 0, 0);
-    glClear(GL_COLOR_BUFFER_BIT);
-    gwemu_hud_set_framebuffer_texture(tex, flip_required);
+    /* DisplaySurface data is top-down; no GL-style flip needed. */
+    gwemu_hud_set_framebuffer_texture(tex, false);
 
     /* FIXME: Finer locking. Event handlers in segments of the code expect
      * to be running on the main thread with the BQL. For now, acquire the
-     * lock and perform rendering, but release before swap to avoid
+     * lock and perform rendering, but release before present to avoid
      * possible lengthy blocking (for vsync).
      */
     gwemu_main_loop_lock();
@@ -851,16 +823,7 @@ static void gl_render_frame(struct gwemu_console *scon)
     gwemu_main_loop_unlock();
 
     gwemu_hud_render();
-    glFinish();
-
-    if (release_surface_texture) {
-        gwemu_main_loop_lock();
-        xb_surface_gl_destroy_texture(scon->surface);
-        gwemu_main_loop_unlock();
-    }
-
-    SDL_GL_SwapWindow(scon->real_window);
-    assert(glGetError() == GL_NO_ERROR);
+    SDL_RenderPresent(m_renderer);
 
     qatomic_set(&rendering, false);
 
@@ -983,6 +946,25 @@ static void display_very_early_init(DisplayOptions *o)
     SDL_SetHint(SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR, "0");
 #endif
 
+#ifdef __linux__
+    /*
+     * Default to the x11 driver (XWayland on Wayland desktops) unless
+     * the user explicitly chose one via SDL_VIDEODRIVER. Native Wayland
+     * has cost this project three separate real-world breakages so far:
+     * the libdecor crash above, ImGui's multi-viewport mouse-coordinate
+     * whitelist (see gwemu_hud_init()), and (post-SDL_Renderer port)
+     * wrong UI scaling/window sizing under fractional display scale --
+     * confirmed side by side: identical build renders correctly under
+     * x11 and mis-scaled under wayland. Revisit if SDL3's Wayland
+     * fractional-scale reporting stabilizes; until then x11 is the
+     * config that actually works everywhere. SDL_VIDEODRIVER=wayland
+     * still forces native Wayland for testing.
+     */
+    if (getenv("SDL_VIDEODRIVER") == NULL) {
+        SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
+    }
+#endif
+
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "Failed to initialize SDL video subsystem: %s\n",
                 SDL_GetError());
@@ -994,29 +976,12 @@ static void display_very_early_init(DisplayOptions *o)
 #endif
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
 
-    // Initialize rendering context
-    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    // GL 4.0 was inherited straight from xemu, which needs it for real
-    // Xbox/NV2A framebuffer features (see ShaderType::BlitGamma in
-    // gl-helpers.cc, its own "FIXME: Move to nv2a_get_framebuffer_surface"
-    // comment). We don't use that shader anywhere reachable -- every
-    // shader this GUI actually instantiates (Mask/Blit/Logo) is
-    // "#version 150 core" (GLSL 1.50 = GL 3.2), matching what ImGui's
-    // own OpenGL3 backend is initialized with ("#version 150" in
-    // main.cc). GL 4.0 Core was needlessly failing to create a context
-    // at all on real hardware that only supports GL 3.2/3.3 (confirmed:
-    // "Unable to create OpenGL context" on a real Windows machine).
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
-    SDL_GL_SetAttribute(
-        SDL_GL_CONTEXT_PROFILE_MASK,
-        SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    // No GL context needed: rendering goes through SDL_Renderer, which
+    // picks the native accelerated backend per platform (D3D11 on
+    // Windows, Metal on macOS, OpenGL/software elsewhere). The previous
+    // hard GL 3.2 Core requirement was pure xemu inheritance and cost a
+    // real "Unable to create OpenGL context" failure on a real Windows
+    // machine.
 
     char *title = g_strdup_printf("GWemu | v%s"
 #ifdef GWEMU_DEBUG_BUILD
@@ -1066,7 +1031,7 @@ static void display_very_early_init(DisplayOptions *o)
     // real-world Wayland (no decorations, non-functional menus), since
     // SDL's hit-test support isn't reliably honored by every compositor.
     // Depend on the host WM's own decorations instead.
-    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
 
     // Create main window
     m_window = SDL_CreateWindow(
@@ -1092,25 +1057,6 @@ static void display_very_early_init(DisplayOptions *o)
             SDL_QuitSubSystem(SDL_INIT_VIDEO);
             SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
             if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
-                // GL attributes are subsystem-lifetime state -- quitting
-                // and reinitializing SDL_INIT_VIDEO can drop them back
-                // to defaults, so the retry needs them set again before
-                // the second SDL_CreateWindow() or GLX visual matching
-                // can fail for a completely different reason than the
-                // original EGL failure (real user report: "Couldn't
-                // find matching GLX visual" on the retry, X11/GLX
-                // otherwise works fine on that exact machine).
-                SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
-                SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
-                SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
-                SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
-                SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-                SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-                SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
-                SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
-                                     SDL_GL_CONTEXT_PROFILE_CORE);
-                SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
                 m_window = SDL_CreateWindow(title, window_width,
                                              window_height, window_flags);
             }
@@ -1131,19 +1077,28 @@ static void display_very_early_init(DisplayOptions *o)
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     }
 
-    m_context = SDL_GL_CreateContext(m_window);
-
-    if (m_context != NULL && epoxy_gl_version() < 32) {
-        SDL_GL_MakeCurrent(NULL, NULL);
-        SDL_GL_DestroyContext(m_context);
-        m_context = NULL;
+#ifdef __linux__
+    /* Prefer Vulkan over GL on Linux (project owner's call) -- the hint
+     * only biases SDL's driver order; unavailable Vulkan still falls
+     * back to GL and ultimately the software renderer below. */
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "vulkan");
+#endif
+    m_renderer = SDL_CreateRenderer(m_window, NULL);
+    if (m_renderer == NULL) {
+        SDL_ResetHint(SDL_HINT_RENDER_DRIVER);
+        m_renderer = SDL_CreateRenderer(m_window, NULL);
+    }
+    if (m_renderer == NULL) {
+        /* Last resort: SDL's software renderer -- slow but universal. */
+        fprintf(stderr, "Failed to create accelerated renderer (%s) -- "
+                "falling back to software rendering.\n", SDL_GetError());
+        m_renderer = SDL_CreateRenderer(m_window, SDL_SOFTWARE_RENDERER);
     }
 
-    if (m_context == NULL) {
+    if (m_renderer == NULL) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-            "Unable to create OpenGL context",
-            "Unable to create OpenGL context. This usually means the\r\n"
-            "graphics device on this system does not support OpenGL 3.2.\r\n"
+            "Unable to create renderer",
+            "Unable to create any SDL renderer (accelerated or software).\r\n"
             "\r\n"
             "GWemu cannot continue and will now exit.",
             m_window);
@@ -1158,26 +1113,75 @@ static void display_very_early_init(DisplayOptions *o)
 
     fprintf(stderr, "CPU: %s\n", gwemu_get_cpu_info());
     fprintf(stderr, "OS_Version: %s\n", gwemu_get_os_info());
-    fprintf(stderr, "GL_VENDOR: %s\n", glGetString(GL_VENDOR));
-    fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
-    fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
-    fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
+    fprintf(stderr, "SDL_RENDERER: %s\n", SDL_GetRendererName(m_renderer));
+}
 
-    SDL_GL_MakeCurrent(NULL, NULL);
+SDL_Renderer *gwemu_get_renderer(void)
+{
+    return m_renderer;
+}
+
+/*
+ * Copy the current guest framebuffer as tightly-packed RGBA8888,
+ * top-down. Caller frees *pixels with free(). Used by the screenshot/
+ * thumbnail path (ui/xui/gl-helpers.cc) so nothing ever needs to read
+ * pixels back from the SDL renderer backend.
+ */
+bool gwemu_get_fb_pixels(uint8_t **pixels, int *w, int *h)
+{
+    bool ok = false;
+
+    gwemu_main_loop_lock();
+    DisplaySurface *surface = scon_list ? scon_list[0].surface : NULL;
+    if (surface) {
+        int sw = surface_width(surface), sh = surface_height(surface);
+        int stride = surface_stride(surface);
+        uint8_t *src = surface_data(surface);
+        uint8_t *dst = malloc((size_t)sw * sh * 4);
+        if (dst) {
+            pixman_format_code_t fmt = surface_format(surface);
+            for (int y = 0; y < sh; y++) {
+                const uint8_t *row = src + (size_t)y * stride;
+                uint8_t *out = dst + (size_t)y * sw * 4;
+                for (int x = 0; x < sw; x++) {
+                    uint8_t r, g, b;
+                    if (fmt == PIXMAN_r5g6b5) {
+                        uint16_t px = ((const uint16_t *)row)[x];
+                        r = ((px >> 11) & 0x1f) << 3;
+                        g = ((px >> 5) & 0x3f) << 2;
+                        b = (px & 0x1f) << 3;
+                    } else {
+                        /* x8r8g8b8 little-endian: B G R X in memory */
+                        r = row[x * 4 + 2];
+                        g = row[x * 4 + 1];
+                        b = row[x * 4 + 0];
+                    }
+                    out[x * 4 + 0] = r;
+                    out[x * 4 + 1] = g;
+                    out[x * 4 + 2] = b;
+                    out[x * 4 + 3] = 0xff;
+                }
+            }
+            *pixels = dst;
+            *w = sw;
+            *h = sh;
+            ok = true;
+        }
+    }
+    gwemu_main_loop_unlock();
+    return ok;
 }
 
 static void display_early_init(DisplayOptions *o)
 {
     assert(o->type == DISPLAY_TYPE_GWEMU);
-    display_opengl = 1;
-
-    SDL_GL_MakeCurrent(m_window, m_context);
-    SDL_GL_SetSwapInterval(g_config.display.window.vsync ? 1 : 0);
-    gwemu_hud_init(m_window, m_context);
+    SDL_SetRenderVSync(m_renderer, g_config.display.window.vsync ?
+                       1 : SDL_RENDERER_VSYNC_DISABLED);
+    gwemu_hud_init(m_window, m_renderer);
 }
 
 static const DisplayChangeListenerOps dcl_gl_ops = {
-    .dpy_name                = "gwemu-gl",
+    .dpy_name                = "gwemu",
     .dpy_gfx_switch          = gl_switch,
     .dpy_gfx_check_format    = xb_console_gl_check_format,
     .dpy_mouse_set           = mouse_warp,
@@ -1190,7 +1194,6 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     int i;
 
     assert(o->type == DISPLAY_TYPE_GWEMU);
-    SDL_GL_MakeCurrent(m_window, m_context);
 
     gui_fullscreen = o->has_full_screen && o->full_screen;
     gui_fullscreen |= g_config.display.window.fullscreen_on_startup;
@@ -1225,7 +1228,7 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     }
 
     scon_list[0].real_window = m_window;
-    scon_list[0].winctx = m_context;
+    scon_list[0].renderer = m_renderer;
 
     mouse_mode_notifier.notify = mouse_mode_change;
     qemu_add_mouse_mode_change_notifier(&mouse_mode_notifier);
@@ -1246,7 +1249,6 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     }
 
     /* Tell main thread to go ahead and create the app and enter the run loop */
-    SDL_GL_MakeCurrent(NULL, NULL);
     qemu_sem_post(&display_init_sem);
 }
 
@@ -1257,8 +1259,11 @@ static void display_finalize(void)
     }
 
     SDL_RemoveEventWatch(event_watch_callback, &scon_list[0]);
-    SDL_GL_MakeCurrent(NULL, NULL);
-    SDL_GL_DestroyContext(m_context);
+    if (m_fb_tex) {
+        SDL_DestroyTexture(m_fb_tex);
+        m_fb_tex = NULL;
+    }
+    SDL_DestroyRenderer(m_renderer);
     SDL_DestroyWindow(m_window);
     SDL_Quit();
 }
@@ -1388,6 +1393,15 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
 // leak convention gwemu_relaunch_with_flash_images() already uses for
 // its own argv construction, since this only ever runs once at startup.
 static bool g_is_query_invocation = false;
+/*
+ * -display none: run as plain upstream QEMU -- no SDL, no window, no HUD.
+ * The GUI bootstrap below unconditionally creates the SDL window BEFORE
+ * qemu_init() ever parses -display (xemu inheritance: xemu is GUI-first
+ * and never had a headless mode), which left every "headless" run with a
+ * dead black window the WM flags as not-responding. Headless (timeline
+ * capture, CI, gdb-only firmware bring-up) must be genuinely windowless.
+ */
+static bool g_is_headless_invocation = false;
 
 static char **inject_default_args(int argc, char **argv, int *out_argc)
 {
@@ -1405,6 +1419,11 @@ static char **inject_default_args(int argc, char **argv, int *out_argc)
             if (i + 1 < argc && argv[i + 1] && strcmp(argv[i + 1], "help") == 0) {
                 is_query = true;
             }
+            if (i + 1 < argc && argv[i + 1] &&
+                (strcmp(argv[i + 1], "none") == 0 ||
+                 strncmp(argv[i + 1], "none,", 5) == 0)) {
+                g_is_headless_invocation = true;
+            }
         } else if (strcmp(argv[i], "-version") == 0 ||
                    strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "-help") == 0 ||
@@ -1412,6 +1431,22 @@ static char **inject_default_args(int argc, char **argv, int *out_argc)
             is_query = true;
         } else if (strcmp(argv[i], "-global") == 0 && i + 1 < argc &&
                    argv[i + 1] && is_flash_image_global(argv[i + 1])) {
+            have_flash_image = true;
+        } else if (strcmp(argv[i], "-device") == 0 && i + 1 < argc &&
+                   argv[i + 1] &&
+                   strncmp(argv[i + 1], "loader,", 7) == 0 &&
+                   strstr(argv[i + 1], "file=") != NULL) {
+            /*
+             * A generic-loader device with a backing file boots real code
+             * just as much as a -global ...-image= binding does. Missing
+             * this was a genuine trap: boot_qemu.sh's --ephemeral and --diag
+             * paths (and any hand-written command line following them) load
+             * firmware exclusively this way, so they were treated as
+             * imageless, got -S appended below, and came up in
+             * "paused (prelaunch)" with a black screen -- looking like a
+             * hung emulator rather than a deliberately halted one, with
+             * nothing on stderr to say why.
+             */
             have_flash_image = true;
         }
     }
@@ -1467,6 +1502,26 @@ int main(int argc, char **argv)
         setlocale(LC_NUMERIC, "C");
         qemu_init(argc, argv);
         exit(0);
+    }
+
+    if (g_is_headless_invocation) {
+        /*
+         * Mirror system/main.c's non-GUI path (qemu_init +
+         * qemu_default_main's body): main loop on this thread, holding
+         * the locks qemu_init acquired. Nothing gwemu-specific runs --
+         * no SDL, no settings GUI, no window; env-gated headless
+         * features (GNW_TIMELINE/GNW_RECORD) live in device code and
+         * work regardless of display backend.
+         */
+        int status;
+
+        setlocale(LC_NUMERIC, "C");
+        fprintf(stderr, "gwemu_version: %s (headless)\n", gwemu_version);
+        qemu_init(argc, argv);
+        status = qemu_main_loop();
+        qemu_cleanup(status);
+        bql_unlock();
+        exit(status);
     }
 
     g_orig_argc = argc;

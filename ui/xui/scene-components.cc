@@ -182,7 +182,7 @@ public:
 class TitleInfo
 {
 protected:
-    GLuint screenshot;
+    SDL_Texture *screenshot;
     ImVec2 size;
     EasingAnimation m_animation;
 
@@ -190,7 +190,7 @@ public:
     TitleInfo()
     : m_animation(0.2, 0.2)
     {
-        screenshot = 0;
+        screenshot = NULL;
     }
 
     void Show()
@@ -210,21 +210,18 @@ public:
 
     void initScreenshot()
     {
-        if (screenshot == 0) {
-            glGenTextures(1, &screenshot);
+        if (screenshot == NULL) {
             int w, h, n;
             stbi_set_flip_vertically_on_load(0);
             unsigned char *data = stbi_load("./data/cover_front.jpg", &w, &h, &n, 4);
             assert(data);
             assert(n == 4 || n == 3);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, screenshot);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,  0);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,     GL_CLAMP_TO_BORDER);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,     GL_CLAMP_TO_BORDER);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+            screenshot = SDL_CreateTexture(gwemu_get_renderer(),
+                                           SDL_PIXELFORMAT_RGBA32,
+                                           SDL_TEXTUREACCESS_STATIC, w, h);
+            assert(screenshot);
+            SDL_UpdateTexture(screenshot, NULL, data, w * 4);
+            SDL_SetTextureScaleMode(screenshot, SDL_SCALEMODE_LINEAR);
             stbi_image_free(data);
 
             // Fix width

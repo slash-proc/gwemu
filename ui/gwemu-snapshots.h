@@ -27,7 +27,7 @@ extern "C" {
 #endif
 
 #include "block/snapshot.h"
-#include <epoxy/gl.h>
+
 
 #define GWEMU_SNAPSHOT_DATA_MAGIC 0x78656d75 // 'xemu'
 #define GWEMU_SNAPSHOT_DATA_VERSION 1
@@ -40,7 +40,7 @@ extern const char **g_snapshot_shortcut_index_key_map[];
 typedef struct GwemuSnapshotData {
     char *disc_path;
     char *xbe_title_name;
-    GLuint gl_thumbnail;
+    /* thumbnail PNG support removed with the OpenGL renderer */
 } GwemuSnapshotData;
 
 // Implemented in gwemu-snapshots.c
@@ -56,8 +56,7 @@ bool gwemu_snapshots_offset_extra_data(QEMUFile *f);
 void gwemu_snapshots_mark_dirty(void);
 
 // Implemented in xemu-thumbnail.cc
-void gwemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip);
-bool gwemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size);
+void gwemu_snapshots_set_framebuffer_texture(void *tex, bool flip);
 void *gwemu_snapshots_create_framebuffer_thumbnail_png(size_t *size);
 
 #ifdef __cplusplus

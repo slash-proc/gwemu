@@ -18,7 +18,6 @@
 //
 
 #include <SDL3/SDL.h>
-#include <epoxy/gl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -57,7 +56,8 @@ float g_main_menu_height;
 static ImGuiStyle g_base_style;
 static float g_last_scale;
 static int g_vsync;
-static GLuint g_tex;
+static SDL_Texture *g_tex;
+static SDL_Renderer *g_renderer;
 static bool g_flip_req;
 
 
@@ -123,7 +123,7 @@ static void InitializeStyle()
     g_base_style = s;
 }
 
-void gwemu_hud_init(SDL_Window* window, void* sdl_gl_context)
+void gwemu_hud_init(SDL_Window* window, SDL_Renderer* renderer)
 {
     gwemu_monitor_init();
     g_vsync = g_config.display.window.vsync;
@@ -163,8 +163,9 @@ void gwemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     io.IniFilename = NULL;
 
     // Setup Platform/Renderer bindings
-    ImGui_ImplSDL3_InitForOpenGL(window, sdl_gl_context);
-    ImGui_ImplOpenGL3_Init("#version 150");
+    g_renderer = renderer;
+    ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
+    ImGui_ImplSDLRenderer3_Init(renderer);
     ImPlot::CreateContext();
 
     g_last_scale = g_viewport_mgr.m_scale;
@@ -174,7 +175,7 @@ void gwemu_hud_init(SDL_Window* window, void* sdl_gl_context)
 
 void gwemu_hud_cleanup(void)
 {
-    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
 }
@@ -196,7 +197,7 @@ void gwemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse)
     if (mouse) *mouse = io.WantCaptureMouse;
 }
 
-void gwemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
+void gwemu_hud_set_framebuffer_texture(SDL_Texture *tex, bool flip)
 {
     g_tex = tex;
     g_flip_req = flip;
@@ -210,10 +211,10 @@ bool gwemu_hud_get_framebuffer_size(int *w, int *h)
     if (!g_tex) {
         return false;
     }
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_tex);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, w);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, h);
+    float fw = 0, fh = 0;
+    SDL_GetTextureSize(g_tex, &fw, &fh);
+    *w = (int)fw;
+    *h = (int)fh;
     return *w > 0 && *h > 0;
 }
 
@@ -237,7 +238,7 @@ void gwemu_hud_update(void)
         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
     }
 
-    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplSDLRenderer3_NewFrame();
     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     ImGui_ImplSDL3_NewFrame();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
@@ -339,7 +340,7 @@ void gwemu_hud_update(void)
 void gwemu_hud_render()
 {
     ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), g_renderer);
 
     // Update/render any ImGui windows (e.g. Settings) that got dragged out
     // into their own real OS-level window -- see ImGuiConfigFlags_ViewportsEnable
@@ -349,16 +350,14 @@ void gwemu_hud_render()
     // (ui/gwemu.c) swaps the main window.
     ImGuiIO &io_vp = ImGui::GetIO();
     if (io_vp.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
-        SDL_Window *backup_window = SDL_GL_GetCurrentWindow();
-        SDL_GLContext backup_context = SDL_GL_GetCurrentContext();
         ImGui::UpdatePlatformWindows();
         ImGui::RenderPlatformWindowsDefault();
-        SDL_GL_MakeCurrent(backup_window, backup_context);
     }
 
     if (g_vsync != g_config.display.window.vsync) {
         g_vsync = g_config.display.window.vsync;
-        SDL_GL_SetSwapInterval(g_vsync ? 1 : 0);
+        SDL_SetRenderVSync(g_renderer,
+                           g_vsync ? 1 : SDL_RENDERER_VSYNC_DISABLED);
     }
 
     if (g_screenshot_pending) {

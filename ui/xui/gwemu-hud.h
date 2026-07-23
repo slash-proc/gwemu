@@ -24,7 +24,6 @@
 #define GWEMU_HUD_H
 
 #include <SDL3/SDL.h>
-#include <epoxy/gl.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,17 +33,19 @@ extern "C" {
 int gwemu_is_fullscreen(void);
 void gwemu_toggle_fullscreen(void);
 SDL_Window *gwemu_get_window(void);
+SDL_Renderer *gwemu_get_renderer(void);
+bool gwemu_get_fb_pixels(uint8_t **pixels, int *w, int *h);
 void gwemu_main_loop_lock(void);
 void gwemu_main_loop_unlock(void);
 
 // Implemented in gwemu_hud.cc
-void gwemu_hud_init(SDL_Window *window, void *sdl_gl_context);
+void gwemu_hud_init(SDL_Window *window, SDL_Renderer *renderer);
 void gwemu_hud_cleanup(void);
 void gwemu_hud_update(void);
 void gwemu_hud_render(void);
 void gwemu_hud_process_sdl_events(SDL_Event *event);
 void gwemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
-void gwemu_hud_set_framebuffer_texture(GLuint tex, bool flip);
+void gwemu_hud_set_framebuffer_texture(SDL_Texture *tex, bool flip);
 bool gwemu_hud_get_framebuffer_size(int *w, int *h);
 
 /*

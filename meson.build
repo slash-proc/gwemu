@@ -1658,7 +1658,7 @@ if true
     'SDL_HAPTIC': 'OFF',
     'SDL_LIBTHAI': 'OFF',
     'SDL_POWER': 'OFF',
-    'SDL_RENDER': 'OFF',
+    'SDL_RENDER': 'ON',
     'SDL_SENSOR': 'OFF',
     'SDL_SHARED': 'OFF',
     'SDL_STATIC': 'ON',
@@ -1703,9 +1703,19 @@ if true
       # macOS backends it statically compiled in, just not linked).
       # Declare them explicitly and fold into the sdl3 dependency object
       # so every consumer picks them up automatically.
+      # Metal + QuartzCore (CAMetalLayer) joined the list when the
+      # SDL_Renderer port turned SDL_RENDER back on -- SDL3's Metal
+      # renderer backend is compiled in on macOS and linked nowhere else.
       sdl3_macos_frameworks = dependency('appleframeworks',
         modules: ['AudioToolbox', 'CoreHaptics', 'ForceFeedback',
-                   'GameController', 'Carbon', 'UniformTypeIdentifiers'])
+                   'GameController', 'Carbon', 'UniformTypeIdentifiers',
+                   'Metal', 'QuartzCore',
+                   # IOKit/Cocoa/CoreVideo: pulled in by SDL3's HID and
+                   # video backends -- the main QEMU binary happened to
+                   # get them transitively, but any leaner consumer of
+                   # the sdl3 dependency (tests/audio/test-audio) links
+                   # the same static libSDL3 and needs the full set.
+                   'IOKit', 'Cocoa', 'CoreVideo'])
       sdl3 = declare_dependency(dependencies: [sdl3, sdl3_macos_frameworks])
     endif
     meson.override_dependency('sdl3', sdl3)
@@ -1924,8 +1934,15 @@ if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
   # cc.has_header()'s `dependencies:` kwarg only accepts external
   # (pkg-config-found) dependency objects, not subproject-provided ones --
   # skip the redundant check when we just built epoxy from the wrap
-  # ourselves, since it's a real, known-good build either way.
-  if not epoxy_from_pkgconfig or cc.has_header('epoxy/egl.h', dependencies: epoxy)
+  # ourselves, since it's a real, known-good build either way. EXCEPT on
+  # macOS: the wrap builds epoxy without EGL there (no EGL on Darwin, so
+  # egl_generated.h is never generated), and treating that build as
+  # EGL-capable set CONFIG_OPENGL and compiled ui/egl-*.c into a fatal
+  # missing-header error. Darwin must always take the not-found path
+  # here (see the CONFIG_GWEMU_DESKTOP_GL comment below -- the GUI's own
+  # desktop-GL use doesn't need CONFIG_OPENGL).
+  if (not epoxy_from_pkgconfig and host_os != 'darwin') or \
+     (epoxy_from_pkgconfig and cc.has_header('epoxy/egl.h', dependencies: epoxy))
     opengl = epoxy
   elif get_option('opengl').enabled()
     error('epoxy/egl.h not found')
@@ -2431,6 +2448,7 @@ if have_system
     'pa': pulse.found(),
     'pipewire': pipewire.found(),
     'sdl': sdl.found(),
+    'sdl3': sdl3.found(),
     'sndio': sndio.found(),
   }
   foreach k, v: audio_drivers_available
@@ -2438,8 +2456,11 @@ if have_system
   endforeach
 
   # Default to native drivers first, OSS second, SDL third
+  # sdl3 first: the fork's own backend, reaching the modern native API on
+  # every host through the statically-linked SDL3 the GUI already ships
+  # (dsound failed outright on a real Windows 11 guest).
   audio_drivers_priority = \
-    [ 'pa', 'coreaudio', 'dsound', 'sndio', 'oss' ] + \
+    [ 'sdl3', 'pa', 'coreaudio', 'dsound', 'sndio', 'oss' ] + \
     (host_os == 'linux' ? [] : [ 'sdl' ])
   audio_drivers_default = []
   foreach k: audio_drivers_priority
@@ -3926,8 +3947,8 @@ if sdl3.found()
                              'werror=false',
                              'dx9=disabled', 'dx10=disabled', 'dx11=disabled',
                              'dx12=disabled', 'metal=disabled',
-                             'opengl=enabled',
-                             'sdl2_renderer=disabled', 'sdl3_renderer=disabled',
+                             'opengl=disabled',
+                             'sdl2_renderer=disabled', 'sdl3_renderer=enabled',
                              'vulkan=disabled', 'webgpu=disabled',
                              'glfw=disabled', 'sdl2=disabled', 'sdl3=enabled',
                              'osx=disabled', 'win=disabled', 'allegro5=disabled',
