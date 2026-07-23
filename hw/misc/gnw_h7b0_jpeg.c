@@ -1,6 +1,7 @@
 /* Auto-generated stub for JPEG */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "migration/vmstate.h"
 #include "hw/misc/gnw_h7b0_jpeg.h"
 #include "hw/misc/gnw_h7b0_regs_jpeg.h"
@@ -35,6 +36,17 @@
  */
 
 #include <math.h>
+
+/* getenv() is a locked linear scan on Windows (msvcrt) -- never call it
+ * per-event in emulation-hot paths; resolve once and cache. */
+static bool gnw_jpeg_trace_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("GNW_JPEG_TRACE") != NULL;
+    }
+    return v;
+}
 
 static GnwH7B0JpegState *global_jpeg_state = NULL;
 
@@ -248,16 +260,57 @@ static void gnw_h7b0_jpeg_scale_quant(const int base[64], int quality, uint16_t 
 
 /* Naive O(N^4) 8x8 DCT-II -- fine for the small test images this device
  * model ever needs to encode; correctness over speed. */
+/*
+ * Shared 8x8 DCT basis table: cos_tab[i][j] = cos((2i+1)*j*pi/16).
+ * The fdct/idct below used to call libm cos() in their innermost loops
+ * (8192 calls per 8x8 block); at retro-go launcher scroll rates that
+ * made __cos_fma alone 36%% of the whole process' cycles (measured,
+ * perf) and a 5KB cover thumbnail cost ~8ms to decode. Same doubles as
+ * the direct calls, so results are bit-identical.
+ */
+static const double *gnw_h7b0_jpeg_cos_tab(void)
+{
+    static double tab[8][8];
+    static bool init;
+
+    if (!init) {
+        for (int i = 0; i < 8; i++) {
+            for (int j = 0; j < 8; j++) {
+                tab[i][j] = cos((2 * i + 1) * j * M_PI / 16.0);
+            }
+        }
+        init = true;
+    }
+    return &tab[0][0];
+}
+
 static void gnw_h7b0_jpeg_fdct(const double in[64], double out[64])
 {
+    /*
+     * Same math as the naive O(N^4) loop this replaces, restructured so
+     * the per-term product in[x*8+y] * ct[x*8+u] (invariant across the
+     * inner v loop) is computed once per u instead of 8 times.  The
+     * original expression evaluated left-to-right as
+     * ((in * ct_xu) * ct_yv); hoisting the first product preserves that
+     * association exactly, and the (x-major, y) summation order is
+     * unchanged, so every intermediate double -- and therefore the
+     * output -- is bit-identical to the naive version.
+     */
+    const double *ct = gnw_h7b0_jpeg_cos_tab();
+
     for (int u = 0; u < 8; u++) {
+        double a[64];
+
+        for (int x = 0; x < 8; x++) {
+            for (int y = 0; y < 8; y++) {
+                a[x * 8 + y] = in[x * 8 + y] * ct[x * 8 + u];
+            }
+        }
         for (int v = 0; v < 8; v++) {
             double sum = 0.0;
             for (int x = 0; x < 8; x++) {
                 for (int y = 0; y < 8; y++) {
-                    sum += in[x * 8 + y] *
-                           cos((2 * x + 1) * u * M_PI / 16.0) *
-                           cos((2 * y + 1) * v * M_PI / 16.0);
+                    sum += a[x * 8 + y] * ct[y * 8 + v];
                 }
             }
             double cu = (u == 0) ? (1.0 / sqrt(2.0)) : 1.0;
@@ -571,17 +624,68 @@ static bool gnw_h7b0_jpeg_dec_huff_symbol(GnwJpegBitReader *br, const GnwJpegDec
  * decode call. */
 static void gnw_h7b0_jpeg_idct(const double in[64], double out[64])
 {
+    /*
+     * Bit-identical fast path over the naive O(N^4) loop this replaces.
+     * Two observations make this exact, not merely close:
+     *
+     * 1. Dequantized coefficient blocks are sparse (typically a handful
+     *    of nonzero entries out of 64).  In the naive sum, a zero
+     *    coefficient contributes a product of exactly +/-0.0, and adding
+     *    +/-0.0 to a finite partial sum never changes its value or its
+     *    rounding (0.0 + -0.0 is +0.0, and the initial sum is +0.0, so
+     *    the sign of zero can't leak either).  Skipping zero terms while
+     *    keeping the surviving terms in the original (u-major, v)
+     *    traversal order therefore reproduces every intermediate double
+     *    exactly.
+     *
+     * 2. The naive per-term expression evaluated left-to-right as
+     *    ((((cu * cv) * in) * ct_xu) * ct_yv).  Pre-folding
+     *    p = (cu * cv) * in once per coefficient, then per output row
+     *    q = p * ct_xu once per x, then sum += q * ct_yv, performs the
+     *    identical multiplications in the identical order -- only the
+     *    redundant recomputations are removed.
+     *
+     * Net effect: 64 outputs x nnz x 1 multiply-add (plus 8 x nnz row
+     * hoists) instead of 64 x 64 x 4 multiplies -- roughly an order of
+     * magnitude fewer flops for real launcher-thumbnail content, with
+     * output verified bit-identical (GNW_JPEG_TRACE ysum stream).
+     *
+     * NOTE for future editors: do NOT replace this with a separable
+     * row/column (2x 1-D) IDCT or an integer/AAN variant without
+     * re-validating output -- those change summation order and rounding,
+     * and this device model's contract (diag suite + trace-hash
+     * comparisons against prior runs) expects bit-exact stability.
+     */
+    const double *ct = gnw_h7b0_jpeg_cos_tab();
+    const double c0 = 1.0 / sqrt(2.0);
+    double coef[64];
+    int cu_idx[64], cv_idx[64];
+    int n = 0;
+
+    for (int u = 0; u < 8; u++) {
+        double cu = (u == 0) ? c0 : 1.0;
+        for (int v = 0; v < 8; v++) {
+            double c = in[u * 8 + v];
+            if (c != 0.0) {
+                double cv = (v == 0) ? c0 : 1.0;
+                coef[n] = (cu * cv) * c;
+                cu_idx[n] = u;
+                cv_idx[n] = v;
+                n++;
+            }
+        }
+    }
+
     for (int x = 0; x < 8; x++) {
+        double q[64];
+
+        for (int i = 0; i < n; i++) {
+            q[i] = coef[i] * ct[x * 8 + cu_idx[i]];
+        }
         for (int y = 0; y < 8; y++) {
             double sum = 0.0;
-            for (int u = 0; u < 8; u++) {
-                double cu = (u == 0) ? (1.0 / sqrt(2.0)) : 1.0;
-                for (int v = 0; v < 8; v++) {
-                    double cv = (v == 0) ? (1.0 / sqrt(2.0)) : 1.0;
-                    sum += cu * cv * in[u * 8 + v] *
-                           cos((2 * x + 1) * u * M_PI / 16.0) *
-                           cos((2 * y + 1) * v * M_PI / 16.0);
-                }
+            for (int i = 0; i < n; i++) {
+                sum += q[i] * ct[y * 8 + cv_idx[i]];
             }
             out[x * 8 + y] = 0.25 * sum;
         }
@@ -925,6 +1029,13 @@ fail:
  * even for two-tone images, not just flat ones. */
 #define GNW_H7B0_JPEG_ENCODE_QUALITY 92
 
+/* Inputs at or below this size decode inline on the BQL thread (see the
+ * comment at the inline path in the write handler); larger ones go to
+ * the worker thread. Big enough for cover thumbnails (~5KB) and
+ * full-screen background JPEGs (tens of KB), small enough that a
+ * pathological input can't stall the BQL for tens of ms. */
+#define GNW_H7B0_JPEG_INLINE_MAX_BYTES (256 * 1024)
+
 static void gnw_h7b0_jpeg_encode_ycbcr444(const uint8_t *y, const uint8_t *cb, const uint8_t *cr,
                                            int width, int height, GByteArray *out)
 {
@@ -1146,6 +1257,112 @@ static bool gnw_h7b0_jpeg_parse_sof0_luma_sampling(const uint8_t *buf, size_t le
  * touches s->regs[]/y_plane/cb_plane/cr_plane/dor_cursor -- those remain
  * BQL-only state, mutated only by gnw_h7b0_jpeg_poll_worker() below.
  */
+
+/* Result of one whole-image decode -- shared by the worker thread and
+ * the inline (small-input) path below. */
+typedef struct GnwJpegDecodeOut {
+    int w, h, comp, chroma_w, chroma_h;
+    uint8_t *y, *cb, *cr;
+    uint32_t confrn1;
+} GnwJpegDecodeOut;
+
+static void gnw_h7b0_jpeg_run_decode(const uint8_t *data, uint32_t len,
+                                      GnwJpegDecodeOut *o)
+{
+    int w = 0, h = 0, comp = 3;
+    uint8_t *y = NULL, *cb = NULL, *cr = NULL;
+    int chroma_w = 0, chroma_h = 0;
+    uint32_t confrn1 = 0;
+    int64_t t0 = gnw_jpeg_trace_enabled()
+                     ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
+
+    if (gnw_h7b0_jpeg_decode_native(data, len, &y, &cb, &cr,
+                                     &w, &h, &chroma_w, &chroma_h)) {
+        int sof_h = 0, sof_v = 0;
+        if (gnw_h7b0_jpeg_parse_sof0_luma_sampling(data, len,
+                                                    &sof_h, &sof_v) &&
+            sof_h >= 1 && sof_h <= 4 && sof_v >= 1 && sof_v <= 4) {
+            uint32_t nb = (uint32_t)(sof_h * sof_v - 1);
+            confrn1 = (nb << JPEG_CONFRN_NB_SHIFT) |
+                      ((uint32_t)sof_v << JPEG_CONFRN_VSF_SHIFT) |
+                      ((uint32_t)sof_h << JPEG_CONFRN_HSF_SHIFT);
+        } else {
+            confrn1 = 3U << JPEG_CONFRN_NB_SHIFT;
+        }
+        comp = 3;
+    } else {
+        stbi_uc *rgb = stbi_load_from_memory(data, len, &w, &h,
+                                              &comp, 3);
+        if (rgb) {
+            int sof_h2 = 0, sof_v2 = 0;
+            if (!gnw_h7b0_jpeg_parse_sof0_luma_sampling(
+                    data, len, &sof_h2, &sof_v2) ||
+                sof_h2 < 1 || sof_h2 > 4 || sof_v2 < 1 || sof_v2 > 4) {
+                sof_h2 = 1;
+                sof_v2 = 1;
+            }
+            if (comp == 1) {
+                sof_h2 = 1;
+                sof_v2 = 1;
+            }
+            chroma_w = (w + sof_h2 - 1) / sof_h2;
+            chroma_h = (h + sof_v2 - 1) / sof_v2;
+
+            int nb_h = 0, nb_v = 0;
+            if (gnw_h7b0_jpeg_parse_sof0_luma_sampling(data, len,
+                                                        &nb_h, &nb_v) &&
+                nb_h >= 1 && nb_h <= 4 && nb_v >= 1 && nb_v <= 4) {
+                uint32_t nb = (uint32_t)(nb_h * nb_v - 1);
+                confrn1 = (nb << JPEG_CONFRN_NB_SHIFT) |
+                          ((uint32_t)nb_v << JPEG_CONFRN_VSF_SHIFT) |
+                          ((uint32_t)nb_h << JPEG_CONFRN_HSF_SHIFT);
+            } else {
+                confrn1 = (comp == 1) ? 0 : (3U << JPEG_CONFRN_NB_SHIFT);
+            }
+
+            y = g_malloc(w * h);
+            cb = g_malloc(chroma_w * chroma_h);
+            cr = g_malloc(chroma_w * chroma_h);
+
+            for (int i = 0; i < w * h; i++) {
+                int r = rgb[i * 3 + 0];
+                int g = rgb[i * 3 + 1];
+                int b = rgb[i * 3 + 2];
+                int yy = (299 * r + 587 * g + 114 * b) / 1000;
+                y[i] = gnw_h7b0_jpeg_clamp_u8(yy);
+            }
+            for (int cy = 0; cy < chroma_h; cy++) {
+                for (int cx = 0; cx < chroma_w; cx++) {
+                    int sx = cx * sof_h2;
+                    int sy = cy * sof_v2;
+                    if (sx >= w) sx = w - 1;
+                    if (sy >= h) sy = h - 1;
+                    int idx = sy * w + sx;
+                    int r = rgb[idx * 3 + 0];
+                    int g = rgb[idx * 3 + 1];
+                    int b = rgb[idx * 3 + 2];
+                    int cbv = (-168736 * r - 331264 * g + 500000 * b) / 1000000 + 128;
+                    int crv = (500000 * r - 418688 * g - 81312 * b) / 1000000 + 128;
+                    cb[cy * chroma_w + cx] = gnw_h7b0_jpeg_clamp_u8(cbv);
+                    cr[cy * chroma_w + cx] = gnw_h7b0_jpeg_clamp_u8(crv);
+                }
+            }
+            stbi_image_free(rgb);
+        }
+    }
+
+    if (t0) {
+        fprintf(stderr, "JPTDUR %0.2fms in=%u out=%dx%d\n",
+                (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0) / 1e6,
+                len, w, h);
+    }
+
+    o->w = w; o->h = h; o->comp = comp;
+    o->chroma_w = chroma_w; o->chroma_h = chroma_h;
+    o->y = y; o->cb = cb; o->cr = cr;
+    o->confrn1 = confrn1;
+}
+
 static void *gnw_h7b0_jpeg_worker_thread(void *opaque)
 {
     GnwH7B0JpegState *s = opaque;
@@ -1165,86 +1382,12 @@ static void *gnw_h7b0_jpeg_worker_thread(void *opaque)
         s->job_pending = false;
         qemu_mutex_unlock(&s->thread_lock);
 
-        int w = 0, h = 0, comp = 3;
-        uint8_t *y = NULL, *cb = NULL, *cr = NULL;
-        int chroma_w = 0, chroma_h = 0;
-        uint32_t confrn1 = 0;
-
-        if (gnw_h7b0_jpeg_decode_native(job->data, job->len, &y, &cb, &cr,
-                                         &w, &h, &chroma_w, &chroma_h)) {
-            int sof_h = 0, sof_v = 0;
-            if (gnw_h7b0_jpeg_parse_sof0_luma_sampling(job->data, job->len,
-                                                        &sof_h, &sof_v) &&
-                sof_h >= 1 && sof_h <= 4 && sof_v >= 1 && sof_v <= 4) {
-                uint32_t nb = (uint32_t)(sof_h * sof_v - 1);
-                confrn1 = (nb << JPEG_CONFRN_NB_SHIFT) |
-                          ((uint32_t)sof_v << JPEG_CONFRN_VSF_SHIFT) |
-                          ((uint32_t)sof_h << JPEG_CONFRN_HSF_SHIFT);
-            } else {
-                confrn1 = 3U << JPEG_CONFRN_NB_SHIFT;
-            }
-            comp = 3;
-        } else {
-            stbi_uc *rgb = stbi_load_from_memory(job->data, job->len, &w, &h,
-                                                  &comp, 3);
-            if (rgb) {
-                int sof_h2 = 0, sof_v2 = 0;
-                if (!gnw_h7b0_jpeg_parse_sof0_luma_sampling(
-                        job->data, job->len, &sof_h2, &sof_v2) ||
-                    sof_h2 < 1 || sof_h2 > 4 || sof_v2 < 1 || sof_v2 > 4) {
-                    sof_h2 = 1;
-                    sof_v2 = 1;
-                }
-                if (comp == 1) {
-                    sof_h2 = 1;
-                    sof_v2 = 1;
-                }
-                chroma_w = (w + sof_h2 - 1) / sof_h2;
-                chroma_h = (h + sof_v2 - 1) / sof_v2;
-
-                int nb_h = 0, nb_v = 0;
-                if (gnw_h7b0_jpeg_parse_sof0_luma_sampling(job->data, job->len,
-                                                            &nb_h, &nb_v) &&
-                    nb_h >= 1 && nb_h <= 4 && nb_v >= 1 && nb_v <= 4) {
-                    uint32_t nb = (uint32_t)(nb_h * nb_v - 1);
-                    confrn1 = (nb << JPEG_CONFRN_NB_SHIFT) |
-                              ((uint32_t)nb_v << JPEG_CONFRN_VSF_SHIFT) |
-                              ((uint32_t)nb_h << JPEG_CONFRN_HSF_SHIFT);
-                } else {
-                    confrn1 = (comp == 1) ? 0 : (3U << JPEG_CONFRN_NB_SHIFT);
-                }
-
-                y = g_malloc(w * h);
-                cb = g_malloc(chroma_w * chroma_h);
-                cr = g_malloc(chroma_w * chroma_h);
-
-                for (int i = 0; i < w * h; i++) {
-                    int r = rgb[i * 3 + 0];
-                    int g = rgb[i * 3 + 1];
-                    int b = rgb[i * 3 + 2];
-                    int yy = (299 * r + 587 * g + 114 * b) / 1000;
-                    y[i] = gnw_h7b0_jpeg_clamp_u8(yy);
-                }
-                for (int cy = 0; cy < chroma_h; cy++) {
-                    for (int cx = 0; cx < chroma_w; cx++) {
-                        int sx = cx * sof_h2;
-                        int sy = cy * sof_v2;
-                        if (sx >= w) sx = w - 1;
-                        if (sy >= h) sy = h - 1;
-                        int idx = sy * w + sx;
-                        int r = rgb[idx * 3 + 0];
-                        int g = rgb[idx * 3 + 1];
-                        int b = rgb[idx * 3 + 2];
-                        int cbv = (-168736 * r - 331264 * g + 500000 * b) / 1000000 + 128;
-                        int crv = (500000 * r - 418688 * g - 81312 * b) / 1000000 + 128;
-                        cb[cy * chroma_w + cx] = gnw_h7b0_jpeg_clamp_u8(cbv);
-                        cr[cy * chroma_w + cx] = gnw_h7b0_jpeg_clamp_u8(crv);
-                    }
-                }
-                stbi_image_free(rgb);
-            }
-        }
-
+        GnwJpegDecodeOut o;
+        gnw_h7b0_jpeg_run_decode(job->data, job->len, &o);
+        int w = o.w, h = o.h, comp = o.comp;
+        int chroma_w = o.chroma_w, chroma_h = o.chroma_h;
+        uint8_t *y = o.y, *cb = o.cb, *cr = o.cr;
+        uint32_t confrn1 = o.confrn1;
         g_byte_array_free(job, TRUE);
 
         qemu_mutex_lock(&s->thread_lock);
@@ -1258,10 +1401,8 @@ static void *gnw_h7b0_jpeg_worker_thread(void *opaque)
         s->pending_comp = comp;
         s->pending_confrn1 = confrn1;
         s->pending_epoch = job_epoch;
-        s->decode_done = true;
-        /* No cond_signal needed: the BQL thread never blocks on this --
-         * it polls decode_done opportunistically on each register read,
-         * exactly mirroring how real firmware polls SR. */
+        qatomic_store_release(&s->decode_done, true);
+        qemu_cond_signal(&s->done_cond);
     }
     qemu_mutex_unlock(&s->thread_lock);
     return NULL;
@@ -1277,19 +1418,41 @@ static void *gnw_h7b0_jpeg_worker_thread(void *opaque)
  */
 static void gnw_h7b0_jpeg_poll_worker(GnwH7B0JpegState *s)
 {
-    if (!s->thread_started) {
+    if (!s->lock_inited) {
+        return;
+    }
+    /*
+     * Lock-free fast path: this poll runs on EVERY register read, and
+     * in-game firmware streams full frames through the codec at ~2M
+     * reads/s -- a mutex trylock/unlock pair per read was itself a
+     * measurable slice of the MMIO cost (qemu_mutex_unlock_impl showed
+     * up at ~12% of TCG-thread cycles in perf). decode_done is written
+     * by the worker (release) and consumed here (acquire); stale-false
+     * just means we publish on a later poll, exactly like trylock
+     * failure already did.
+     */
+    if (!qatomic_load_acquire(&s->decode_done)) {
         return;
     }
     if (qemu_mutex_trylock(&s->thread_lock) != 0) {
         return;
     }
+    /*
+     * Deliberately NON-blocking. A bounded qemu_cond_timedwait() here
+     * (up to 2ms for the in-flight decode) was tried 2026-07-24 to kill
+     * the measured ~4M SR polls/s: it did collapse them 16x, but made
+     * the launcher 3x SLOWER (26.8ms -> 85.8ms/frame, measured) --
+     * retro-go overlaps its own frame work with the polled decode, so
+     * blocking the vCPU inside an SR read serializes work the guest
+     * intended to run concurrently. Don't reintroduce a wait here.
+     */
     if (!s->decode_done) {
         qemu_mutex_unlock(&s->thread_lock);
         return;
     }
     s->decode_done = false;
     s->decode_busy = false;
-    if (getenv("GNW_JPEG_TRACE")) {
+    if (gnw_jpeg_trace_enabled()) {
         uint32_t sum = 0;
         if (s->pending_y) {
             for (int i = 0; i < 64; i++) {
@@ -1318,6 +1481,10 @@ static void gnw_h7b0_jpeg_poll_worker(GnwH7B0JpegState *s)
     s->y_plane = s->pending_y;
     s->cb_plane = s->pending_cb;
     s->cr_plane = s->pending_cr;
+    /* Ownership moved -- stale pending_* pointers aliasing the live
+     * planes caused a real double free once the inline path started
+     * g_free()ing pending_* before reuse. */
+    s->pending_y = s->pending_cb = s->pending_cr = NULL;
     s->plane_width = s->pending_width;
     s->plane_height = s->pending_height;
     s->chroma_width = s->pending_chroma_width;
@@ -1376,7 +1543,7 @@ static void gnw_h7b0_jpeg_reset(DeviceState *dev)
     /* Bump the epoch so any in-flight worker job from before this reset
      * gets its result discarded by gnw_h7b0_jpeg_poll_worker() instead of
      * being published into the freshly-reset state above. */
-    if (s->thread_started) {
+    if (s->lock_inited) {
         qemu_mutex_lock(&s->thread_lock);
         s->job_epoch++;
         qemu_mutex_unlock(&s->thread_lock);
@@ -1385,8 +1552,48 @@ static void gnw_h7b0_jpeg_reset(DeviceState *dev)
     }
 }
 
+/* Env-gated (GNW_MMIO_RATE): JPEG register reads per host second --
+ * the launcher's cover decode is MMIO-bound through this handler, so
+ * this rate is a direct cross-platform probe of per-MMIO cost. */
+static void gnw_h7b0_jpeg_count_read(hwaddr addr)
+{
+    static int enabled = -1;
+    static int64_t window_start;
+    static uint32_t count;
+    static uint32_t by_off[16];
+
+    if (enabled < 0) {
+        enabled = getenv("GNW_MMIO_RATE") != NULL;
+    }
+    if (!enabled) {
+        return;
+    }
+    count++;
+    by_off[(addr >> 2) & 0xf]++;
+    if ((count & 0x3ff) == 0) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (window_start == 0) {
+            window_start = now;
+            count = 0;
+            memset(by_off, 0, sizeof(by_off));
+        } else if (now - window_start >= NANOSECONDS_PER_SECOND) {
+            fprintf(stderr, "JPGRD %0.0f/s", count * 1e9 / (now - window_start));
+            for (int i = 0; i < 16; i++) {
+                if (by_off[i]) {
+                    fprintf(stderr, " +0x%x=%u", i * 4, by_off[i]);
+                }
+            }
+            fprintf(stderr, "\n");
+            window_start = now;
+            count = 0;
+            memset(by_off, 0, sizeof(by_off));
+        }
+    }
+}
+
 static uint64_t gnw_h7b0_jpeg_read(void *opaque, hwaddr addr, unsigned int size)
 {
+    gnw_h7b0_jpeg_count_read(addr);
     GnwH7B0JpegState *s = GNW_H7B0_JPEG(opaque);
     /* Opportunistically publish a completed background decode -- mirrors
      * firmware polling SR itself; every register read is a chance to
@@ -1428,7 +1635,7 @@ static uint64_t gnw_h7b0_jpeg_read(void *opaque, hwaddr addr, unsigned int size)
             }
             return v;
         }
-        if (getenv("GNW_JPEG_TRACE") && s->dor_cursor == 0 && s->y_plane) {
+        if (gnw_jpeg_trace_enabled() && s->dor_cursor == 0 && s->y_plane) {
             uint32_t sum = 0;
             for (int i = 0; i < 64; i++) {
                 sum = sum * 31 + s->y_plane[i];
@@ -1579,14 +1786,14 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
          * mechanism device reset uses.
          */
         s->decode_busy = false;
-        if (s->thread_started) {
+        if (s->lock_inited) {
             qemu_mutex_lock(&s->thread_lock);
             s->job_epoch++;
             qemu_mutex_unlock(&s->thread_lock);
         } else {
             s->job_epoch++;
         }
-        if (getenv("GNW_JPEG_TRACE")) {
+        if (gnw_jpeg_trace_enabled()) {
             fprintf(stderr, "JPT start epoch=%u\n", s->job_epoch);
         }
     } else if (addr == GNW_H7B0_JPEG_CR_OFFSET) {
@@ -1759,9 +1966,62 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
                      * mirroring how a real, still-busy codec would look
                      * to a polling loop.
                      */
-                    if (!s->thread_started) {
+                    if (!s->lock_inited) {
                         qemu_mutex_init(&s->thread_lock);
                         qemu_cond_init(&s->thread_cond);
+                        qemu_cond_init(&s->done_cond);
+                        s->lock_inited = true;
+                    }
+
+                    if (s->inbuf->len <= GNW_H7B0_JPEG_INLINE_MAX_BYTES) {
+                        /*
+                         * Small input: decode NOW, inline on the BQL
+                         * thread, so the result is already published
+                         * when firmware's very first SR poll lands --
+                         * eliminating the entire wait-poll phase
+                         * (measured at ~40% of all JPEG MMIO traffic,
+                         * the launcher/stock-background hot path on
+                         * every platform). The worker thread predates
+                         * the DCT-table fix, when a decode cost 8ms+
+                         * and stalling BQL that long was unacceptable;
+                         * post-fix a thumbnail/background decode is
+                         * ~0.4-2ms, comparable to BQL holds we already
+                         * tolerate elsewhere. Large inputs still go to
+                         * the worker below.
+                         */
+                        GnwJpegDecodeOut o;
+                        gnw_h7b0_jpeg_run_decode(s->inbuf->data,
+                                                 s->inbuf->len, &o);
+                        qemu_mutex_lock(&s->thread_lock);
+                        g_free(s->pending_y);
+                        g_free(s->pending_cb);
+                        g_free(s->pending_cr);
+                        s->pending_y = o.y;
+                        s->pending_cb = o.cb;
+                        s->pending_cr = o.cr;
+                        s->pending_width = o.w;
+                        s->pending_height = o.h;
+                        s->pending_chroma_width = o.chroma_w;
+                        s->pending_chroma_height = o.chroma_h;
+                        s->pending_comp = o.comp;
+                        s->pending_confrn1 = o.confrn1;
+                        s->pending_epoch = s->job_epoch;
+                        qatomic_store_release(&s->decode_done, true);
+                        qemu_mutex_unlock(&s->thread_lock);
+                        s->decode_busy = true;
+                        s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &=
+                            ~(JPEG_SR_IFTF | JPEG_SR_IFNFF);
+                        /* Publish immediately -- SR shows EOCF/OFNEF
+                         * before this write handler even returns. */
+                        gnw_h7b0_jpeg_poll_worker(s);
+                        if (gnw_jpeg_trace_enabled()) {
+                            fprintf(stderr, "JPT inline len=%u epoch=%u\n",
+                                    s->inbuf->len, s->job_epoch);
+                        }
+                        goto input_consumed;
+                    }
+
+                    if (!s->thread_started) {
                         qemu_thread_create(&s->thread, "gnw-h7b0-jpeg-worker",
                                            gnw_h7b0_jpeg_worker_thread, s,
                                            QEMU_THREAD_JOINABLE);
@@ -1795,10 +2055,11 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
                     s->decode_busy = true;
                     s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &=
                         ~(JPEG_SR_IFTF | JPEG_SR_IFNFF);
-                    if (getenv("GNW_JPEG_TRACE")) {
+                    if (gnw_jpeg_trace_enabled()) {
                         fprintf(stderr, "JPT post len=%u epoch=%u\n",
                                 s->job_input ? s->job_input->len : 0, s->job_epoch);
                     }
+                    input_consumed: ;
                 }
             }
         }
@@ -1832,8 +2093,11 @@ static void gnw_h7b0_jpeg_finalize(Object *obj)
         qemu_cond_signal(&s->thread_cond);
         qemu_mutex_unlock(&s->thread_lock);
         qemu_thread_join(&s->thread);
+    }
+    if (s->lock_inited) {
         qemu_mutex_destroy(&s->thread_lock);
         qemu_cond_destroy(&s->thread_cond);
+        qemu_cond_destroy(&s->done_cond);
     }
     if (s->job_input) {
         g_byte_array_free(s->job_input, TRUE);

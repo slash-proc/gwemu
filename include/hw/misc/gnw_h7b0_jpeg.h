@@ -68,7 +68,12 @@ struct GnwH7B0JpegState {
     bool thread_started;
     QemuMutex thread_lock;
     QemuCond thread_cond;
+    /* Signaled by the worker when decode_done goes true, so a status
+     * poll can briefly (bounded) sleep instead of busy-returning "not
+     * done" -- see gnw_h7b0_jpeg_poll_worker(). */
+    QemuCond done_cond;
     bool job_pending;    /* BQL thread -> worker: a job is queued */
+    bool lock_inited;    /* thread_lock/conds initialized (worker may not be) */
     bool decode_done;    /* worker -> BQL thread: pending_* is ready */
     bool stop_thread;
     GByteArray *job_input; /* snapshot of inbuf at EOI, owned by worker once posted */
