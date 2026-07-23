@@ -545,5 +545,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: '*.zip'
-          draft: false
+          draft: true
           generate_release_notes: true
