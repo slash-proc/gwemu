@@ -1,3 +1,54 @@
+2026-07-24  PERF: JPEG device model decode/poll overhaul (the "retro-go is
+            slow on Windows" hunt, which ended somewhere else entirely).
+            (1) The naive fdct/idct called libm cos() in their innermost
+            loops -- 8192 calls per 8x8 block, measured at 36% of ALL
+            process cycles under launcher scroll; now a precomputed
+            8x8 cosine table plus a sparse, hoisted restructure of both
+            transforms that preserves float evaluation order exactly
+            (bit-identical output, verified via decode-hash traces).
+            ~5KB cover thumbnail: 8.0ms -> 0.43ms. (2) Inputs <=256KB now
+            decode synchronously inline at EOI (worker thread retained
+            for larger), so results are published before firmware's first
+            status poll -- eliminates the SR wait-poll storm (was ~40% of
+            launcher JPEG MMIO). Fixed a pending-pointer double free the
+            inline path exposed in the publish handoff. (3) Lock-free
+            atomic decode_done check replaces a mutex trylock/unlock pair
+            that ran on every register read (~12% of vCPU cycles at the
+            measured ~2-4M reads/s). (4) All env-var trace checks in
+            emulation-hot paths now resolve getenv() once and cache --
+            msvcrt's getenv is a locked linear scan, and one per-CNT-read
+            check in TIM2 measurably slowed whole-guest execution on
+            Windows. Findings worth keeping: retro-go's launcher AND the
+            stock-side zelda3/GB games are JPEG-MMIO-throughput-bound on
+            every host (fps tracks register-access rate; ~2M/s Windows VM,
+            ~2.8M/s bare-metal Linux on faster silicon, ~4.4M/s laptop);
+            two approaches tried and REVERTED with warnings left in code:
+            blocking the SR poll (3x slower -- firmware overlaps work with
+            the polled decode) and memory_region_enable_lockless_io (hard
+            crash on real Windows). New env-gated instrumentation:
+            GNW_TIMER_LATE (vblank/DMA dispatch lateness + TIM expiry
+            counters), GNW_MMIO_RATE (JPEG register-read rate, per-offset),
+            JPTDUR decode timing under GNW_JPEG_TRACE.
+
+2026-07-24  Windows portability fixes: %lx -> HWADDR_PRIx/PRIx64 in RTC/
+            TAMP trace printfs (LLP64 -Werror break), and the RTC/TAMP
+            debug printfs themselves removed (unconditional per-MMIO
+            console writes; conhost made them a real whole-emulator
+            slowdown). Settings window opens 900x700 clamped to the
+            desktop's usable bounds (was 1600x1200, larger than some
+            screens with no reachable resize edge).
+
+2026-07-24  start.sh: Linux counterpart to start.bat (same dual-boot image
+            set), tees traces to gwemu.log, perf-probe env vars on.
+
+2026-07-24  CI: release.yml's Windows job now uses the documented Docker
+            cross-build (gwemu-win-cross image, --disable-sdl et al.,
+            recursive DLL-walk dist packaging) instead of a divergent
+            MSYS2 native build that still linked SDL2; new fifth
+            build-docker job publishes contrib/docker-headless to Docker
+            Hub as slashproc/gwemu-headless with a vX.Y.Z -> :X, :X.Y,
+            :X.Y.Z, :latest tag cascade (REGISTRY_TOKEN secret).
+
 2026-07-23  FEATURE: headless capture appliance (Docker/CI) -- true
             `-display none` support (windowless upstream-main path in
             ui/gwemu.c; previously every "headless" run still opened a dead
@@ -73,7 +124,19 @@
 
 # Changelog
 
-## # Changelog
+## 2026-07-23 — FEATURE: multi-context Settings window and RTC host sync
+- Developed a dual-context native OS window architecture for the Settings 
+  menu (`m_settings_window`), bypassing ImGui's native viewport limitations on
+  Wayland. The second window operates independently with a decoupled ImGuiContext, 
+  its own high-DPI scaling variables (`g_last_scale_settings`), and explicit font
+  atlas rebuilds to ensure perfectly scaled ui elements across displays.
+- Patched an active OS cursor flicker issue by preventing the primary game context
+  from enforcing its 3-second cursor idle-hide rule whenever the Settings window
+  is active.
+- Added a "Sync RTC to Host Time" toggle to the System Settings tab, exposed as
+  the `sync-host` QOM property on the `gnw-h7b0-rtc` device. Bound it to the UI 
+  via `gnw_h7b0_rtc_set_sync_host()` so the emulated RTC correctly tracks the
+  host time on boot and toggle.
 
 ## 2026-07-22 — FIX: stock-firmware "crunchy audio" root-caused and fixed (LTDC vblank re-phasing)
 

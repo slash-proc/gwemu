@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-07-23
+Last updated: 2026-07-24
 
 Fork of upstream QEMU (`qemu/qemu`), pinned to tag `v11.0.2`. Working
 branch `gnw-h7b0`.
@@ -51,6 +51,15 @@ audio, gamepad input, SD card, save/flash persistence.
   the addressable overhead (per-pixel MMIO translation calls) has already
   been batched away. Remaining gap is generic TCG cost, not a device-model
   bug.
+- JPEG-streaming firmware paths (retro-go launcher coverflow; the stock-
+  side zelda3/GB games, which decode background JPEGs continuously) are
+  bound by per-MMIO-access cost on every host (~2-4.4M register reads/s
+  depending on machine; fps tracks that rate). Decode latency and all
+  cheap per-access overhead already optimized away (2026-07-24 CHANGELOG);
+  two deeper approaches tried and reverted (blocking SR poll, lockless
+  MMIO -- see warning comments in hw/misc/gnw_h7b0_jpeg.c). Wine runs the
+  Windows build at ~0.1fps for a separate unresolved reason (GUI-thread
+  yield storm).
 - Real subsampled chroma storage was traded for full-resolution internal
   storage in the JPEG model (a documented scope decision, not a bug).
 
@@ -69,11 +78,13 @@ audio, gamepad input, SD card, save/flash persistence.
   Phase 1 (SDL3+ImGui foundation, ported from xemu with zero Xbox content)
   is committed and verified. Phase 2 (real menu content — Flash/SD Card
   presets and geometry-bar extflash editor, Input rebinding, Display/Audio,
-  Snapshots, Reset/Power buttons, an Apply-triggered restart flow) is built
-  and working through several real bug-fix rounds (async subprocess
-  handling, settings persistence, a Wayland-specific ImGui viewport
-  limitation) but **not yet committed** — sitting in the working tree
-  pending a consolidation/review pass.
+  Snapshots, RTC time sync, Reset/Power buttons, an Apply-triggered restart flow)
+  is built and working. The Wayland-specific ImGui viewport limitations were
+  bypassed by engineering a dual-context native OS window architecture for
+  Settings, complete with independent high-DPI scaling and flicker-free
+  cross-context cursor management. Phase 2 is now fully operational. All of
+  it (plus the 2026-07-24 perf/CI work) is uncommitted in the working tree;
+  a 7-commit landing plan is agreed and pending execution.
 - `contrib/gnw-tools/`: C ports of `make_boot_images.py` and
   `make_cfw_images.py` (including a from-scratch C port of gnwmanager's
   Thumb-2 assembler/lz77/LZMA/relocation-engine patch pipeline), both
