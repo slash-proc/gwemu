@@ -8,16 +8,17 @@ name: Release build
 # Packaging scope (deliberately kept simple for now -- the project owner
 # flagged this as still-TBD long-term, e.g. turning scripts/*.py into a
 # library the eventual GUI imports directly instead of shelling out; do
-# not build anything here that assumes today's zip-of-binaries-plus-scripts
-# packaging is permanent): each platform's zip contains gwemu (gwemu.exe on
-# Windows -- the standalone, zero-argument GUI binary, see meson.build's
-# gwemu-binary-alias target and ui/gwemu.c) plus qemu-system-arm (the
-# same binary under its generic upstream name, still useful for anyone
-# scripting explicit -M/-display invocations), both portable-ized per-OS
-# (see each job), plus this project's own scripts/*.py, scripts/*.sh, and
-# scripts/requirements.txt. Upstream QEMU's own scripts/ (the vast
-# majority of the directory) are NOT included -- only the gnw-specific
-# ones this project actually added.
+# not build anything here that assumes today's packaging is permanent):
+#
+# - Linux/macOS: one zip per platform containing gwemu (the standalone,
+#   zero-argument GUI binary, see meson.build's gwemu-binary-alias target
+#   and ui/gwemu.c) plus qemu-system-arm (same binary, generic upstream
+#   name, for scripted -M/-display invocations), portable-ized per-OS
+#   (see each job), plus this project's own scripts/*.py, scripts/*.sh
+#   and requirements.txt. Upstream QEMU's own scripts/ are NOT included.
+# - Windows: NO zip -- two direct assets, a fully static single-file
+#   gwemu.exe (portable) and gwemu-setup.exe (NSIS per-user installer).
+#   No scripts, no qemu-system-arm.exe (owner's call, 2026-07-24).
 
 on:
   push:
@@ -385,103 +386,89 @@ jobs:
           # not a pre-made zip -- publish-release does the one real zip.
 
   build-windows:
-    # Cross-compiled from Linux via Docker -- the SAME workflow used
-    # locally (docs/cross-platform-builds.md "Windows"): QEMU's own
-    # fedora-win64-cross CI image plus mingw64-xz (liblzma for
-    # contrib/gnw-tools' LZMA compressor), cmake and ninja. This replaced
-    # an earlier MSYS2 windows-latest job so CI and the local workflow
-    # can't drift apart, and because the mingw SDL2.dll shipped by that
-    # toolchain fails DllMain initialization (status c0000142) before
-    # main() runs -- hence --disable-sdl/--disable-sdl-image below being
-    # REQUIRED, not cosmetic. SDL3 (our GUI's actual backend) is
-    # statically linked and unaffected.
+    # Cross-compiled from Linux in the MXE-based static toolchain
+    # (contrib/docker-win-static/, derived from xemu's public toolchain
+    # image): every dependency including glib is a static .a, so the
+    # result is a SINGLE self-contained gwemu.exe importing only Windows
+    # system DLLs -- xemu's own distribution model. This replaced the
+    # fedora-win64-cross + bundled-DLLs job (v0.0.11 and earlier zips);
+    # Windows ships two direct (un-zipped) release assets: gwemu.exe
+    # (portable) and gwemu-setup.exe (NSIS per-user installer, see
+    # contrib/gwemu-installer/gwemu.nsi). No scripts/, no
+    # qemu-system-arm.exe -- owner's call, Windows users don't use them.
+    # --disable-sdl/--disable-sdl-image: QEMU's legacy SDL2 display, not
+    # our SDL3 GUI (statically built via its cmake subproject).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build gwemu-win-cross image
-        run: |
-          set -euo pipefail
-          cat > /tmp/gwemu-win-cross.dockerfile <<'EOF'
-          FROM registry.gitlab.com/qemu-project/qemu/qemu/fedora-win64-cross:latest
-          RUN dnf -y install mingw64-xz mingw64-xz-libs cmake ninja-build && dnf clean all
-          EOF
-          docker build -t gwemu-win-cross -f /tmp/gwemu-win-cross.dockerfile /tmp
+      - name: Build static toolchain image
+        run: docker build -t gwemu-win-static contrib/docker-win-static/
 
-      - name: Configure and build (inside cross container)
+      - name: Configure and build (inside static cross container)
         run: |
           set -euo pipefail
-          mkdir -p build-win
-          docker run --rm -v "$PWD":/src -w /src/build-win gwemu-win-cross \
-            sh -c 'git config --global --add safe.directory "*" \
+          mkdir -p build-win-static
+          docker run --rm -v "$PWD":/src -w /src/build-win-static gwemu-win-static \
+            bash -c 'git config --global --add safe.directory "*" \
                    && ../configure --target-list=arm-softmmu \
-                        --cross-prefix=x86_64-w64-mingw32- \
+                        --cross-prefix=x86_64-w64-mingw32.static- \
                         --disable-sdl --disable-sdl-image --disable-gtk \
-                   && ninja qemu-system-arm.exe gwemu.exe'
-          # safe.directory: the container runs as root against a checkout
-          # owned by the runner user -- same "dubious ownership" trap the
-          # Linux container job documents (it silently blanked
-          # gwemu_commit in a shipped binary once).
-          # Naming qemu-system-arm.exe explicitly means ninja does NOT
-          # fall back to build_by_default, so gwemu.exe must be requested
-          # too (same reasoning as the macOS job's explicit target list).
+                   && ninja -j"$(nproc)" qemu-system-arm.exe gwemu.exe \
+                   && x86_64-w64-mingw32.static-strip gwemu.exe'
+          # safe.directory: container runs as root against a runner-owned
+          # checkout -- without it gwemu_commit silently stamps blank
+          # (bit for real twice now: the v0.0.2 zip and a local
+          # container rebuild). gwemu.exe is the meson alias copy with
+          # the GUI-subsystem flip already applied
+          # (scripts/make-gwemu-alias.py); stripping preserves the PE
+          # optional header, i.e. the subsystem flip survives.
 
-      - name: Package (dist folder, inside cross container)
+      - name: Verify the exe is genuinely self-contained
         run: |
           set -euo pipefail
-          # PE binaries have no rpath -- every required mingw DLL must sit
-          # next to the exe. Recursively resolve `objdump -p | grep 'DLL
-          # Name'` against the mingw sysroot's bin dir (DLLs not found
-          # there are Windows system DLLs and are skipped), then strip
-          # everything. This runs inside the container because that's
-          # where the sysroot and the mingw binutils live. Result lands at
-          # build-win/dist/ (~31 files / ~55MB locally). SDL3 is static,
-          # so it never appears here.
-          docker run --rm -v "$PWD":/src -w /src/build-win gwemu-win-cross \
-            bash -c '
-              set -euo pipefail
-              SYSROOT_BIN=/usr/x86_64-w64-mingw32/sys-root/mingw/bin
-              rm -rf dist && mkdir dist
-              cp qemu-system-arm.exe gwemu.exe dist/
-              queue="dist/qemu-system-arm.exe dist/gwemu.exe"
-              while [ -n "$queue" ]; do
-                next=""
-                for f in $queue; do
-                  for dll in $(x86_64-w64-mingw32-objdump -p "$f" \
-                                 | grep "DLL Name" | awk "{print \$3}"); do
-                    if [ -f "$SYSROOT_BIN/$dll" ] && [ ! -f "dist/$dll" ]; then
-                      cp "$SYSROOT_BIN/$dll" dist/
-                      next="$next dist/$dll"
-                    fi
-                  done
-                done
-                queue="$next"
-              done
-              x86_64-w64-mingw32-strip dist/*.exe dist/*.dll
-              ls -l dist
-            '
+          # Guardrail: fail the release if the static link regressed and
+          # the exe picked up a non-system DLL import (same silent-drift
+          # class as the GUI-less macOS assets). Whitelist = Windows
+          # system DLLs only (api-ms-win-* covered by the last pattern).
+          docker run --rm -v "$PWD":/src -w /src/build-win-static gwemu-win-static \
+            bash -c 'x86_64-w64-mingw32.static-objdump -p gwemu.exe \
+                       | grep "DLL Name" | awk "{print \$3}"' \
+            | grep -viE '^(ADVAPI32|CRYPT32|DNSAPI|GDI32|IMM32|IPHLPAPI|KERNEL32|SETUPAPI|SHELL32|SHLWAPI|Secur32|USER32|VERSION|WINMM|WLDAP32|WS2_32|bcrypt|msvcrt|ole32|OLEAUT32|api-ms-win-.*)\.dll$' \
+            && { echo "Unexpected non-system DLL import(s) above"; exit 1; } || true
 
-      - name: Assemble artifact directory
+      - name: Build NSIS installer
         run: |
           set -euo pipefail
-          OUT=gwemu-windows-x86_64
-          mkdir -p "$OUT"
-          # The container ran as root; the dist tree is root-owned on the
-          # host side of the bind mount -- cp works fine, we just never
-          # try to modify build-win/ from here.
-          cp build-win/dist/* "$OUT/"
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p win-installer-stage
+          cp build-win-static/gwemu.exe win-installer-stage/
+          cp LICENSE win-installer-stage/LICENSE.txt
+          cp COPYING win-installer-stage/COPYING.txt
+          # The MXE image is Ubuntu-based; nsis comes from apt there.
+          docker run --rm -v "$PWD":/src -w /src gwemu-win-static \
+            bash -c "apt-get update -q && apt-get install -qy nsis >/dev/null \
+                     && makensis -DDISTDIR=/src/win-installer-stage \
+                          -DVERSION='$VERSION' \
+                          -DOUTFILE=/src/gwemu-setup.exe \
+                          contrib/gwemu-installer/gwemu.nsi"
 
-          mkdir -p "$OUT/scripts"
-          for f in $GNW_SCRIPTS; do
-            cp "scripts/$f" "$OUT/scripts/"
-          done
+      - name: Stage artifact
+        run: |
+          set -euo pipefail
+          # One flat directory: multi-path upload-artifact preserves the
+          # common-ancestor directory structure, which publish-release
+          # would then have to un-nest -- avoid that entirely.
+          mkdir win-exes
+          cp build-win-static/gwemu.exe gwemu-setup.exe win-exes/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gwemu-windows-x86_64
-          path: gwemu-windows-x86_64/
-          # See build-linux's identical comment: upload the raw directory,
-          # not a pre-made zip -- publish-release does the one real zip.
+          name: gwemu-windows-exes
+          # Both files ship as DIRECT release assets -- publish-release
+          # moves the contents of this artifact out un-zipped instead of
+          # zipping the directory like the other platforms.
+          path: win-exes/
 
   # Fifth platform build: the headless capture appliance image
   # (contrib/docker-headless/, see docs/headless-capture.md), published to
@@ -552,6 +539,13 @@ jobs:
             [ -d "$d" ] || continue
             chmod +x "$d"/qemu-system-arm* "$d"/gwemu* "$d"/scripts/* 2>/dev/null || true
           done
+          # Windows ships its two exes as DIRECT assets (owner's call:
+          # portable gwemu.exe + gwemu-setup.exe, no zip) -- move them
+          # out before the zip loop so they don't get wrapped.
+          if [ -d gwemu-windows-exes ]; then
+            mv gwemu-windows-exes/* ..
+            rm -rf gwemu-windows-exes
+          fi
           for d in */; do
             d="${d%/}"
             zip -r "../$d.zip" "$d"
@@ -560,6 +554,9 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: '*.zip'
+          files: |
+            *.zip
+            gwemu.exe
+            gwemu-setup.exe
           draft: true
           generate_release_notes: true
