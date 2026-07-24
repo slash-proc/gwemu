@@ -2,10 +2,13 @@
             gwemu-<ver>-x86_64.AppImage (contrib/appimage/, verified
             locally against a real firmware boot; fully-static Linux
             ruled out -- GPU userspace is runtime-loaded per-hardware).
-            macOS: gwemu-<ver>-macos-{arm64,x86_64}.dmg with a
-            self-contained gwemu.app (recipe validated on the real
-            Intel iMac incl. the mandatory dylibbundler LC_RPATH dedup
-            -- modern dyld aborts on duplicates). Windows portable
+            macOS: ONE universal gwemu-<ver>-macos-universal.dmg --
+            per-arch self-contained gwemu.app bundles (recipe validated
+            on the real Intel iMac incl. the mandatory dylibbundler
+            LC_RPATH dedup -- modern dyld aborts on duplicates)
+            lipo-merged binary+dylibs pairwise by a new CI job that
+            fails on any arch dylib-set drift and smoke-tests the
+            arm64 slice. Windows portable
             renamed gwemu-portable.exe. All direct un-zipped assets;
             no more platform zips, no qemu-system-arm assets (the
             single binaries accept explicit -M/-display args); gnw
