@@ -939,6 +939,7 @@ static struct {
     uint64_t main_present_ns, main_present_max_ns;
     uint64_t settings_present_ns, settings_present_max_ns;
     uint32_t main_rendered, main_skipped;
+    uint32_t iters;
     uint32_t throttle_retries;
     uint64_t last_report;
 } ui_trace;
@@ -952,14 +953,26 @@ static struct {
  * every main present; two consecutive presents slower than the threshold
  * (while settings is visible) enter throttled mode, where the main
  * window's render/present is skipped except for one probe present every
- * retry-cadence interval. A fast probe exits throttled mode immediately. */
+ * retry-cadence interval. A fast probe exits throttled mode immediately.
+ *
+ * Resuming is primarily EVENT-driven (EXPOSED/FOCUS_GAINED/MOUSE_ENTER/
+ * RESTORED/SHOWN on the main window, tracked in poll_events): a probe
+ * present against a still-occluded window does NOT return fast -- the
+ * vulkan swapchain withholds the image and the present blocks ~500ms
+ * until a compositor timeout (field-traced), so probing often turns into
+ * a stall of its own. The timer probe is kept only as a slow fallback
+ * (5s cadence) so a missed/never-delivered event can't strand the main
+ * window in throttled mode forever; one 500ms stall per 5s is tolerable. */
 #define GNW_PRESENT_STALL_THRESHOLD_NS  50000000ull  /*  50 ms */
-#define GNW_PRESENT_RETRY_CADENCE_NS   500000000ull  /* 500 ms */
+#define GNW_PRESENT_RETRY_CADENCE_NS  5000000000ull  /*   5 s fallback */
 static struct {
     bool throttled;
     uint32_t slow_streak;      /* consecutive slow presents */
     uint64_t last_retry_ns;    /* when the last throttled-mode probe ran */
 } ui_throttle;
+/* Set from poll_events when a visibility-suggesting event hits the main
+ * window; consumed (cleared) by gl_render_frame to exit throttled mode. */
+static bool m_main_window_resume_evt;
 
 static void gl_render_frame(struct gwemu_console *scon)
 {
@@ -985,6 +998,16 @@ static void gl_render_frame(struct gwemu_console *scon)
      * thread-safe across windows.
      */
     uint64_t frame_now = SDL_GetTicksNS();
+    bool trace = gnw_env_enabled("GNW_UI_FRAME_TRACE");
+    if (ui_throttle.throttled && m_main_window_resume_evt) {
+        /* Event-driven resume: cheap and stall-free, unlike a probe. */
+        ui_throttle.throttled = false;
+        ui_throttle.slow_streak = 0;
+        if (trace) {
+            fprintf(stderr, "UI trace: throttle exit resume=event\n");
+        }
+    }
+    m_main_window_resume_evt = false;
     if (!settings_visible) {
         /* Never throttle without a settings window to serve -- an
          * alt-tabbed fullscreen user keeps normal vsync behavior, and
@@ -1001,7 +1024,6 @@ static void gl_render_frame(struct gwemu_console *scon)
     gwemu_settings_hud_update();
     gwemu_main_loop_unlock();
     gwemu_settings_hud_render();
-    bool trace = gnw_env_enabled("GNW_UI_FRAME_TRACE");
     if (settings_visible) {
         uint64_t t0 = trace ? SDL_GetTicksNS() : 0;
         SDL_RenderPresent(m_settings_renderer);
@@ -1021,6 +1043,7 @@ static void gl_render_frame(struct gwemu_console *scon)
      * and how many frames rendered vs skipped the main window. */
     if (trace) {
         uint64_t now = SDL_GetTicksNS();
+        ui_trace.iters++;
         if (skip_main) {
             ui_trace.main_skipped++;
         } else {
@@ -1031,7 +1054,7 @@ static void gl_render_frame(struct gwemu_console *scon)
                     "UI trace: main present %.1fms sum/%.1fms max, "
                     "settings present %.1fms sum/%.1fms max, "
                     "occluded flag=%d evt=%d, main rendered=%u skipped=%u, "
-                    "throttled=%d retries=%u\n",
+                    "throttled=%d retries=%u iters=%u\n",
                     ui_trace.main_present_ns / 1e6,
                     ui_trace.main_present_max_ns / 1e6,
                     ui_trace.settings_present_ns / 1e6,
@@ -1039,13 +1062,22 @@ static void gl_render_frame(struct gwemu_console *scon)
                     !!(SDL_GetWindowFlags(m_window) & SDL_WINDOW_OCCLUDED),
                     m_main_window_occluded,
                     ui_trace.main_rendered, ui_trace.main_skipped,
-                    ui_throttle.throttled, ui_trace.throttle_retries);
+                    ui_throttle.throttled, ui_trace.throttle_retries,
+                    ui_trace.iters);
             memset(&ui_trace, 0, sizeof(ui_trace));
             ui_trace.last_report = now;
         }
     }
 
     if (skip_main) {
+        if (ui_throttle.throttled) {
+            /* The settings renderer isn't vsynced and the (skipped) main
+             * present was this loop's only pacer -- without a cap the
+             * loop free-runs at thousands of iterations/s (field-traced
+             * ~4200/s). Cap at ~120 Hz while throttled; normal mode
+             * keeps vsync pacing from the main present. */
+            SDL_DelayNS(8333333);
+        }
         qatomic_set(&rendering, false);
         return;
     }
@@ -1112,8 +1144,11 @@ static void gl_render_frame(struct gwemu_console *scon)
                 ui_throttle.last_retry_ns = SDL_GetTicksNS();
             }
         } else {
-            /* Fast present (incl. a fast throttled-mode probe): the
-             * window is visible again -- resume full-rate rendering. */
+            /* Fast present (incl. a fast fallback probe): the window is
+             * visible again -- resume full-rate rendering. */
+            if (ui_throttle.throttled && trace) {
+                fprintf(stderr, "UI trace: throttle exit resume=probe\n");
+            }
             ui_throttle.slow_streak = 0;
             ui_throttle.throttled = false;
         }
@@ -1183,6 +1218,16 @@ static void poll_events(struct gwemu_console *scon)
              ev->type == SDL_EVENT_WINDOW_EXPOSED) &&
             get_window_id_from_event(ev) == SDL_GetWindowID(m_window)) {
             m_main_window_occluded = ev->type == SDL_EVENT_WINDOW_OCCLUDED;
+        }
+        /* Adaptive-throttle resume signal (see ui_throttle): any event
+         * suggesting the main window became visible again. */
+        if ((ev->type == SDL_EVENT_WINDOW_EXPOSED ||
+             ev->type == SDL_EVENT_WINDOW_FOCUS_GAINED ||
+             ev->type == SDL_EVENT_WINDOW_MOUSE_ENTER ||
+             ev->type == SDL_EVENT_WINDOW_RESTORED ||
+             ev->type == SDL_EVENT_WINDOW_SHOWN) &&
+            get_window_id_from_event(ev) == SDL_GetWindowID(m_window)) {
+            m_main_window_resume_evt = true;
         }
 
         switch (ev->type) {
