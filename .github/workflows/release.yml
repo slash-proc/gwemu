@@ -10,12 +10,15 @@ name: Release build
 # library the eventual GUI imports directly instead of shelling out; do
 # not build anything here that assumes today's packaging is permanent):
 #
-# - Linux/macOS: one zip per platform containing gwemu (the standalone,
-#   zero-argument GUI binary, see meson.build's gwemu-binary-alias target
-#   and ui/gwemu.c) plus qemu-system-arm (same binary, generic upstream
-#   name, for scripted -M/-display invocations), portable-ized per-OS
-#   (see each job), plus this project's own scripts/*.py, scripts/*.sh
-#   and requirements.txt. Upstream QEMU's own scripts/ are NOT included.
+# - Linux/macOS: one zip per platform containing ONLY the ready-to-run
+#   runtime: gwemu (the standalone, zero-argument GUI binary, see
+#   meson.build's gwemu-binary-alias target and ui/gwemu.c) plus
+#   qemu-system-arm (same binary, generic upstream name, for scripted
+#   -M/-display invocations), portable-ized per-OS (see each job).
+# - scripts.zip: this project's own scripts/*.py, scripts/*.sh and
+#   requirements.txt as ONE separate, optional asset (owner's call,
+#   2026-07-24: binaries ready-to-go, scripts opt-in). Upstream QEMU's
+#   own scripts/ are NOT included.
 # - Windows: NO zip -- two direct assets, a fully static single-file
 #   gwemu.exe (portable) and gwemu-setup.exe (NSIS per-user installer).
 #   No scripts, no qemu-system-arm.exe (owner's call, 2026-07-24).
@@ -185,10 +188,25 @@ jobs:
           package_bin "$(find build -maxdepth 1 -type f -name qemu-system-arm)" qemu-system-arm
           package_bin "$(find build -maxdepth 1 -type f -name gwemu)" gwemu
 
-          mkdir -p "$OUT/scripts"
+      - name: Stage scripts artifact (once, from this job only)
+        run: |
+          set -euo pipefail
+          # Owner's call (2026-07-24): the per-platform zips are pure
+          # ready-to-run runtime; the gnw scripts ship once as their own
+          # separate, optional scripts.zip asset instead of being copied
+          # into every platform zip.
+          mkdir -p scripts-pkg/scripts
           for f in $GNW_SCRIPTS; do
-            cp "scripts/$f" "$OUT/scripts/"
+            cp "scripts/$f" scripts-pkg/scripts/
           done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scripts
+          path: scripts-pkg/
+          # publish-release's zip loop turns this artifact dir into
+          # scripts.zip (containing a scripts/ folder) exactly like the
+          # platform dirs.
 
       - uses: actions/upload-artifact@v4
         with:
@@ -372,11 +390,8 @@ jobs:
 
           package_bin "$(find build -maxdepth 1 -type f -name qemu-system-arm)" qemu-system-arm
           package_bin "$(find build -maxdepth 1 -type f -name gwemu)" gwemu
-
-          mkdir -p "$OUT/scripts"
-          for f in $GNW_SCRIPTS; do
-            cp "scripts/$f" "$OUT/scripts/"
-          done
+          # No scripts/ here -- they ship once as the separate optional
+          # scripts.zip asset (staged by build-linux).
 
       - uses: actions/upload-artifact@v4
         with:
@@ -537,8 +552,9 @@ jobs:
           # real zip (zip -r does preserve them). Windows doesn't care.
           for d in gwemu-linux-* gwemu-macos-*; do
             [ -d "$d" ] || continue
-            chmod +x "$d"/qemu-system-arm* "$d"/gwemu* "$d"/scripts/* 2>/dev/null || true
+            chmod +x "$d"/qemu-system-arm* "$d"/gwemu* 2>/dev/null || true
           done
+          chmod +x scripts/scripts/* 2>/dev/null || true
           # Windows ships its two exes as DIRECT assets (owner's call:
           # portable gwemu.exe + gwemu-setup.exe, no zip) -- move them
           # out before the zip loop so they don't get wrapped.
