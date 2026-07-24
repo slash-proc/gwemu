@@ -41,6 +41,12 @@ void FontManager::Rebuild()
     float scale = g_viewport_mgr.m_scale;
     float pixel_density = g_viewport_mgr.m_pixel_density;
 
+    /* MergeMode attaches to the MOST RECENTLY ADDED font -- each font
+     * that renders FontAwesome glyphs needs its own merge immediately
+     * after it. Historically only m_menu_font (the 34pt HUD font) got
+     * one, so FA codepoints in the default/small fonts (profile wizard
+     * cards/strip) rendered as '?' boxes. */
+    static const ImWchar fa_ranges[] = { ICON_MIN_FA, ICON_MAX_FA, 0 };
     {
         ImFontConfig config;
         config.FontDataOwnedByAtlas = false;
@@ -48,9 +54,36 @@ void FontManager::Rebuild()
         m_default_font = io.Fonts->AddFontFromMemoryTTF(
             (void *)Roboto_Medium_data, Roboto_Medium_size,
             16.0f * scale, &config);
+    }
+    {
+        ImFontConfig config;
+        config.FontDataOwnedByAtlas = false;
+        config.RasterizerDensity = pixel_density;
+        config.MergeMode = true;
+        config.GlyphOffset = ImVec2(0, -1 * scale);
+        config.GlyphMinAdvanceX = 16.0f * scale;
+        io.Fonts->AddFontFromMemoryTTF((void *)font_awesome_6_1_1_solid_min_data,
+                                       font_awesome_6_1_1_solid_min_size,
+                                       12.0f * scale, &config, fa_ranges);
+    }
+    {
+        ImFontConfig config;
+        config.FontDataOwnedByAtlas = false;
+        config.RasterizerDensity = pixel_density;
         m_menu_font_small = io.Fonts->AddFontFromMemoryTTF(
             (void *)RobotoCondensed_Regular_data, RobotoCondensed_Regular_size,
             22.0f * scale, &config);
+    }
+    {
+        ImFontConfig config;
+        config.FontDataOwnedByAtlas = false;
+        config.RasterizerDensity = pixel_density;
+        config.MergeMode = true;
+        config.GlyphOffset = ImVec2(0, -2 * scale);
+        config.GlyphMinAdvanceX = 20.0f * scale;
+        io.Fonts->AddFontFromMemoryTTF((void *)font_awesome_6_1_1_solid_min_data,
+                                       font_awesome_6_1_1_solid_min_size,
+                                       16.0f * scale, &config, fa_ranges);
     }
     {
         ImFontConfig config;
