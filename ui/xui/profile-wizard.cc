@@ -929,7 +929,7 @@ void ProfileWizard::DrawBankAssignments()
     struct B1Item { const char *label; int choice; };
     B1Item b1_items[4];
     int b1_n = 0;
-    b1_items[b1_n++] = { "Blank (0xFF)", B1Blank };
+    b1_items[b1_n++] = { "Empty", B1Blank };
     if (m_library.status[0].Available()) b1_items[b1_n++] = { "Mario OFW", B1OfwMario };
     if (m_library.status[1].Available()) b1_items[b1_n++] = { "Zelda OFW", B1OfwZelda };
     b1_items[b1_n++] = { "File...", B1File };
@@ -1006,7 +1006,7 @@ void ProfileWizard::DrawBankAssignments()
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Bank 2");
     ImGui::SameLine(120 * g_viewport_mgr.m_scale);
-    const char *b2_items[] = { "Blank (0xFF)", "File..." };
+    const char *b2_items[] = { "Empty", "File..." };
     ImGui::SetNextItemWidth(-FLT_MIN);
     changed |= ImGui::Combo("##b2", &m_bank2_choice, b2_items, 2);
     if (m_bank2_choice == B2File) {
@@ -1021,7 +1021,7 @@ void ProfileWizard::DrawBankAssignments()
     struct ExtItem { const char *label; int choice; };
     ExtItem ext_items[4];
     int ext_n = 0;
-    ext_items[ext_n++] = { "Blank (0xFF)", ExtBlank };
+    ext_items[ext_n++] = { "Empty", ExtBlank };
     if (m_library.status[0].external_found) ext_items[ext_n++] = { "Mario Assets", ExtOfwMario };
     if (m_library.status[1].external_found) ext_items[ext_n++] = { "Zelda Assets", ExtOfwZelda };
     ext_items[ext_n++] = { "File...", ExtFile };
