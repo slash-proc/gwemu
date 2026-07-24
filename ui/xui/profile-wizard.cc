@@ -879,6 +879,16 @@ void ProfileWizard::DrawFirmwareStrip()
     }
 }
 
+
+// Width of the shared right-hand column in Bank Assignments -- Patched
+// checkbox (row 1) and the size stepper (row 3) both live in it, and all
+// three combos end where it begins (owner call: uniform widths, vertical
+// alignment).
+static float kRightColW()
+{
+    return 150.0f * g_viewport_mgr.m_scale;
+}
+
 bool ProfileWizard::DrawExtSizeStepper()
 {
     bool changed = false;
@@ -954,11 +964,7 @@ void ProfileWizard::DrawBankAssignments()
         if (b1_items[i].choice == m_bank1_choice) b1_sel = i;
     }
     bool b1_show_patch = Bank1Game() >= 0;
-    float patch_w = b1_show_patch
-        ? ImGui::CalcTextSize("Patched").x + ImGui::GetFrameHeight() +
-          3 * ImGui::GetStyle().ItemSpacing.x
-        : 0.0f;
-    ImGui::SetNextItemWidth(b1_show_patch ? -patch_w : -FLT_MIN);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
     if (ImGui::BeginCombo("##b1", b1_items[b1_sel].label)) {
         for (int i = 0; i < b1_n; i++) {
             if (ImGui::Selectable(b1_items[i].label, i == b1_sel)) {
@@ -990,7 +996,7 @@ void ProfileWizard::DrawBankAssignments()
         ImGui::EndCombo();
     }
     if (b1_show_patch) {
-        ImGui::SameLine();
+        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
         // Deliberately NOT part of `changed`: toggling Patched on a
         // stock template is still that stock template (patched stock is
         // a first-class stock flavor), it must not flip to Custom.
@@ -1023,7 +1029,7 @@ void ProfileWizard::DrawBankAssignments()
     ImGui::TextUnformatted("Bank 2");
     ImGui::SameLine(120 * g_viewport_mgr.m_scale);
     const char *b2_items[] = { "Empty", "File..." };
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
     changed |= ImGui::Combo("##b2", &m_bank2_choice, b2_items, 2);
     if (m_bank2_choice == B2File) {
         slot_file("Bank2 file", m_bank2_path);
@@ -1046,9 +1052,7 @@ void ProfileWizard::DrawBankAssignments()
         if (ext_items[i].choice == m_ext_choice) ext_sel = i;
     }
     // Leave room for the inline size stepper on the same row (owner call).
-    float stepper_w = 150 * g_viewport_mgr.m_scale;
-    ImGui::SetNextItemWidth(m_ext_choice == ExtFile ? -FLT_MIN
-                            : ImGui::GetContentRegionAvail().x - stepper_w);
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
     if (ImGui::BeginCombo("##ext", ext_items[ext_sel].label)) {
         for (int i = 0; i < ext_n; i++) {
             if (ImGui::Selectable(ext_items[i].label, i == ext_sel)) {
