@@ -160,10 +160,16 @@ void ProfileWizard::Open()
     m_created_id.clear();
     m_completed = false;
     m_name_hint = GwProfileStore::GenerateName();
-    // Stage entry: re-entry with existing profiles starts at S2 directly;
-    // first run starts at the firmware prompt (S1a), or its status page
-    // if a folder was already chosen this session.
-    if (!g_profile_store.Profiles().empty()) {
+    // Stage entry keys off FIRMWARE status, not profile existence (owner
+    // decision: the backup-folder question is the absolute first thing
+    // whenever firmware isn't set up yet -- existing profiles don't
+    // change that). Any complete game set (or an explicitly chosen
+    // folder this session) skips straight to the profile form.
+    bool any_complete = false;
+    for (int i = 0; i < GnwBackupLibrary::kGameCount; i++) {
+        any_complete |= GnwCardStateOf(m_library.status[i]) == kCardComplete;
+    }
+    if (any_complete) {
         m_stage = StageProfile;
         m_s2_visited = true;
     } else {
