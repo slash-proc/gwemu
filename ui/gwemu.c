@@ -47,6 +47,7 @@
 #include "system/system.h"
 #include "xui/gwemu-hud.h"
 #include "gwemu-gnw-input.h"
+#include "hw/misc/gnw_env.h"
 #include "gwemu-input.h"
 #include "gwemu-settings.h"
 #include "gwemu-snapshots.h"
@@ -928,6 +929,11 @@ static void report_stats(void)
  * Renders the main interface. Usually called from the main thread,
  * but may sometimes be called from another thread.
  */
+/* Main-window occlusion, event-driven (SDL_EVENT_WINDOW_OCCLUDED/
+ * EXPOSED in poll_events) OR'd with the live window flag -- belt and
+ * braces, the flag alone is compositor-dependent. */
+static bool m_main_window_occluded;
+
 static void gl_render_frame(struct gwemu_console *scon)
 {
     static bool rendering;
@@ -936,6 +942,55 @@ static void gl_render_frame(struct gwemu_console *scon)
     }
 
     SDL_Texture *tex;
+
+    bool settings_visible = m_settings_window && m_settings_renderer &&
+        !(SDL_GetWindowFlags(m_settings_window) & SDL_WINDOW_HIDDEN);
+    bool main_occluded = m_main_window_occluded ||
+        (SDL_GetWindowFlags(m_window) & SDL_WINDOW_OCCLUDED);
+    /*
+     * The interactive settings window renders and presents FIRST, and
+     * while the main window is occluded (compositor-throttled presents
+     * can stall to a few fps under vulkan/XWayland) its present is
+     * skipped entirely -- otherwise the settings window, chained behind
+     * it in this single loop, went sluggish exactly when the user
+     * covered the main window and worked in settings (confirmed field
+     * repro). Single-threaded on purpose: SDL renderer APIs are not
+     * thread-safe across windows.
+     */
+    bool skip_main = main_occluded && settings_visible;
+
+    gwemu_main_loop_lock();
+    gwemu_settings_hud_update();
+    gwemu_main_loop_unlock();
+    gwemu_settings_hud_render();
+    if (settings_visible) {
+        SDL_RenderPresent(m_settings_renderer);
+    }
+
+#ifdef CONFIG_GWEMU_GUI
+    /* GNW_UI_FRAME_TRACE=1: 1/s settings-present pacing summary (field
+     * diagnosis of the occlusion stall; off by default). */
+    if (gnw_env_enabled("GNW_UI_FRAME_TRACE")) {
+        static uint64_t last_present, last_report;
+        static uint32_t frames, skipped;
+        uint64_t now = SDL_GetTicksNS();
+        if (settings_visible) frames++;
+        if (skip_main) skipped++;
+        (void)last_present;
+        last_present = now;
+        if (now - last_report > 1000000000ull) {
+            fprintf(stderr, "UI trace: settings %u fps, main skipped %u (occluded=%d)\n",
+                    frames, skipped, main_occluded);
+            frames = skipped = 0;
+            last_report = now;
+        }
+    }
+#endif
+
+    if (skip_main) {
+        qatomic_set(&rendering, false);
+        return;
+    }
 
     SDL_SetRenderDrawColor(m_renderer, 0, 0, 0, 255);
     SDL_RenderClear(m_renderer);
@@ -967,20 +1022,13 @@ static void gl_render_frame(struct gwemu_console *scon)
      * possible lengthy blocking (for vsync).
      */
     gwemu_main_loop_lock();
-    
+
     gwemu_hud_update();
-    gwemu_settings_hud_update();
 
     gwemu_main_loop_unlock();
 
-    
     gwemu_hud_render();
     SDL_RenderPresent(m_renderer);
-    
-    gwemu_settings_hud_render();
-    if (m_settings_renderer) {
-        SDL_RenderPresent(m_settings_renderer);
-    }
 
 
     qatomic_set(&rendering, false);
@@ -1038,6 +1086,15 @@ static void poll_events(struct gwemu_console *scon)
         // passthrough below, or a remapped key would double-fire (once as
         // its own literal keypress, once as the synthesized GNW button).
         bool gnw_consumed = gnw_input_process_sdl_event(ev);
+
+        /* Main-window occlusion tracking (see gl_render_frame) -- kept
+         * outside the switch: the window-event range case below would
+         * overlap dedicated case labels. */
+        if ((ev->type == SDL_EVENT_WINDOW_OCCLUDED ||
+             ev->type == SDL_EVENT_WINDOW_EXPOSED) &&
+            get_window_id_from_event(ev) == SDL_GetWindowID(m_window)) {
+            m_main_window_occluded = ev->type == SDL_EVENT_WINDOW_OCCLUDED;
+        }
 
         switch (ev->type) {
         case SDL_EVENT_KEY_DOWN:
