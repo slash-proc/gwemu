@@ -620,6 +620,22 @@ void ProfileWizard::DrawBankAssignments()
                     changed = true;
                     if (Bank1Game() < 0) {
                         m_patched = false; // hidden checkbox never lingers on
+                    } else {
+                        // Assets follow the OFW game: if extflash held the
+                        // other game's assets (or Patched demands matching
+                        // ones), switch it rather than leaving a mismatch
+                        // for validation to complain about -- confirmed
+                        // real misfire: picking Zelda OFW here while
+                        // extflash still said Mario Assets read as "your
+                        // zelda assets aren't valid" to the owner.
+                        int gi = Bank1Game();
+                        int want = gi == 0 ? ExtOfwMario : ExtOfwZelda;
+                        bool have = m_library.status[gi].external_found;
+                        bool was_assets = m_ext_choice == ExtOfwMario ||
+                                          m_ext_choice == ExtOfwZelda;
+                        if (have && (was_assets || m_patched)) {
+                            m_ext_choice = want;
+                        }
                     }
                 }
             }
@@ -631,7 +647,15 @@ void ProfileWizard::DrawBankAssignments()
         // Deliberately NOT part of `changed`: toggling Patched on a
         // stock template is still that stock template (patched stock is
         // a first-class stock flavor), it must not flip to Custom.
-        ImGui::Checkbox("Patched", &m_patched);
+        if (ImGui::Checkbox("Patched", &m_patched) && m_patched) {
+            // Patched hard-requires the matching game's assets -- align
+            // extflash automatically when they're available instead of
+            // failing validation.
+            int g = Bank1Game();
+            if (g >= 0 && m_library.status[g].external_found) {
+                m_ext_choice = g == 0 ? ExtOfwMario : ExtOfwZelda;
+            }
+        }
         int gi = Bank1Game();
         if (m_patched && gi >= 0 && ResolvePatchBinary(gi).empty()) {
             if (m_dl_state[gi].load() == 0) {
@@ -661,10 +685,31 @@ void ProfileWizard::DrawBankAssignments()
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Extflash");
     ImGui::SameLine(120 * g_viewport_mgr.m_scale);
-    const char *ext_items[] = { "Blank (0xFF)", "Mario Assets", "Zelda Assets",
-                                "File..." };
+    // Enum-keyed filtered list, same pattern as Bank 1 -- game-assets
+    // entries appear only when that game's extflash dump exists.
+    struct ExtItem { const char *label; int choice; };
+    ExtItem ext_items[4];
+    int ext_n = 0;
+    ext_items[ext_n++] = { "Blank (0xFF)", ExtBlank };
+    if (m_library.status[0].external_found) ext_items[ext_n++] = { "Mario Assets", ExtOfwMario };
+    if (m_library.status[1].external_found) ext_items[ext_n++] = { "Zelda Assets", ExtOfwZelda };
+    ext_items[ext_n++] = { "File...", ExtFile };
+    int ext_sel = 0;
+    for (int i = 0; i < ext_n; i++) {
+        if (ext_items[i].choice == m_ext_choice) ext_sel = i;
+    }
     ImGui::SetNextItemWidth(-FLT_MIN);
-    changed |= ImGui::Combo("##ext", &m_ext_choice, ext_items, 4);
+    if (ImGui::BeginCombo("##ext", ext_items[ext_sel].label)) {
+        for (int i = 0; i < ext_n; i++) {
+            if (ImGui::Selectable(ext_items[i].label, i == ext_sel)) {
+                if (m_ext_choice != ext_items[i].choice) {
+                    m_ext_choice = ext_items[i].choice;
+                    changed = true;
+                }
+            }
+        }
+        ImGui::EndCombo();
+    }
     if (m_ext_choice == ExtFile) {
         slot_file("Extflash file", m_ext_path);
     } else {
