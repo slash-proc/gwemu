@@ -934,6 +934,14 @@ static void report_stats(void)
  * braces, the flag alone is compositor-dependent. */
 static bool m_main_window_occluded;
 
+/* GNW_UI_FRAME_TRACE=1 per-second accumulators (see gl_render_frame). */
+static struct {
+    uint64_t main_present_ns, main_present_max_ns;
+    uint64_t settings_present_ns, settings_present_max_ns;
+    uint32_t main_rendered, main_skipped;
+    uint64_t last_report;
+} ui_trace;
+
 static void gl_render_frame(struct gwemu_console *scon)
 {
     static bool rendering;
@@ -963,29 +971,47 @@ static void gl_render_frame(struct gwemu_console *scon)
     gwemu_settings_hud_update();
     gwemu_main_loop_unlock();
     gwemu_settings_hud_render();
+    bool trace = gnw_env_enabled("GNW_UI_FRAME_TRACE");
     if (settings_visible) {
+        uint64_t t0 = trace ? SDL_GetTicksNS() : 0;
         SDL_RenderPresent(m_settings_renderer);
-    }
-
-#ifdef CONFIG_GWEMU_GUI
-    /* GNW_UI_FRAME_TRACE=1: 1/s settings-present pacing summary (field
-     * diagnosis of the occlusion stall; off by default). */
-    if (gnw_env_enabled("GNW_UI_FRAME_TRACE")) {
-        static uint64_t last_present, last_report;
-        static uint32_t frames, skipped;
-        uint64_t now = SDL_GetTicksNS();
-        if (settings_visible) frames++;
-        if (skip_main) skipped++;
-        (void)last_present;
-        last_present = now;
-        if (now - last_report > 1000000000ull) {
-            fprintf(stderr, "UI trace: settings %u fps, main skipped %u (occluded=%d)\n",
-                    frames, skipped, main_occluded);
-            frames = skipped = 0;
-            last_report = now;
+        if (trace) {
+            uint64_t dt = SDL_GetTicksNS() - t0;
+            ui_trace.settings_present_ns += dt;
+            if (dt > ui_trace.settings_present_max_ns) {
+                ui_trace.settings_present_max_ns = dt;
+            }
         }
     }
-#endif
+
+    /* GNW_UI_FRAME_TRACE=1: 1/s pacing summary (field diagnosis of the
+     * occluded-main settings sluggishness; off by default). Reports per
+     * second: sum+max time inside each window's SDL_RenderPresent, the
+     * live SDL_WINDOW_OCCLUDED flag vs the event-tracked occluded bool,
+     * and how many frames rendered vs skipped the main window. */
+    if (trace) {
+        uint64_t now = SDL_GetTicksNS();
+        if (skip_main) {
+            ui_trace.main_skipped++;
+        } else {
+            ui_trace.main_rendered++;
+        }
+        if (now - ui_trace.last_report > 1000000000ull) {
+            fprintf(stderr,
+                    "UI trace: main present %.1fms sum/%.1fms max, "
+                    "settings present %.1fms sum/%.1fms max, "
+                    "occluded flag=%d evt=%d, main rendered=%u skipped=%u\n",
+                    ui_trace.main_present_ns / 1e6,
+                    ui_trace.main_present_max_ns / 1e6,
+                    ui_trace.settings_present_ns / 1e6,
+                    ui_trace.settings_present_max_ns / 1e6,
+                    !!(SDL_GetWindowFlags(m_window) & SDL_WINDOW_OCCLUDED),
+                    m_main_window_occluded,
+                    ui_trace.main_rendered, ui_trace.main_skipped);
+            memset(&ui_trace, 0, sizeof(ui_trace));
+            ui_trace.last_report = now;
+        }
+    }
 
     if (skip_main) {
         qatomic_set(&rendering, false);
@@ -1028,7 +1054,17 @@ static void gl_render_frame(struct gwemu_console *scon)
     gwemu_main_loop_unlock();
 
     gwemu_hud_render();
-    SDL_RenderPresent(m_renderer);
+    {
+        uint64_t t0 = trace ? SDL_GetTicksNS() : 0;
+        SDL_RenderPresent(m_renderer);
+        if (trace) {
+            uint64_t dt = SDL_GetTicksNS() - t0;
+            ui_trace.main_present_ns += dt;
+            if (dt > ui_trace.main_present_max_ns) {
+                ui_trace.main_present_max_ns = dt;
+            }
+        }
+    }
 
 
     qatomic_set(&rendering, false);
@@ -1673,6 +1709,17 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
         g_ptr_array_add(new_argv, (char *)"-global");
         g_ptr_array_add(new_argv, ef);
     }
+    /* -config_path is gwemu-private and was compacted OUT of argv before
+     * qemu_init() (and out of g_orig_argv, captured post-compaction) --
+     * re-append it from the live settings path so a profile-scoped config
+     * survives the relaunch. */
+    const char *cfg_path = gwemu_settings_get_path();
+    char *cfg = NULL;
+    if (cfg_path && cfg_path[0]) {
+        cfg = g_strdup(cfg_path);
+        g_ptr_array_add(new_argv, (char *)"-config_path");
+        g_ptr_array_add(new_argv, cfg);
+    }
     g_ptr_array_add(new_argv, NULL);
 
     // execv() replaces this process image and does NOT run atexit handlers
@@ -1682,15 +1729,24 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
     // on relaunch.
     gwemu_settings_save();
 
+    /* One-shot diagnostic: this path replaces the process image, so log
+     * exactly what we are about to exec -- if the new process fails to
+     * appear, this is the only record of why. */
+    for (guint n = 0; n + 1 < new_argv->len; n++) {
+        fprintf(stderr, "relaunch: argv[%u]=%s\n", n,
+                (const char *)g_ptr_array_index(new_argv, n));
+    }
+    {
+        char cwd_buf[PATH_MAX];
+        fprintf(stderr, "relaunch: cwd=%s\n",
+                getcwd(cwd_buf, sizeof(cwd_buf)) ? cwd_buf : "(unknown)");
+    }
+
     execv(g_orig_argv[0], (char *const *)new_argv->pdata);
-    // execv only returns on failure -- nothing sane to do but report it and
-    // keep running with the old configuration rather than exit silently.
-    fprintf(stderr, "gwemu_relaunch_with_flash_images: execv failed: %s\n",
-            strerror(errno));
-    g_free(b1);
-    g_free(b2);
-    g_free(ef);
-    g_ptr_array_free(new_argv, TRUE);
+    /* execv only returns on failure. Be loud: a silent fall-through here
+     * previously looked identical to "the app vanished". */
+    fprintf(stderr, "relaunch: execv FAILED: %s\n", strerror(errno));
+    abort();
 }
 
 // This fork only has one real machine (gnw-h7b0), unlike genuinely
@@ -1837,9 +1893,6 @@ int main(int argc, char **argv)
         exit(status);
     }
 
-    g_orig_argc = argc;
-    g_orig_argv = argv;
-
     setlocale(LC_NUMERIC, "C");
 
 #ifdef _WIN32
@@ -1890,6 +1943,16 @@ int main(int argc, char **argv)
             break;
         }
     }
+
+    /* Capture AFTER the -config_path compaction above: capturing before it
+     * left g_orig_argc at the pre-compaction count while the array had been
+     * shifted (NULL hole at the new argc, stale duplicate at the end), so
+     * gwemu_relaunch_with_flash_images() walked past the end and crashed on
+     * strcmp(NULL, ...) -- the "Launch makes the app vanish" bug. The
+     * relaunch path re-appends -config_path itself from the saved settings
+     * path so the compaction doesn't lose it across an execv(). */
+    g_orig_argc = argc;
+    g_orig_argv = argv;
 
     gArgc = argc;
     gArgv = argv;
