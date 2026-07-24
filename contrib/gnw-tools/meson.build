@@ -46,12 +46,20 @@ gnw_cfw_engine_lib = static_library('gnw_cfw_engine',
                                      dependencies: [gnw_lzma_dep],
                                      install: false)
 
-# Top-level CFW patch driver -- see gnw_make_cfw_images.c's own comment.
-# Verified byte-exact against scripts/make_cfw_images.py for both mario and
-# zelda (see CHANGELOG); wired here as its own CLI tool, same convention as
+# CFW patch build driver as a LIBRARY (gnw_cfw_build.h) -- the actual
+# patch pipeline (verified byte-exact against scripts/make_cfw_images.py
+# for both games, see CHANGELOG), linkable by the GUI so profile creation
+# patches in-process instead of popen()ing the CLI.
+gnw_cfw_build_lib = static_library('gnw_cfw_build',
+                                    files('gnw_cfw_build.c', 'gnw_mario_patch.c', 'gnw_zelda_patch.c'),
+                                    link_with: [gnw_cfw_engine_lib],
+                                    dependencies: [gnw_lzma_dep],
+                                    install: false)
+
+# Thin CLI wrapper over gnw_cfw_build_lib, same convention as
 # gnw-make-boot-images above.
 executable('gnw-make-cfw-images',
-           files('gnw_make_cfw_images.c', 'gnw_mario_patch.c', 'gnw_zelda_patch.c'),
-           link_with: [gnw_cfw_engine_lib],
+           files('gnw_make_cfw_images.c'),
+           link_with: [gnw_cfw_build_lib],
            dependencies: [gnw_lzma_dep],
            install: false)
