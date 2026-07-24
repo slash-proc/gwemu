@@ -37,9 +37,11 @@ void DrawSlider(float v, bool hovered, ImVec2 pos, ImVec2 size);
 void DrawToggle(bool enabled, bool hovered, ImVec2 pos, ImVec2 size);
 bool Toggle(const char *str_id, bool *v, const char *description = nullptr);
 void Slider(const char *str_id, float *v, const char *description = nullptr);
-void FilePicker(const char *str_id, const char *current_path,
-                const SDL_DialogFileFilter *filters, int nfilters, bool dir,
-                std::function<void(const char *new_path)> on_select);
+std::string EllipsizeMiddle(const std::string &s, float max_w);
+
+void InlineFileField(const char *str_id, const char *current_path,
+                     const SDL_DialogFileFilter *filters, int nfilters, bool dir,
+                     std::function<void(const char *new_path)> on_select);
 void DrawComboChevron();
 void PrepareComboTitleDescription(const char *label, const char *description,
                                   float combo_size_ratio);

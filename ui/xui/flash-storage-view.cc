@@ -393,10 +393,9 @@ void GnwFlashStorageView::DrawBankSlot(const char *label, int bank_idx, bool all
     }
 
     if (slot.choice == 3) { // Browse...
-        ImGui::TextUnformatted(slot.custom_path.empty() ? "(no file)" : slot.custom_path.c_str());
-        ImGui::SameLine();
-        FilePicker("File", slot.custom_path.c_str(), kBankBrowseFilter, 2, false,
-                   [&slot](const char *p) { slot.custom_path = p; });
+        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
+        InlineFileField("##file", slot.custom_path.c_str(), kBankBrowseFilter, 2, false,
+                        [&slot](const char *p) { slot.custom_path = p; });
     } else if (slot.choice != 0 && allow_patch) {
         if (ImGui::Checkbox("Patch", &slot.patch)) {
             SyncImplicitExtflashRow();
@@ -506,8 +505,8 @@ void GnwFlashStorageView::DrawAddBlobModal()
             m_modal_path = path_buf;
         }
         ImGui::SameLine();
-        FilePicker("File", m_modal_path.c_str(), bin_filter, 2, false,
-                   [this](const char *p) { m_modal_path = p; });
+        InlineFileField("##modalfile", m_modal_path.c_str(), bin_filter, 2, false,
+                        [this](const char *p) { m_modal_path = p; });
         ImGui::InputInt("Offset (MiB)", &m_modal_offset_mib);
         if (m_modal_offset_mib < 0) m_modal_offset_mib = 0;
 
@@ -596,8 +595,8 @@ void GnwFlashStorageView::Draw()
         m_backup_dir = dir_buf;
     }
     ImGui::SameLine();
-    FilePicker("Folder", m_backup_dir.c_str(), nullptr, 0, true,
-               [this](const char *p) { m_backup_dir = p; RescanBackupDir(); });
+    InlineFileField("##backupdirpicker", m_backup_dir.c_str(), nullptr, 0, true,
+                    [this](const char *p) { m_backup_dir = p; RescanBackupDir(); });
     ImGui::SameLine();
     if (ImGui::Button("Rescan")) RescanBackupDir();
     DrawGameStatusRow("Mario", m_status[0]);
@@ -633,10 +632,10 @@ void GnwFlashStorageView::Draw()
     } else { // +Retro-Go
         ImGui::Text("Bank 1: %s (patched)", kGameNames[m_bank[0].choice - 1]);
         static const SDL_DialogFileFilter bin_filter[] = { { ".bin Files", "bin" }, { "All Files", "*" } };
-        ImGui::Text("Bank 2: %s", m_bank[1].custom_path.empty() ? "(no retro-go image selected)" : m_bank[1].custom_path.c_str());
+        ImGui::Text("Bank 2: ");
         ImGui::SameLine();
-        FilePicker("File", m_bank[1].custom_path.c_str(), bin_filter, 2, false,
-                   [this](const char *p) { m_bank[1].custom_path = p; });
+        InlineFileField("##bank2rg", m_bank[1].custom_path.c_str(), bin_filter, 2, false,
+                        [this](const char *p) { m_bank[1].custom_path = p; });
     }
 
     if (m_preset != kPresetStockMario && m_preset != kPresetStockZelda) {

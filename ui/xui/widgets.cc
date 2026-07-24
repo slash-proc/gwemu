@@ -298,23 +298,39 @@ void Slider(const char *str_id, float *v, const char *description)
     ImGui::PopStyleColor();
 }
 
-void FilePicker(const char *str_id, const char *current_path,
-                const SDL_DialogFileFilter *filters, int nfilters, bool dir,
-                std::function<void(const char *new_path)> on_select)
+std::string EllipsizeMiddle(const std::string &s, float max_w)
 {
-    ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32_BLACK_TRANS);
-    ImGuiStyle &style = ImGui::GetStyle();
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    ImVec2 cursor = ImGui::GetCursorPos();
-    const char *desc = (current_path && strlen(current_path)) ? current_path : "(None Selected)";
-    ImVec2 bb(ImGui::GetColumnWidth(),
-              GetWidgetTitleDescriptionHeight(str_id, desc));
-    ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0, 0));
+    if (ImGui::CalcTextSize(s.c_str()).x <= max_w) {
+        return s;
+    }
+    for (size_t keep = s.size(); keep > 6; keep--) {
+        size_t head = keep / 2, tail = keep - head;
+        std::string t = s.substr(0, head) + "..." + s.substr(s.size() - tail);
+        if (ImGui::CalcTextSize(t.c_str()).x <= max_w) {
+            return t;
+        }
+    }
+    return "...";
+}
+
+void InlineFileField(const char *str_id, const char *current_path,
+                     const SDL_DialogFileFilter *filters, int nfilters, bool dir,
+                     std::function<void(const char *new_path)> on_select)
+{
+    float sc = g_viewport_mgr.m_scale;
     ImGui::PushID(str_id);
-    bool status =
-        ImGui::ButtonEx("###file_button", bb, ImGuiButtonFlags_AllowOverlap);
-    ImGui::SetItemAllowOverlap();
-    if (status) {
+    ImGui::TextDisabled(dir ? ICON_FA_FOLDER : ICON_FA_FILE);
+    ImGui::SameLine(0, 4 * sc);
+    float reserve = ImGui::CalcTextSize("Change...").x + 30 * sc;
+    float max_w = ImGui::GetContentRegionAvail().x - reserve;
+    std::string p = (current_path && *current_path) ? current_path : "(no file)";
+    std::string disp = EllipsizeMiddle(p, max_w > 40 * sc ? max_w : 40 * sc);
+    ImGui::TextDisabled("%s", disp.c_str());
+    if (ImGui::IsItemHovered() && p != "(no file)") {
+        ImGui::SetTooltip("%s", p.c_str());
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Change...")) {
         if (dir) {
             ShowOpenFolderDialog(current_path, on_select);
         } else {
@@ -322,45 +338,6 @@ void FilePicker(const char *str_id, const char *current_path,
         }
     }
     ImGui::PopID();
-    ImGui::PopStyleVar();
-
-    WidgetTitleDescription(str_id, desc, p);
-
-    const ImVec2 p0 = ImGui::GetItemRectMin();
-    const ImVec2 p1 = ImGui::GetItemRectMax();
-
-    ImDrawList *draw_list = ImGui::GetWindowDrawList();
-
-    ImGui::PushFont(g_font_mgr.m_menu_font);
-    const char *icon = dir ? ICON_FA_FOLDER : ICON_FA_FILE;
-    ImVec2 ts_icon = ImGui::CalcTextSize(icon);
-    ImVec2 icon_pos = ImVec2(p1.x - style.FramePadding.x - ts_icon.x,
-                              p0.y + (p1.y - p0.y - ts_icon.y) / 2);
-    draw_list->AddText(icon_pos, ImGui::GetColorU32(ImGuiCol_Text), icon);
-
-    ImVec2 ts_clear_icon = ImGui::CalcTextSize(ICON_FA_XMARK);
-    ts_clear_icon.x += 2 * style.FramePadding.x;
-    ImVec2 clear_icon_pos = ImVec2(cursor.x + bb.x - ts_icon.x - ts_clear_icon.x, cursor.y);
-
-    auto prev_pos = ImGui::GetCursorPos();
-    ImGui::SetCursorPos(clear_icon_pos);
-
-    char *clear_button_id = g_strdup_printf("%s_clear", str_id);
-    ImGui::PushID(clear_button_id);
-
-    bool clear = ImGui::Button(ICON_FA_XMARK, ImVec2(ts_clear_icon.x, bb.y));
-    if (clear) {
-        on_select("");
-    }
-
-    ImGui::PopID();
-    g_free(clear_button_id);
-
-    ImGui::SetCursorPos(prev_pos);
-
-    ImGui::PopFont();
-
-    ImGui::PopStyleColor();
 }
 
 void DrawComboChevron()

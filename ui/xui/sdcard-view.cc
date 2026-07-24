@@ -101,8 +101,8 @@ void GnwSdCardView::Draw()
         m_content_dir = dir_buf;
     }
     ImGui::SameLine();
-    FilePicker("Folder", m_content_dir.c_str(), nullptr, 0, true,
-               [this](const char *p) { m_content_dir = p; });
+    InlineFileField("##contentdir", m_content_dir.c_str(), nullptr, 0, true,
+                    [this](const char *p) { m_content_dir = p; });
 
     const char *size_items[3] = { "8G", "16G", "32G" };
     ImGui::Combo("Size", &m_size_choice, size_items, 3);

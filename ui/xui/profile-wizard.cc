@@ -731,21 +731,7 @@ void ProfileWizard::SyncStockReflection()
 
 static const char *kGameDisplay[2] = { "Mario", "Zelda" };
 
-// Middle-ellipsize a path to fit max_w (full path goes in a tooltip).
-static std::string EllipsizeMiddle(const std::string &s, float max_w)
-{
-    if (ImGui::CalcTextSize(s.c_str()).x <= max_w) {
-        return s;
-    }
-    for (size_t keep = s.size(); keep > 6; keep--) {
-        size_t head = keep / 2, tail = keep - head;
-        std::string t = s.substr(0, head) + "..." + s.substr(s.size() - tail);
-        if (ImGui::CalcTextSize(t.c_str()).x <= max_w) {
-            return t;
-        }
-    }
-    return "...";
-}
+
 
 static void PushAccentButton()
 {
@@ -1127,7 +1113,7 @@ void ProfileWizard::DrawBankAssignments()
         ImGui::SetNextItemOpen(false);
         m_close_assignments_next = false;
     }
-    m_assignments_open = ImGui::CollapsingHeader("Bank Assignments");
+    m_assignments_open = ImGui::CollapsingHeader("Flash");
     if (!m_assignments_open) {
         return;
     }
@@ -1138,15 +1124,6 @@ void ProfileWizard::DrawBankAssignments()
     // including the one just changed (owner call, reverses the earlier
     // read-only-reflection behavior).
     bool changed = false;
-
-    auto slot_file = [&changed](const char *label, std::string &path) {
-        ImGui::TextUnformatted(path.empty() ? "(no file)" : path.c_str());
-        ImGui::SameLine();
-        FilePicker(label, path.c_str(), kBinFilter, 2, false,
-                   [&path](const char *p) { path = p; });
-        // (dialog result lands via callback; the combo switch to File...
-        // already counted as a change)
-    };
 
     ImGui::Indent();
 
@@ -1174,6 +1151,10 @@ void ProfileWizard::DrawBankAssignments()
                 if (m_bank1_choice != b1_items[i].choice) {
                     m_bank1_choice = b1_items[i].choice;
                     changed = true;
+                    if (m_bank1_choice == B1File) {
+                        ShowOpenFileDialog(kBinFilter, 2, m_bank1_path.c_str(),
+                                           [this](const char *p) { m_bank1_path = p; });
+                    }
                     if (Bank1Game() < 0) {
                         m_patched = false; // hidden checkbox never lingers on
                     } else {
@@ -1225,7 +1206,9 @@ void ProfileWizard::DrawBankAssignments()
         }
     }
     if (m_bank1_choice == B1File) {
-        slot_file("Bank1 file", m_bank1_path);
+        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
+        InlineFileField("##b1file", m_bank1_path.c_str(), kBinFilter, 2, false,
+                        [this](const char *p) { m_bank1_path = p; });
     }
 
     ImGui::AlignTextToFramePadding();
@@ -1233,9 +1216,25 @@ void ProfileWizard::DrawBankAssignments()
     ImGui::SameLine(120 * g_viewport_mgr.m_scale);
     const char *b2_items[] = { "Empty", "File..." };
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
-    changed |= ImGui::Combo("##b2", &m_bank2_choice, b2_items, 2);
+    if (ImGui::BeginCombo("##b2", b2_items[m_bank2_choice])) {
+        for (int i = 0; i < 2; i++) {
+            if (ImGui::Selectable(b2_items[i], i == m_bank2_choice)) {
+                if (m_bank2_choice != i) {
+                    m_bank2_choice = i;
+                    changed = true;
+                    if (m_bank2_choice == B2File) {
+                        ShowOpenFileDialog(kBinFilter, 2, m_bank2_path.c_str(),
+                                           [this](const char *p) { m_bank2_path = p; });
+                    }
+                }
+            }
+        }
+        ImGui::EndCombo();
+    }
     if (m_bank2_choice == B2File) {
-        slot_file("Bank2 file", m_bank2_path);
+        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
+        InlineFileField("##b2file", m_bank2_path.c_str(), kBinFilter, 2, false,
+                        [this](const char *p) { m_bank2_path = p; });
     }
 
     ImGui::AlignTextToFramePadding();
@@ -1262,13 +1261,19 @@ void ProfileWizard::DrawBankAssignments()
                 if (m_ext_choice != ext_items[i].choice) {
                     m_ext_choice = ext_items[i].choice;
                     changed = true;
+                    if (m_ext_choice == ExtFile) {
+                        ShowOpenFileDialog(kBinFilter, 2, m_ext_path.c_str(),
+                                           [this](const char *p) { m_ext_path = p; });
+                    }
                 }
             }
         }
         ImGui::EndCombo();
     }
     if (m_ext_choice == ExtFile) {
-        slot_file("Extflash file", m_ext_path);
+        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
+        InlineFileField("##extfile", m_ext_path.c_str(), kBinFilter, 2, false,
+                        [this](const char *p) { m_ext_path = p; });
     } else {
         ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
         changed |= DrawExtSizeStepper();
@@ -1377,7 +1382,13 @@ void ProfileWizard::DrawSdSection()
             }
         }
         if (ImGui::Selectable("Import file...", m_sd_mode == SdImport)) {
-            m_sd_mode = SdImport;
+            if (m_sd_mode != SdImport) {
+                m_sd_mode = SdImport;
+                ShowOpenFileDialog(kQcow2Filter, 2, m_sd_import_path.c_str(),
+                                   [this](const char *path) {
+                                       m_sd_import_path = path;
+                                   });
+            }
         }
         if (shareable.empty()) {
             ImGui::Selectable("Shared card... -- no shared cards yet", false,
@@ -1421,29 +1432,9 @@ void ProfileWizard::DrawSdSection()
         ImGui::TextDisabled("%d GiB card, sparse -- takes almost no disk "
                             "until written.", m_sd_new_size_gib);
     } else if (m_sd_mode == SdImport) {
-        // File row (slot_file idiom: glyph + dim ellipsized path + Browse).
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted("File");
-        ImGui::SameLine(120 * sc);
-        ImGui::TextDisabled(ICON_FA_FOLDER);
-        ImGui::SameLine();
-        float reserve = ImGui::CalcTextSize("Browse...").x + 40 * sc;
-        std::string p = m_sd_import_path.empty()
-            ? "(no file)"
-            : EllipsizeMiddle(m_sd_import_path,
-                              ImGui::GetContentRegionAvail().x - reserve);
-        ImGui::TextDisabled("%s", p.c_str());
-        if (ImGui::IsItemHovered() && p != m_sd_import_path &&
-            !m_sd_import_path.empty()) {
-            ImGui::SetTooltip("%s", m_sd_import_path.c_str());
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Browse...##sdimport")) {
-            ShowOpenFileDialog(kQcow2Filter, 2, m_sd_import_path.c_str(),
-                               [this](const char *path) {
-                                   m_sd_import_path = path;
-                               });
-        }
+        ImGui::SameLine(0, 10 * sc);
+        InlineFileField("##sdimport", m_sd_import_path.c_str(), kQcow2Filter, 2, false,
+                        [this](const char *p) { m_sd_import_path = p; });
 
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Transfer");
