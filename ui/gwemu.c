@@ -939,8 +939,27 @@ static struct {
     uint64_t main_present_ns, main_present_max_ns;
     uint64_t settings_present_ns, settings_present_max_ns;
     uint32_t main_rendered, main_skipped;
+    uint32_t throttle_retries;
     uint64_t last_report;
 } ui_trace;
+
+/* Adaptive present-stall throttle (self-clocking; needed because some
+ * compositors -- GNOME/Mutter over XWayland with the vulkan renderer,
+ * confirmed by field trace -- withhold swapchain images from an occluded
+ * window WITHOUT ever setting SDL_WINDOW_OCCLUDED or sending the OCCLUDED
+ * event, so the event/flag path above never engages and each main
+ * SDL_RenderPresent blocks ~1s, starving the settings window). We measure
+ * every main present; two consecutive presents slower than the threshold
+ * (while settings is visible) enter throttled mode, where the main
+ * window's render/present is skipped except for one probe present every
+ * retry-cadence interval. A fast probe exits throttled mode immediately. */
+#define GNW_PRESENT_STALL_THRESHOLD_NS  50000000ull  /*  50 ms */
+#define GNW_PRESENT_RETRY_CADENCE_NS   500000000ull  /* 500 ms */
+static struct {
+    bool throttled;
+    uint32_t slow_streak;      /* consecutive slow presents */
+    uint64_t last_retry_ns;    /* when the last throttled-mode probe ran */
+} ui_throttle;
 
 static void gl_render_frame(struct gwemu_console *scon)
 {
@@ -965,7 +984,18 @@ static void gl_render_frame(struct gwemu_console *scon)
      * repro). Single-threaded on purpose: SDL renderer APIs are not
      * thread-safe across windows.
      */
-    bool skip_main = main_occluded && settings_visible;
+    uint64_t frame_now = SDL_GetTicksNS();
+    if (!settings_visible) {
+        /* Never throttle without a settings window to serve -- an
+         * alt-tabbed fullscreen user keeps normal vsync behavior, and
+         * closing the wizard/settings always exits throttled mode. */
+        ui_throttle.throttled = false;
+        ui_throttle.slow_streak = 0;
+    }
+    bool throttle_retry = ui_throttle.throttled &&
+        frame_now - ui_throttle.last_retry_ns >= GNW_PRESENT_RETRY_CADENCE_NS;
+    bool skip_main = settings_visible &&
+        (main_occluded || (ui_throttle.throttled && !throttle_retry));
 
     gwemu_main_loop_lock();
     gwemu_settings_hud_update();
@@ -1000,14 +1030,16 @@ static void gl_render_frame(struct gwemu_console *scon)
             fprintf(stderr,
                     "UI trace: main present %.1fms sum/%.1fms max, "
                     "settings present %.1fms sum/%.1fms max, "
-                    "occluded flag=%d evt=%d, main rendered=%u skipped=%u\n",
+                    "occluded flag=%d evt=%d, main rendered=%u skipped=%u, "
+                    "throttled=%d retries=%u\n",
                     ui_trace.main_present_ns / 1e6,
                     ui_trace.main_present_max_ns / 1e6,
                     ui_trace.settings_present_ns / 1e6,
                     ui_trace.settings_present_max_ns / 1e6,
                     !!(SDL_GetWindowFlags(m_window) & SDL_WINDOW_OCCLUDED),
                     m_main_window_occluded,
-                    ui_trace.main_rendered, ui_trace.main_skipped);
+                    ui_trace.main_rendered, ui_trace.main_skipped,
+                    ui_throttle.throttled, ui_trace.throttle_retries);
             memset(&ui_trace, 0, sizeof(ui_trace));
             ui_trace.last_report = now;
         }
@@ -1055,14 +1087,35 @@ static void gl_render_frame(struct gwemu_console *scon)
 
     gwemu_hud_render();
     {
-        uint64_t t0 = trace ? SDL_GetTicksNS() : 0;
+        /* Timed unconditionally (nanosecond-cheap): this measurement
+         * drives the adaptive stall throttle; the tracer just reads it. */
+        uint64_t t0 = SDL_GetTicksNS();
         SDL_RenderPresent(m_renderer);
+        uint64_t dt = SDL_GetTicksNS() - t0;
         if (trace) {
-            uint64_t dt = SDL_GetTicksNS() - t0;
             ui_trace.main_present_ns += dt;
             if (dt > ui_trace.main_present_max_ns) {
                 ui_trace.main_present_max_ns = dt;
             }
+            if (throttle_retry) {
+                ui_trace.throttle_retries++;
+            }
+        }
+        if (throttle_retry) {
+            ui_throttle.last_retry_ns = SDL_GetTicksNS();
+        }
+        if (dt > GNW_PRESENT_STALL_THRESHOLD_NS) {
+            /* Require 2 consecutive slow presents before throttling so a
+             * one-off compositor hiccup doesn't trip it. */
+            if (settings_visible && ++ui_throttle.slow_streak >= 2) {
+                ui_throttle.throttled = true;
+                ui_throttle.last_retry_ns = SDL_GetTicksNS();
+            }
+        } else {
+            /* Fast present (incl. a fast throttled-mode probe): the
+             * window is visible again -- resume full-rate rendering. */
+            ui_throttle.slow_streak = 0;
+            ui_throttle.throttled = false;
         }
     }
 
