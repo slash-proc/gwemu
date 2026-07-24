@@ -14,11 +14,12 @@ name: Release build
 #   (contrib/appimage/build-appimage.sh) -- the zero-argument GUI binary
 #   plus bundled libs in a single executable file. It accepts explicit
 #   -M/-display arguments too, so no separate qemu-system-arm asset.
-# - macOS: ONE direct asset per arch, gwemu-<version>-macos-<arch>.dmg
-#   containing a self-contained gwemu.app (dylibs in Contents/
-#   Frameworks, ad-hoc signed) -- recipe validated on real hardware
-#   2026-07-24. The .app binary accepts explicit -M/-display args, so
-#   no separate qemu-system-arm asset here either.
+# - macOS: ONE direct asset, gwemu-<version>-macos-universal.dmg -- a
+#   universal (arm64+x86_64 lipo-merged) self-contained gwemu.app
+#   (dylibs in Contents/Frameworks, ad-hoc signed; per-arch recipe
+#   validated on real Intel hardware 2026-07-24, arm64 slice smoke-
+#   tested on the merge runner). The .app binary accepts explicit
+#   -M/-display args, so no separate qemu-system-arm asset either.
 # - scripts.zip: this project's own scripts/*.py, scripts/*.sh and
 #   requirements.txt as ONE separate, optional asset (owner's call,
 #   2026-07-24: binaries ready-to-go, scripts opt-in). Upstream QEMU's
@@ -399,17 +400,85 @@ jobs:
           # re-sign must come AFTER the rpath fix (dylibbundler's own
           # per-file ad-hoc signing is fine underneath).
           codesign --force --deep -s - "$APP"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gwemu-macos-${{ matrix.arch }}-app
+          path: dist-macos/
+          # Intermediate (NOT a release asset): merge-macos-universal
+          # lipo-merges both arch .apps into the one universal DMG.
+          # artifact@v4 strips exec bits; the merge job restores them.
+
+  # lipo both arch .apps into ONE universal gwemu.app / DMG -- the only
+  # macOS release asset (xemu's macos-universal model). The main binary
+  # AND every bundled dylib get fat-merged pairwise; the two Homebrew
+  # prefixes (/opt/homebrew vs /usr/local) can drift in what dylibs they
+  # pull in, so a set mismatch FAILS the job instead of silently
+  # shipping a half-universal app that dies on one arch.
+  merge-macos-universal:
+    needs: [build-macos]
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: gwemu-macos-arm64-app
+          path: arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: gwemu-macos-x86_64-app
+          path: x86_64
+
+      - name: Merge, sign, DMG
+        run: |
+          set -euo pipefail
+          A=arm64/gwemu.app
+          X=x86_64/gwemu.app
+
+          diff <(cd "$A/Contents/Frameworks" && ls | sort) \
+               <(cd "$X/Contents/Frameworks" && ls | sort) || {
+            echo "Frameworks sets differ between arches (see diff above)" >&2
+            exit 1
+          }
+
+          mkdir -p dist-macos
+          cp -R "$A" dist-macos/gwemu.app
+          U=dist-macos/gwemu.app
+          lipo -create "$A/Contents/MacOS/gwemu" "$X/Contents/MacOS/gwemu" \
+               -output "$U/Contents/MacOS/gwemu"
+          for f in "$A"/Contents/Frameworks/*.dylib; do
+            b="$(basename "$f")"
+            lipo -create "$f" "$X/Contents/Frameworks/$b" \
+                 -output "$U/Contents/Frameworks/$b"
+          done
+          chmod +x "$U/Contents/MacOS/gwemu"
+          lipo -info "$U/Contents/MacOS/gwemu"
+          # lipo output is unsigned; ad-hoc sign the merged bundle.
+          codesign --force --deep -s - "$U"
           ln -s /Applications dist-macos/Applications
 
           VERSION="${GITHUB_REF_NAME#v}"
           case "$GITHUB_REF_NAME" in v*) ;; *) VERSION="${GITHUB_SHA::8}" ;; esac
           mkdir macos-dmg
           hdiutil create -volname GWemu -srcfolder dist-macos -ov -format UDZO \
-            "macos-dmg/gwemu-$VERSION-macos-${{ matrix.arch }}.dmg"
+            "macos-dmg/gwemu-$VERSION-macos-universal.dmg"
+
+      - name: Smoke test (native arch of this runner)
+        run: |
+          set -euo pipefail
+          # macos-14 = arm64: launching the universal app here exercises
+          # the arm64 slice (the x86_64 slice was validated on real
+          # Intel hardware when the recipe landed). Alive after 10s with
+          # sane startup output = pass.
+          ./dist-macos/gwemu.app/Contents/MacOS/gwemu > out.log 2>&1 &
+          pid=$!
+          sleep 10
+          kill -0 "$pid" || { echo "app died:"; cat out.log; exit 1; }
+          kill "$pid" || true
+          grep -E "gwemu_version|SDL_RENDERER" out.log
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gwemu-macos-${{ matrix.arch }}-dmg
+          name: gwemu-macos-universal-dmg
           path: macos-dmg/
           # Single-file direct asset -- publish-release moves the .dmg
           # out un-zipped (a DMG needs no exec bit, unlike the AppImage).
@@ -539,7 +608,7 @@ jobs:
           done
 
   publish-release:
-    needs: [build-linux, build-macos, build-windows]
+    needs: [build-linux, merge-macos-universal, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
