@@ -18,7 +18,7 @@ exec 2> >(tee gwemu.log >&2)
 
 #./build/qemu-system-arm -M gnw-h7b0 \
 
-~/Downloads/gwemu-linux-x86_64\(1\)/gwemu-linux-x86_64/qemu-system-arm.bin -M gnw-h7b0 \
+build/qemu-system-arm -M gnw-h7b0 \
   -global gnw-h7b0-soc.bank1-image=backup/qemu-images/zelda-bank1-patched.bin \
   -global gnw-h7b0-soc.bank2-image=backup/qemu-images/retro-go-bank2.bin \
   -global gnw-h7b0-soc.extflash-image=backup/qemu-images/zelda-extflash-patched-plus-retro-go.bin \
