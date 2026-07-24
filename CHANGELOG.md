@@ -1,3 +1,32 @@
+2026-07-24  GUI: device-profile system Phases 1-2 + staged firmware wizard.
+            Profile store backend (ui/gwemu-profiles: per-profile dirs
+            with owned flash copies + profile.toml via tomlplusplus,
+            shared-SD registry, docker-style name generator). CFW patch
+            driver librarified (gnw_cfw_build_images -- GUI patches
+            in-process, popen path deleted); gnwmanager per-game patch
+            binaries lazily downloaded (hardcoded raw-file URLs, sha1
+            spot-verified, appdata cache). Two-stage wizard designed by
+            a multi-agent UI team (flow + visual specs, merged/arbitrated)
+            replaces the xemu welcome window entirely, hosted in the
+            settings window: Add Firmware stage (Mario/Zelda status cards
+            with tactful illumination, folder unit) -> New Device Profile
+            form (template radios, Bank Assignments accordion, unified
+            Patched checkbox default-on, power-of-2 extflash stepper with
+            a shared ZeldaInvolved() 4MiB floor, SD Card section --
+            import/attach live, create gated). Launch = relaunch flow,
+            now carrying -drive if=sd. New C SD-image builder
+            gnw-make-sd-image (MBR+FAT32 behind a sector-write callback;
+            fsck-clean, mtools tree-identical to the Python oracle which
+            is now test-only). Fixes en route: -config_path argv
+            compaction segfault + relaunch argv capture ordering,
+            FontAwesome merged into default/small fonts (MergeMode
+            attaches per-font -- '?' glyph boxes), dialog defaults
+            absolutize-or-NULL, pinned-row margins, occluded-main-window
+            render stall (event-driven adaptive present throttle;
+            compositor never reports SDL occlusion here -- self-clocking
+            50ms/2-strike detection, event-driven resume, 5s failsafe
+            probe, GNW_UI_FRAME_TRACE tracer).
+
 2026-07-24  RELEASES: single-file-per-platform asset lineup. Linux:
             gwemu-<ver>-x86_64.AppImage (contrib/appimage/, verified
             locally against a real firmware boot; fully-static Linux

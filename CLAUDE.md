@@ -197,6 +197,27 @@ only where it's genuine attribution to the real upstream project (license header
   originals for both games. `make_sdcard_image.py` (FAT32/qcow2 generation)
   is NOT ported to C — the GUI shells out to it as a subprocess (on a
   background thread, see the async rule above).
+- **Device profiles** (2026-07-24): the GUI is profile-centric -- named sets of
+  bank1/bank2/extflash + optional SD living in per-profile dirs under app data
+  (`ui/gwemu-profiles`), created by the staged wizard in `ui/xui/profile-wizard.*`
+  (hosted inside the settings window). Images stay content-blind opaque blobs
+  (owner decision -- no extflash offset awareness). UI colors/spacing route
+  through `ui/xui/gnw-style-tokens.hh`; the compiled FontAwesome subset is ~55
+  glyphs and `MergeMode` attaches icons PER FONT in `font-manager.cc` -- a '?'
+  box means the glyph isn't merged into the font you're drawing with, or isn't
+  in the subset at all.
+- **Occluded-window render throttle** (`ui/gwemu.c` gl_render_frame): the settings
+  window presents FIRST; a self-clocking throttle (2 consecutive >50ms main
+  presents) skips the main window while covered, resumes on main-window events
+  (EXPOSED/FOCUS/MOUSE_ENTER; Mutter never sets SDL's occlusion flag) with a 5s
+  failsafe probe (a probe BLOCKS ~500ms -- never probe frequently).
+  `GNW_UI_FRAME_TRACE=1` prints per-second pacing lines. GNW_* diag env vars
+  treat unset/empty/0 as OFF (`gnw_env_enabled`) -- never bare getenv()!=NULL,
+  and never let per-frame stderr spam reach an attached Windows console (it
+  blocks the process into unusability).
+- **`gnw-make-sd-image`** (contrib/gnw-tools): C MBR+FAT32 SD image builder
+  behind a sector-write callback (QEMU-block-layer glue reuses it);
+  `scripts/make_sdcard_image.py` is a test oracle only now.
 - When multiple agents/sessions touch `ui/xui/main-menu.cc` (the shared tab
   registration point) concurrently, keep each tab's actual content in its own
   `.cc`/`.hh` file pair and only touch `main-menu.cc`/`.hh` for the minimal

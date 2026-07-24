@@ -75,22 +75,23 @@ audio, gamepad input, SD card, save/flash persistence.
   genuine persistent flash-image backing via `CreateFileMapping`, not a
   silent ephemeral-RAM fallback).
 - GUI (`gwemu`, see `CLAUDE.md`'s "GUI" section for build/workflow specifics):
-  Phase 1 (SDL3+ImGui foundation, ported from xemu with zero Xbox content)
-  is committed and verified. Phase 2 (real menu content — Flash/SD Card
-  presets and geometry-bar extflash editor, Input rebinding, Display/Audio,
-  Snapshots, RTC time sync, Reset/Power buttons, an Apply-triggered restart flow)
-  is built and working. The Wayland-specific ImGui viewport limitations were
-  bypassed by engineering a dual-context native OS window architecture for
-  Settings, complete with independent high-DPI scaling and flicker-free
-  cross-context cursor management. Phase 2 is now fully operational. All of
-  it (plus the 2026-07-24 perf/CI work) is uncommitted in the working tree;
-  a 7-commit landing plan is agreed and pending execution.
-- `contrib/gnw-tools/`: C ports of `make_boot_images.py` and
-  `make_cfw_images.py` (including a from-scratch C port of gnwmanager's
-  Thumb-2 assembler/lz77/LZMA/relocation-engine patch pipeline), both
-  byte-exact verified against their Python originals, built specifically
-  so the GUI can call them as real library functions. `make_sdcard_image.py`
-  is not ported to C; the GUI shells it out on a background thread.
+  device-PROFILE-centric restructure underway (plan:
+  Phases 1-2 landed 2026-07-24: profile store backend
+  (`ui/gwemu-profiles`, per-profile dirs + profile.toml under app data),
+  the staged Add Firmware -> New Device Profile wizard hosted in the
+  settings window (game-status cards, firmware strip, template radios,
+  Bank Assignments accordion, in-process CFW patching, gnwmanager patch
+  auto-download, SD Card section with import/attach live), and launch
+  wiring incl. the SD -drive. Remaining: Phase 3 (Profiles top-level tab,
+  Flash/SD tab demotion, CLI-adopt toast) and the qcow2-create glue that
+  un-gates "New card".
+- `contrib/gnw-tools/`: C ports of `make_boot_images.py`,
+  `make_cfw_images.py` (full patch pipeline, byte-exact verified, now a
+  linkable library `gnw_cfw_build` -- the GUI patches in-process, no
+  popen), and NEW 2026-07-24: `gnw-make-sd-image` (MBR+FAT32 SD image
+  builder behind a sector-write callback, fsck-clean and tree-identical
+  to the Python oracle via mtools). `make_sdcard_image.py` is now a test
+  oracle only.
 
 ## Tooling notes worth keeping in mind
 
