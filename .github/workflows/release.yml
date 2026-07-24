@@ -10,17 +10,18 @@ name: Release build
 # library the eventual GUI imports directly instead of shelling out; do
 # not build anything here that assumes today's packaging is permanent):
 #
-# - Linux/macOS: one zip per platform containing ONLY the ready-to-run
-#   runtime: gwemu (the standalone, zero-argument GUI binary, see
-#   meson.build's gwemu-binary-alias target and ui/gwemu.c) plus
-#   qemu-system-arm (same binary, generic upstream name, for scripted
-#   -M/-display invocations), portable-ized per-OS (see each job).
+# - Linux: ONE direct asset, gwemu-<version>-x86_64.AppImage
+#   (contrib/appimage/build-appimage.sh) -- the zero-argument GUI binary
+#   plus bundled libs in a single executable file. It accepts explicit
+#   -M/-display arguments too, so no separate qemu-system-arm asset.
+# - macOS: one zip per arch with gwemu/qemu-system-arm + libs/ (single-
+#   file DMG conversion in progress, see the mac-DMG work 2026-07-24).
 # - scripts.zip: this project's own scripts/*.py, scripts/*.sh and
 #   requirements.txt as ONE separate, optional asset (owner's call,
 #   2026-07-24: binaries ready-to-go, scripts opt-in). Upstream QEMU's
 #   own scripts/ are NOT included.
 # - Windows: NO zip -- two direct assets, a fully static single-file
-#   gwemu.exe (portable) and gwemu-setup.exe (NSIS per-user installer).
+#   gwemu-portable.exe and gwemu-setup.exe (NSIS per-user installer).
 #   No scripts, no qemu-system-arm.exe (owner's call, 2026-07-24).
 
 on:
@@ -134,59 +135,38 @@ jobs:
         # signed qemu-system-arm custom_target below, which needs naming
         # explicitly.
 
-      - name: Package
+      - name: Package (AppImage -- the single-file Linux asset)
         run: |
           set -euo pipefail
-          OUT=gwemu-linux-x86_64
-          mkdir -p "$OUT/lib"
-
-          package_bin() {
-            local src="$1" dst_name="$2"
-            if [ ! -f "$src" ]; then
-              echo "$src not found under build/ -- build tree:" >&2
-              find build -maxdepth 2 >&2
-              exit 1
-            fi
-            cp "$src" "$OUT/$dst_name.bin"
-            # Linux embeds full DWARF debug info directly in the ELF
-            # binary (unlike macOS, where it lives in a separate .dSYM
-            # bundle we never package) -- confirmed real difference:
-            # unstripped qemu-system-arm here is ~138MB vs the macOS
-            # build's much smaller packaged binary. Strip it; end users
-            # of a release build don't need debug symbols.
-            strip "$OUT/$dst_name.bin"
-            # Bundle non-base-OS shared libs (SDL2/glib/pixman/epoxy and
-            # their own transitive deps) next to the binary, since those
-            # aren't guaranteed present on an arbitrary target system the
-            # way libc/libpthread/etc. are. A wrapper script points
-            # LD_LIBRARY_PATH at them. This does NOT solve glibc-version
-            # skew on its own (see the container comment above) -- it
-            # only covers "these libs aren't installed at all" on the
-            # target machine. SDL3 itself is built static (see meson.build)
-            # so it never shows up here for either binary.
-            for lib in $(ldd "$src" | awk '{print $3}' | grep -v '^$'); do
-              base=$(basename "$lib")
-              case "$base" in
-                libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-linux*|libresolv.so*|libutil.so*)
-                  continue ;;
-              esac
-              cp -n "$lib" "$OUT/lib/" 2>/dev/null || true
-            done
-            # (printf, not a heredoc: a heredoc body would inherit this
-            # YAML block's own indentation literally, breaking the
-            # shebang -- printf sidesteps that entirely.)
-            printf '%s\n' \
-              '#!/bin/sh' \
-              '# Portable launcher: point the loader at the bundled libs next' \
-              '# to this script before exec'"'"'ing the real binary.' \
-              'DIR="$(cd "$(dirname "$0")" && pwd)"' \
-              "exec env LD_LIBRARY_PATH=\"\$DIR/lib:\${LD_LIBRARY_PATH:-}\" \"\$DIR/$dst_name.bin\" \"\$@\"" \
-              > "$OUT/$dst_name"
-            chmod +x "$OUT/$dst_name" "$OUT/$dst_name.bin"
-          }
-
-          package_bin "$(find build -maxdepth 1 -type f -name qemu-system-arm)" qemu-system-arm
-          package_bin "$(find build -maxdepth 1 -type f -name gwemu)" gwemu
+          # contrib/appimage/build-appimage.sh does what the old zip
+          # packaging did (strip, bundle non-base-OS shared libs, an
+          # LD_LIBRARY_PATH launcher -- glibc floor still comes from the
+          # 22.04 container, see the container comment above) folded
+          # into ONE executable file. No qemu-system-arm asset anymore:
+          # the AppImage accepts the same explicit -M/-display arguments.
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y --no-install-recommends curl file
+          curl -fsSL -o /usr/local/bin/appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x /usr/local/bin/appimagetool
+          # No FUSE inside the container -- run appimagetool extracted.
+          printf '%s\n' '#!/bin/sh' \
+            'exec /usr/local/bin/appimagetool --appimage-extract-and-run "$@"' \
+            > /usr/local/bin/appimagetool-wrapped
+          chmod +x /usr/local/bin/appimagetool-wrapped
+          src="$(find build -maxdepth 1 -type f -name qemu-system-arm)"
+          if [ -z "$src" ]; then
+            echo "qemu-system-arm not found under build/ -- build tree:" >&2
+            find build -maxdepth 2 >&2
+            exit 1
+          fi
+          # Conventional AppImage naming: gwemu-<version>-x86_64.AppImage
+          # (workflow_dispatch runs have no tag -- fall back to the sha).
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$GITHUB_REF_NAME" in v*) ;; *) VERSION="${GITHUB_SHA::8}" ;; esac
+          APPIMAGETOOL=/usr/local/bin/appimagetool-wrapped \
+            contrib/appimage/build-appimage.sh "$src" "gwemu-$VERSION-x86_64.AppImage"
+          mkdir linux-bin && mv "gwemu-$VERSION-x86_64.AppImage" linux-bin/
 
       - name: Stage scripts artifact (once, from this job only)
         run: |
@@ -210,14 +190,11 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gwemu-linux-x86_64
-          path: gwemu-linux-x86_64/
-          # Uploading a pre-made .zip here and re-zipping in publish-release
-          # produced a real, confirmed zip-inside-a-zip in the actual
-          # release asset a user downloaded (v0.0.1) -- upload-artifact's
-          # own storage wrapping doesn't compose cleanly with an
-          # already-zipped single file feeding into action-gh-release.
-          # Upload the raw directory; publish-release zips it exactly once.
+          name: gwemu-linux-bin
+          path: linux-bin/
+          # Single-file direct asset (like the Windows exes):
+          # publish-release moves it out un-zipped and restores its exec
+          # bit (upload-artifact@v4 strips permissions).
 
   build-macos:
     strategy:
@@ -407,8 +384,8 @@ jobs:
     # result is a SINGLE self-contained gwemu.exe importing only Windows
     # system DLLs -- xemu's own distribution model. This replaced the
     # fedora-win64-cross + bundled-DLLs job (v0.0.11 and earlier zips);
-    # Windows ships two direct (un-zipped) release assets: gwemu.exe
-    # (portable) and gwemu-setup.exe (NSIS per-user installer, see
+    # Windows ships two direct (un-zipped) release assets:
+    # gwemu-portable.exe and gwemu-setup.exe (NSIS per-user installer, see
     # contrib/gwemu-installer/gwemu.nsi). No scripts/, no
     # qemu-system-arm.exe -- owner's call, Windows users don't use them.
     # --disable-sdl/--disable-sdl-image: QEMU's legacy SDL2 display, not
@@ -475,7 +452,8 @@ jobs:
           # common-ancestor directory structure, which publish-release
           # would then have to un-nest -- avoid that entirely.
           mkdir win-exes
-          cp build-win-static/gwemu.exe gwemu-setup.exe win-exes/
+          cp build-win-static/gwemu.exe win-exes/gwemu-portable.exe
+          cp gwemu-setup.exe win-exes/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -550,17 +528,24 @@ jobs:
           # build jobs is gone by the time we get here. Restore exec bits
           # on the Linux/macOS binaries, launchers and scripts before the
           # real zip (zip -r does preserve them). Windows doesn't care.
-          for d in gwemu-linux-* gwemu-macos-*; do
+          for d in gwemu-macos-*; do
             [ -d "$d" ] || continue
             chmod +x "$d"/qemu-system-arm* "$d"/gwemu* 2>/dev/null || true
           done
           chmod +x scripts/scripts/* 2>/dev/null || true
-          # Windows ships its two exes as DIRECT assets (owner's call:
-          # portable gwemu.exe + gwemu-setup.exe, no zip) -- move them
-          # out before the zip loop so they don't get wrapped.
+          # Windows exes and the Linux AppImage ship as DIRECT un-zipped
+          # assets -- move them out before the zip loop so they don't
+          # get wrapped. The AppImage needs its exec bit restored
+          # (artifact@v4 strips permissions; a non-executable AppImage
+          # is dead on arrival).
           if [ -d gwemu-windows-exes ]; then
             mv gwemu-windows-exes/* ..
             rm -rf gwemu-windows-exes
+          fi
+          if [ -d gwemu-linux-bin ]; then
+            chmod +x gwemu-linux-bin/*
+            mv gwemu-linux-bin/* ..
+            rm -rf gwemu-linux-bin
           fi
           for d in */; do
             d="${d%/}"
@@ -572,7 +557,8 @@ jobs:
         with:
           files: |
             *.zip
-            gwemu.exe
+            *.AppImage
+            gwemu-portable.exe
             gwemu-setup.exe
           draft: true
           generate_release_notes: true
