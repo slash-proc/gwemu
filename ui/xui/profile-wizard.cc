@@ -9,6 +9,7 @@
 #include "font-manager.hh"
 #include "widgets.hh"
 #include "misc.hh"
+#include "gnw-style-tokens.hh"
 #include "gwemu-hud.h"
 #include "../gwemu-profiles.hh"
 
@@ -159,6 +160,18 @@ void ProfileWizard::Open()
     m_created_id.clear();
     m_completed = false;
     m_name_hint = GwProfileStore::GenerateName();
+    // Stage entry: re-entry with existing profiles starts at S2 directly;
+    // first run starts at the firmware prompt (S1a), or its status page
+    // if a folder was already chosen this session.
+    if (!g_profile_store.Profiles().empty()) {
+        m_stage = StageProfile;
+        m_s2_visited = true;
+    } else {
+        m_stage = m_folder_chosen ? StageFwStatus : StageFwPrompt;
+    }
+    m_focus_continue = false;
+    m_card_prev_state[0] = m_card_prev_state[1] = -1;
+    m_card_lit_ns[0] = m_card_lit_ns[1] = 0;
     is_open = true;
 }
 
@@ -502,30 +515,348 @@ void ProfileWizard::SyncStockReflection()
     }
 }
 
-void ProfileWizard::DrawBackupFolderRow()
+/* ------------------------------------------------------------------ */
+/* Firmware stage (S1a prompt / S1b status) + the game-card motif       */
+
+static const char *kGameDisplay[2] = { "Mario", "Zelda" };
+
+// Middle-ellipsize a path to fit max_w (full path goes in a tooltip).
+static std::string EllipsizeMiddle(const std::string &s, float max_w)
 {
-    // Clean minimal backup-folder affordance (the Flash tab's picker is
-    // deliberately NOT reused here -- owner call).
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted("Backup folder");
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", m_library.dir.c_str());
-    ImGui::SameLine();
-    if (ImGui::Button("Browse...##backupdir")) {
-        ShowOpenFolderDialog(m_library.dir.c_str(), [this](const char *path) {
-            m_library.dir = path;
-            m_library.Rescan();
-            if ((m_template == TplStockMario && !m_library.status[0].Available()) ||
-                (m_template == TplStockZelda && !m_library.status[1].Available())) {
-                m_template = TplCustom;
-            }
-        });
+    if (ImGui::CalcTextSize(s.c_str()).x <= max_w) {
+        return s;
     }
-    bool any = m_library.status[0].Available() || m_library.status[1].Available();
-    if (!any) {
-        ImGui::TextDisabled("No verified stock dumps found -- pick the folder "
-                            "with your gnwmanager backups to enable the stock "
-                            "templates.");
+    for (size_t keep = s.size(); keep > 6; keep--) {
+        size_t head = keep / 2, tail = keep - head;
+        std::string t = s.substr(0, head) + "..." + s.substr(s.size() - tail);
+        if (ImGui::CalcTextSize(t.c_str()).x <= max_w) {
+            return t;
+        }
+    }
+    return "...";
+}
+
+static void PushAccentButton()
+{
+    ImGui::PushStyleColor(ImGuiCol_Button, GNW_COL_ACCENT);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, GNW_COL_ACCENT_HOVER);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, GNW_COL_ACCENT_ACTIVE);
+}
+
+static void PopAccentButton()
+{
+    ImGui::PopStyleColor(3);
+}
+
+int ProfileWizard::CompleteCount() const
+{
+    int n = 0;
+    for (int i = 0; i < 2; i++) {
+        if (GnwCardStateOf(m_library.status[i]) == kCardComplete) {
+            n++;
+        }
+    }
+    return n;
+}
+
+void ProfileWizard::PickFolder()
+{
+    // Default-location convention: only pass it if it exists as an
+    // absolute path, else NULL (SDL rejects relative paths).
+    const char *def = NULL;
+    if (g_path_is_absolute(m_library.dir.c_str()) &&
+        g_file_test(m_library.dir.c_str(), G_FILE_TEST_IS_DIR)) {
+        def = m_library.dir.c_str();
+    }
+    ShowOpenFolderDialog(def, [this](const char *path) {
+        m_library.dir = path;
+        m_library.Rescan();
+        m_folder_chosen = true;
+        if (m_stage == StageFwPrompt) {
+            m_stage = StageFwStatus;
+        }
+        if ((m_template == TplStockMario && !m_library.status[0].Available()) ||
+            (m_template == TplStockZelda && !m_library.status[1].Available())) {
+            m_template = TplCustom;
+        }
+    });
+}
+
+void ProfileWizard::EnterProfileStage()
+{
+    if (!m_s2_visited) {
+        m_s2_visited = true;
+        // Template default on first S2 entry: first Complete stock game
+        // if any, else Custom.
+        int first = -1;
+        for (int i = 0; i < 2; i++) {
+            if (GnwCardStateOf(m_library.status[i]) == kCardComplete) {
+                first = i;
+                break;
+            }
+        }
+        if (first >= 0) {
+            m_template = first;
+            SyncStockReflection();
+        } else {
+            m_template = TplCustom;
+            m_open_assignments_next = true;
+        }
+    }
+    m_stage = StageProfile;
+}
+
+void ProfileWizard::DrawCardTooltip(int gi)
+{
+    const GnwBackupGameStatus &st = m_library.status[gi];
+    GnwGameCardState cs = GnwCardStateOf(st);
+    const char *game = GnwBackupLibrary::GameName(gi);
+    ImGui::BeginTooltip();
+    ImGui::Text("%s firmware", kGameDisplay[gi]);
+    ImGui::Separator();
+    // Per-blob rows (filenames live here, never on the card face).
+    ImGui::TextUnformatted("intflash ");
+    ImGui::SameLine();
+    if (st.internal_found && st.internal_verified) {
+        ImGui::TextColored(GNW_COL_ACCENT, ICON_FA_CHECK " verified");
+    } else if (st.internal_found) {
+        ImGui::TextColored(GNW_COL_ERR, ICON_FA_XMARK " wrong dump");
+    } else {
+        ImGui::TextDisabled("missing");
+    }
+    ImGui::TextUnformatted("extflash ");
+    ImGui::SameLine();
+    if (st.external_found) {
+        ImGui::TextColored(GNW_COL_ACCENT, ICON_FA_CHECK " present");
+    } else {
+        ImGui::TextDisabled("missing");
+    }
+    if (cs == kCardPartial) {
+        ImGui::Spacing();
+        std::string want = !st.internal_found
+            ? std::string("internal_flash_backup_") + game + ".bin"
+            : std::string("flash_backup_") + game + ".bin";
+        ImGui::TextDisabled("Expected %s in this folder.", want.c_str());
+    } else if (cs == kCardMismatch) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("SHA1 doesn't match a stock dump.");
+        ImGui::PushFont(g_font_mgr.m_fixed_width_font);
+        ImGui::Text("expected %s", GnwStockInternalSha1(gi));
+        ImGui::Text("found    %s", st.internal_sha1.c_str());
+        ImGui::PopFont();
+    }
+    ImGui::EndTooltip();
+}
+
+void ProfileWizard::DrawGameCard(int gi, float w)
+{
+    float sc = g_viewport_mgr.m_scale;
+    GnwGameCardState st = GnwCardStateOf(m_library.status[gi]);
+
+    // Transition bookkeeping: one-shot 250ms ease-in when a card becomes
+    // Complete mid-flow (never on first show, never looping).
+    if (m_card_prev_state[gi] != (int)st) {
+        if (st == kCardComplete && m_card_prev_state[gi] != -1) {
+            m_card_lit_ns[gi] = SDL_GetTicks();
+            m_focus_continue = true;
+        }
+        m_card_prev_state[gi] = (int)st;
+    }
+    float lit = 1.0f;
+    if (st == kCardComplete && m_card_lit_ns[gi] != 0) {
+        float t = (SDL_GetTicks() - m_card_lit_ns[gi]) / 250.0f;
+        lit = t >= 1.0f ? 1.0f : t * t; // ease-in
+    }
+
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImVec2 size(w, GNW_CARD_H * sc);
+    ImVec2 end(pos.x + size.x, pos.y + size.y);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float r = GNW_RADIUS_CARD * sc;
+    float pad = GNW_PAD_CARD * sc;
+
+    ImVec4 border = GNW_COL_CARD_BORDER;
+    border.w = 0.5f;
+    if (st == kCardComplete) {
+        border = GNW_COL_ACCENT_DIM;
+        border.w *= lit;
+    } else if (st == kCardPartial) {
+        border = GNW_COL_WARN;
+        border.w = 0.4f;
+    }
+    dl->AddRectFilled(pos, end, ImGui::GetColorU32(GNW_COL_CARD_BG), r);
+    if (st == kCardComplete) {
+        ImVec4 wash = GNW_COL_ACCENT_WASH;
+        wash.w *= lit;
+        dl->AddRectFilled(pos, end, ImGui::GetColorU32(wash), r);
+    }
+    dl->AddRect(pos, end, ImGui::GetColorU32(border), r, 0, 1.0f);
+
+    // Face text: max two lines, one status glyph max.
+    ImU32 dis = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+    ImU32 txt = st == kCardAbsent ? dis : ImGui::GetColorU32(ImGuiCol_Text);
+    float lh = ImGui::GetTextLineHeight();
+    float y0 = pos.y + (size.y - 2 * lh - 4 * sc) * 0.5f;
+    std::string l1 = std::string(ICON_FA_MICROCHIP "  ") + kGameDisplay[gi];
+    dl->AddText(ImVec2(pos.x + pad, y0), txt, l1.c_str());
+    ImVec2 l2p(pos.x + pad, y0 + lh + 4 * sc);
+    switch (st) {
+    case kCardAbsent:
+        dl->AddText(l2p, dis, "not added");
+        break;
+    case kCardComplete: {
+        dl->AddText(l2p, dis, "firmware ready");
+        ImVec4 c = GNW_COL_ACCENT;
+        c.w *= lit;
+        ImVec2 cs = ImGui::CalcTextSize(ICON_FA_CHECK);
+        dl->AddText(ImVec2(end.x - pad - cs.x, pos.y + pad * 0.75f),
+                    ImGui::GetColorU32(c), ICON_FA_CHECK);
+        break;
+    }
+    case kCardPartial:
+        dl->AddText(l2p, ImGui::GetColorU32(GNW_COL_WARN),
+                    !m_library.status[gi].internal_found
+                        ? ICON_FA_CIRCLE_INFO " intflash missing"
+                        : ICON_FA_CIRCLE_INFO " extflash missing");
+        break;
+    case kCardMismatch:
+        dl->AddText(l2p, ImGui::GetColorU32(GNW_COL_ERR),
+                    ICON_FA_XMARK " wrong dump");
+        break;
+    }
+
+    ImGui::PushID(gi);
+    ImGui::InvisibleButton("##card", size);
+    ImGui::PopID();
+    if (ImGui::IsItemHovered()) {
+        DrawCardTooltip(gi);
+    }
+}
+
+void ProfileWizard::DrawFolderUnit()
+{
+    float sc = g_viewport_mgr.m_scale;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled(ICON_FA_FOLDER);
+    ImGui::SameLine();
+    float reserve = ImGui::CalcTextSize("Change...").x + 40 * sc;
+    std::string p =
+        EllipsizeMiddle(m_library.dir, ImGui::GetContentRegionAvail().x - reserve);
+    ImGui::TextDisabled("%s", p.c_str());
+    if (ImGui::IsItemHovered() && p != m_library.dir) {
+        ImGui::SetTooltip("%s", m_library.dir.c_str());
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Change...##fwdir")) {
+        PickFolder();
+    }
+}
+
+void ProfileWizard::DrawFirmwareStage()
+{
+    float sc = g_viewport_mgr.m_scale;
+    float win_w = ImGui::GetWindowWidth();
+
+    ImGui::PushFont(g_font_mgr.m_menu_font_medium);
+    const char *title = "Add official firmware";
+    ImGui::SetCursorPosX((win_w - ImGui::CalcTextSize(title).x) * 0.5f);
+    ImGui::TextUnformatted(title);
+    ImGui::PopFont();
+    ImGui::Dummy(ImVec2(0, GNW_GAP_SECTION * sc));
+
+    if (m_stage == StageFwPrompt) {
+        const char *hint =
+            "GWemu can use firmware dumped from your own Game & Watch devices.";
+        ImGui::SetCursorPosX((win_w - ImGui::CalcTextSize(hint).x) * 0.5f);
+        ImGui::TextDisabled("%s", hint);
+        ImGui::Dummy(ImVec2(0, GNW_GAP_SECTION * sc));
+    }
+
+    float gutter = GNW_GAP_GUTTER * sc;
+    float cw = (ImGui::GetContentRegionAvail().x - gutter) * 0.5f;
+    DrawGameCard(0, cw);
+    ImGui::SameLine(0, gutter);
+    DrawGameCard(1, cw);
+
+    if (m_stage == StageFwStatus) {
+        ImGui::Dummy(ImVec2(0, 12 * sc));
+        DrawFolderUnit();
+    }
+}
+
+void ProfileWizard::DrawFirmwareStrip()
+{
+    float sc = g_viewport_mgr.m_scale;
+    bool any_files = false;
+    for (int i = 0; i < 2; i++) {
+        any_files |= m_library.status[i].internal_found ||
+                     m_library.status[i].external_found;
+    }
+    if (!m_folder_chosen && !any_files) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("Firmware: none");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Add...##fwstrip")) {
+            m_stage = StageFwPrompt;
+        }
+        return;
+    }
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::BeginGroup();
+    for (int gi = 0; gi < 2; gi++) {
+        GnwGameCardState st = GnwCardStateOf(m_library.status[gi]);
+        ImVec4 chip = st == kCardComplete ? GNW_COL_ACCENT
+                    : st == kCardPartial  ? GNW_COL_WARN
+                    : st == kCardMismatch ? GNW_COL_ERR
+                    : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+        ImGui::TextColored(chip, ICON_FA_MICROCHIP);
+        ImGui::SameLine(0, 4 * sc);
+        if (st == kCardAbsent) {
+            ImGui::TextDisabled("%s", kGameDisplay[gi]);
+        } else {
+            ImGui::TextUnformatted(kGameDisplay[gi]);
+        }
+        ImGui::SameLine(0, 4 * sc);
+        switch (st) {
+        case kCardComplete:
+            ImGui::TextColored(GNW_COL_ACCENT, ICON_FA_CHECK);
+            break;
+        case kCardPartial:
+            ImGui::TextColored(GNW_COL_WARN, ICON_FA_CIRCLE_INFO);
+            break;
+        case kCardMismatch:
+            ImGui::TextColored(GNW_COL_ERR, ICON_FA_XMARK);
+            break;
+        default:
+            ImGui::Dummy(ImVec2(0, 0));
+            break;
+        }
+        ImGui::SameLine(0, 14 * sc);
+    }
+    ImGui::TextDisabled(ICON_FA_FOLDER);
+    ImGui::SameLine(0, 4 * sc);
+    float reserve = ImGui::CalcTextSize("Change...").x + 30 * sc;
+    ImGui::TextDisabled("%s",
+        EllipsizeMiddle(m_library.dir,
+                        ImGui::GetContentRegionAvail().x - reserve).c_str());
+    ImGui::EndGroup();
+    if (ImGui::IsItemHovered()) {
+        // The full card pair, as a tooltip.
+        ImGui::BeginTooltip();
+        float cw = 220 * sc;
+        DrawGameCard(0, cw);
+        ImGui::SameLine(0, GNW_GAP_GUTTER * sc);
+        DrawGameCard(1, cw);
+        ImGui::EndTooltip();
+    }
+    if (ImGui::IsItemClicked()) {
+        // Non-destructive: all S2 selections are kept; Continue returns.
+        m_stage = StageFwStatus;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Change...##fwstrip")) {
+        PickFolder();
     }
 }
 
@@ -736,7 +1067,7 @@ void ProfileWizard::DrawForm()
     ImGui::InputTextWithHint("##name", m_name_hint.c_str(), m_name, sizeof(m_name));
 
     ImGui::Spacing();
-    DrawBackupFolderRow();
+    DrawFirmwareStrip();
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -845,16 +1176,20 @@ void ProfileWizard::Draw()
         return;
     }
 
-    ImGui::PushFont(g_font_mgr.m_menu_font_medium);
-    ImGui::TextUnformatted("New Device Profile");
-    ImGui::PopFont();
-    ImGui::Dummy(ImVec2(0, 10 * g_viewport_mgr.m_scale));
-
     bool building = m_build_state.load() != BuildIdle;
-    if (building) {
-        DrawBuildView();
+    bool fw_stage = !building && m_stage != StageProfile;
+    if (fw_stage) {
+        DrawFirmwareStage(); // draws its own centered title
     } else {
-        DrawForm();
+        ImGui::PushFont(g_font_mgr.m_menu_font_medium);
+        ImGui::TextUnformatted("New Device Profile");
+        ImGui::PopFont();
+        ImGui::Dummy(ImVec2(0, 10 * g_viewport_mgr.m_scale));
+        if (building) {
+            DrawBuildView();
+        } else {
+            DrawForm();
+        }
     }
 
     // Natural height of everything above the bottom row, BEFORE any
@@ -879,6 +1214,11 @@ void ProfileWizard::Draw()
                    ((unsigned)m_bank2_choice << 9) |
                    ((unsigned)m_ext_choice << 11) |
                    ((unsigned)((int)(m_desired_h / 24)) << 16);
+    // Stage + card states also change the natural layout (hash-combined
+    // rather than shifted -- the height field above uses the high bits).
+    sig ^= (unsigned)m_stage * 0x9E3779B9u;
+    sig ^= (unsigned)GnwCardStateOf(m_library.status[0]) * 0x85EBCA6Bu;
+    sig ^= (unsigned)GnwCardStateOf(m_library.status[1]) * 0xC2B2AE35u;
     if (sig != m_last_sig) {
         m_last_sig = sig;
         m_content_changed = true;
@@ -887,7 +1227,46 @@ void ProfileWizard::Draw()
     // Bottom row: Cancel (left) / Create (right), pinned to the window
     // bottom. Cancel = skip into the normal settings menu (the host
     // falls back there because WasCompleted() stays false).
-    if (!building) {
+    if (fw_stage) {
+        // Firmware-stage bottom row: [Skip] left; right = the single
+        // accent element (Select folder... on S1a, Continue on S1b once
+        // at least one card is Complete).
+        float sc = g_viewport_mgr.m_scale;
+        float y = ImGui::GetWindowHeight() - btn_h -
+                  ImGui::GetStyle().WindowPadding.y;
+        if (ImGui::GetCursorPosY() < y) {
+            ImGui::SetCursorPosY(y);
+        }
+        if (ImGui::Button("Skip", ImVec2(110 * sc, 0))) {
+            EnterProfileStage();
+        }
+        float bw = 160 * sc;
+        ImGui::SameLine(ImGui::GetWindowWidth() - bw -
+                        ImGui::GetStyle().WindowPadding.x);
+        if (m_stage == StageFwPrompt) {
+            m_focus_continue = false;
+            PushAccentButton();
+            if (ImGui::Button("Select folder...", ImVec2(bw, 0))) {
+                PickFolder();
+            }
+            PopAccentButton();
+        } else {
+            bool lit = CompleteCount() >= 1;
+            if (lit) {
+                PushAccentButton();
+                if (m_focus_continue) {
+                    ImGui::SetKeyboardFocusHere();
+                }
+            }
+            m_focus_continue = false;
+            if (ImGui::Button("Continue", ImVec2(bw, 0))) {
+                EnterProfileStage();
+            }
+            if (lit) {
+                PopAccentButton();
+            }
+        }
+    } else if (!building) {
         float y = ImGui::GetWindowHeight() - btn_h -
                   ImGui::GetStyle().WindowPadding.y;
         if (ImGui::GetCursorPosY() < y) {

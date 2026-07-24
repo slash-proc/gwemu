@@ -30,21 +30,40 @@ const char *GnwBackupLibrary::GameName(int i)
     return kGameNames[i];
 }
 
-bool GnwBackupLibrary::Sha1Matches(const char *path, const char *expected_hex)
+static std::string sha1_of_file(const char *path)
 {
     GError *gerr = nullptr;
     gchar *contents = nullptr;
     gsize len = 0;
     if (!g_file_get_contents(path, &contents, &len, &gerr)) {
         if (gerr) g_error_free(gerr);
-        return false;
+        return {};
     }
     gchar *sum = g_compute_checksum_for_data(
         G_CHECKSUM_SHA1, (const guchar *)contents, len);
-    bool ok = sum && strcmp(sum, expected_hex) == 0;
+    std::string out = sum ? sum : "";
     g_free(sum);
     g_free(contents);
-    return ok;
+    return out;
+}
+
+bool GnwBackupLibrary::Sha1Matches(const char *path, const char *expected_hex)
+{
+    return sha1_of_file(path) == expected_hex;
+}
+
+GnwGameCardState GnwCardStateOf(const GnwBackupGameStatus &st)
+{
+    if (st.internal_found && !st.internal_verified) {
+        return kCardMismatch;
+    }
+    if (st.internal_verified && st.external_found) {
+        return kCardComplete;
+    }
+    if (st.internal_verified || st.external_found) {
+        return kCardPartial;
+    }
+    return kCardAbsent;
 }
 
 std::string GnwBackupLibrary::InternalPath(int i) const
@@ -55,6 +74,11 @@ std::string GnwBackupLibrary::InternalPath(int i) const
 std::string GnwBackupLibrary::ExternalPath(int i) const
 {
     return dir + "/flash_backup_" + kGameNames[i] + ".bin";
+}
+
+const char *GnwStockInternalSha1(int game)
+{
+    return game == 0 ? kMarioIntSha1 : kZeldaIntSha1;
 }
 
 void GnwBackupLibrary::Rescan()
@@ -68,7 +92,8 @@ void GnwBackupLibrary::Rescan()
         std::string p = InternalPath(i);
         if (g_file_test(p.c_str(), G_FILE_TEST_EXISTS)) {
             st.internal_found = true;
-            st.internal_verified = Sha1Matches(p.c_str(), int_sha1[i]);
+            st.internal_sha1 = sha1_of_file(p.c_str());
+            st.internal_verified = st.internal_sha1 == int_sha1[i];
         }
 
         p = ExternalPath(i);

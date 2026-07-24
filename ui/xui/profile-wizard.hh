@@ -44,6 +44,9 @@ public:
 
 private:
     enum Template { TplStockMario, TplStockZelda, TplCustom };
+    // Two-stage flow (flow spec sect. 2): S1a prompt -> S1b status ->
+    // S2 profile form. Re-entry with existing profiles starts at S2.
+    enum Stage { StageFwPrompt, StageFwStatus, StageProfile };
 
     // Custom-template slot choices (content-blind: files are opaque).
     enum Bank1Choice { B1Blank, B1OfwMario, B1OfwZelda, B1File };
@@ -51,7 +54,14 @@ private:
     enum ExtChoice { ExtBlank, ExtOfwMario, ExtOfwZelda, ExtFile };
 
     void DrawForm();
-    void DrawBackupFolderRow();
+    void DrawFirmwareStage();
+    void DrawFolderUnit();
+    void DrawGameCard(int gi, float w);
+    void DrawCardTooltip(int gi);
+    void DrawFirmwareStrip();
+    void PickFolder();
+    int CompleteCount() const;
+    void EnterProfileStage();
     void DrawBankAssignments();
     bool DrawExtSizeStepper(); // returns true when the user changed it
     void DrawBuildView();
@@ -71,6 +81,14 @@ private:
     GnwBackupLibrary m_library;
 
     int m_template = TplStockMario;
+    int m_stage = StageFwPrompt;
+    bool m_folder_chosen = false;
+    bool m_focus_continue = false;         // one-shot keyboard focus
+    // Card illumination: one-shot 250ms ease-in on completion (never
+    // looping) -- previous shown state + transition timestamp per card.
+    int m_card_prev_state[2] = { -1, -1 };
+    uint64_t m_card_lit_ns[2] = { 0, 0 };
+    bool m_s2_visited = false;             // template default applied once
     bool m_open_assignments_next = false;  // one-shot accordion auto-open
     bool m_close_assignments_next = false; // one-shot collapse (stock selected)
     char m_name[64] = "";

@@ -14,8 +14,24 @@
 struct GnwBackupGameStatus {
     bool internal_found = false, internal_verified = false;
     bool external_found = false, external_verified = false;
+    // Computed SHA1 of the internal dump when found (for the mismatch
+    // tooltip: expected vs found).
+    std::string internal_sha1;
     bool Available() const { return internal_found && internal_verified; }
 };
+
+// Card-face state for the firmware cards/strip (visual spec, sect. 4).
+enum GnwGameCardState {
+    kCardAbsent,    // no files: calm/dimmed, never a warning
+    kCardPartial,   // one blob short: amber, actionable
+    kCardMismatch,  // internal found but SHA1 wrong: the only red
+    kCardComplete,  // internal verified + external present
+};
+
+GnwGameCardState GnwCardStateOf(const GnwBackupGameStatus &st);
+
+// Expected SHA1 of a game's internal stock dump (for tooltips).
+const char *GnwStockInternalSha1(int game);
 
 class GnwBackupLibrary {
 public:
