@@ -1923,6 +1923,15 @@ if test "$skip_meson" = no; then
   if has $sdl2_config; then
     echo "sdl2-config = [$(meson_quote $sdl2_config)]" >> $cross
   fi
+  # gnw-h7b0: the SDL3 GUI dependency is built via meson's
+  # cmake.subproject(), and in a cross build (macOS x86_64 leg: empty
+  # --cross-prefix= still sets cross_compile=yes) meson resolves the
+  # host-machine cmake through this machine file, NOT $PATH -- without
+  # this entry the sdl3 subproject failed with "Unable to find CMake"
+  # and (pre-guardrail) shipped a GUI-less binary (v0.0.10 macOS).
+  if has cmake; then
+    echo "cmake = [$(meson_quote $(command -v cmake))]" >> $cross
+  fi
   echo "strip = [$(meson_quote $strip)]" >> $cross
   echo "widl = [$(meson_quote $widl)]" >> $cross
   echo "windres = [$(meson_quote $windres)]" >> $cross
@@ -1944,6 +1953,11 @@ if test "$skip_meson" = no; then
     echo "c = [$(meson_quote $host_cc)]" >> $native
     if test "$rust" != disabled; then
       echo "rust = [$(meson_quote $rustc)]" >> $native
+    fi
+    # See the cross-file cmake entry above -- keep the native file
+    # consistent so build-machine cmake lookups can't diverge.
+    if has cmake; then
+      echo "cmake = [$(meson_quote $(command -v cmake))]" >> $native
     fi
     mv $native config-meson.native
     meson_option_add --native-file
