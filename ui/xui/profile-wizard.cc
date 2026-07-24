@@ -170,8 +170,8 @@ void ProfileWizard::Open()
         any_complete |= GnwCardStateOf(m_library.status[i]) == kCardComplete;
     }
     if (any_complete) {
-        m_stage = StageProfile;
-        m_s2_visited = true;
+        m_s2_visited = false;      // run EnterProfileStage's defaults
+        EnterProfileStage();
     } else {
         m_stage = m_folder_chosen ? StageFwStatus : StageFwPrompt;
     }
@@ -510,11 +510,13 @@ void ProfileWizard::SyncStockReflection()
         m_bank2_choice = B2Blank;
         m_ext_choice = ExtOfwMario;
         m_ext_size_mib = 64;
+        m_patched = true;   // assumed case, incl. Stock Mario (owner call)
     } else if (m_template == TplStockZelda) {
         m_bank1_choice = B1OfwZelda;
         m_bank2_choice = B2Blank;
         m_ext_choice = ExtOfwZelda;
         m_ext_size_mib = 64;
+        m_patched = true;   // assumed case (owner call)
     }
     if (m_ext_size_mib < MinExtSizeMiB()) {
         m_ext_size_mib = MinExtSizeMiB();
@@ -604,6 +606,7 @@ void ProfileWizard::EnterProfileStage()
         if (first >= 0) {
             m_template = first;
             SyncStockReflection();
+            m_close_assignments_next = true; // stock preselect starts closed
         } else {
             m_template = TplCustom;
             m_open_assignments_next = true;
@@ -883,9 +886,6 @@ bool ProfileWizard::DrawExtSizeStepper()
     if (m_ext_size_mib < min_mib) {
         m_ext_size_mib = min_mib;
     }
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted("Size");
-    ImGui::SameLine();
     ImGui::BeginDisabled(m_ext_size_mib <= min_mib);
     if (ImGui::Button("-##extsize")) {
         m_ext_size_mib = std::max(min_mib, m_ext_size_mib / 2);
@@ -1045,7 +1045,10 @@ void ProfileWizard::DrawBankAssignments()
     for (int i = 0; i < ext_n; i++) {
         if (ext_items[i].choice == m_ext_choice) ext_sel = i;
     }
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    // Leave room for the inline size stepper on the same row (owner call).
+    float stepper_w = 150 * g_viewport_mgr.m_scale;
+    ImGui::SetNextItemWidth(m_ext_choice == ExtFile ? -FLT_MIN
+                            : ImGui::GetContentRegionAvail().x - stepper_w);
     if (ImGui::BeginCombo("##ext", ext_items[ext_sel].label)) {
         for (int i = 0; i < ext_n; i++) {
             if (ImGui::Selectable(ext_items[i].label, i == ext_sel)) {
@@ -1060,6 +1063,7 @@ void ProfileWizard::DrawBankAssignments()
     if (m_ext_choice == ExtFile) {
         slot_file("Extflash file", m_ext_path);
     } else {
+        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
         changed |= DrawExtSizeStepper();
     }
 

@@ -96,7 +96,7 @@ private:
 
     // Unified "Patched" concept (one checkbox, lives next to Bank 1's
     // OFW selection; stock templates share it)
-    bool m_patched = false;
+    bool m_patched = true;   // Patched is the assumed case (owner call)
 
     // Custom options
     int m_bank1_choice = B1OfwMario;
