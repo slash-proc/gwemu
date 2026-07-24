@@ -1815,19 +1815,27 @@ int main(int argc, char **argv)
 
     init_sdl_app_metadata();
 
-    gArgc = argc;
-    gArgv = argv;
-
     for (int i = 1; i < argc; i++) {
         if (argv[i] && strcmp(argv[i], "-config_path") == 0) {
-            argv[i] = NULL;
-            if (i < argc - 1 && argv[i+1]) {
-                gwemu_settings_set_path(argv[i+1]);
-                argv[i+1] = NULL;
+            int consumed = 1;
+            if (i < argc - 1 && argv[i + 1]) {
+                gwemu_settings_set_path(argv[i + 1]);
+                consumed = 2;
             }
+            /* Compact argv rather than NULLing the slots: qemu_init()'s
+             * option walk dereferences argv[optind] unconditionally, so a
+             * NULL hole here segfaulted the whole process the moment
+             * -config_path was actually used. */
+            for (int j = i; j + consumed <= argc; j++) {
+                argv[j] = argv[j + consumed];
+            }
+            argc -= consumed;
             break;
         }
     }
+
+    gArgc = argc;
+    gArgv = argv;
 
     if (!gwemu_settings_load()) {
         const char *err_msg = gwemu_settings_get_error_message();
