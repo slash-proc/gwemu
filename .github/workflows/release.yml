@@ -530,7 +530,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-          merge-multiple: true
+          # NO merge-multiple: upload-artifact@v4 archives a directory's
+          # CONTENTS (lib/, scripts/, loose binaries), not the directory
+          # itself -- merging all platforms into one pot made the zip
+          # loop below produce lib.zip/libs.zip/scripts.zip while every
+          # platform binary sat unzipped at the root (broken releases
+          # v0.0.2..v0.0.10). Without merging, each artifact lands in
+          # artifacts/<artifact-name>/ and the loop zips one complete
+          # per-platform directory per asset, v0.0.1-style.
 
       - name: Zip each platform's directory (exactly once)
         run: |
