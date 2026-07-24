@@ -194,9 +194,8 @@ only where it's genuine attribution to the real upstream project (license header
   including a full from-scratch C port of gnwmanager's Thumb-2 assembler,
   lz77 decompressor, LZMA1 compressor via system `liblzma`, and the
   relocation/patch engine) are both byte-exact verified against their Python
-  originals for both games. `make_sdcard_image.py` (FAT32/qcow2 generation)
-  is NOT ported to C — the GUI shells out to it as a subprocess (on a
-  background thread, see the async rule above).
+  originals for both games. The CFW driver is a linkable library
+  (`gnw_cfw_build_images`) -- the GUI patches in-process, no popen.
 - **Device profiles** (2026-07-24): the GUI is profile-centric -- named sets of
   bank1/bank2/extflash + optional SD living in per-profile dirs under app data
   (`ui/gwemu-profiles`), created by the staged wizard in `ui/xui/profile-wizard.*`
