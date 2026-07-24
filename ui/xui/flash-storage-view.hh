@@ -26,12 +26,7 @@
 #include <thread>
 #include <atomic>
 #include "main-menu.hh"
-
-struct GnwBackupGameStatus {
-    bool internal_found = false, internal_verified = false;
-    bool external_found = false, external_verified = false;
-    bool Available() const { return internal_found && internal_verified; }
-};
+#include "flash-backups.hh"
 
 struct GnwExtflashBlobRow {
     std::string path;
@@ -63,7 +58,8 @@ class GnwFlashStorageView : public virtual MainMenuTabView
 {
 protected:
     std::string m_backup_dir;
-    GnwBackupGameStatus m_status[2]; // 0=mario, 1=zelda
+    GnwBackupLibrary m_library;      // shared scanner, see flash-backups.hh
+    GnwBackupGameStatus m_status[2]; // 0=mario, 1=zelda (mirror of m_library)
 
     int m_preset = kPresetCustom;
     GnwBankSlot m_bank[2]; // 0=bank1 (allow_patch=true), 1=bank2 (allow_patch=false)

@@ -2,6 +2,7 @@
 // gnw-h7b0 User Interface -- Flash tab (Phase 2, presets iteration)
 //
 #include "flash-storage-view.hh"
+#include "flash-backups.hh"
 #include "widgets.hh"
 #include "misc.hh"
 #include <glib.h>
@@ -16,47 +17,12 @@ extern "C" {
 }
 #include "gwemu-hud.h"
 
-// SHA1 hashes of genuine stock firmware dumps, matching gnwmanager's own
-// STOCK_ROM_SHA1_HASH constants (gnwmanager/cli/gnw_patch/{mario,zelda}.py,
-// remove-keystone-engine branch) -- reused verbatim, not re-derived.
-//
-// KNOWN CAVEAT, confirmed via real sha1sum against this project's own
-// backup/ files: the *internal* hashes match real dumps exactly, but the
-// *external* (extflash) ones never will here -- this project's own
-// flash_backup_<game>.bin captures are documented partial dumps (4MiB of a
-// 64MB chip, see scripts/make_boot_images.py's docstring), while
-// gnwmanager's Ext hash is computed against a full/canonical dump. A real
-// file can never match that hash, so the extflash SHA1 constants below are
-// NOT used for verification (only presence is checked) -- kept for
-// reference / a future full-dump capture, not dead code by accident.
-static const char *kMarioIntSha1 = "efa04c387ad7b40549e15799b471a6e1cd234c76";
-[[maybe_unused]] static const char *kMarioExtSha1 = "eea70bb171afece163fb4b293c5364ddb90637ae";
-static const char *kZeldaIntSha1 = "ac14bcea6e4ff68c88fd2302c021025a2fb47940";
-[[maybe_unused]] static const char *kZeldaExtSha1 = "1c1c0ed66d07324e560dcd9e86a322ec5e4c1e96";
-
 static const char *kGameNames[2] = { "mario", "zelda" };
 
 // Extflash size presets, MiB, powers of two 1..256. Index 9 (past the end)
 // means "Custom", using m_ext_size_custom_mib instead.
 static const int kExtSizeMiB[9] = { 1, 2, 4, 8, 16, 32, 64, 128, 256 };
 static const int kExtSizeCustomIdx = 9;
-
-static bool Sha1Matches(const char *path, const char *expected_hex)
-{
-    GError *gerr = nullptr;
-    gchar *contents = nullptr;
-    gsize len = 0;
-    if (!g_file_get_contents(path, &contents, &len, &gerr)) {
-        if (gerr) g_error_free(gerr);
-        return false;
-    }
-    gchar *sum = g_compute_checksum_for_data(
-        G_CHECKSUM_SHA1, (const guchar *)contents, len);
-    bool ok = sum && strcmp(sum, expected_hex) == 0;
-    g_free(sum);
-    g_free(contents);
-    return ok;
-}
 
 GnwFlashStorageView::GnwFlashStorageView()
 {
@@ -73,34 +39,11 @@ GnwFlashStorageView::~GnwFlashStorageView()
 
 void GnwFlashStorageView::RescanBackupDir()
 {
-    const char *int_sha1[2] = { kMarioIntSha1, kZeldaIntSha1 };
-
+    // Shared scanner (flash-backups.cc) -- also used by the profile wizard.
+    m_library.dir = m_backup_dir;
+    m_library.Rescan();
     for (int i = 0; i < 2; i++) {
-        GnwBackupGameStatus &st = m_status[i];
-        st = GnwBackupGameStatus{};
-
-        gchar *p = g_strdup_printf("%s/internal_flash_backup_%s.bin",
-                                    m_backup_dir.c_str(), kGameNames[i]);
-        if (g_file_test(p, G_FILE_TEST_EXISTS)) {
-            st.internal_found = true;
-            st.internal_verified = Sha1Matches(p, int_sha1[i]);
-        }
-        g_free(p);
-
-        p = g_strdup_printf("%s/flash_backup_%s.bin", m_backup_dir.c_str(),
-                             kGameNames[i]);
-        if (g_file_test(p, G_FILE_TEST_EXISTS)) {
-            st.external_found = true;
-            // Not SHA1-checked: gnwmanager's Ext hash is computed over a
-            // full/canonical 64MB dump, but this project's own
-            // flash_backup_<game>.bin captures are documented partial (4MiB)
-            // dumps (scripts/make_boot_images.py's docstring) -- a real file
-            // will NEVER match that hash, so showing "mismatch" here would
-            // be a permanent false alarm, not a real signal. Presence is
-            // the only thing we can actually check.
-            st.external_verified = true;
-        }
-        g_free(p);
+        m_status[i] = m_library.status[i];
     }
 
     // A preset/selection may no longer be valid after a rescan.

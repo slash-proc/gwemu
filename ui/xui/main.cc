@@ -50,6 +50,8 @@ void gnw_h7b0_rtc_set_sync_host(bool sync_host);
 #include "notifications.hh"
 #include "monitor.hh"
 #include "welcome.hh"
+#include "profile-wizard.hh"
+#include "../gwemu-profiles.hh"
 #include "menubar.hh"
 
 bool g_screenshot_pending;
@@ -159,7 +161,15 @@ void gwemu_hud_init(SDL_Window* window, SDL_Renderer* renderer)
 
     g_last_scale = g_viewport_mgr.m_scale;
     InitializeStyle();
-    first_boot_window.is_open = g_config.general.show_welcome;
+    // First-run: the profile-creation wizard IS the welcome experience
+    // now (owner decision) -- the old FirstBootWindow only shows for the
+    // profiles-already-exist case until it's removed entirely in Phase 3.
+    if (g_config.general.show_welcome && g_profile_store.Profiles().empty()) {
+        g_profile_wizard.Open();
+        g_config.general.show_welcome = false;
+    } else {
+        first_boot_window.is_open = g_config.general.show_welcome;
+    }
     gnw_h7b0_rtc_set_sync_host(g_config.sys.rtc_sync_host);
 }
 
@@ -222,7 +232,7 @@ void gwemu_hud_update(void)
         g_last_scale = g_viewport_mgr.m_scale;
     }
 
-    if (!first_boot_window.is_open) {
+    if (!first_boot_window.is_open && !g_profile_wizard.is_open) {
         int ww, wh;
         SDL_GetWindowSizeInPixels(gwemu_get_window(), &ww, &wh);
         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
@@ -245,7 +255,8 @@ void gwemu_hud_update(void)
     }
 #endif
 
-    if (g_config.display.ui.show_menubar && !first_boot_window.is_open) {
+    if (g_config.display.ui.show_menubar && !first_boot_window.is_open &&
+        !g_profile_wizard.is_open) {
         // Auto-hide main menu after 5s of inactivity
         static uint32_t last_check = 0;
         float alpha = 1.0;
@@ -320,6 +331,7 @@ void gwemu_hud_update(void)
     }
 
     first_boot_window.Draw();
+    g_profile_wizard.Draw();
     monitor_window.Draw();
     g_scene_mgr.Draw();
     if (!first_boot_window.is_open) notification_manager.Draw();

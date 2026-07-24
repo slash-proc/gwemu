@@ -4001,6 +4001,12 @@ if sdl3.found()
   gwemu_json = dependency('nlohmann_json', required: true, fallback: ['json', 'nlohmann_json_dep'])
 endif
 
+# gnw-h7b0: always build our own small standalone tools, independent of
+# have_tools (this project only builds --target-list=arm-softmmu, which
+# leaves have_tools false). Ordered BEFORE subdir('ui') so ui/xui can
+# link_whole gnw_cfw_build_lib (profile wizard patches in-process).
+subdir('contrib/gnw-tools')
+
 subdir('ui')
 if sdl3.found()
   subdir('data')
@@ -4845,11 +4851,6 @@ if have_tools
     subdir('contrib/ivshmem-server')
   endif
 endif
-
-# gnw-h7b0: always build our own small standalone tools, independent of
-# have_tools (this project only builds --target-list=arm-softmmu, which
-# leaves have_tools false).
-subdir('contrib/gnw-tools')
 
 if stap.found()
   foreach t: traceable
