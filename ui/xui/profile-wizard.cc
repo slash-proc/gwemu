@@ -12,6 +12,7 @@
 #include "gnw-style-tokens.hh"
 #include "gwemu-hud.h"
 #include "../gwemu-profiles.hh"
+#include "../gwemu-sdcreate.h"
 
 #include <glib.h>
 #include <glib/gstdio.h>
@@ -38,10 +39,9 @@ static const SDL_DialogFileFilter kQcow2Filter[] = {
     { "All files", "*" },
 };
 
-// "New card" is fully designed but the FAT32 image backend hasn't landed
-// yet -- the combo entry shows disabled ("coming soon") and the rows stay
-// hidden. Flip this to light the UI once the backend exists.
-static const bool kSdCreateEnabled = false;
+// "New card" creates a fresh MBR+FAT32 qcow2 in-process via
+// gwemu_sdcreate_qcow2() (ui/gwemu-sdcreate.c).
+static const bool kSdCreateEnabled = true;
 
 // Shareable subset of the shared-SD registry (only shareable=true cards
 // are attachable).
@@ -424,10 +424,61 @@ bool ProfileWizard::BuildWorker(std::string &err)
         }
     }
 
-    // SD card (step 4). "New card" is compile-time gated (kSdCreateEnabled
-    // is false until the FAT32 backend lands), so only Import/Shared can
-    // reach here today.
-    if (ok && m_sd_mode == SdImport) {
+    // SD card (step 4).
+    if (ok && m_sd_mode == SdNew && kSdCreateEnabled) {
+        m_build_step.store(4);
+        std::string dst;
+        if (m_sd_storage == 0) {
+            // Bundled: into the profile dir under the fixed name.
+            dst = p->dir + "/sdcard.qcow2";
+            p->sd.mode = GwSdMode::Bundled;
+            p->sd.image = "sdcard.qcow2";
+        } else {
+            // Shared storage: into the sd-cards/ registry, named after the
+            // profile, deduped by numeric suffix, shareable=true sidecar
+            // (same conventions as Import below).
+            std::string stem = name;
+            for (char &c : stem) {
+                if (c == '/' || c == '\\') {
+                    c = '_';
+                }
+            }
+            std::string root = GwProfileStore::SdCardsRoot();
+            g_mkdir_with_parents(root.c_str(), 0755);
+            std::string sd_name = stem + ".qcow2";
+            for (int n = 2; g_file_test((root + "/" + sd_name).c_str(),
+                                        G_FILE_TEST_EXISTS); n++) {
+                sd_name = stem + "-" + std::to_string(n) + ".qcow2";
+            }
+            dst = root + "/" + sd_name;
+            p->sd.mode = GwSdMode::Shared;
+            p->sd.image = sd_name;
+        }
+        char *cerr = NULL;
+        ok = gwemu_sdcreate_qcow2(dst.c_str(),
+                                  (uint64_t)m_sd_new_size_gib << 30,
+                                  NULL, &cerr);
+        if (!ok) {
+            err = cerr ? cerr : "SD card creation failed";
+        }
+        free(cerr);
+        if (ok && p->sd.mode == GwSdMode::Shared) {
+            std::string sidecar = dst.substr(0, dst.size() - 6) + ".toml";
+            FILE *f = g_fopen(sidecar.c_str(), "wb");
+            if (f) {
+                char *b2 = g_path_get_basename(dst.c_str());
+                fprintf(f, "shareable = true\ndisplay_name = \"%s\"\n", b2);
+                g_free(b2);
+                fclose(f);
+            } else {
+                err = "cannot create " + sidecar;
+                ok = false;
+            }
+        }
+        if (!ok) {
+            p->sd = GwProfileSd();
+        }
+    } else if (ok && m_sd_mode == SdImport) {
         m_build_step.store(4);
         std::string dst;
         if (m_sd_storage == 0) {
@@ -1324,9 +1375,6 @@ void ProfileWizard::DrawSdSection()
             if (ImGui::Selectable("New card", m_sd_mode == SdNew)) {
                 m_sd_mode = SdNew;
             }
-        } else {
-            ImGui::Selectable("New card -- coming soon", false,
-                              ImGuiSelectableFlags_Disabled);
         }
         if (ImGui::Selectable("Import file...", m_sd_mode == SdImport)) {
             m_sd_mode = SdImport;

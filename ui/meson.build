@@ -41,8 +41,12 @@ if sdl3.found()
     'gwemu-data.c',
     'gwemu-settings.cc',
     'gwemu-profiles.cc',
+    'gwemu-sdcreate.c',
     'gwemu.c',
   ))
+  # In-process SD image creation (gwemu-sdcreate.c) formats through the
+  # gnw-tools FAT32/MBR builder.
+  gnw_gui_ss.add(declare_dependency(link_with: gnw_sdimg_lib))
   gnw_gui_ss.add(files('../gwemu-version.c'))
 
   if host_os == 'linux'
