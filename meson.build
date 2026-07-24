@@ -1721,6 +1721,20 @@ if true
     meson.override_dependency('sdl3', sdl3)
   endif
 endif
+if not sdl3.found()
+  # CONFIG_GWEMU_GUI is keyed on sdl3.found(): a failed SDL3 subproject
+  # silently produced a complete, working-looking build with NO GUI at
+  # all -- shipped for real in the v0.0.10 macOS release assets (gwemu
+  # behaved like plain upstream QEMU: no -M injection, no window). The
+  # GUI is this fork's whole point; fail loudly instead. Set
+  # GNW_ALLOW_NO_GUI=1 only for deliberate GUI-less builds.
+  gnw_allow_no_gui = run_command('sh', '-c', 'echo -n "${GNW_ALLOW_NO_GUI:-}"', check: false).stdout()
+  if gnw_allow_no_gui != '1'
+    error('SDL3 subproject failed to configure -- the gwemu GUI cannot be built. ' +
+          'This would silently ship a GUI-less binary (happened in v0.0.10 macOS assets). ' +
+          'Fix the SDL3 build, or set GNW_ALLOW_NO_GUI=1 to build without the GUI deliberately.')
+  endif
+endif
 if sdl3.found() and host_os == 'windows'
   # SDL3-3.4.10's SDL_assert.h redeclares __debugbreak(), which MinGW
   # GCC 16.1's own _mingw.h already declares -- real, confirmed conflict

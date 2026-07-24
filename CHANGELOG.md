@@ -1,3 +1,24 @@
+2026-07-24  CI/BUILD: three release-asset fixes from the v0.0.10 field
+            reports. (1) Linux/Mac zips shipped non-executable binaries:
+            upload/download-artifact@v4 strips permission bits, so the
+            build jobs' chmod +x never survived to publish-release; exec
+            bits are now restored there right before the final zip.
+            (2) Windows gwemu.exe opened a console window: the meson
+            alias byte-copies console-subsystem qemu-system-arm.exe;
+            scripts/make-gwemu-alias.py now flips the copy's PE subsystem
+            to GUI (qemu-system-arm.exe stays console for -M help etc.).
+            (3) The v0.0.10 macOS assets shipped with NO GUI at all: the
+            SDL3 cmake subproject failed on the mac runners and its
+            required:false let configure finish silently (gwemu behaved
+            like plain upstream QEMU -- no -M injection, no window).
+            meson now hard-errors when SDL3 fails unless GNW_ALLOW_NO_GUI=1
+            is set; the runner-side SDL3 failure itself is still to be
+            diagnosed from the next CI run's configure output.
+            Also field-diagnosed as NOT bugs: "menus stopped appearing"
+            was Tab's toggle-and-persist of display.ui.show_menubar in
+            gwemu.toml (affects every binary equally); the Linux CI
+            binary benchmarks identical to a local build.
+
 2026-07-24  PERF: JPEG device model decode/poll overhaul (the "retro-go is
             slow on Windows" hunt, which ended somewhere else entirely).
             (1) The naive fdct/idct called libm cos() in their innermost
