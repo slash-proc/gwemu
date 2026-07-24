@@ -63,3 +63,17 @@ executable('gnw-make-cfw-images',
            link_with: [gnw_cfw_build_lib],
            dependencies: [gnw_lzma_dep],
            install: false)
+
+# FAT32 mkfs + MBR/SD-image builder (gnw_fat32.h/gnw_sdimg.h) -- C port of
+# scripts/make_sdcard_image.py's raw-image half. All disk I/O goes through
+# a caller-supplied sector-write callback so the GUI can later drive it
+# through QEMU's own block layer (qcow2) instead of a raw file.
+gnw_sdimg_lib = static_library('gnw_sdimg',
+                                files('gnw_fat32.c', 'gnw_sdimg.c'),
+                                c_args: ['-D_GNU_SOURCE'],
+                                install: false)
+
+executable('gnw-make-sd-image',
+           files('make_sd_image.c'),
+           link_with: [gnw_sdimg_lib],
+           install: false)

@@ -3,6 +3,11 @@
 make_sdcard_image.py -- build an MBR + FAT32 SD card disk image from any
 local directory tree, for gnw-h7b0's SD card model.
 
+NOTE: this script is now the TEST ORACLE only -- the product path uses the
+C port in contrib/gnw-tools/ (gnw_fat32.c/gnw_sdimg.c, CLI
+gnw-make-sd-image), verified against this script's output. Keep this
+script working for parity testing, but new features belong in the C code.
+
 Dead simple by design: point --content at ANY folder (e.g. a built
 game-and-watch-retro-go-sd checkout's sd_content/ directory, or an
 extracted release zip) and this generates a working SD image with that
