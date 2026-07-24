@@ -1,3 +1,26 @@
+2026-07-24  WINDOWS: single-file static gwemu.exe + installer, and the
+            console-flood freeze. Adopted xemu's distribution model via
+            its public MXE static toolchain image plus a static liblzma
+            (contrib/docker-win-static/): gwemu.exe now links glib/
+            pixman/everything statically, imports only Windows system
+            DLLs (~42MB stripped), replacing the 38-DLL dist folder.
+            Releases ship it and gwemu-setup.exe (new NSIS per-user
+            installer, contrib/gwemu-installer/) as direct un-zipped
+            assets; Windows gets no scripts/ or qemu-system-arm.exe.
+            CI enforces self-containment via an objdump import
+            whitelist. Field-debugged en route: the "static exe
+            freezes" report was per-frame GNW_* trace output flooding
+            an attached Windows console (console I/O blocks; redirect
+            to a file and it ran perfectly) -- the probes were stuck on
+            because bare getenv() presence checks treated GNW_FOO=0 as
+            enabled. gnw_env_enabled() now treats unset/empty/0 as off,
+            start.sh no longer exports the probes, and the framebuffer
+            texture path logs its failures instead of dying silently
+            (fb_texture: lines). Both artifacts verified working on
+            real Windows (portable exe and installer). Verified the
+            hard way that wine is useless for testing this (~1 frame
+            per 10-15s) -- docs now say so.
+
 2026-07-24  CI/BUILD: three release-asset fixes from the v0.0.10 field
             reports. (1) Linux/Mac zips shipped non-executable binaries:
             upload/download-artifact@v4 strips permission bits, so the

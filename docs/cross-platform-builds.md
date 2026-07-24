@@ -29,42 +29,51 @@ Standard build (see CLAUDE.md "Build"). Notes:
 
 No MSYS2 and no Windows machine needed to *build* (only to run/test).
 
-1. One-time image setup (QEMU's own CI cross image + two extras):
+Since 2026-07-24 the Windows build is FULLY STATIC (xemu's model): the
+MXE-based toolchain in `contrib/docker-win-static/` (derived from xemu's
+public toolchain image, plus a static liblzma for `contrib/gnw-tools`)
+links everything -- glib included -- into a single `gwemu.exe` that
+imports only Windows system DLLs. No bundled-DLL dist folder anymore.
+
+1. One-time image setup:
 
    ```
-   docker pull registry.gitlab.com/qemu-project/qemu/qemu/fedora-win64-cross:latest
-   cat > /tmp/gwemu-win-cross.dockerfile <<'EOF'
-   FROM registry.gitlab.com/qemu-project/qemu/qemu/fedora-win64-cross:latest
-   RUN dnf -y install mingw64-xz mingw64-xz-libs cmake ninja-build && dnf clean all
-   EOF
-   docker build -t gwemu-win-cross -f /tmp/gwemu-win-cross.dockerfile .
+   docker build -t gwemu-win-static contrib/docker-win-static/
    ```
 
-   (`mingw64-xz` = liblzma for `contrib/gnw-tools`' LZMA compressor.)
-
-2. Configure + build (from repo root; `build-win/` is the out-of-tree dir):
+2. Configure + build (from repo root; `build-win-static/` is the
+   out-of-tree dir; the `.static-` cross prefix is what selects MXE's
+   static libs):
 
    ```
-   mkdir -p build-win
-   docker run --rm -v "$PWD":/src -w /src/build-win gwemu-win-cross \
-     sh -c '../configure --target-list=arm-softmmu \
-              --cross-prefix=x86_64-w64-mingw32- \
+   mkdir -p build-win-static
+   docker run --rm -v "$PWD":/src -w /src/build-win-static gwemu-win-static \
+     bash -c 'git config --global --add safe.directory "*" \
+            && ../configure --target-list=arm-softmmu \
+              --cross-prefix=x86_64-w64-mingw32.static- \
               --disable-sdl --disable-sdl-image --disable-gtk \
-            && ninja qemu-system-arm.exe'
+            && ninja -j12 qemu-system-arm.exe gwemu.exe \
+            && x86_64-w64-mingw32.static-strip gwemu.exe'
    ```
 
-   `--disable-sdl/--disable-sdl-image` is REQUIRED, not cosmetic: the
-   mingw SDL2.dll fails DllMain initialization and aborts the whole
-   process at startup (status c0000142) before main() runs. SDL3 is
-   unaffected (statically linked). `--disable-gtk` just drops an unneeded
-   display backend and ~20 DLLs.
+   `safe.directory`: without it the root-run container can't read git
+   metadata and `gwemu_commit` silently stamps blank into the binary.
+   `--disable-sdl/--disable-sdl-image` is QEMU's legacy SDL2 display,
+   not our SDL3 GUI (built static via its cmake subproject).
+   `gwemu.exe` (the meson alias) is already flipped to a GUI-subsystem
+   PE (`scripts/make-gwemu-alias.py`) so it opens no console window;
+   `qemu-system-arm.exe` deliberately stays a console app. NOTE: a
+   GUI-subsystem exe's stderr only goes somewhere if redirected
+   (`2> file`); an *attached* console flooded with per-frame trace
+   output blocks the process into unusability -- keep the GNW_* trace
+   env vars off (unset/`=0`) for normal runs.
 
-3. Package a portable folder (exe + every non-system DLL, stripped):
-   the dist-collection loop lives in this repo's session history and CI;
-   in short: recursively resolve `objdump -p | grep 'DLL Name'` against
-   `/usr/x86_64-w64-mingw32/sys-root/mingw/bin`, copy matches next to the
-   exe, `x86_64-w64-mingw32-strip` everything. Result ≈ 31 files / 55MB
-   at `build-win/dist/`.
+   Verify self-containment: `objdump -p gwemu.exe | grep 'DLL Name'`
+   must list only Windows system DLLs (CI enforces this).
+
+3. Installer (optional): `contrib/gwemu-installer/gwemu.nsi` via
+   `makensis` (`apt-get install nsis` inside the same container works),
+   `-DDISTDIR=<dir with gwemu.exe> -DVERSION=x.y.z -DOUTFILE=...`.
 
 4. `start.bat` at the repo root launches it with the standard image set
    (run from the repo root so relative paths resolve). Flash images bind
@@ -74,13 +83,13 @@ No MSYS2 and no Windows machine needed to *build* (only to run/test).
    force-raw=on` (addresses 0x08000000 / 0x08100000 / 0x90000000) is the
    ephemeral alternative.
 
-5. Smoke-testing under wine works for console paths (`--version`,
-   `-M help`) and, since the SDL_Renderer port, for the actual GUI too.
-   Wine console output is unreliable — absence of output is not failure;
-   check the exit code and `WINEDEBUG=warn+module` for loader errors.
-   The definitive test is real Windows (a libvirt Win11 VM with QXL
-   works: renderer falls back to SDL's software rasterizer, audio via
-   WASAPI; expect reduced speed from the double emulation).
+5. Do NOT test under wine. Confirmed 2026-07-24: the GUI does launch
+   and boot firmware there (absolute `Z:\...` paths required for the
+   flash-image properties), but at ~1 frame per 10-15s it is useless
+   for judging anything, its console/stderr handling swallows output,
+   and conclusions drawn from wine runs in this project have repeatedly
+   been wrong. The definitive test is real Windows; make each real run
+   count via targeted stderr diagnostics (`2> gwemu.log`).
 
 ## macOS (native build over SSH)
 
