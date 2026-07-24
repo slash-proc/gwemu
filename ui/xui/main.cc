@@ -485,21 +485,22 @@ void gwemu_settings_hud_update(void)
             // Cancel button closes it to fall through here.
             g_profile_wizard.Draw();
 
-            // Track the wizard's natural content height so it never
-            // scrolls or clips: resize the OS window when the content
-            // height meaningfully changes (accordion open/close,
-            // validation text). Hysteresis + last-applied guard prevent
-            // per-frame churn and WM-refusal loops. Height only -- the
-            // user's chosen width is respected (content stretches).
-            int cur_w, cur_h;
-            SDL_GetWindowSize(g_settings_window, &cur_w, &cur_h);
-            int want = (int)(g_profile_wizard.DesiredHeight() + 0.5f);
-            if (want < 260) want = 260;
-            if (want > 1000) want = 1000;
-            static int last_applied_h = 0;
-            if (want != last_applied_h && SDL_abs(want - cur_h) > 8) {
-                SDL_SetWindowSize(g_settings_window, cur_w, want);
-                last_applied_h = want;
+            // Event-driven height tracking: exactly ONE resize request
+            // per genuine layout change (accordion toggle, template/
+            // validation rows) -- whatever size the WM then grants is
+            // accepted as-is. Per-frame height-delta resizing fought
+            // user drag-resizes and compositor size grants and
+            // degraded the window over time. Height only -- the user's
+            // chosen width is always respected.
+            if (g_profile_wizard.TakeContentChanged()) {
+                int cur_w, cur_h;
+                SDL_GetWindowSize(g_settings_window, &cur_w, &cur_h);
+                int want = (int)(g_profile_wizard.DesiredHeight() + 0.5f);
+                if (want < 260) want = 260;
+                if (want > 1000) want = 1000;
+                if (SDL_abs(want - cur_h) > 8) {
+                    SDL_SetWindowSize(g_settings_window, cur_w, want);
+                }
             }
 
             if (!g_profile_wizard.is_open && g_profile_wizard.WasCompleted()) {

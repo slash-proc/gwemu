@@ -35,6 +35,12 @@ public:
     // Draw() -- the host resizes the SDL settings window to this so the
     // wizard never scrolls or clips (see gwemu_settings_hud_update).
     float DesiredHeight() const { return m_desired_h; }
+    // True exactly on frames where the layout genuinely changed
+    // (accordion toggled, template/validation rows changed) -- the host
+    // issues ONE resize request then and otherwise never touches the
+    // window (accepting whatever size the WM granted; fighting the
+    // compositor per-frame degraded the whole window over time).
+    bool TakeContentChanged() { bool c = m_content_changed; m_content_changed = false; return c; }
 
 private:
     enum Template { TplStockMario, TplStockZelda, TplCustom };
@@ -84,6 +90,15 @@ private:
     std::string m_created_id;     // set by worker on success
     bool m_completed = false;
     float m_desired_h = 0.0f;
+    bool m_content_changed = false;
+    unsigned m_last_sig = ~0u;
+    bool m_assignments_open = false;
+    // Cached existence of the gnwmanager patch binary (per game),
+    // rechecked at most once a second -- g_file_test ran every frame
+    // from ValidSources()/DrawForm() before.
+    mutable bool m_patchbin_ok[2] = { false, false };
+    mutable uint64_t m_patchbin_check_ms[2] = { 0, 0 };
+    bool PatchBinaryOk(int gi) const;
     std::thread m_thread;
     void JoinWorker();
 };

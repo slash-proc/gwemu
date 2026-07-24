@@ -42,6 +42,18 @@ static std::string PatchBinaryPath(const char *game)
 
 ProfileWizard::ProfileWizard() = default;
 
+bool ProfileWizard::PatchBinaryOk(int gi) const
+{
+    uint64_t now = SDL_GetTicks();
+    if (now - m_patchbin_check_ms[gi] > 1000 || m_patchbin_check_ms[gi] == 0) {
+        m_patchbin_check_ms[gi] = now;
+        m_patchbin_ok[gi] = g_file_test(
+            PatchBinaryPath(GnwBackupLibrary::GameName(gi)).c_str(),
+            G_FILE_TEST_EXISTS);
+    }
+    return m_patchbin_ok[gi];
+}
+
 ProfileWizard::~ProfileWizard()
 {
     JoinWorker();
@@ -305,9 +317,7 @@ bool ProfileWizard::ValidSources(std::string *why) const
             if (why) *why = "verified OFW dumps not found in the backup folder";
             return false;
         }
-        if (m_stock_patched &&
-            !g_file_test(PatchBinaryPath(GnwBackupLibrary::GameName(gi)).c_str(),
-                         G_FILE_TEST_EXISTS)) {
+        if (m_stock_patched && !PatchBinaryOk(gi)) {
             if (why) *why = "gnwmanager patch binary not found (../gnwmanager checkout)";
             return false;
         }
@@ -422,7 +432,8 @@ void ProfileWizard::DrawBankAssignments()
         ImGui::SetNextItemOpen(true);
         m_open_assignments_next = false;
     }
-    if (!ImGui::CollapsingHeader("Bank Assignments")) {
+    m_assignments_open = ImGui::CollapsingHeader("Bank Assignments");
+    if (!m_assignments_open) {
         return;
     }
 
@@ -515,11 +526,9 @@ void ProfileWizard::DrawForm()
 
     if (m_template == TplStockMario || m_template == TplStockZelda) {
         ImGui::Spacing();
-        ImGui::Checkbox("Patched OFW (retro-go dual-boot hotkey)", &m_stock_patched);
+        ImGui::Checkbox("Patched OFW (allows dual-boot)", &m_stock_patched);
         if (m_stock_patched &&
-            !g_file_test(PatchBinaryPath(GnwBackupLibrary::GameName(
-                             m_template == TplStockMario ? 0 : 1)).c_str(),
-                         G_FILE_TEST_EXISTS)) {
+            !PatchBinaryOk(m_template == TplStockMario ? 0 : 1)) {
             ImGui::TextDisabled("gnwmanager patch binary not found -- needs a "
                                 "../gnwmanager checkout");
         }
@@ -624,6 +633,23 @@ void ProfileWizard::Draw()
     float btn_h = ImGui::GetFrameHeightWithSpacing();
     m_desired_h = content_bottom + reason_h + btn_h +
                   ImGui::GetStyle().WindowPadding.y;
+
+    // Layout signature: the discrete states that legitimately change the
+    // natural height. The host resizes only when this changes -- never
+    // from per-frame height deltas (which fought user drag-resizes and
+    // compositor size grants, degrading the window over time).
+    unsigned sig = (unsigned)m_template |
+                   ((unsigned)m_assignments_open << 3) |
+                   ((unsigned)(m_build_state.load() != BuildIdle) << 4) |
+                   ((unsigned)m_stock_patched << 5) |
+                   ((unsigned)m_bank1_choice << 6) |
+                   ((unsigned)m_bank2_choice << 9) |
+                   ((unsigned)m_ext_choice << 11) |
+                   ((unsigned)((int)(m_desired_h / 24)) << 16);
+    if (sig != m_last_sig) {
+        m_last_sig = sig;
+        m_content_changed = true;
+    }
 
     // Bottom row: Cancel (left) / Create (right), pinned to the window
     // bottom. Cancel = skip into the normal settings menu (the host
