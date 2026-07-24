@@ -162,13 +162,14 @@ void gwemu_hud_init(SDL_Window* window, SDL_Renderer* renderer)
     g_last_scale = g_viewport_mgr.m_scale;
     InitializeStyle();
     // First-run: the profile-creation wizard IS the welcome experience
-    // now (owner decision) -- the old FirstBootWindow only shows for the
-    // profiles-already-exist case until it's removed entirely in Phase 3.
-    if (g_config.general.show_welcome && g_profile_store.Profiles().empty()) {
+    // (owner decision) -- in every case. The xemu-inherited
+    // FirstBootWindow is never shown anymore (it resurfaced once via the
+    // old else-branch when show_welcome was set while profiles already
+    // existed). Wizard's Open() starts at S1a with no profiles, S2 when
+    // profiles exist (flow-spec re-entry rule).
+    if (g_config.general.show_welcome) {
         g_profile_wizard.Open();
         g_config.general.show_welcome = false;
-    } else {
-        first_boot_window.is_open = g_config.general.show_welcome;
     }
     gnw_h7b0_rtc_set_sync_host(g_config.sys.rtc_sync_host);
 }
