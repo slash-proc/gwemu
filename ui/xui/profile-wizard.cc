@@ -73,6 +73,8 @@ void ProfileWizard::Open()
         (m_template == TplStockZelda && !m_library.status[1].Available())) {
         m_template = TplCustom;
         m_open_assignments_next = true;
+    } else if (m_template != TplCustom) {
+        SyncStockReflection();
     }
     m_build_state.store(BuildIdle);
     m_created_id.clear();
@@ -352,11 +354,16 @@ bool ProfileWizard::ValidSources(std::string *why) const
     return true;
 }
 
+bool ProfileWizard::ZeldaInvolved() const
+{
+    return m_template == TplStockZelda ||
+           m_ext_choice == ExtOfwZelda ||
+           m_bank1_choice == B1OfwZelda;
+}
+
 int ProfileWizard::MinExtSizeMiB() const
 {
-    bool zelda = m_template == TplStockZelda ||
-                 (m_template == TplCustom && m_ext_choice == ExtOfwZelda);
-    return zelda ? 4 : 1;
+    return ZeldaInvolved() ? 4 : 1;
 }
 
 // While a stock template is active the Bank Assignments accordion is a
@@ -375,6 +382,9 @@ void ProfileWizard::SyncStockReflection()
         m_ext_choice = ExtOfwZelda;
         m_ext_size_mib = 64;
     }
+    if (m_ext_size_mib < MinExtSizeMiB()) {
+        m_ext_size_mib = MinExtSizeMiB();
+    }
 }
 
 void ProfileWizard::DrawBackupFolderRow()
@@ -390,6 +400,10 @@ void ProfileWizard::DrawBackupFolderRow()
         ShowOpenFolderDialog(m_library.dir.c_str(), [this](const char *path) {
             m_library.dir = path;
             m_library.Rescan();
+            if ((m_template == TplStockMario && !m_library.status[0].Available()) ||
+                (m_template == TplStockZelda && !m_library.status[1].Available())) {
+                m_template = TplCustom;
+            }
         });
     }
     bool any = m_library.status[0].Available() || m_library.status[1].Available();
@@ -400,19 +414,20 @@ void ProfileWizard::DrawBackupFolderRow()
     }
 }
 
-void ProfileWizard::DrawExtSizeStepper(bool disabled)
+bool ProfileWizard::DrawExtSizeStepper()
 {
+    bool changed = false;
     int min_mib = MinExtSizeMiB();
     if (m_ext_size_mib < min_mib) {
         m_ext_size_mib = min_mib;
     }
-    ImGui::BeginDisabled(disabled);
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Size");
     ImGui::SameLine();
     ImGui::BeginDisabled(m_ext_size_mib <= min_mib);
     if (ImGui::Button("-##extsize")) {
         m_ext_size_mib = std::max(min_mib, m_ext_size_mib / 2);
+        changed = true;
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
@@ -421,9 +436,10 @@ void ProfileWizard::DrawExtSizeStepper(bool disabled)
     ImGui::BeginDisabled(m_ext_size_mib >= 256);
     if (ImGui::Button("+##extsize")) {
         m_ext_size_mib = std::min(256, m_ext_size_mib * 2);
+        changed = true;
     }
     ImGui::EndDisabled();
-    ImGui::EndDisabled();
+    return changed;
 }
 
 void ProfileWizard::DrawBankAssignments()
@@ -432,33 +448,40 @@ void ProfileWizard::DrawBankAssignments()
         ImGui::SetNextItemOpen(true);
         m_open_assignments_next = false;
     }
+    if (m_close_assignments_next) {
+        ImGui::SetNextItemOpen(false);
+        m_close_assignments_next = false;
+    }
     m_assignments_open = ImGui::CollapsingHeader("Bank Assignments");
     if (!m_assignments_open) {
         return;
     }
 
-    bool stock = m_template != TplCustom;
-    if (stock) {
-        SyncStockReflection();
-    }
+    // Always editable: under a stock template these show the reflected
+    // stock values (synced at selection time); the first edit here
+    // switches the Template to Custom, keeping every current value --
+    // including the one just changed (owner call, reverses the earlier
+    // read-only-reflection behavior).
+    bool changed = false;
 
-    auto slot_file = [](const char *label, std::string &path) {
+    auto slot_file = [&changed](const char *label, std::string &path) {
         ImGui::TextUnformatted(path.empty() ? "(no file)" : path.c_str());
         ImGui::SameLine();
         FilePicker(label, path.c_str(), kBinFilter, 2, false,
                    [&path](const char *p) { path = p; });
+        // (dialog result lands via callback; the combo switch to File...
+        // already counted as a change)
     };
 
     ImGui::Indent();
-    ImGui::BeginDisabled(stock);
 
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Bank 1");
     ImGui::SameLine(120 * g_viewport_mgr.m_scale);
     const char *b1_items[] = { "Blank (0xFF)", "Mario OFW", "Zelda OFW", "File..." };
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::Combo("##b1", &m_bank1_choice, b1_items, 4);
-    if (!stock && m_bank1_choice == B1File) {
+    changed |= ImGui::Combo("##b1", &m_bank1_choice, b1_items, 4);
+    if (m_bank1_choice == B1File) {
         slot_file("Bank1 file", m_bank1_path);
     }
 
@@ -467,28 +490,32 @@ void ProfileWizard::DrawBankAssignments()
     ImGui::SameLine(120 * g_viewport_mgr.m_scale);
     const char *b2_items[] = { "Blank (0xFF)", "File..." };
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::Combo("##b2", &m_bank2_choice, b2_items, 2);
-    if (!stock && m_bank2_choice == B2File) {
+    changed |= ImGui::Combo("##b2", &m_bank2_choice, b2_items, 2);
+    if (m_bank2_choice == B2File) {
         slot_file("Bank2 file", m_bank2_path);
     }
 
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Extflash");
     ImGui::SameLine(120 * g_viewport_mgr.m_scale);
-    // In stock reflection the asset copy reads "<Game> Assets", matching
-    // what the template actually builds.
     const char *ext_items[] = { "Blank (0xFF)", "Mario Assets", "Zelda Assets",
                                 "File..." };
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::Combo("##ext", &m_ext_choice, ext_items, 4);
-    if (!stock && m_ext_choice == ExtFile) {
+    changed |= ImGui::Combo("##ext", &m_ext_choice, ext_items, 4);
+    if (m_ext_choice == ExtFile) {
         slot_file("Extflash file", m_ext_path);
-    } else if (m_ext_choice != ExtFile) {
-        DrawExtSizeStepper(stock);
+    } else {
+        changed |= DrawExtSizeStepper();
     }
 
-    ImGui::EndDisabled();
     ImGui::Unindent();
+
+    if (changed && m_template != TplCustom) {
+        m_template = TplCustom;
+    }
+    if (changed && m_ext_size_mib < MinExtSizeMiB()) {
+        m_ext_size_mib = MinExtSizeMiB();
+    }
 }
 
 void ProfileWizard::DrawForm()
@@ -508,20 +535,28 @@ void ProfileWizard::DrawForm()
 
     ImGui::TextUnformatted("Template");
     ImGui::Spacing();
-    const char *stock_names[2] = { "Stock Mario", "Stock Zelda" };
-    for (int i = 0; i < 2; i++) {
-        bool avail = m_library.status[i].Available() && m_library.status[i].external_found;
-        ImGui::BeginDisabled(!avail);
-        if (ImGui::RadioButton(stock_names[i], m_template == i)) {
-            m_template = i;
-        }
-        ImGui::EndDisabled();
-    }
     if (ImGui::RadioButton("Custom", m_template == TplCustom)) {
         if (m_template != TplCustom) {
             m_open_assignments_next = true;
         }
         m_template = TplCustom;
+    }
+    // Stock entries are hidden entirely (not disabled) until that game's
+    // dumps are found+verified -- the backup-folder row above is how
+    // users make them appear.
+    const char *stock_names[2] = { "Stock Mario", "Stock Zelda" };
+    for (int i = 0; i < 2; i++) {
+        bool avail = m_library.status[i].Available() && m_library.status[i].external_found;
+        if (!avail) {
+            continue;
+        }
+        if (ImGui::RadioButton(stock_names[i], m_template == i)) {
+            if (m_template != i) {
+                m_close_assignments_next = true;
+            }
+            m_template = i;
+            SyncStockReflection();
+        }
     }
 
     if (m_template == TplStockMario || m_template == TplStockZelda) {

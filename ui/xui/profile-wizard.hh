@@ -53,9 +53,14 @@ private:
     void DrawForm();
     void DrawBackupFolderRow();
     void DrawBankAssignments();
-    void DrawExtSizeStepper(bool disabled);
+    bool DrawExtSizeStepper(); // returns true when the user changed it
     void DrawBuildView();
     void StartBuild();
+    // Single shared predicate: is Zelda content involved in ANY current
+    // selection (stock zelda template, zelda assets extflash, zelda OFW
+    // bank1 -- in any template state)? Future zelda-touching contexts
+    // must extend THIS, so the 4 MiB floor can't miss one.
+    bool ZeldaInvolved() const;
     // Lowest legal extflash size for the current selection (Zelda content
     // needs at least 4 MiB -- owner-specified floor).
     int MinExtSizeMiB() const;
@@ -66,7 +71,8 @@ private:
     GnwBackupLibrary m_library;
 
     int m_template = TplStockMario;
-    bool m_open_assignments_next = false; // one-shot accordion auto-open
+    bool m_open_assignments_next = false;  // one-shot accordion auto-open
+    bool m_close_assignments_next = false; // one-shot collapse (stock selected)
     char m_name[64] = "";
     std::string m_name_hint;      // generated placeholder
 
