@@ -543,6 +543,15 @@ jobs:
         run: |
           set -euo pipefail
           cd artifacts
+          # upload/download-artifact@v4 round-trips files through its own
+          # zip and DROPS permission bits, so the chmod +x done in the
+          # build jobs is gone by the time we get here. Restore exec bits
+          # on the Linux/macOS binaries, launchers and scripts before the
+          # real zip (zip -r does preserve them). Windows doesn't care.
+          for d in gwemu-linux-* gwemu-macos-*; do
+            [ -d "$d" ] || continue
+            chmod +x "$d"/qemu-system-arm* "$d"/gwemu* "$d"/scripts/* 2>/dev/null || true
+          done
           for d in */; do
             d="${d%/}"
             zip -r "../$d.zip" "$d"
