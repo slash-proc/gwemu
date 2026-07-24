@@ -773,8 +773,18 @@ void ProfileWizard::DrawFirmwareStage()
     if (m_stage == StageFwPrompt) {
         const char *hint =
             "GWemu can use firmware dumped from your own Game & Watch devices.";
-        ImGui::SetCursorPosX((win_w - ImGui::CalcTextSize(hint).x) * 0.5f);
+        // Center only when it fits inside the content margin; otherwise
+        // start at the margin and wrap before the opposite one -- naive
+        // (win-text)/2 centering lands inside the margins when the line
+        // is wider than the window (owner report: butted against both
+        // sides).
+        float margin = 28 * sc;
+        float text_w = ImGui::CalcTextSize(hint).x;
+        float x = (win_w - text_w) * 0.5f;
+        ImGui::SetCursorPosX(x > margin ? x : margin);
+        ImGui::PushTextWrapPos(win_w - margin);
         ImGui::TextDisabled("%s", hint);
+        ImGui::PopTextWrapPos();
         ImGui::Dummy(ImVec2(0, GNW_GAP_SECTION * sc));
     }
 
