@@ -63,6 +63,7 @@ private:
     int CompleteCount() const;
     void EnterProfileStage();
     void DrawBankAssignments();
+    void DrawSdSection();
     bool DrawExtSizeStepper(); // returns true when the user changed it
     void DrawBuildView();
     void StartBuild();
@@ -106,6 +107,26 @@ private:
     int m_ext_choice = ExtBlank;
     std::string m_ext_path;
     int m_ext_size_mib = 64;
+
+    // SD Card section (see DrawSdSection). SD state deliberately never
+    // resets on template selection and never flips the template to
+    // Custom -- it's orthogonal to the flash-slot template concept.
+    enum SdMode { SdNone, SdNew, SdImport, SdShared };
+    int m_sd_mode = SdNone;
+    std::string m_sd_import_path;
+    int m_sd_transfer = 0;          // 0=Copy 1=Move original
+    int m_sd_storage = 0;           // 0=Bundled 1=Shared
+    int m_sd_new_size_gib = 8;      // power-of-2, 4..32 (create gated off)
+    std::string m_sd_shared_image;  // filename under sd-cards/
+    bool m_sd_open = false;
+    bool m_close_sd_next = false;   // one-shot collapse (stock selected)
+    // 1s-TTL qcow2-magic check of m_sd_import_path (same pattern as
+    // ResolvePatchBinary -- never per-frame file I/O). 0=ok 1=no file
+    // 2=missing 3=not qcow2.
+    int CheckSdImport() const;
+    mutable std::string m_sd_chk_path;
+    mutable int m_sd_chk_result = 1;
+    mutable uint64_t m_sd_chk_ms = 0;
 
     // Build state (worker thread; UI polls)
     enum BuildState { BuildIdle, BuildRunning, BuildDone, BuildFailed };

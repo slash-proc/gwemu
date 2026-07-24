@@ -70,10 +70,15 @@ void gwemu_settings_hud_show(void);
  * process image) -- QEMU cannot hot-swap a real-ized RAM MemoryRegion's file
  * backing while running, so a full restart is the correct mechanism here,
  * not a workaround.
+ *
+ * sdcard_qcow2: absolute path to a qcow2 SD image appended as
+ * "-drive if=sd,format=qcow2,file=..." (any pre-existing if=sd -drive
+ * pair is stripped first); NULL = no SD card.
  */
 void gwemu_relaunch_with_flash_images(const char *bank1_image,
                                       const char *bank2_image,
-                                      const char *extflash_image);
+                                      const char *extflash_image,
+                                      const char *sdcard_qcow2);
 
 #ifdef __cplusplus
 }

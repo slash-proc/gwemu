@@ -1771,7 +1771,8 @@ static bool is_flash_image_global(const char *arg)
 
 void gwemu_relaunch_with_flash_images(const char *bank1_image,
                                       const char *bank2_image,
-                                      const char *extflash_image)
+                                      const char *extflash_image,
+                                      const char *sdcard_qcow2)
 {
     GPtrArray *new_argv = g_ptr_array_new();
     g_ptr_array_add(new_argv, g_orig_argv[0]);
@@ -1779,6 +1780,11 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
         if (strcmp(g_orig_argv[i], "-global") == 0 && i + 1 < g_orig_argc &&
             is_flash_image_global(g_orig_argv[i + 1])) {
             i++; // also skip the "gnw-h7b0-soc.*-image=..." argument itself
+            continue;
+        }
+        if (strcmp(g_orig_argv[i], "-drive") == 0 && i + 1 < g_orig_argc &&
+            strstr(g_orig_argv[i + 1], "if=sd") != NULL) {
+            i++; // skip a pre-existing SD -drive pair (mirrors -global)
             continue;
         }
         if (strcmp(g_orig_argv[i], "-S") == 0) {
@@ -1806,6 +1812,12 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
         ef = g_strdup_printf("gnw-h7b0-soc.extflash-image=%s", extflash_image);
         g_ptr_array_add(new_argv, (char *)"-global");
         g_ptr_array_add(new_argv, ef);
+    }
+    char *sd = NULL;
+    if (sdcard_qcow2 && sdcard_qcow2[0]) {
+        sd = g_strdup_printf("if=sd,format=qcow2,file=%s", sdcard_qcow2);
+        g_ptr_array_add(new_argv, (char *)"-drive");
+        g_ptr_array_add(new_argv, sd);
     }
     /* -config_path is gwemu-private and was compacted OUT of argv before
      * qemu_init() (and out of g_orig_argv, captured post-compaction) --

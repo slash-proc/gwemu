@@ -33,6 +33,29 @@ static const SDL_DialogFileFilter kBinFilter[] = {
     { "All files", "*" },
 };
 
+static const SDL_DialogFileFilter kQcow2Filter[] = {
+    { "SD card images (*.qcow2)", "qcow2" },
+    { "All files", "*" },
+};
+
+// "New card" is fully designed but the FAT32 image backend hasn't landed
+// yet -- the combo entry shows disabled ("coming soon") and the rows stay
+// hidden. Flip this to light the UI once the backend exists.
+static const bool kSdCreateEnabled = false;
+
+// Shareable subset of the shared-SD registry (only shareable=true cards
+// are attachable).
+static std::vector<const GwSharedSd *> ShareableSds()
+{
+    std::vector<const GwSharedSd *> v;
+    for (const GwSharedSd &s : g_profile_store.SharedSds()) {
+        if (s.shareable) {
+            v.push_back(&s);
+        }
+    }
+    return v;
+}
+
 // gnwmanager's pre-built novel-code binary. Local dev override: a
 // checkout next to this repo (same convention the CLI tool documents).
 static std::string CheckoutPatchPath(const char *game)
@@ -149,6 +172,19 @@ void ProfileWizard::JoinWorker()
 void ProfileWizard::Open()
 {
     m_library.Rescan();
+    g_profile_store.Scan();   // shared-SD registry may have changed
+    if (m_sd_mode == SdShared) {
+        // Auto-fallback: an armed Shared mode whose registry emptied (or
+        // whose card vanished) reverts to None on re-open.
+        bool found = false;
+        for (const GwSharedSd *s : ShareableSds()) {
+            found |= s->image == m_sd_shared_image;
+        }
+        if (!found) {
+            m_sd_mode = SdNone;
+            m_sd_shared_image.clear();
+        }
+    }
     if ((m_template == TplStockMario && !m_library.status[0].Available()) ||
         (m_template == TplStockZelda && !m_library.status[1].Available())) {
         m_template = TplCustom;
@@ -388,13 +424,80 @@ bool ProfileWizard::BuildWorker(std::string &err)
         }
     }
 
+    // SD card (step 4). "New card" is compile-time gated (kSdCreateEnabled
+    // is false until the FAT32 backend lands), so only Import/Shared can
+    // reach here today.
+    if (ok && m_sd_mode == SdImport) {
+        m_build_step.store(4);
+        std::string dst;
+        if (m_sd_storage == 0) {
+            // Bundled: into the profile dir under the fixed name.
+            dst = p->dir + "/sdcard.qcow2";
+            p->sd.mode = GwSdMode::Bundled;
+            p->sd.image = "sdcard.qcow2";
+        } else {
+            // Shared storage: into the sd-cards/ registry under the
+            // original basename, deduped by numeric suffix, with a
+            // shareable=true sidecar.
+            char *b = g_path_get_basename(m_sd_import_path.c_str());
+            std::string base = b;
+            g_free(b);
+            std::string stem = base, ext = "";
+            size_t dot = base.rfind(".qcow2");
+            if (dot != std::string::npos && dot == base.size() - 6) {
+                stem = base.substr(0, dot);
+            }
+            std::string root = GwProfileStore::SdCardsRoot();
+            g_mkdir_with_parents(root.c_str(), 0755);
+            std::string sd_name = stem + ".qcow2";
+            for (int n = 2; g_file_test((root + "/" + sd_name).c_str(),
+                                        G_FILE_TEST_EXISTS); n++) {
+                sd_name = stem + "-" + std::to_string(n) + ".qcow2";
+            }
+            dst = root + "/" + sd_name;
+            p->sd.mode = GwSdMode::Shared;
+            p->sd.image = sd_name;
+        }
+        if (m_sd_transfer == 1) {
+            // Move: rename when possible, copy+unlink across filesystems.
+            if (g_rename(m_sd_import_path.c_str(), dst.c_str()) != 0) {
+                ok = copy_padded(m_sd_import_path, dst, 0, err);
+                if (ok) {
+                    g_unlink(m_sd_import_path.c_str());
+                }
+            }
+        } else {
+            ok = copy_padded(m_sd_import_path, dst, 0, err);
+        }
+        if (ok && p->sd.mode == GwSdMode::Shared) {
+            std::string sidecar = dst.substr(0, dst.size() - 6) + ".toml";
+            FILE *f = g_fopen(sidecar.c_str(), "wb");
+            if (f) {
+                char *b2 = g_path_get_basename(dst.c_str());
+                fprintf(f, "shareable = true\ndisplay_name = \"%s\"\n", b2);
+                g_free(b2);
+                fclose(f);
+            } else {
+                err = "cannot create " + sidecar;
+                ok = false;
+            }
+        }
+        if (!ok) {
+            p->sd = GwProfileSd();
+        }
+    } else if (ok && m_sd_mode == SdShared) {
+        m_build_step.store(4);
+        p->sd.mode = GwSdMode::Shared;
+        p->sd.image = m_sd_shared_image;   // no file ops -- just attach
+    }
+
     if (!ok) {
         std::string derr;
         g_profile_store.Delete(id, derr); // best-effort cleanup
         return false;
     }
 
-    m_build_step.store(4);
+    m_build_step.store(5);
     if (!g_profile_store.Save(*p, err)) {
         return false;
     }
@@ -424,8 +527,57 @@ void ProfileWizard::StartBuild()
 /* ------------------------------------------------------------------ */
 /* Drawing                                                             */
 
+int ProfileWizard::CheckSdImport() const
+{
+    // 1s TTL, same reasoning as ResolvePatchBinary: this runs from
+    // ValidSources() every frame and must not hit the filesystem per
+    // frame.
+    if (m_sd_import_path.empty()) {
+        return 1;
+    }
+    uint64_t now = SDL_GetTicks();
+    if (m_sd_import_path != m_sd_chk_path ||
+        now - m_sd_chk_ms > 1000 || m_sd_chk_ms == 0) {
+        m_sd_chk_path = m_sd_import_path;
+        m_sd_chk_ms = now;
+        FILE *f = g_fopen(m_sd_import_path.c_str(), "rb");
+        if (!f) {
+            m_sd_chk_result = 2;
+        } else {
+            unsigned char magic[4] = { 0 };
+            size_t n = fread(magic, 1, 4, f);
+            fclose(f);
+            m_sd_chk_result =
+                (n == 4 && memcmp(magic, "QFI\xfb", 4) == 0) ? 0 : 3;
+        }
+    }
+    return m_sd_chk_result;
+}
+
+// SD validity is independent of the flash-slot template rules; None/New
+// are always valid.
+static const char *SdInvalidReason(int chk)
+{
+    switch (chk) {
+    case 1: return "sd: no file selected";
+    case 2: return "sd: file not found";
+    case 3: return "sd: not a qcow2 image";
+    }
+    return NULL;
+}
+
 bool ProfileWizard::ValidSources(std::string *why) const
 {
+    if (m_sd_mode == SdImport) {
+        const char *r = SdInvalidReason(CheckSdImport());
+        if (r) {
+            if (why) *why = r;
+            return false;
+        }
+    } else if (m_sd_mode == SdShared && m_sd_shared_image.empty()) {
+        if (why) *why = "sd: no shared card selected";
+        return false;
+    }
     // Unified Patched rules (one concept for stock and custom): needs an
     // OFW bank1, a matching-game assets extflash (the patch transforms
     // both), and the gnwmanager patch binary (auto-downloaded).
@@ -1081,6 +1233,235 @@ void ProfileWizard::DrawBankAssignments()
     }
 }
 
+void ProfileWizard::DrawSdSection()
+{
+    float sc = g_viewport_mgr.m_scale;
+    std::vector<const GwSharedSd *> shareable = ShareableSds();
+
+    if (m_close_sd_next) {
+        ImGui::SetNextItemOpen(false);
+        m_close_sd_next = false;
+    }
+
+    // Live summary for the header line, computed before the header so the
+    // right edge can be measured. TextDisabled only for "No SD card".
+    std::string summary;
+    bool summary_dim = false;
+    bool warn_glyph = false;
+    switch (m_sd_mode) {
+    case SdNone:
+        summary = "No SD card";
+        summary_dim = true;
+        break;
+    case SdNew:
+        summary = std::string("New ") + std::to_string(m_sd_new_size_gib) +
+                  " GiB card";
+        break;
+    case SdImport: {
+        std::string base = "(no file)";
+        if (!m_sd_import_path.empty()) {
+            char *b = g_path_get_basename(m_sd_import_path.c_str());
+            base = b;
+            g_free(b);
+        }
+        summary = "Import: " + base;
+        warn_glyph = m_sd_transfer == 1; // armed Move must not hide
+        break;
+    }
+    case SdShared:
+        summary = m_sd_shared_image.empty()
+            ? "Shared: (none)"
+            : "Shared: \"" + m_sd_shared_image + "\"";
+        break;
+    }
+
+    m_sd_open = ImGui::CollapsingHeader("SD Card");
+
+    // Right-aligned summary on the header line itself.
+    {
+        float right = ImGui::GetWindowContentRegionMax().x;
+        float max_w = right - ImGui::GetItemRectMax().x + ImGui::GetWindowPos().x
+                    - ImGui::CalcTextSize("SD Card").x - 60 * sc;
+        std::string s = EllipsizeMiddle(summary, max_w > 40 * sc ? max_w : 40 * sc);
+        float w = ImGui::CalcTextSize(s.c_str()).x;
+        float glyph_w = 0;
+        if (warn_glyph && !m_sd_open) {
+            glyph_w = ImGui::CalcTextSize(ICON_FA_CIRCLE_INFO).x + 5 * sc;
+        }
+        ImGui::SameLine(right - w - glyph_w - ImGui::GetStyle().FramePadding.x);
+        if (warn_glyph && !m_sd_open) {
+            ImGui::TextColored(GNW_COL_WARN, ICON_FA_CIRCLE_INFO);
+            ImGui::SameLine(0, 5 * sc);
+        }
+        if (summary_dim) {
+            ImGui::TextDisabled("%s", s.c_str());
+        } else {
+            ImGui::TextUnformatted(s.c_str());
+        }
+    }
+    if (!m_sd_open) {
+        return;
+    }
+
+    ImGui::Indent();
+
+    // Row 1: mode combo. "Shared card..." is present-but-disabled when
+    // nothing is attachable (never hidden); "New card" is gated behind
+    // kSdCreateEnabled (backend not landed).
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Card");
+    ImGui::SameLine(120 * sc);
+    const char *mode_label =
+        m_sd_mode == SdNone   ? "None" :
+        m_sd_mode == SdNew    ? "New card" :
+        m_sd_mode == SdImport ? "Import file..." : "Shared card...";
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
+    if (ImGui::BeginCombo("##sdmode", mode_label)) {
+        if (ImGui::Selectable("None", m_sd_mode == SdNone)) {
+            m_sd_mode = SdNone;
+        }
+        if (kSdCreateEnabled) {
+            if (ImGui::Selectable("New card", m_sd_mode == SdNew)) {
+                m_sd_mode = SdNew;
+            }
+        } else {
+            ImGui::Selectable("New card -- coming soon", false,
+                              ImGuiSelectableFlags_Disabled);
+        }
+        if (ImGui::Selectable("Import file...", m_sd_mode == SdImport)) {
+            m_sd_mode = SdImport;
+        }
+        if (shareable.empty()) {
+            ImGui::Selectable("Shared card... -- no shared cards yet", false,
+                              ImGuiSelectableFlags_Disabled);
+        } else if (ImGui::Selectable("Shared card...", m_sd_mode == SdShared)) {
+            m_sd_mode = SdShared;
+            if (m_sd_shared_image.empty() && shareable.size() == 1) {
+                m_sd_shared_image = shareable[0]->image; // preselect
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    auto storage_radios = [&]() {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Storage");
+        ImGui::SameLine(120 * sc);
+        ImGui::RadioButton("Bundled with profile", &m_sd_storage, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Shared (other profiles can attach)", &m_sd_storage, 1);
+    };
+
+    if (m_sd_mode == SdNew && kSdCreateEnabled) {
+        // Size stepper in the right column, on the combo's row.
+        ImGui::SameLine(0, 10 * sc);
+        ImGui::BeginDisabled(m_sd_new_size_gib <= 4);
+        if (ImGui::Button("-##sdsize")) {
+            m_sd_new_size_gib = std::max(4, m_sd_new_size_gib / 2);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Text("%d GiB", m_sd_new_size_gib);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(m_sd_new_size_gib >= 32);
+        if (ImGui::Button("+##sdsize")) {
+            m_sd_new_size_gib = std::min(32, m_sd_new_size_gib * 2);
+        }
+        ImGui::EndDisabled();
+
+        storage_radios();
+        ImGui::TextDisabled("%d GiB card, sparse -- takes almost no disk "
+                            "until written.", m_sd_new_size_gib);
+    } else if (m_sd_mode == SdImport) {
+        // File row (slot_file idiom: glyph + dim ellipsized path + Browse).
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("File");
+        ImGui::SameLine(120 * sc);
+        ImGui::TextDisabled(ICON_FA_FOLDER);
+        ImGui::SameLine();
+        float reserve = ImGui::CalcTextSize("Browse...").x + 40 * sc;
+        std::string p = m_sd_import_path.empty()
+            ? "(no file)"
+            : EllipsizeMiddle(m_sd_import_path,
+                              ImGui::GetContentRegionAvail().x - reserve);
+        ImGui::TextDisabled("%s", p.c_str());
+        if (ImGui::IsItemHovered() && p != m_sd_import_path &&
+            !m_sd_import_path.empty()) {
+            ImGui::SetTooltip("%s", m_sd_import_path.c_str());
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Browse...##sdimport")) {
+            ShowOpenFileDialog(kQcow2Filter, 2, m_sd_import_path.c_str(),
+                               [this](const char *path) {
+                                   m_sd_import_path = path;
+                               });
+        }
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Transfer");
+        ImGui::SameLine(120 * sc);
+        ImGui::RadioButton("Copy", &m_sd_transfer, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Move original", &m_sd_transfer, 1);
+
+        storage_radios();
+
+        if (m_sd_transfer == 1) {
+            ImGui::TextColored(GNW_COL_WARN, ICON_FA_CIRCLE_INFO
+                " Move relocates the original file into this profile.");
+        } else {
+            ImGui::TextDisabled(
+                "Copies the image; the original file is untouched.");
+        }
+    } else if (m_sd_mode == SdShared) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("From");
+        ImGui::SameLine(120 * sc);
+        if (shareable.empty()) {
+            // Mode armed but registry emptied mid-session: disabled combo
+            // + hint; Open() falls back to None next time.
+            ImGui::BeginDisabled();
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
+            if (ImGui::BeginCombo("##sdshared", "(no shared cards)")) {
+                ImGui::EndCombo();
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Mark a card as shareable to attach it here.");
+        } else {
+            if (m_sd_shared_image.empty() && shareable.size() == 1) {
+                m_sd_shared_image = shareable[0]->image;
+            }
+            auto entry = [](const GwSharedSd *s) {
+                double gib = (double)s->disk_bytes / (1024.0 * 1024.0 * 1024.0);
+                char buf[192];
+                snprintf(buf, sizeof(buf), "%s  --  %.1f GiB",
+                         s->display_name.c_str(), gib);
+                return std::string(buf);
+            };
+            std::string cur = "(select a card)";
+            for (const GwSharedSd *s : shareable) {
+                if (s->image == m_sd_shared_image) {
+                    cur = entry(s);
+                }
+            }
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
+            if (ImGui::BeginCombo("##sdshared", cur.c_str())) {
+                for (const GwSharedSd *s : shareable) {
+                    if (ImGui::Selectable(entry(s).c_str(),
+                                          s->image == m_sd_shared_image)) {
+                        m_sd_shared_image = s->image;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::TextDisabled(
+                "Shared with other profiles; changes are visible everywhere.");
+        }
+    }
+
+    ImGui::Unindent();
+}
+
 void ProfileWizard::DrawForm()
 {
     // Name -- single line, label + field.
@@ -1111,6 +1492,9 @@ void ProfileWizard::DrawForm()
         if (ImGui::RadioButton(stock_names[i], m_template == i)) {
             if (m_template != i) {
                 m_close_assignments_next = true;
+                // Also collapse the SD section (but NEVER reset SD state
+                // -- it survives template switches by design).
+                m_close_sd_next = true;
             }
             m_template = i;
             SyncStockReflection();
@@ -1125,20 +1509,21 @@ void ProfileWizard::DrawForm()
 
     ImGui::Spacing();
     DrawBankAssignments();
+    DrawSdSection();
 }
 
 void ProfileWizard::DrawBuildView()
 {
     static const char *kSteps[] = {
         "Creating profile", "Building bank 1", "Building bank 2",
-        "Building external flash", "Finishing",
+        "Building external flash", "Preparing SD card", "Finishing",
     };
     int state = m_build_state.load();
     int step = m_build_step.load();
 
     if (state == BuildRunning) {
-        ImGui::Text("%s...", kSteps[step < 5 ? step : 4]);
-        ImGui::ProgressBar((step + 1) / 5.0f, ImVec2(-1, 0));
+        ImGui::Text("%s...", kSteps[step < 6 ? step : 5]);
+        ImGui::ProgressBar((step + 1) / 6.0f, ImVec2(-1, 0));
     } else if (state == BuildDone) {
         JoinWorker();
         ImGui::TextUnformatted("Profile created.");
@@ -1150,9 +1535,11 @@ void ProfileWizard::DrawBuildView()
                                           m_created_id.c_str());
                 m_completed = true;
                 is_open = false;
+                std::string sdp = p->SdPath();
                 gwemu_relaunch_with_flash_images(p->Bank1Path().c_str(),
                                                  p->Bank2Path().c_str(),
-                                                 p->ExtflashPath().c_str());
+                                                 p->ExtflashPath().c_str(),
+                                                 sdp.empty() ? NULL : sdp.c_str());
             }
         }
         ImGui::SameLine();
@@ -1242,6 +1629,14 @@ void ProfileWizard::Draw()
     // Stage + card states also change the natural layout (hash-combined
     // rather than shifted -- the height field above uses the high bits).
     sig ^= (unsigned)m_stage * 0x9E3779B9u;
+    // SD section states that change the natural height.
+    unsigned sd_sig = (unsigned)m_sd_open |
+                      ((unsigned)m_sd_mode << 1) |
+                      ((unsigned)m_sd_storage << 3) |
+                      ((unsigned)m_sd_transfer << 4) |
+                      ((unsigned)!m_sd_import_path.empty() << 5) |
+                      ((unsigned)ShareableSds().size() << 6);
+    sig ^= sd_sig * 0x27D4EB2Fu;
     sig ^= (unsigned)GnwCardStateOf(m_library.status[0]) * 0x85EBCA6Bu;
     sig ^= (unsigned)GnwCardStateOf(m_library.status[1]) * 0xC2B2AE35u;
     if (sig != m_last_sig) {
