@@ -1,6 +1,15 @@
-2026-07-24  RELEASES: Linux/mac zips now contain only the ready-to-run
-            runtime (binaries + bundled libs); the gnw scripts moved to
-            a single separate, optional scripts.zip asset.
+2026-07-24  RELEASES: single-file-per-platform asset lineup. Linux:
+            gwemu-<ver>-x86_64.AppImage (contrib/appimage/, verified
+            locally against a real firmware boot; fully-static Linux
+            ruled out -- GPU userspace is runtime-loaded per-hardware).
+            macOS: gwemu-<ver>-macos-{arm64,x86_64}.dmg with a
+            self-contained gwemu.app (recipe validated on the real
+            Intel iMac incl. the mandatory dylibbundler LC_RPATH dedup
+            -- modern dyld aborts on duplicates). Windows portable
+            renamed gwemu-portable.exe. All direct un-zipped assets;
+            no more platform zips, no qemu-system-arm assets (the
+            single binaries accept explicit -M/-display args); gnw
+            scripts ship once as a separate optional scripts.zip.
 
 2026-07-24  WINDOWS: single-file static gwemu.exe + installer, and the
             console-flood freeze. Adopted xemu's distribution model via
