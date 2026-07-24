@@ -1,3 +1,7 @@
+2026-07-24  RELEASES: Linux/mac zips now contain only the ready-to-run
+            runtime (binaries + bundled libs); the gnw scripts moved to
+            a single separate, optional scripts.zip asset.
+
 2026-07-24  WINDOWS: single-file static gwemu.exe + installer, and the
             console-flood freeze. Adopted xemu's distribution model via
             its public MXE static toolchain image plus a static liblzma
