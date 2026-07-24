@@ -284,10 +284,25 @@ jobs:
               --extra-cflags="-arch x86_64" \
               --extra-cxxflags="-arch x86_64" \
               --extra-ldflags="-arch x86_64" \
-              --disable-sdl
+              --disable-sdl \
+              --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
+              --disable-curl --disable-libssh --disable-curses --disable-libusb \
+              --disable-zstd --disable-dbus-display --disable-png
           else
-            ../configure --target-list=arm-softmmu --disable-sdl
+            ../configure --target-list=arm-softmmu --disable-sdl \
+              --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
+              --disable-curl --disable-libssh --disable-curses --disable-libusb \
+              --disable-zstd --disable-dbus-display --disable-png
           fi
+          # The --disable-vnc..--disable-png block pins the OPTIONAL
+          # feature set identically on both legs: the arm64 runner's
+          # preinstalled Homebrew otherwise auto-enables a pile of
+          # features (gnutls+its chain, vnc jpeg/png, libusb, zstd,
+          # gio) the minimal x86_64 prefix doesn't have, and the
+          # universal merge job (correctly) refuses to lipo two apps
+          # with different dylib sets -- exactly how v0.0.12's first
+          # run failed. None of these features are part of what gwemu
+          # ships (same trimming rationale as the static Windows exe).
           # --disable-sdl: QEMU's own legacy `-display sdl` backend (SDL2,
           # separate from our GUI's SDL3) -- our GUI (`-display gwemu`)
           # supersedes it entirely, and a real user's crash report on a
