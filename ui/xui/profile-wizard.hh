@@ -31,6 +31,10 @@ public:
     // settings-window host to decide whether closing the wizard should
     // also close the window vs fall back to the settings menu).
     bool WasCompleted() const { return m_completed; }
+    // Natural content height (ImGui points) measured during the last
+    // Draw() -- the host resizes the SDL settings window to this so the
+    // wizard never scrolls or clips (see gwemu_settings_hud_update).
+    float DesiredHeight() const { return m_desired_h; }
 
 private:
     enum Template { TplStockMario, TplStockZelda, TplCustom };
@@ -79,6 +83,7 @@ private:
     std::string m_build_error;    // written before state flip
     std::string m_created_id;     // set by worker on success
     bool m_completed = false;
+    float m_desired_h = 0.0f;
     std::thread m_thread;
     void JoinWorker();
 };

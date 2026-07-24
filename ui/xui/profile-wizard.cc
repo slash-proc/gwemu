@@ -15,6 +15,7 @@
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <algorithm>
+#include <cfloat>
 #include <cstring>
 
 extern "C" {
@@ -444,7 +445,7 @@ void ProfileWizard::DrawBankAssignments()
     ImGui::TextUnformatted("Bank 1");
     ImGui::SameLine(120 * g_viewport_mgr.m_scale);
     const char *b1_items[] = { "Blank (0xFF)", "Mario OFW", "Zelda OFW", "File..." };
-    ImGui::SetNextItemWidth(220 * g_viewport_mgr.m_scale);
+    ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::Combo("##b1", &m_bank1_choice, b1_items, 4);
     if (!stock && m_bank1_choice == B1File) {
         slot_file("Bank1 file", m_bank1_path);
@@ -454,7 +455,7 @@ void ProfileWizard::DrawBankAssignments()
     ImGui::TextUnformatted("Bank 2");
     ImGui::SameLine(120 * g_viewport_mgr.m_scale);
     const char *b2_items[] = { "Blank (0xFF)", "File..." };
-    ImGui::SetNextItemWidth(220 * g_viewport_mgr.m_scale);
+    ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::Combo("##b2", &m_bank2_choice, b2_items, 2);
     if (!stock && m_bank2_choice == B2File) {
         slot_file("Bank2 file", m_bank2_path);
@@ -467,7 +468,7 @@ void ProfileWizard::DrawBankAssignments()
     // what the template actually builds.
     const char *ext_items[] = { "Blank (0xFF)", "Mario Assets", "Zelda Assets",
                                 "File..." };
-    ImGui::SetNextItemWidth(220 * g_viewport_mgr.m_scale);
+    ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::Combo("##ext", &m_ext_choice, ext_items, 4);
     if (!stock && m_ext_choice == ExtFile) {
         slot_file("Extflash file", m_ext_path);
@@ -485,7 +486,7 @@ void ProfileWizard::DrawForm()
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Name");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(240 * g_viewport_mgr.m_scale);
+    ImGui::SetNextItemWidth(-FLT_MIN);
     ImGui::InputTextWithHint("##name", m_name_hint.c_str(), m_name, sizeof(m_name));
 
     ImGui::Spacing();
@@ -593,7 +594,9 @@ void ProfileWizard::Draw()
     bool began = ImGui::Begin("New Device Profile", nullptr,
                               ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
                               ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDecoration |
-                              ImGuiWindowFlags_NoBringToFrontOnFocus);
+                              ImGuiWindowFlags_NoBringToFrontOnFocus |
+                              ImGuiWindowFlags_NoScrollbar |
+                              ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
     if (!began) {
         ImGui::End();
@@ -612,11 +615,20 @@ void ProfileWizard::Draw()
         DrawForm();
     }
 
+    // Natural height of everything above the bottom row, BEFORE any
+    // pinning -- the host resizes the OS window toward
+    // DesiredHeight(), which is what makes "never scrolls, never
+    // clips" hold.
+    float content_bottom = ImGui::GetCursorPosY();
+    float reason_h = ImGui::GetTextLineHeightWithSpacing();
+    float btn_h = ImGui::GetFrameHeightWithSpacing();
+    m_desired_h = content_bottom + reason_h + btn_h +
+                  ImGui::GetStyle().WindowPadding.y;
+
     // Bottom row: Cancel (left) / Create (right), pinned to the window
     // bottom. Cancel = skip into the normal settings menu (the host
     // falls back there because WasCompleted() stays false).
     if (!building) {
-        float btn_h = ImGui::GetFrameHeightWithSpacing();
         float y = ImGui::GetWindowHeight() - btn_h -
                   ImGui::GetStyle().WindowPadding.y;
         if (ImGui::GetCursorPosY() < y) {

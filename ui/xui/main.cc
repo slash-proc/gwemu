@@ -232,7 +232,7 @@ void gwemu_hud_update(void)
         g_last_scale = g_viewport_mgr.m_scale;
     }
 
-    if (!first_boot_window.is_open && !g_profile_wizard.is_open) {
+    if (!first_boot_window.is_open) {
         int ww, wh;
         SDL_GetWindowSizeInPixels(gwemu_get_window(), &ww, &wh);
         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
@@ -255,8 +255,7 @@ void gwemu_hud_update(void)
     }
 #endif
 
-    if (g_config.display.ui.show_menubar && !first_boot_window.is_open &&
-        !g_profile_wizard.is_open) {
+    if (g_config.display.ui.show_menubar && !first_boot_window.is_open) {
         // Auto-hide main menu after 5s of inactivity
         static uint32_t last_check = 0;
         float alpha = 1.0;
@@ -330,8 +329,16 @@ void gwemu_hud_update(void)
 
     }
 
+    // First-boot wizard lives in the settings window -- pop that window
+    // once, after all init (gwemu_settings_hud_init runs after
+    // gwemu_hud_init, so showing it from there would no-op).
+    static bool wizard_autoshow_done = false;
+    if (!wizard_autoshow_done && g_profile_wizard.is_open) {
+        gwemu_settings_hud_show();
+        wizard_autoshow_done = true;
+    }
+
     first_boot_window.Draw();
-    g_profile_wizard.Draw();
     monitor_window.Draw();
     g_scene_mgr.Draw();
     if (!first_boot_window.is_open) notification_manager.Draw();
@@ -422,6 +429,16 @@ void gwemu_settings_hud_cleanup(void)
 void gwemu_settings_hud_show(void)
 {
     if (g_settings_window) {
+        if ((SDL_GetWindowFlags(g_settings_window) & SDL_WINDOW_HIDDEN) &&
+            g_settings_renderer) {
+            // The renderer still holds the last frame this window ever
+            // presented (e.g. the settings menu) -- showing it now would
+            // flash that stale content for a frame before the first real
+            // draw. Present a clean frame first.
+            SDL_SetRenderDrawColor(g_settings_renderer, 25, 25, 25, 255);
+            SDL_RenderClear(g_settings_renderer);
+            SDL_RenderPresent(g_settings_renderer);
+        }
         SDL_ShowWindow(g_settings_window);
         SDL_RaiseWindow(g_settings_window);
     }
@@ -460,13 +477,42 @@ void gwemu_settings_hud_update(void)
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        
-        bool is_open = g_main_menu.Draw();
 
-        if (!is_open) {
-            SDL_HideWindow(g_settings_window);
+        if (g_profile_wizard.is_open) {
+            // The wizard owns the settings window while open (owner
+            // decision: it IS the first-run settings experience). The
+            // normal settings menu is hidden; the wizard's own
+            // Cancel button closes it to fall through here.
+            g_profile_wizard.Draw();
+
+            // Track the wizard's natural content height so it never
+            // scrolls or clips: resize the OS window when the content
+            // height meaningfully changes (accordion open/close,
+            // validation text). Hysteresis + last-applied guard prevent
+            // per-frame churn and WM-refusal loops. Height only -- the
+            // user's chosen width is respected (content stretches).
+            int cur_w, cur_h;
+            SDL_GetWindowSize(g_settings_window, &cur_w, &cur_h);
+            int want = (int)(g_profile_wizard.DesiredHeight() + 0.5f);
+            if (want < 260) want = 260;
+            if (want > 1000) want = 1000;
+            static int last_applied_h = 0;
+            if (want != last_applied_h && SDL_abs(want - cur_h) > 8) {
+                SDL_SetWindowSize(g_settings_window, cur_w, want);
+                last_applied_h = want;
+            }
+
+            if (!g_profile_wizard.is_open && g_profile_wizard.WasCompleted()) {
+                SDL_HideWindow(g_settings_window);
+            }
+        } else {
+            bool is_open = g_main_menu.Draw();
+
+            if (!is_open) {
+                SDL_HideWindow(g_settings_window);
+            }
         }
-        
+
         if (g_ctx_main) ImGui::SetCurrentContext(g_ctx_main);
     }
 }
