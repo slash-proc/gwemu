@@ -27,9 +27,12 @@ public:
     // Reset to page 0 and rescan the backup library, then open.
     void Open();
     void Draw();
+    // True once a profile was actually created this session (used by the
+    // settings-window host to decide whether closing the wizard should
+    // also close the window vs fall back to the settings menu).
+    bool WasCompleted() const { return m_completed; }
 
 private:
-    enum Page { PageTemplate, PageSources, PageBuild };
     enum Template { TplStockMario, TplStockZelda, TplCustom };
 
     // Custom-template slot choices (content-blind: files are opaque).
@@ -37,17 +40,23 @@ private:
     enum Bank2Choice { B2Blank, B2File };
     enum ExtChoice { ExtBlank, ExtOfwMario, ExtOfwZelda, ExtFile };
 
-    void DrawTemplatePage();
-    void DrawSourcesPage();
-    void DrawBuildPage();
+    void DrawForm();
+    void DrawBackupFolderRow();
+    void DrawBankAssignments();
+    void DrawExtSizeStepper(bool disabled);
+    void DrawBuildView();
     void StartBuild();
+    // Lowest legal extflash size for the current selection (Zelda content
+    // needs at least 4 MiB -- owner-specified floor).
+    int MinExtSizeMiB() const;
+    void SyncStockReflection();
     bool BuildWorker(std::string &err);   // runs on m_thread
     bool ValidSources(std::string *why) const;
 
     GnwBackupLibrary m_library;
 
-    int m_page = PageTemplate;
     int m_template = TplStockMario;
+    bool m_open_assignments_next = false; // one-shot accordion auto-open
     char m_name[64] = "";
     std::string m_name_hint;      // generated placeholder
 
@@ -69,6 +78,7 @@ private:
     std::atomic<int> m_build_step{0};
     std::string m_build_error;    // written before state flip
     std::string m_created_id;     // set by worker on success
+    bool m_completed = false;
     std::thread m_thread;
     void JoinWorker();
 };

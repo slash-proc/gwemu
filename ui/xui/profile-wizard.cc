@@ -14,6 +14,7 @@
 
 #include <glib.h>
 #include <glib/gstdio.h>
+#include <algorithm>
 #include <cstring>
 
 extern "C" {
@@ -55,9 +56,14 @@ void ProfileWizard::JoinWorker()
 void ProfileWizard::Open()
 {
     m_library.Rescan();
-    m_page = PageTemplate;
+    if ((m_template == TplStockMario && !m_library.status[0].Available()) ||
+        (m_template == TplStockZelda && !m_library.status[1].Available())) {
+        m_template = TplCustom;
+        m_open_assignments_next = true;
+    }
     m_build_state.store(BuildIdle);
     m_created_id.clear();
+    m_completed = false;
     m_name_hint = GwProfileStore::GenerateName();
     is_open = true;
 }
@@ -277,7 +283,6 @@ void ProfileWizard::StartBuild()
     JoinWorker();
     m_build_error.clear();
     m_build_state.store(BuildRunning);
-    m_page = PageBuild;
     m_thread = std::thread([this]() {
         std::string err;
         bool ok = BuildWorker(err);
@@ -329,50 +334,100 @@ bool ProfileWizard::ValidSources(std::string *why) const
         if (why) *why = "extflash: no file selected";
         return false;
     }
+    if (m_ext_choice != ExtFile && m_ext_size_mib < MinExtSizeMiB()) {
+        if (why) *why = "extflash: Zelda content needs at least 4 MiB";
+        return false;
+    }
     return true;
 }
 
-void ProfileWizard::DrawTemplatePage()
+int ProfileWizard::MinExtSizeMiB() const
 {
-    ImGui::TextUnformatted("Template");
-    ImGui::Spacing();
-
-    const char *stock_names[2] = { "Stock Mario", "Stock Zelda" };
-    for (int i = 0; i < 2; i++) {
-        bool avail = m_library.status[i].Available() && m_library.status[i].external_found;
-        ImGui::BeginDisabled(!avail);
-        if (ImGui::RadioButton(stock_names[i], m_template == i)) {
-            m_template = i;
-        }
-        ImGui::EndDisabled();
-        if (!avail) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("(needs verified dumps in the backup folder)");
-        }
-    }
-    if (ImGui::RadioButton("Custom", m_template == TplCustom)) {
-        m_template = TplCustom;
-    }
-
-    ImGui::Spacing();
-    ImGui::TextUnformatted("Name (optional)");
-    ImGui::SetNextItemWidth(240 * g_viewport_mgr.m_scale);
-    ImGui::InputTextWithHint("##name", m_name_hint.c_str(), m_name, sizeof(m_name));
+    bool zelda = m_template == TplStockZelda ||
+                 (m_template == TplCustom && m_ext_choice == ExtOfwZelda);
+    return zelda ? 4 : 1;
 }
 
-void ProfileWizard::DrawSourcesPage()
+// While a stock template is active the Bank Assignments accordion is a
+// read-only reflection of what the template will build -- keep the slot
+// state mirroring it so opening the accordion always shows the truth.
+void ProfileWizard::SyncStockReflection()
 {
-    if (m_template == TplStockMario || m_template == TplStockZelda) {
-        int gi = m_template == TplStockMario ? 0 : 1;
-        ImGui::Text("Stock %s from your verified dumps.", GnwBackupLibrary::GameName(gi));
-        ImGui::Spacing();
-        ImGui::Checkbox("Patched OFW (retro-go dual-boot hotkey)", &m_stock_patched);
-        if (m_stock_patched &&
-            !g_file_test(PatchBinaryPath(GnwBackupLibrary::GameName(gi)).c_str(),
-                         G_FILE_TEST_EXISTS)) {
-            ImGui::TextDisabled("gnwmanager patch binary not found -- needs a ../gnwmanager checkout");
-        }
+    if (m_template == TplStockMario) {
+        m_bank1_choice = B1OfwMario;
+        m_bank2_choice = B2Blank;
+        m_ext_choice = ExtOfwMario;
+        m_ext_size_mib = 64;
+    } else if (m_template == TplStockZelda) {
+        m_bank1_choice = B1OfwZelda;
+        m_bank2_choice = B2Blank;
+        m_ext_choice = ExtOfwZelda;
+        m_ext_size_mib = 64;
+    }
+}
+
+void ProfileWizard::DrawBackupFolderRow()
+{
+    // Clean minimal backup-folder affordance (the Flash tab's picker is
+    // deliberately NOT reused here -- owner call).
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Backup folder");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", m_library.dir.c_str());
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...##backupdir")) {
+        ShowOpenFolderDialog(m_library.dir.c_str(), [this](const char *path) {
+            m_library.dir = path;
+            m_library.Rescan();
+        });
+    }
+    bool any = m_library.status[0].Available() || m_library.status[1].Available();
+    if (!any) {
+        ImGui::TextDisabled("No verified stock dumps found -- pick the folder "
+                            "with your gnwmanager backups to enable the stock "
+                            "templates.");
+    }
+}
+
+void ProfileWizard::DrawExtSizeStepper(bool disabled)
+{
+    int min_mib = MinExtSizeMiB();
+    if (m_ext_size_mib < min_mib) {
+        m_ext_size_mib = min_mib;
+    }
+    ImGui::BeginDisabled(disabled);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Size");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(m_ext_size_mib <= min_mib);
+    if (ImGui::Button("-##extsize")) {
+        m_ext_size_mib = std::max(min_mib, m_ext_size_mib / 2);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::Text("%d MiB", m_ext_size_mib);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(m_ext_size_mib >= 256);
+    if (ImGui::Button("+##extsize")) {
+        m_ext_size_mib = std::min(256, m_ext_size_mib * 2);
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+}
+
+void ProfileWizard::DrawBankAssignments()
+{
+    if (m_open_assignments_next) {
+        ImGui::SetNextItemOpen(true);
+        m_open_assignments_next = false;
+    }
+    if (!ImGui::CollapsingHeader("Bank Assignments")) {
         return;
+    }
+
+    bool stock = m_template != TplCustom;
+    if (stock) {
+        SyncStockReflection();
     }
 
     auto slot_file = [](const char *label, std::string &path) {
@@ -382,40 +437,98 @@ void ProfileWizard::DrawSourcesPage()
                    [&path](const char *p) { path = p; });
     };
 
-    ImGui::TextUnformatted("Bank 1 (internal flash)");
+    ImGui::Indent();
+    ImGui::BeginDisabled(stock);
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Bank 1");
+    ImGui::SameLine(120 * g_viewport_mgr.m_scale);
     const char *b1_items[] = { "Blank (0xFF)", "Mario OFW", "Zelda OFW", "File..." };
-    ImGui::SetNextItemWidth(200 * g_viewport_mgr.m_scale);
+    ImGui::SetNextItemWidth(220 * g_viewport_mgr.m_scale);
     ImGui::Combo("##b1", &m_bank1_choice, b1_items, 4);
-    if (m_bank1_choice == B1File) {
+    if (!stock && m_bank1_choice == B1File) {
         slot_file("Bank1 file", m_bank1_path);
     }
-    ImGui::Spacing();
 
-    ImGui::TextUnformatted("Bank 2 (internal flash)");
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Bank 2");
+    ImGui::SameLine(120 * g_viewport_mgr.m_scale);
     const char *b2_items[] = { "Blank (0xFF)", "File..." };
-    ImGui::SetNextItemWidth(200 * g_viewport_mgr.m_scale);
+    ImGui::SetNextItemWidth(220 * g_viewport_mgr.m_scale);
     ImGui::Combo("##b2", &m_bank2_choice, b2_items, 2);
-    if (m_bank2_choice == B2File) {
+    if (!stock && m_bank2_choice == B2File) {
         slot_file("Bank2 file", m_bank2_path);
     }
-    ImGui::Spacing();
 
-    ImGui::TextUnformatted("External flash");
-    const char *ext_items[] = { "Blank (0xFF)", "Blank + Mario OFW assets",
-                                "Blank + Zelda OFW assets", "File..." };
-    ImGui::SetNextItemWidth(240 * g_viewport_mgr.m_scale);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Extflash");
+    ImGui::SameLine(120 * g_viewport_mgr.m_scale);
+    // In stock reflection the asset copy reads "<Game> Assets", matching
+    // what the template actually builds.
+    const char *ext_items[] = { "Blank (0xFF)", "Mario Assets", "Zelda Assets",
+                                "File..." };
+    ImGui::SetNextItemWidth(220 * g_viewport_mgr.m_scale);
     ImGui::Combo("##ext", &m_ext_choice, ext_items, 4);
-    if (m_ext_choice == ExtFile) {
+    if (!stock && m_ext_choice == ExtFile) {
         slot_file("Extflash file", m_ext_path);
-    } else {
-        ImGui::SetNextItemWidth(120 * g_viewport_mgr.m_scale);
-        ImGui::InputInt("Size (MiB)", &m_ext_size_mib);
-        if (m_ext_size_mib < 1) m_ext_size_mib = 1;
-        if (m_ext_size_mib > 256) m_ext_size_mib = 256;
+    } else if (m_ext_choice != ExtFile) {
+        DrawExtSizeStepper(stock);
     }
+
+    ImGui::EndDisabled();
+    ImGui::Unindent();
 }
 
-void ProfileWizard::DrawBuildPage()
+void ProfileWizard::DrawForm()
+{
+    // Name -- single line, label + field.
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Name");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(240 * g_viewport_mgr.m_scale);
+    ImGui::InputTextWithHint("##name", m_name_hint.c_str(), m_name, sizeof(m_name));
+
+    ImGui::Spacing();
+    DrawBackupFolderRow();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::TextUnformatted("Template");
+    ImGui::Spacing();
+    const char *stock_names[2] = { "Stock Mario", "Stock Zelda" };
+    for (int i = 0; i < 2; i++) {
+        bool avail = m_library.status[i].Available() && m_library.status[i].external_found;
+        ImGui::BeginDisabled(!avail);
+        if (ImGui::RadioButton(stock_names[i], m_template == i)) {
+            m_template = i;
+        }
+        ImGui::EndDisabled();
+    }
+    if (ImGui::RadioButton("Custom", m_template == TplCustom)) {
+        if (m_template != TplCustom) {
+            m_open_assignments_next = true;
+        }
+        m_template = TplCustom;
+    }
+
+    if (m_template == TplStockMario || m_template == TplStockZelda) {
+        ImGui::Spacing();
+        ImGui::Checkbox("Patched OFW (retro-go dual-boot hotkey)", &m_stock_patched);
+        if (m_stock_patched &&
+            !g_file_test(PatchBinaryPath(GnwBackupLibrary::GameName(
+                             m_template == TplStockMario ? 0 : 1)).c_str(),
+                         G_FILE_TEST_EXISTS)) {
+            ImGui::TextDisabled("gnwmanager patch binary not found -- needs a "
+                                "../gnwmanager checkout");
+        }
+    }
+
+    ImGui::Spacing();
+    DrawBankAssignments();
+}
+
+void ProfileWizard::DrawBuildView()
 {
     static const char *kSteps[] = {
         "Creating profile", "Building bank 1", "Building bank 2",
@@ -436,6 +549,7 @@ void ProfileWizard::DrawBuildPage()
             if (p) {
                 gwemu_settings_set_string(&g_config.general.active_profile,
                                           m_created_id.c_str());
+                m_completed = true;
                 is_open = false;
                 gwemu_relaunch_with_flash_images(p->Bank1Path().c_str(),
                                                  p->Bank2Path().c_str(),
@@ -447,6 +561,7 @@ void ProfileWizard::DrawBuildPage()
             gwemu_settings_set_string(&g_config.general.active_profile,
                                       m_created_id.c_str());
             gwemu_settings_save();
+            m_completed = true;
             is_open = false;
         }
     } else if (state == BuildFailed) {
@@ -456,7 +571,6 @@ void ProfileWizard::DrawBuildPage()
         ImGui::Spacing();
         if (ImGui::Button("Back")) {
             m_build_state.store(BuildIdle);
-            m_page = PageSources;
         }
     }
 }
@@ -467,54 +581,66 @@ void ProfileWizard::Draw()
         return;
     }
 
-    ImVec2 size(460 * g_viewport_mgr.m_scale, 340 * g_viewport_mgr.m_scale);
+    // Hosted inside the settings window's own ImGui context (see
+    // gwemu_settings_hud_update) -- fill that window edge to edge, with a
+    // healthy uniform content margin (owner call: left-aligned content,
+    // never hugging the edges).
+    float pad = 28 * g_viewport_mgr.m_scale;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
     ImGuiIO &io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - size.x) / 2,
-                                   (io.DisplaySize.y - size.y) / 2),
-                            ImGuiCond_Always);
-    ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
-    if (!ImGui::Begin("New Device Profile", &is_open,
-                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(io.DisplaySize, ImGuiCond_Always);
+    bool began = ImGui::Begin("New Device Profile", nullptr,
+                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                              ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDecoration |
+                              ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImGui::PopStyleVar();
+    if (!began) {
         ImGui::End();
         return;
     }
 
     ImGui::PushFont(g_font_mgr.m_menu_font_medium);
-    const char *title = "New Device Profile";
-    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - ImGui::CalcTextSize(title).x) / 2);
-    ImGui::TextUnformatted(title);
+    ImGui::TextUnformatted("New Device Profile");
     ImGui::PopFont();
-    ImGui::Dummy(ImVec2(0, 8 * g_viewport_mgr.m_scale));
-
-    switch (m_page) {
-    case PageTemplate: DrawTemplatePage(); break;
-    case PageSources:  DrawSourcesPage();  break;
-    case PageBuild:    DrawBuildPage();    break;
-    }
-
     ImGui::Dummy(ImVec2(0, 10 * g_viewport_mgr.m_scale));
 
-    if (m_page != PageBuild) {
-        if (m_page > PageTemplate && ImGui::Button("Back")) {
-            m_page--;
+    bool building = m_build_state.load() != BuildIdle;
+    if (building) {
+        DrawBuildView();
+    } else {
+        DrawForm();
+    }
+
+    // Bottom row: Cancel (left) / Create (right), pinned to the window
+    // bottom. Cancel = skip into the normal settings menu (the host
+    // falls back there because WasCompleted() stays false).
+    if (!building) {
+        float btn_h = ImGui::GetFrameHeightWithSpacing();
+        float y = ImGui::GetWindowHeight() - btn_h -
+                  ImGui::GetStyle().WindowPadding.y;
+        if (ImGui::GetCursorPosY() < y) {
+            ImGui::SetCursorPosY(y);
         }
-        if (m_page > PageTemplate) {
-            ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(110 * g_viewport_mgr.m_scale, 0))) {
+            is_open = false;
         }
         std::string why;
-        bool can_next = m_page == PageTemplate || ValidSources(&why);
-        ImGui::BeginDisabled(!can_next);
-        if (ImGui::Button(m_page == PageSources ? "Create" : "Next")) {
-            if (m_page == PageTemplate) {
-                m_page = PageSources;
-            } else {
-                StartBuild();
-            }
+        bool can_create = ValidSources(&why);
+        float create_w = 110 * g_viewport_mgr.m_scale;
+        ImGui::SameLine(ImGui::GetWindowWidth() - create_w -
+                        ImGui::GetStyle().WindowPadding.x);
+        ImGui::BeginDisabled(!can_create);
+        if (ImGui::Button("Create", ImVec2(create_w, 0))) {
+            StartBuild();
         }
         ImGui::EndDisabled();
-        if (!can_next && m_page == PageSources) {
-            ImGui::SameLine();
+        if (!can_create) {
+            // Reason, subtle, right-aligned above the button row.
+            ImVec2 sz = ImGui::CalcTextSize(why.c_str());
+            ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - sz.x -
+                                           ImGui::GetStyle().WindowPadding.x,
+                                       y - ImGui::GetTextLineHeightWithSpacing()));
             ImGui::TextDisabled("%s", why.c_str());
         }
     }
