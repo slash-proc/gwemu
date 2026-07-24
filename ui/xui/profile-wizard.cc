@@ -32,31 +32,110 @@ static const SDL_DialogFileFilter kBinFilter[] = {
     { "All files", "*" },
 };
 
-// gnwmanager's pre-built novel-code binary -- same repo-layout
-// convention the CLI tool documents (checkout next to this repo).
-static std::string PatchBinaryPath(const char *game)
+// gnwmanager's pre-built novel-code binary. Local dev override: a
+// checkout next to this repo (same convention the CLI tool documents).
+static std::string CheckoutPatchPath(const char *game)
 {
     return std::string("../gnwmanager/gnwmanager/cli/gnw_patch/binaries/") +
            game + "/0x08032000.bin";
 }
 
+static std::string CachePatchDir(const char *game)
+{
+    return std::string(gwemu_settings_get_base_path()) + "cache/gnw-patch/" + game;
+}
+
+// Raw single-file fetch from BrianPugh/gnwmanager@main -- path verified
+// byte-identical (sha1) against a real checkout for both games
+// (2026-07-24). NEVER clones/fetches the repo itself (owner rule);
+// worst-case fallback if raw URLs ever break: pull the repo zip and
+// extract just these blobs.
+static std::string PatchBinaryUrl(const char *game)
+{
+    return std::string("https://raw.githubusercontent.com/BrianPugh/gnwmanager/"
+                       "main/gnwmanager/cli/gnw_patch/binaries/") +
+           game + "/0x08032000.bin";
+}
+
 ProfileWizard::ProfileWizard() = default;
 
-bool ProfileWizard::PatchBinaryOk(int gi) const
+const std::string &ProfileWizard::ResolvePatchBinary(int gi) const
 {
+    // 1s TTL: g_file_test every frame is exactly the kind of per-frame
+    // filesystem work that got purged in batch 3.
     uint64_t now = SDL_GetTicks();
     if (now - m_patchbin_check_ms[gi] > 1000 || m_patchbin_check_ms[gi] == 0) {
         m_patchbin_check_ms[gi] = now;
-        m_patchbin_ok[gi] = g_file_test(
-            PatchBinaryPath(GnwBackupLibrary::GameName(gi)).c_str(),
-            G_FILE_TEST_EXISTS);
+        const char *game = GnwBackupLibrary::GameName(gi);
+        std::string p = CheckoutPatchPath(game);
+        if (!g_file_test(p.c_str(), G_FILE_TEST_EXISTS)) {
+            p = CachePatchDir(game) + "/0x08032000.bin";
+            if (!g_file_test(p.c_str(), G_FILE_TEST_EXISTS)) {
+                p.clear();
+            }
+        }
+        m_patchbin_path[gi] = p;
     }
-    return m_patchbin_ok[gi];
+    return m_patchbin_path[gi];
+}
+
+int ProfileWizard::Bank1Game() const
+{
+    if (m_bank1_choice == B1OfwMario) return 0;
+    if (m_bank1_choice == B1OfwZelda) return 1;
+    return -1;
+}
+
+void ProfileWizard::StartPatchDownload(int gi)
+{
+    int expect = 0;
+    if (!m_dl_state[gi].compare_exchange_strong(expect, 1)) {
+        return; // already running/done/failed
+    }
+    if (m_dl_threads[gi].joinable()) {
+        m_dl_threads[gi].join();
+    }
+    m_dl_error[gi].clear();
+    m_dl_threads[gi] = std::thread([this, gi]() {
+        const char *game = GnwBackupLibrary::GameName(gi);
+        std::string dir = CachePatchDir(game);
+        g_mkdir_with_parents(dir.c_str(), 0755);
+        std::string dst = dir + "/0x08032000.bin";
+        std::string tmp = dst + ".part";
+        std::string url = PatchBinaryUrl(game);
+        // TODO: replace the popen curl/wget chain with a proper
+        // cross-platform in-process fetch (owner accepts this jank on
+        // Linux for now; Windows static build has no shell tools).
+        std::string cmd = "curl -fsSL -o '" + tmp + "' '" + url +
+                          "' 2>/dev/null || wget -qO '" + tmp + "' '" + url + "'";
+        int rc = -1;
+        FILE *pf = popen(cmd.c_str(), "r");
+        if (pf) {
+            rc = pclose(pf);
+        }
+        GStatBuf st;
+        bool ok = rc == 0 && g_stat(tmp.c_str(), &st) == 0 && st.st_size > 0;
+        if (ok) {
+            ok = g_rename(tmp.c_str(), dst.c_str()) == 0;
+        }
+        if (!ok) {
+            g_unlink(tmp.c_str());
+            m_dl_error[gi] = "download failed (check network); "
+                             "url: " + url;
+        }
+        m_patchbin_check_ms[gi] = 0; // force re-resolution
+        m_dl_state[gi].store(ok ? 2 : 3);
+    });
 }
 
 ProfileWizard::~ProfileWizard()
 {
     JoinWorker();
+    for (auto &t : m_dl_threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
 }
 
 void ProfileWizard::JoinWorker()
@@ -182,28 +261,43 @@ bool ProfileWizard::BuildWorker(std::string &err)
     GwProfile *p = g_profile_store.Find(id);
 
     bool ok = true;
-    if (m_template == TplStockMario || m_template == TplStockZelda) {
+    bool patched_pair = m_patched && Bank1Game() >= 0;
+    if (patched_pair) {
+        // Patched OFW (stock template or custom with OFW bank1 +
+        // matching assets -- ValidSources guarantees the pairing):
+        // gnw_cfw_build writes bank1+extflash directly into the profile
+        // (in-process -- no popen, see Phase 1).
+        int gi = Bank1Game();
+        const char *game = GnwBackupLibrary::GameName(gi);
+        m_build_step.store(1);
+        char *cerr = NULL;
+        ok = gnw_cfw_build_images(game,
+                                  m_library.InternalPath(gi).c_str(),
+                                  m_library.ExternalPath(gi).c_str(),
+                                  ResolvePatchBinary(gi).c_str(),
+                                  p->Bank1Path().c_str(),
+                                  p->ExtflashPath().c_str(),
+                                  NULL, &cerr);
+        if (!ok) {
+            err = cerr ? cerr : "CFW patch failed";
+            free(cerr);
+        }
+        p->prov_bank1 = std::string("patched-") + game;
+        p->prov_extflash = std::string("patched-") + game;
+        if (ok) {
+            m_build_step.store(2);
+            if (m_template != TplCustom || m_bank2_choice == B2Blank) {
+                ok = write_blank(p->Bank2Path(), kBankSize, err);
+                p->prov_bank2 = "blank";
+            } else {
+                ok = copy_padded(m_bank2_path, p->Bank2Path(), kBankSize, err);
+                p->prov_bank2 = "user-file";
+            }
+        }
+    } else if (m_template == TplStockMario || m_template == TplStockZelda) {
         int gi = m_template == TplStockMario ? 0 : 1;
         const char *game = GnwBackupLibrary::GameName(gi);
-        if (m_stock_patched) {
-            // Patched OFW: gnw_cfw_build writes bank1+extflash directly
-            // into the profile (in-process -- no popen, see Phase 1).
-            m_build_step.store(1);
-            char *cerr = NULL;
-            ok = gnw_cfw_build_images(game,
-                                      m_library.InternalPath(gi).c_str(),
-                                      m_library.ExternalPath(gi).c_str(),
-                                      PatchBinaryPath(game).c_str(),
-                                      p->Bank1Path().c_str(),
-                                      p->ExtflashPath().c_str(),
-                                      NULL, &cerr);
-            if (!ok) {
-                err = cerr ? cerr : "CFW patch failed";
-                free(cerr);
-            }
-            p->prov_bank1 = std::string("patched-") + game;
-            p->prov_extflash = std::string("patched-") + game;
-        } else {
+        {
             m_build_step.store(1);
             ok = copy_padded(m_library.InternalPath(gi), p->Bank1Path(), kBankSize, err);
             if (ok) {
@@ -313,14 +407,35 @@ void ProfileWizard::StartBuild()
 
 bool ProfileWizard::ValidSources(std::string *why) const
 {
+    // Unified Patched rules (one concept for stock and custom): needs an
+    // OFW bank1, a matching-game assets extflash (the patch transforms
+    // both), and the gnwmanager patch binary (auto-downloaded).
+    if (m_patched) {
+        int gi = Bank1Game();
+        if (gi < 0) {
+            if (why) *why = "Patched needs an OFW in bank 1";
+            return false;
+        }
+        if (!((gi == 0 && m_ext_choice == ExtOfwMario) ||
+              (gi == 1 && m_ext_choice == ExtOfwZelda))) {
+            if (why) *why = std::string("Patched needs matching ") +
+                            GnwBackupLibrary::GameName(gi) + " assets in extflash";
+            return false;
+        }
+        if (ResolvePatchBinary(gi).empty()) {
+            int dl = m_dl_state[gi].load();
+            if (why) {
+                *why = dl == 1 ? "downloading patch binary..."
+                     : dl == 3 ? "patch binary download failed"
+                               : "patch binary not available yet";
+            }
+            return false;
+        }
+    }
     if (m_template == TplStockMario || m_template == TplStockZelda) {
         int gi = m_template == TplStockMario ? 0 : 1;
         if (!m_library.status[gi].Available() || !m_library.status[gi].external_found) {
             if (why) *why = "verified OFW dumps not found in the backup folder";
-            return false;
-        }
-        if (m_stock_patched && !PatchBinaryOk(gi)) {
-            if (why) *why = "gnwmanager patch binary not found (../gnwmanager checkout)";
             return false;
         }
         return true;
@@ -478,9 +593,57 @@ void ProfileWizard::DrawBankAssignments()
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Bank 1");
     ImGui::SameLine(120 * g_viewport_mgr.m_scale);
-    const char *b1_items[] = { "Blank (0xFF)", "Mario OFW", "Zelda OFW", "File..." };
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    changed |= ImGui::Combo("##b1", &m_bank1_choice, b1_items, 4);
+    // OFW entries appear only when found+verified in the backup library
+    // -- mirror of the hidden-until-available stock templates.
+    struct B1Item { const char *label; int choice; };
+    B1Item b1_items[4];
+    int b1_n = 0;
+    b1_items[b1_n++] = { "Blank (0xFF)", B1Blank };
+    if (m_library.status[0].Available()) b1_items[b1_n++] = { "Mario OFW", B1OfwMario };
+    if (m_library.status[1].Available()) b1_items[b1_n++] = { "Zelda OFW", B1OfwZelda };
+    b1_items[b1_n++] = { "File...", B1File };
+    int b1_sel = 0;
+    for (int i = 0; i < b1_n; i++) {
+        if (b1_items[i].choice == m_bank1_choice) b1_sel = i;
+    }
+    bool b1_show_patch = Bank1Game() >= 0;
+    float patch_w = b1_show_patch
+        ? ImGui::CalcTextSize("Patched").x + ImGui::GetFrameHeight() +
+          3 * ImGui::GetStyle().ItemSpacing.x
+        : 0.0f;
+    ImGui::SetNextItemWidth(b1_show_patch ? -patch_w : -FLT_MIN);
+    if (ImGui::BeginCombo("##b1", b1_items[b1_sel].label)) {
+        for (int i = 0; i < b1_n; i++) {
+            if (ImGui::Selectable(b1_items[i].label, i == b1_sel)) {
+                if (m_bank1_choice != b1_items[i].choice) {
+                    m_bank1_choice = b1_items[i].choice;
+                    changed = true;
+                    if (Bank1Game() < 0) {
+                        m_patched = false; // hidden checkbox never lingers on
+                    }
+                }
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (b1_show_patch) {
+        ImGui::SameLine();
+        // Deliberately NOT part of `changed`: toggling Patched on a
+        // stock template is still that stock template (patched stock is
+        // a first-class stock flavor), it must not flip to Custom.
+        ImGui::Checkbox("Patched", &m_patched);
+        int gi = Bank1Game();
+        if (m_patched && gi >= 0 && ResolvePatchBinary(gi).empty()) {
+            if (m_dl_state[gi].load() == 0) {
+                StartPatchDownload(gi);
+            }
+            if (m_dl_state[gi].load() == 1) {
+                ImGui::TextDisabled("downloading patch binary...");
+            } else if (m_dl_state[gi].load() == 3) {
+                ImGui::TextDisabled("%s", m_dl_error[gi].c_str());
+            }
+        }
+    }
     if (m_bank1_choice == B1File) {
         slot_file("Bank1 file", m_bank1_path);
     }
@@ -556,16 +719,6 @@ void ProfileWizard::DrawForm()
             }
             m_template = i;
             SyncStockReflection();
-        }
-    }
-
-    if (m_template == TplStockMario || m_template == TplStockZelda) {
-        ImGui::Spacing();
-        ImGui::Checkbox("Patched OFW (allows dual-boot)", &m_stock_patched);
-        if (m_stock_patched &&
-            !PatchBinaryOk(m_template == TplStockMario ? 0 : 1)) {
-            ImGui::TextDisabled("gnwmanager patch binary not found -- needs a "
-                                "../gnwmanager checkout");
         }
     }
 
@@ -676,7 +829,7 @@ void ProfileWizard::Draw()
     unsigned sig = (unsigned)m_template |
                    ((unsigned)m_assignments_open << 3) |
                    ((unsigned)(m_build_state.load() != BuildIdle) << 4) |
-                   ((unsigned)m_stock_patched << 5) |
+                   ((unsigned)m_patched << 5) |
                    ((unsigned)m_bank1_choice << 6) |
                    ((unsigned)m_bank2_choice << 9) |
                    ((unsigned)m_ext_choice << 11) |

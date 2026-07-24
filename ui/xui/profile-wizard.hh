@@ -76,8 +76,9 @@ private:
     char m_name[64] = "";
     std::string m_name_hint;      // generated placeholder
 
-    // Stock options
-    bool m_stock_patched = false; // retro-go dual-boot hotkey patch
+    // Unified "Patched" concept (one checkbox, lives next to Bank 1's
+    // OFW selection; stock templates share it)
+    bool m_patched = false;
 
     // Custom options
     int m_bank1_choice = B1OfwMario;
@@ -102,9 +103,19 @@ private:
     // Cached existence of the gnwmanager patch binary (per game),
     // rechecked at most once a second -- g_file_test ran every frame
     // from ValidSources()/DrawForm() before.
-    mutable bool m_patchbin_ok[2] = { false, false };
+    mutable std::string m_patchbin_path[2];
     mutable uint64_t m_patchbin_check_ms[2] = { 0, 0 };
-    bool PatchBinaryOk(int gi) const;
+    // Resolution order: ../gnwmanager checkout, then <appdata>/cache.
+    // Empty string = not available locally (a download may provide it).
+    const std::string &ResolvePatchBinary(int gi) const;
+
+    // Lazy per-game download of gnwmanager's patch binary (worker
+    // thread; UI polls state). 0=idle 1=running 2=done 3=failed.
+    std::atomic<int> m_dl_state[2] = { 0, 0 };
+    std::string m_dl_error[2];       // written before the state flip
+    std::thread m_dl_threads[2];
+    void StartPatchDownload(int gi);
+    int Bank1Game() const;           // 0/1 for OFW bank1 choice, -1 otherwise
     std::thread m_thread;
     void JoinWorker();
 };

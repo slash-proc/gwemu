@@ -62,6 +62,16 @@ static std::string NormalizeDefaultLocation(const char *default_location)
 
     try {
         std::filesystem::path path(default_location);
+        // A nonexistent default makes the portal/dialog error out
+        // ("Unable to find ...") on every platform -- and a RELATIVE
+        // path is resolved by the portal against $HOME, not our cwd
+        // (confirmed real: library dir "backup" from an empty cwd
+        // produced "Unable to find /home/<user>/backup"). Absolutize
+        // against our cwd first, drop it entirely if it doesn't exist.
+        path = std::filesystem::absolute(path);
+        if (!std::filesystem::exists(path)) {
+            return {};
+        }
 #if defined(SDL_PLATFORM_LINUX)
         if (std::filesystem::is_regular_file(path)) {
             return path.parent_path().string();
@@ -70,15 +80,11 @@ static std::string NormalizeDefaultLocation(const char *default_location)
         if (std::filesystem::is_directory(path)) {
             return (path / "").string();
         }
-        // Prevent a crash in SDL3 file dialog
-        if (!std::filesystem::exists(path)) {
-            return {};
-        }
 #endif
+        return path.string();
     } catch (...) {
-        // Fall through to return original path
+        return {};
     }
-    return default_location;
 }
 
 void ShowOpenFileDialog(const SDL_DialogFileFilter *filters, int nfilters,
@@ -98,14 +104,19 @@ void ShowSaveFileDialog(const SDL_DialogFileFilter *filters, int nfilters,
                         FileDialogCallback callback)
 {
     auto *cb = new FileDialogCallback(std::move(callback));
+    std::string normalized = NormalizeDefaultLocation(default_location);
     SDL_ShowSaveFileDialog(FileDialogCallbackWrapper, cb, gwemu_get_window(),
-                           filters, nfilters, default_location);
+                           filters, nfilters,
+                           normalized.empty() ? nullptr : normalized.c_str());
 }
 
 void ShowOpenFolderDialog(const char *default_location,
                           FileDialogCallback callback)
 {
     auto *cb = new FileDialogCallback(std::move(callback));
+    std::string normalized = NormalizeDefaultLocation(default_location);
     SDL_ShowOpenFolderDialog(FileDialogCallbackWrapper, cb,
-                             gwemu_get_window(), default_location, false);
+                             gwemu_get_window(),
+                             normalized.empty() ? nullptr : normalized.c_str(),
+                             false);
 }
