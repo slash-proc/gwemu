@@ -33,6 +33,7 @@
 #include <locale.h>
 
 #include "gwemu-settings.h"
+#include "gwemu-profiles.hh"
 
 #define DEFINE_CONFIG_TREE
 #include "gwemu-config.h"
@@ -202,6 +203,11 @@ bool gwemu_settings_load(void)
     }
 
     config_tree.store_to_struct(&g_config);
+
+    /* Device-profile store lives under the same base path; scanning here
+     * (earliest point the base path is settled) also creates the
+     * profiles/ and sd-cards/ directories on first run. */
+    g_profile_store.Scan();
 
     return success;
 }

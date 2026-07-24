@@ -2,6 +2,10 @@ general:
   show_welcome:
     type: bool
     default: true
+  # Directory id of the most-recently-launched device profile (see
+  # ui/gwemu-profiles.hh) -- empty means none. Generated field:
+  # g_config.general.active_profile.
+  active_profile: string
   updates:
     check:
       type: bool

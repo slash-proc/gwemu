@@ -40,6 +40,7 @@ if sdl3.found()
     'gwemu-monitor.c',
     'gwemu-data.c',
     'gwemu-settings.cc',
+    'gwemu-profiles.cc',
     'gwemu.c',
   ))
   gnw_gui_ss.add(files('../gwemu-version.c'))
