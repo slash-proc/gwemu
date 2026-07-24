@@ -36,6 +36,7 @@
  */
 
 #include <math.h>
+#include "hw/misc/gnw_env.h"
 
 /* getenv() is a locked linear scan on Windows (msvcrt) -- never call it
  * per-event in emulation-hot paths; resolve once and cache. */
@@ -43,7 +44,7 @@ static bool gnw_jpeg_trace_enabled(void)
 {
     static int v = -1;
     if (v < 0) {
-        v = getenv("GNW_JPEG_TRACE") != NULL;
+        v = gnw_env_enabled("GNW_JPEG_TRACE");
     }
     return v;
 }
@@ -1563,7 +1564,7 @@ static void gnw_h7b0_jpeg_count_read(hwaddr addr)
     static uint32_t by_off[16];
 
     if (enabled < 0) {
-        enabled = getenv("GNW_MMIO_RATE") != NULL;
+        enabled = gnw_env_enabled("GNW_MMIO_RATE");
     }
     if (!enabled) {
         return;

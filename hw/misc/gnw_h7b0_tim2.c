@@ -4,6 +4,7 @@
 #include "migration/vmstate.h"
 #include "hw/misc/gnw_h7b0_tim2.h"
 #include "hw/misc/gnw_h7b0_regs_tim2.h"
+#include "hw/misc/gnw_env.h"
 
 /*
  * TIM2-TIM14's real kernel clock, not a guess: game-and-watch-retro-go-sd's
@@ -166,7 +167,7 @@ static void gnw_h7b0_tim2_count_expiry(int idx)
     static uint32_t counts[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
 
     if (enabled < 0) {
-        enabled = getenv("GNW_TIMER_LATE") != NULL;
+        enabled = gnw_env_enabled("GNW_TIMER_LATE");
     }
     if (!enabled) {
         return;
@@ -255,7 +256,7 @@ static uint64_t gnw_h7b0_tim2_read(void *opaque, hwaddr addr, unsigned int size)
              * per-read measurably slowed the whole guest on Windows. */
             static int trace_env = -1;
             if (trace_env < 0) {
-                trace_env = getenv("GNW_AUDIO_TRACE") != NULL;
+                trace_env = gnw_env_enabled("GNW_AUDIO_TRACE");
             }
             if (trace_env) {
                 fprintf(stderr, "TR %d %" PRId64 " %u\n", idx,

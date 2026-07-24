@@ -25,6 +25,7 @@
 #include "hw/misc/gnw_h7b0_sai1.h"
 #include "hw/misc/gnw_h7b0_regs_sai1.h"
 #include "exec/cpu-common.h"
+#include "hw/misc/gnw_env.h"
 
 /* getenv() is a locked linear scan on Windows (msvcrt) -- never call it
  * per-event in emulation-hot paths; resolve once and cache. */
@@ -32,7 +33,7 @@ static bool gnw_audio_trace_enabled(void)
 {
     static int v = -1;
     if (v < 0) {
-        v = getenv("GNW_AUDIO_TRACE") != NULL;
+        v = gnw_env_enabled("GNW_AUDIO_TRACE");
     }
     return v;
 }

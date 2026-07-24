@@ -34,6 +34,7 @@
 #include "hw/misc/gnw_timeline.h"
 #include "hw/display/gnw_h7b0_recorder.h"
 #include "hw/display/gnw_h7b0_regs_ltdc.h"
+#include "hw/misc/gnw_env.h"
 #include "framebuffer.h"
 #include "system/address-spaces.h"
 
@@ -43,7 +44,7 @@ static bool gnw_ltdc_trace_enabled(void)
 {
     static int v = -1;
     if (v < 0) {
-        v = getenv("GNW_LTDC_TRACE") != NULL;
+        v = gnw_env_enabled("GNW_LTDC_TRACE");
     }
     return v;
 }
@@ -54,7 +55,7 @@ static bool gnw_timer_late_enabled(void)
 {
     static int v = -1;
     if (v < 0) {
-        v = getenv("GNW_TIMER_LATE") != NULL;
+        v = gnw_env_enabled("GNW_TIMER_LATE");
     }
     return v;
 }

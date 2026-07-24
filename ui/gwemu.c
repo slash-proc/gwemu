@@ -783,10 +783,25 @@ static SDL_Texture *gwemu_update_fb_texture(DisplaySurface *surface)
                                      SDL_TEXTUREACCESS_STREAMING, w, h);
         m_fb_w = w;
         m_fb_h = h;
+        /* Every branch of this function fails silently, and a silent
+         * failure here IS the "GUI works but game screen stays black"
+         * symptom -- log the outcome of each (re)creation, it happens
+         * once per surface size change. */
+        fprintf(stderr, "fb_texture: create %dx%d sdl_fmt=%s -> %s%s%s\n",
+                w, h, SDL_GetPixelFormatName(fmt),
+                m_fb_tex ? "ok" : "FAILED",
+                m_fb_tex ? "" : ": ", m_fb_tex ? "" : SDL_GetError());
     }
     if (m_fb_tex) {
-        SDL_UpdateTexture(m_fb_tex, NULL, surface_data(surface),
-                          surface_stride(surface));
+        if (!SDL_UpdateTexture(m_fb_tex, NULL, surface_data(surface),
+                               surface_stride(surface))) {
+            static bool warned;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "fb_texture: SDL_UpdateTexture FAILED: %s\n",
+                        SDL_GetError());
+            }
+        }
     }
     return m_fb_tex;
 }
@@ -927,7 +942,20 @@ static void gl_render_frame(struct gwemu_console *scon)
 
     gwemu_main_loop_lock();
     // FIXME: Don't upload if notdirty
-    tex = gwemu_update_fb_texture(scon->surface);
+    if (!scon->surface) {
+        /* No DisplaySurface means the console never attached -- the HUD
+         * still draws (menus work) but the game area stays empty. One
+         * line so a field log can tell this apart from a texture
+         * failure inside gwemu_update_fb_texture(). */
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "fb_texture: no DisplaySurface attached yet\n");
+        }
+        tex = NULL;
+    } else {
+        tex = gwemu_update_fb_texture(scon->surface);
+    }
     gwemu_main_loop_unlock();
 
     /* DisplaySurface data is top-down; no GL-style flip needed. */
