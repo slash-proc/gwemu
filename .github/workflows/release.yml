@@ -287,12 +287,12 @@ jobs:
               --disable-sdl \
               --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
               --disable-curl --disable-libssh --disable-curses --disable-libusb \
-              --disable-zstd --disable-dbus-display --disable-png
+              --disable-zstd --disable-dbus-display --disable-png --disable-gio
           else
             ../configure --target-list=arm-softmmu --disable-sdl \
               --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
               --disable-curl --disable-libssh --disable-curses --disable-libusb \
-              --disable-zstd --disable-dbus-display --disable-png
+              --disable-zstd --disable-dbus-display --disable-png --disable-gio
           fi
           # The --disable-vnc..--disable-png block pins the OPTIONAL
           # feature set identically on both legs: the arm64 runner's
