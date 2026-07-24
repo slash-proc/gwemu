@@ -4739,11 +4739,12 @@ endforeach
 # use case; harmless no-op otherwise).
 if 'qemu-system-arm' in emulators
   gwemu_binary_name = host_os == 'windows' ? 'gwemu.exe' : 'gwemu'
+  # scripts/make-gwemu-alias.py also flips the Windows copy to a
+  # GUI-subsystem PE so double-clicking gwemu.exe doesn't open a console.
   custom_target('gwemu-binary-alias',
                  input: emulators['qemu-system-arm'],
                  output: gwemu_binary_name,
-                 command: [python, '-c',
-                           'import shutil, sys; shutil.copy2(sys.argv[1], sys.argv[2])',
+                 command: [python, meson.current_source_dir() / 'scripts/make-gwemu-alias.py',
                            '@INPUT@', '@OUTPUT@'],
                  build_by_default: true,
                  install: false)
