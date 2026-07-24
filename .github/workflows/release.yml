@@ -14,8 +14,11 @@ name: Release build
 #   (contrib/appimage/build-appimage.sh) -- the zero-argument GUI binary
 #   plus bundled libs in a single executable file. It accepts explicit
 #   -M/-display arguments too, so no separate qemu-system-arm asset.
-# - macOS: one zip per arch with gwemu/qemu-system-arm + libs/ (single-
-#   file DMG conversion in progress, see the mac-DMG work 2026-07-24).
+# - macOS: ONE direct asset per arch, gwemu-<version>-macos-<arch>.dmg
+#   containing a self-contained gwemu.app (dylibs in Contents/
+#   Frameworks, ad-hoc signed) -- recipe validated on real hardware
+#   2026-07-24. The .app binary accepts explicit -M/-display args, so
+#   no separate qemu-system-arm asset here either.
 # - scripts.zip: this project's own scripts/*.py, scripts/*.sh and
 #   requirements.txt as ONE separate, optional asset (owner's call,
 #   2026-07-24: binaries ready-to-go, scripts opt-in). Upstream QEMU's
@@ -339,43 +342,77 @@ jobs:
             exit 1
           fi
 
-      - name: Package
+      - name: Package (gwemu.app in a DMG -- the single-file macOS asset)
         run: |
           set -euo pipefail
-          OUT=gwemu-macos-${{ matrix.arch }}
-          mkdir -p "$OUT/libs"
+          # Recipe validated end-to-end on a real Intel Mac (macOS 26.5,
+          # 2026-07-24): self-contained gwemu.app, dylibs hidden in
+          # Contents/Frameworks, launched fine from the mounted DMG.
+          # No separate qemu-system-arm asset -- the .app binary accepts
+          # the same explicit -M/-display arguments
+          # (gwemu.app/Contents/MacOS/gwemu ... from a shell).
+          src="$(find build -maxdepth 1 -type f -name gwemu)"
+          if [ -z "$src" ]; then
+            echo "gwemu not found under build/ -- build tree:" >&2
+            find build -maxdepth 2 >&2
+            exit 1
+          fi
 
-          package_bin() {
-            local src="$1" dst_name="$2"
-            if [ ! -f "$src" ]; then
-              echo "$src not found under build/ -- build tree:" >&2
-              find build -maxdepth 2 >&2
-              exit 1
-            fi
-            cp "$src" "$OUT/$dst_name"
-            # dylibbundler copies non-system dylibs alongside the binary
-            # and rewrites its load commands (@executable_path-relative)
-            # so it runs standalone without needing Homebrew installed on
-            # the target machine. Shared libs/ dir between both binaries
-            # (dylibbundler is safe to call twice against the same -d, it
-            # just skips libs already copied).
-            dylibbundler -od -b \
-              -x "$OUT/$dst_name" \
-              -d "$OUT/libs/" \
-              -p "@executable_path/libs/"
-          }
+          APP=dist-macos/gwemu.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks"
+          # sed strips the YAML block indentation the heredoc inherits --
+          # the <?xml?> declaration must start at column 0 (same class of
+          # trap as the printf-not-heredoc note in the old Linux job).
+          sed 's/^[[:space:]]*//' > "$APP/Contents/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleIdentifier</key><string>org.gwemu.gwemu</string>
+            <key>CFBundleName</key><string>GWemu</string>
+            <key>CFBundleExecutable</key><string>gwemu</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          cp "$src" "$APP/Contents/MacOS/gwemu"
+          dylibbundler -od -b \
+            -x "$APP/Contents/MacOS/gwemu" \
+            -d "$APP/Contents/Frameworks/" \
+            -p "@executable_path/../Frameworks/"
+          # CRITICAL: dylibbundler rewrites EVERY existing LC_RPATH (the
+          # qemu binary carries ~12 from subproject/Homebrew paths) to
+          # the same @executable_path/../Frameworks/ value, and modern
+          # dyld hard-aborts on duplicate LC_RPATH ("dyld: duplicate
+          # LC_RPATH") -- the app dies instantly without this dedup.
+          # Zero remaining rpaths is fine: dylibbundler rewrites the
+          # dylib load commands themselves to @executable_path paths.
+          B="$APP/Contents/MacOS/gwemu"
+          n=$(otool -l "$B" | grep -c 'path @executable_path/../Frameworks/' || true)
+          while [ "$n" -gt 1 ]; do
+            install_name_tool -delete_rpath "@executable_path/../Frameworks/" "$B" 2>/dev/null || true
+            n=$((n-1))
+          done
+          # install_name_tool invalidates the signature -- the bundle
+          # re-sign must come AFTER the rpath fix (dylibbundler's own
+          # per-file ad-hoc signing is fine underneath).
+          codesign --force --deep -s - "$APP"
+          ln -s /Applications dist-macos/Applications
 
-          package_bin "$(find build -maxdepth 1 -type f -name qemu-system-arm)" qemu-system-arm
-          package_bin "$(find build -maxdepth 1 -type f -name gwemu)" gwemu
-          # No scripts/ here -- they ship once as the separate optional
-          # scripts.zip asset (staged by build-linux).
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$GITHUB_REF_NAME" in v*) ;; *) VERSION="${GITHUB_SHA::8}" ;; esac
+          mkdir macos-dmg
+          hdiutil create -volname GWemu -srcfolder dist-macos -ov -format UDZO \
+            "macos-dmg/gwemu-$VERSION-macos-${{ matrix.arch }}.dmg"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gwemu-macos-${{ matrix.arch }}
-          path: gwemu-macos-${{ matrix.arch }}/
-          # See build-linux's identical comment: upload the raw directory,
-          # not a pre-made zip -- publish-release does the one real zip.
+          name: gwemu-macos-${{ matrix.arch }}-dmg
+          path: macos-dmg/
+          # Single-file direct asset -- publish-release moves the .dmg
+          # out un-zipped (a DMG needs no exec bit, unlike the AppImage).
 
   build-windows:
     # Cross-compiled from Linux in the MXE-based static toolchain
@@ -528,10 +565,6 @@ jobs:
           # build jobs is gone by the time we get here. Restore exec bits
           # on the Linux/macOS binaries, launchers and scripts before the
           # real zip (zip -r does preserve them). Windows doesn't care.
-          for d in gwemu-macos-*; do
-            [ -d "$d" ] || continue
-            chmod +x "$d"/qemu-system-arm* "$d"/gwemu* 2>/dev/null || true
-          done
           chmod +x scripts/scripts/* 2>/dev/null || true
           # Windows exes and the Linux AppImage ship as DIRECT un-zipped
           # assets -- move them out before the zip loop so they don't
@@ -547,6 +580,11 @@ jobs:
             mv gwemu-linux-bin/* ..
             rm -rf gwemu-linux-bin
           fi
+          for d in gwemu-macos-*-dmg; do
+            [ -d "$d" ] || continue
+            mv "$d"/*.dmg ..
+            rm -rf "$d"
+          done
           for d in */; do
             d="${d%/}"
             zip -r "../$d.zip" "$d"
@@ -558,6 +596,7 @@ jobs:
           files: |
             *.zip
             *.AppImage
+            *.dmg
             gwemu-portable.exe
             gwemu-setup.exe
           draft: true
