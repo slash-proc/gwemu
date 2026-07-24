@@ -1080,15 +1080,10 @@ void ProfileWizard::DrawForm()
 
     ImGui::TextUnformatted("Template");
     ImGui::Spacing();
-    if (ImGui::RadioButton("Custom", m_template == TplCustom)) {
-        if (m_template != TplCustom) {
-            m_open_assignments_next = true;
-        }
-        m_template = TplCustom;
-    }
-    // Stock entries are hidden entirely (not disabled) until that game's
-    // dumps are found+verified -- the backup-folder row above is how
-    // users make them appear.
+    // Order (owner call): Mario, Zelda, Custom last. Stock entries are
+    // hidden entirely (not disabled) until that game's dumps are
+    // found+verified -- the backup-folder row above is how users make
+    // them appear.
     const char *stock_names[2] = { "Stock Mario", "Stock Zelda" };
     for (int i = 0; i < 2; i++) {
         bool avail = m_library.status[i].Available() && m_library.status[i].external_found;
@@ -1102,6 +1097,12 @@ void ProfileWizard::DrawForm()
             m_template = i;
             SyncStockReflection();
         }
+    }
+    if (ImGui::RadioButton("Custom", m_template == TplCustom)) {
+        if (m_template != TplCustom) {
+            m_open_assignments_next = true;
+        }
+        m_template = TplCustom;
     }
 
     ImGui::Spacing();
@@ -1206,7 +1207,7 @@ void ProfileWizard::Draw()
     float reason_h = ImGui::GetTextLineHeightWithSpacing();
     float btn_h = ImGui::GetFrameHeightWithSpacing();
     m_desired_h = content_bottom + reason_h + btn_h +
-                  ImGui::GetStyle().WindowPadding.y;
+                  (28 * g_viewport_mgr.m_scale);
 
     // Layout signature: the discrete states that legitimately change the
     // natural height. The host resizes only when this changes -- never
@@ -1239,7 +1240,7 @@ void ProfileWizard::Draw()
         // at least one card is Complete).
         float sc = g_viewport_mgr.m_scale;
         float y = ImGui::GetWindowHeight() - btn_h -
-                  ImGui::GetStyle().WindowPadding.y;
+                  (28 * g_viewport_mgr.m_scale);
         if (ImGui::GetCursorPosY() < y) {
             ImGui::SetCursorPosY(y);
         }
@@ -1248,7 +1249,7 @@ void ProfileWizard::Draw()
         }
         float bw = 160 * sc;
         ImGui::SameLine(ImGui::GetWindowWidth() - bw -
-                        ImGui::GetStyle().WindowPadding.x);
+                        (28 * g_viewport_mgr.m_scale));
         if (m_stage == StageFwPrompt) {
             m_focus_continue = false;
             PushAccentButton();
@@ -1274,7 +1275,7 @@ void ProfileWizard::Draw()
         }
     } else if (!building) {
         float y = ImGui::GetWindowHeight() - btn_h -
-                  ImGui::GetStyle().WindowPadding.y;
+                  (28 * g_viewport_mgr.m_scale);
         if (ImGui::GetCursorPosY() < y) {
             ImGui::SetCursorPosY(y);
         }
@@ -1285,7 +1286,7 @@ void ProfileWizard::Draw()
         bool can_create = ValidSources(&why);
         float create_w = 110 * g_viewport_mgr.m_scale;
         ImGui::SameLine(ImGui::GetWindowWidth() - create_w -
-                        ImGui::GetStyle().WindowPadding.x);
+                        (28 * g_viewport_mgr.m_scale));
         ImGui::BeginDisabled(!can_create);
         if (ImGui::Button("Create", ImVec2(create_w, 0))) {
             StartBuild();
@@ -1295,7 +1296,7 @@ void ProfileWizard::Draw()
             // Reason, subtle, right-aligned above the button row.
             ImVec2 sz = ImGui::CalcTextSize(why.c_str());
             ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - sz.x -
-                                           ImGui::GetStyle().WindowPadding.x,
+                                           (28 * g_viewport_mgr.m_scale),
                                        y - ImGui::GetTextLineHeightWithSpacing()));
             ImGui::TextDisabled("%s", why.c_str());
         }
