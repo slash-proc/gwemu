@@ -755,6 +755,26 @@ static void mouse_define(DisplayChangeListener *dcl,
  * ui/console-gl.c's own surface_gl_create_texture() already does this for
  * every other display backend in this tree).
  */
+/*
+ * Set whenever the guest surface can have changed -- i.e. right after
+ * graphic_hw_update() in process_vblank(), which is the ONLY thing that
+ * redraws it (no dpy_gfx_update op is registered). Consumed by
+ * gl_render_frame, which otherwise reuses the texture it already has.
+ *
+ * This is the FIXME below ("Don't upload if notdirty"). It matters more
+ * than it looks: the upload holds the BQL, and the render loop runs at
+ * the host refresh rate (120/s on a 120Hz panel) while the guest panel
+ * is ~59Hz, so we were re-uploading a 1.2MB texture roughly twice per
+ * actual new frame. Measured cost before this change: 130ms of BQL held
+ * per second (13% of wall time) that the vCPU and every device timer
+ * were contending for -- audible as periodic audio rips that vanish the
+ * moment the window is hidden and rendering stops.
+ */
+static int m_fb_dirty = 1;
+static void *m_fb_stage;
+static size_t m_fb_stage_size;
+static size_t m_fb_stage_stride;
+
 static SDL_Texture *gwemu_update_fb_texture(DisplaySurface *surface)
 {
     SDL_PixelFormat fmt;
@@ -793,18 +813,40 @@ static SDL_Texture *gwemu_update_fb_texture(DisplaySurface *surface)
                 m_fb_tex ? "ok" : "FAILED",
                 m_fb_tex ? "" : ": ", m_fb_tex ? "" : SDL_GetError());
     }
-    if (m_fb_tex) {
-        if (!SDL_UpdateTexture(m_fb_tex, NULL, surface_data(surface),
-                               surface_stride(surface))) {
-            static bool warned;
-            if (!warned) {
-                warned = true;
-                fprintf(stderr, "fb_texture: SDL_UpdateTexture FAILED: %s\n",
-                        SDL_GetError());
-            }
+    /*
+     * Stage the pixels under the caller's BQL, then hand the slow part
+     * (SDL_UpdateTexture -> GPU) back to the caller to do UNLOCKED.
+     * The lock exists only to stop the vblank thread's
+     * graphic_hw_update() rewriting the surface mid-read; it does not
+     * need to cover the transfer. Measured: ~0.7ms of BQL per upload
+     * before, and 60 uploads/s is 40ms/s the vCPU spends blocked.
+     * A memcpy of the same bytes is roughly a tenth of that.
+     */
+    size_t stride = surface_stride(surface);
+    size_t need = stride * (size_t)h;
+    if (m_fb_stage_size < need) {
+        m_fb_stage = g_realloc(m_fb_stage, need);
+        m_fb_stage_size = need;
+    }
+    memcpy(m_fb_stage, surface_data(surface), need);
+    m_fb_stage_stride = stride;
+    return m_fb_tex;
+}
+
+/* Unlocked half of the upload -- see gwemu_update_fb_texture(). */
+static void gwemu_upload_fb_texture(void)
+{
+    if (!m_fb_tex || !m_fb_stage) {
+        return;
+    }
+    if (!SDL_UpdateTexture(m_fb_tex, NULL, m_fb_stage, m_fb_stage_stride)) {
+        static bool warned;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "fb_texture: SDL_UpdateTexture FAILED: %s\n",
+                    SDL_GetError());
         }
     }
-    return m_fb_tex;
 }
 
 static bool xb_console_gl_check_format(DisplayChangeListener *dcl,
@@ -820,6 +862,7 @@ static bool xb_console_gl_check_format(DisplayChangeListener *dcl,
     }
 }
 
+/* New DisplaySurface => the cached texture is stale/wrong-sized. */
 static void gl_switch(DisplayChangeListener *dcl,
                       DisplaySurface *new_surface)
 {
@@ -865,6 +908,7 @@ static void process_vblank(struct gwemu_console *scon)
 #endif
 
     graphic_hw_update(scon->dcl.con);
+    qatomic_set(&m_fb_dirty, 1);
 }
 
 static void vblank_timer_callback(void *opaque)
@@ -896,9 +940,31 @@ static void *vblank_timer_thread(void *opaque)
         }
 
         if (!qatomic_read(&qemu_exiting)) {
+            static int vtrace = -1;
+            static int64_t vt0;
+            static uint64_t vloops, vlockwait, vrun;
+            if (vtrace < 0) {
+                const char *e = getenv("GNW_UI_FRAME_TRACE");
+                vtrace = (e && *e && strcmp(e, "0") != 0);
+            }
+            int64_t l0 = vtrace ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
             gwemu_main_loop_lock();
+            int64_t l1 = vtrace ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
             process_vblank(scon);
             gwemu_main_loop_unlock();
+            if (vtrace) {
+                int64_t l2 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                vloops++;
+                vlockwait += l1 - l0;
+                vrun += l2 - l1;
+                if (l2 - vt0 >= 1000000000LL) {
+                    fprintf(stderr, "VBLANK loops=%llu lockwait=%.1fms "
+                            "run=%.1fms\n", (unsigned long long)vloops,
+                            vlockwait / 1e6, vrun / 1e6);
+                    vt0 = l2;
+                    vloops = vlockwait = vrun = 0;
+                }
+            }
         }
     }
 
@@ -941,6 +1007,8 @@ static struct {
     uint32_t main_rendered, main_skipped;
     uint32_t iters;
     uint32_t throttle_retries;
+    uint64_t fb_wait_ns, fb_held_ns, hud_held_ns;
+    uint32_t fb_uploads;
     uint64_t last_report;
 } ui_trace;
 
@@ -1054,7 +1122,8 @@ static void gl_render_frame(struct gwemu_console *scon)
                     "UI trace: main present %.1fms sum/%.1fms max, "
                     "settings present %.1fms sum/%.1fms max, "
                     "occluded flag=%d evt=%d, main rendered=%u skipped=%u, "
-                    "throttled=%d retries=%u iters=%u\n",
+                    "throttled=%d retries=%u iters=%u, "
+                    "fb wait=%.1fms held=%.1fms uploads=%u, hud=%.1fms\n",
                     ui_trace.main_present_ns / 1e6,
                     ui_trace.main_present_max_ns / 1e6,
                     ui_trace.settings_present_ns / 1e6,
@@ -1063,7 +1132,9 @@ static void gl_render_frame(struct gwemu_console *scon)
                     m_main_window_occluded,
                     ui_trace.main_rendered, ui_trace.main_skipped,
                     ui_throttle.throttled, ui_trace.throttle_retries,
-                    ui_trace.iters);
+                    ui_trace.iters,
+                    ui_trace.fb_wait_ns / 1e6, ui_trace.fb_held_ns / 1e6,
+                    ui_trace.fb_uploads, ui_trace.hud_held_ns / 1e6);
             memset(&ui_trace, 0, sizeof(ui_trace));
             ui_trace.last_report = now;
         }
@@ -1085,8 +1156,15 @@ static void gl_render_frame(struct gwemu_console *scon)
     SDL_SetRenderDrawColor(m_renderer, 0, 0, 0, 255);
     SDL_RenderClear(m_renderer);
 
+    uint64_t fb_t0 = SDL_GetTicksNS();
+    if (!qatomic_xchg(&m_fb_dirty, 0) && m_fb_tex) {
+        /* Nothing new from the guest since the last upload -- reuse the
+         * texture and, crucially, don't take the BQL at all. */
+        tex = m_fb_tex;
+        goto fb_done;
+    }
     gwemu_main_loop_lock();
-    // FIXME: Don't upload if notdirty
+    uint64_t fb_locked = SDL_GetTicksNS();
     if (!scon->surface) {
         /* No DisplaySurface means the console never attached -- the HUD
          * still draws (menus work) but the game area stays empty. One
@@ -1102,6 +1180,14 @@ static void gl_render_frame(struct gwemu_console *scon)
         tex = gwemu_update_fb_texture(scon->surface);
     }
     gwemu_main_loop_unlock();
+    if (trace) {
+        uint64_t fb_end = SDL_GetTicksNS();
+        ui_trace.fb_wait_ns += fb_locked - fb_t0;
+        ui_trace.fb_held_ns += fb_end - fb_locked;
+        ui_trace.fb_uploads++;
+    }
+    gwemu_upload_fb_texture();
+fb_done:
 
     /* DisplaySurface data is top-down; no GL-style flip needed. */
     gwemu_hud_set_framebuffer_texture(tex, false);
@@ -1111,11 +1197,15 @@ static void gl_render_frame(struct gwemu_console *scon)
      * lock and perform rendering, but release before present to avoid
      * possible lengthy blocking (for vsync).
      */
+    uint64_t hud_t0 = SDL_GetTicksNS();
     gwemu_main_loop_lock();
 
     gwemu_hud_update();
 
     gwemu_main_loop_unlock();
+    if (trace) {
+        ui_trace.hud_held_ns += SDL_GetTicksNS() - hud_t0;
+    }
 
     gwemu_hud_render();
     {

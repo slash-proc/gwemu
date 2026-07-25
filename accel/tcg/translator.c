@@ -21,6 +21,52 @@
 #include "disas/disas.h"
 #include "tb-internal.h"
 
+/*
+ * Known-I/O PC cache.
+ *
+ * QEMU requires an MMIO access to be the LAST instruction of its
+ * translation block; when it isn't, cpu_io_recompile() unwinds CPU
+ * state, longjmps out of the block, and runs a one-instruction block
+ * for the access. That result is never remembered, so a guest polling
+ * loop pays the whole dance every iteration -- measured at 2.68M
+ * times/sec in the retro-go launcher, ~60% of all wall time (skipping
+ * it entirely took that workload from 53 to 129 fps).
+ *
+ * Record the PCs that faulted this way and end the block after them
+ * when it is regenerated -- the same mechanism a target uses for
+ * instructions it knows do I/O (translator_io_start). The access stays
+ * last in its block, so interrupt precision is unchanged; the loop just
+ * stops re-faulting.
+ *
+ * Direct-mapped and lossy on purpose: a miss costs one slow path, a
+ * stale entry costs a slightly shorter block. Bounded, never freed.
+ */
+#define GNW_IOPC_BITS 12
+#define GNW_IOPC_SIZE (1u << GNW_IOPC_BITS)
+static vaddr gnw_io_pc[GNW_IOPC_SIZE];
+
+static inline uint32_t gnw_io_pc_hash(vaddr pc)
+{
+    return (uint32_t)((pc >> 2) & (GNW_IOPC_SIZE - 1));
+}
+
+bool gnw_note_io_pc(vaddr pc);
+bool gnw_note_io_pc(vaddr pc)
+{
+    uint32_t h = gnw_io_pc_hash(pc);
+
+    if (qatomic_read(&gnw_io_pc[h]) == pc) {
+        return false;               /* already known */
+    }
+    qatomic_set(&gnw_io_pc[h], pc);
+    return true;                    /* newly learned */
+}
+
+static inline bool gnw_is_io_pc(vaddr pc)
+{
+    return qatomic_read(&gnw_io_pc[gnw_io_pc_hash(pc)]) == pc;
+}
+
 static void set_can_do_io(DisasContextBase *db, bool val)
 {
     QEMU_BUILD_BUG_ON(sizeof_field(CPUState, neg.can_do_io) != 1);
@@ -173,7 +219,14 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
          * done next -- either exiting this loop or locate the start of
          * the next instruction.
          */
+        bool gnw_io_insn = gnw_is_io_pc(db->pc_next);
+
         ops->translate_insn(db, cpu);
+
+        /* Known to do MMIO: make it this block's last instruction. */
+        if (gnw_io_insn && db->is_jmp == DISAS_NEXT) {
+            db->is_jmp = DISAS_TOO_MANY;
+        }
 
         /*
          * We can't instrument after instructions that change control

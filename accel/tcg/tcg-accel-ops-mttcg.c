@@ -62,6 +62,30 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
  * current CPUState for a given thread.
  */
 
+extern const char *gnw_last_mmio_name;
+extern uint32_t gnw_last_mmio_off;
+static int gnw_idle_prof;
+
+static void gnw_idle_account(int64_t dt)
+{
+    static int64_t t0, idle_ns;
+    static uint64_t waits;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    idle_ns += dt;
+    waits++;
+    if (now - t0 >= 1000000000LL) {
+        fprintf(stderr, "IDLEPROF waits/s=%llu idle=%.1fms/s (%.1f%%) "
+                "last_mmio=%s+0x%x\n", (unsigned long long)waits,
+                idle_ns / 1e6, 100.0 * idle_ns / (double)(now - t0),
+                gnw_last_mmio_name ? gnw_last_mmio_name : "(none)",
+                gnw_last_mmio_off);
+        t0 = now;
+        waits = 0;
+        idle_ns = 0;
+    }
+}
+
 static void *mttcg_cpu_thread_fn(void *arg)
 {
     MttcgForceRcuNotifier force_rcu;
@@ -85,8 +109,29 @@ static void *mttcg_cpu_thread_fn(void *arg)
     cpu_thread_signal_created(cpu);
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
+    /*
+     * GNW_IDLE_PROF=1: wall time the vCPU spends NOT executing guest
+     * code, plus the last MMIO register touched before it stopped.
+     * Gameplay shows the guest idle ~65% with the host CPU unsaturated,
+     * timers on time and MMIO at 0.1% of wall -- this says what it is
+     * actually blocked on.
+     */
+    {
+        static int prof = -1;
+        if (prof < 0) {
+            const char *e = getenv("GNW_IDLE_PROF");
+            prof = (e && *e && strcmp(e, "0") != 0);
+        }
+        gnw_idle_prof = prof;
+    }
+
     do {
+        int64_t w0 = gnw_idle_prof ?
+                     qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
         qemu_process_cpu_events(cpu);
+        if (gnw_idle_prof) {
+            gnw_idle_account(qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - w0);
+        }
 
         if (cpu_can_run(cpu)) {
             int r;

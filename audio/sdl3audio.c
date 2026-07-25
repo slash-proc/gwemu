@@ -144,6 +144,11 @@ static void sdl3_close_out(SDL3VoiceOut *sdl)
  * more bytes -- hand over whatever the emulation has buffered, zero-fill
  * the rest (same underrun policy as the SDL2 driver's callback).
  */
+/* Bytes handed to the device this second -- compare against the nominal
+ * rate printed by SDLFMT to see whether the device really drains at the
+ * rate we opened it at. */
+static uint64_t gnw_sdl3_put_bytes;
+
 static void sdl3_callback_out(void *opaque, SDL_AudioStream *stream,
                               int additional_amount, int total_amount)
 {
@@ -163,6 +168,7 @@ static void sdl3_callback_out(void *opaque, SDL_AudioStream *stream,
                             hw->size_emul - start);
 
             SDL_PutAudioStreamData(stream, hw->buf_emul + start, write_len);
+            gnw_sdl3_put_bytes += write_len;
             hw->pending_emul -= write_len;
             len -= write_len;
         }
@@ -176,6 +182,50 @@ static void sdl3_callback_out(void *opaque, SDL_AudioStream *stream,
             audio_pcm_info_clear_buf(&hw->info, silence, frames);
             SDL_PutAudioStreamData(stream, silence,
                                    frames * hw->info.bytes_per_frame);
+        }
+    }
+
+    /*
+     * GNW_AUDIO_TRACE: once-a-second summary of the LAST hop, device
+     * side. `zerofill` is silence we injected because the emulation had
+     * nothing queued when the device asked -- that is what a listener
+     * hears as a click/pop. `gapmax` is the longest wall-clock interval
+     * between two callbacks: a device that asks on an irregular schedule
+     * starves us even when the average rate is correct.
+     */
+    {
+        static int trace = -1;
+        if (trace < 0) {
+            const char *e = getenv("GNW_AUDIO_TRACE");
+            trace = (e && *e && strcmp(e, "0") != 0);
+        }
+        if (trace) {
+            static Uint64 t0, last_cb;
+            static uint64_t calls, asked, zerofill, gapmax, gapsum;
+            Uint64 now = SDL_GetTicksNS();
+            if (last_cb) {
+                Uint64 gap = now - last_cb;
+                gapsum += gap;
+                if (gap > gapmax) {
+                    gapmax = gap;
+                }
+            }
+            last_cb = now;
+            calls++;
+            asked += additional_amount;
+            zerofill += len;
+            if (now - t0 >= 1000000000ull) {
+                fprintf(stderr, "SDLAUD calls=%llu asked=%lluB put=%lluB "
+                        "zerofill=%lluB queued=%d gapavg=%.1fms gapmax=%.1fms\n",
+                        (unsigned long long)calls, (unsigned long long)asked,
+                        (unsigned long long)gnw_sdl3_put_bytes,
+                        (unsigned long long)zerofill,
+                        SDL_GetAudioStreamQueued(stream),
+                        calls ? gapsum / 1e6 / calls : 0.0, gapmax / 1e6);
+                gnw_sdl3_put_bytes = 0;
+                t0 = now;
+                calls = asked = zerofill = gapmax = gapsum = 0;
+            }
         }
     }
 }
@@ -291,6 +341,22 @@ static int sdl3_init_out(HWVoiceOut *hw, struct audsettings *as)
     sdl3_to_audfmt(req.format, &obt_as);
     audio_pcm_init_info(&hw->info, &obt_as);
 
+    {
+        const char *e = getenv("GNW_AUDIO_TRACE");
+        if (e && *e && strcmp(e, "0") != 0) {
+            SDL_AudioSpec dst;
+            int dst_frames = 0;
+            SDL_AudioDeviceID did = SDL_GetAudioStreamDevice(sdl->stream);
+            SDL_GetAudioDeviceFormat(did, &dst, &dst_frames);
+            fprintf(stderr, "SDLFMT src=%dHz/%dch/fmt0x%x bpf=%d | "
+                    "device=%dHz/%dch/fmt0x%x frames=%d | nominal=%dB/s\n",
+                    as->freq, as->nchannels, (unsigned)req.format,
+                    hw->info.bytes_per_frame,
+                    dst.freq, dst.channels, (unsigned)dst.format, dst_frames,
+                    as->freq * hw->info.bytes_per_frame);
+        }
+    }
+
     frames = audio_buffer_frames(
         qapi_AudiodevSdlPerDirectionOptions_base(spdo), &obt_as, 11610);
     hw->samples = (spdo->has_buffer_count ? spdo->buffer_count : 4) * frames;
@@ -341,6 +407,22 @@ static int sdl3_init_in(HWVoiceIn *hw, struct audsettings *as)
     obt_as = *as;
     sdl3_to_audfmt(req.format, &obt_as);
     audio_pcm_init_info(&hw->info, &obt_as);
+
+    {
+        const char *e = getenv("GNW_AUDIO_TRACE");
+        if (e && *e && strcmp(e, "0") != 0) {
+            SDL_AudioSpec dst;
+            int dst_frames = 0;
+            SDL_AudioDeviceID did = SDL_GetAudioStreamDevice(sdl->stream);
+            SDL_GetAudioDeviceFormat(did, &dst, &dst_frames);
+            fprintf(stderr, "SDLFMT src=%dHz/%dch/fmt0x%x bpf=%d | "
+                    "device=%dHz/%dch/fmt0x%x frames=%d | nominal=%dB/s\n",
+                    as->freq, as->nchannels, (unsigned)req.format,
+                    hw->info.bytes_per_frame,
+                    dst.freq, dst.channels, (unsigned)dst.format, dst_frames,
+                    as->freq * hw->info.bytes_per_frame);
+        }
+    }
 
     frames = audio_buffer_frames(
         qapi_AudiodevSdlPerDirectionOptions_base(spdo), &obt_as, 11610);

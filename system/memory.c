@@ -1463,6 +1463,124 @@ static MemTxResult memory_region_dispatch_read1(MemoryRegion *mr,
     }
 }
 
+/*
+ * GNW_MMIO_PROF=1: per-MemoryRegion MMIO cost profile.
+ *
+ * Every guest MMIO access funnels through the two dispatch functions
+ * below, so this is the one place that sees ALL peripheral traffic
+ * without touching each device model. Reports once a second: the
+ * busiest regions by total time, their access counts, and the share of
+ * wall time spent inside MMIO handlers.
+ *
+ * Why this exists: gwemu runs the same guest ~3x more expensively on
+ * Windows than on Linux with the CPU nowhere near saturated, and every
+ * measurement so far has been indirect (host CPU counters, guest frame
+ * rates). This gives a direct answer to "which peripheral, and how
+ * long", comparable across platforms by running the same deterministic
+ * GNW_TIMELINE on each.
+ *
+ * Cost when enabled: two clock reads per access. Cost when disabled:
+ * one predictable branch on a cached flag.
+ */
+#define GNW_PROF_SLOTS 96
+typedef struct {
+    const char *name;
+    uint64_t count;
+    uint64_t ns;
+    uint64_t max_ns;
+} GnwProfSlot;
+
+static GnwProfSlot gnw_prof[GNW_PROF_SLOTS];
+static uint64_t gnw_prof_total_ns;
+static uint64_t gnw_prof_total_count;
+static uint64_t gnw_prof_unattributed;
+static uint64_t gnw_prof_unattr_ns;
+static int64_t gnw_prof_t0;
+
+static bool gnw_mmio_prof_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GNW_MMIO_PROF");
+        v = (e && *e && strcmp(e, "0") != 0);
+    }
+    return v;
+}
+
+const char *gnw_last_mmio_name;
+uint32_t gnw_last_mmio_off;
+
+static void gnw_prof_account(MemoryRegion *mr, int64_t dt)
+{
+    const char *name = mr->name ? mr->name : "(anon)";
+    int i;
+
+    for (i = 0; i < GNW_PROF_SLOTS; i++) {
+        if (gnw_prof[i].name == NULL) {
+            gnw_prof[i].name = name;
+        }
+        if (gnw_prof[i].name == name || strcmp(gnw_prof[i].name, name) == 0) {
+            gnw_prof[i].count++;
+            gnw_prof[i].ns += dt;
+            if ((uint64_t)dt > gnw_prof[i].max_ns) {
+                gnw_prof[i].max_ns = dt;
+            }
+            break;
+        }
+    }
+    if (i == GNW_PROF_SLOTS) {
+        /* Ran out of slots -- count it so the per-region lines and the
+         * TOTAL can never silently disagree (they did: 24 slots hid a
+         * region doing ~880k accesses/s on macOS). */
+        gnw_prof_unattributed++;
+        gnw_prof_unattr_ns += dt;
+    }
+    gnw_prof_total_count++;
+    gnw_prof_total_ns += dt;
+
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (now - gnw_prof_t0 >= 1000000000LL) {
+        double window_ms = (now - gnw_prof_t0) / 1e6;
+        /* crude top-N by time */
+        for (int pass = 0; pass < 6; pass++) {
+            int best = -1;
+            for (i = 0; i < GNW_PROF_SLOTS; i++) {
+                if (gnw_prof[i].name && gnw_prof[i].count &&
+                    (best < 0 || gnw_prof[i].ns > gnw_prof[best].ns)) {
+                    best = i;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            fprintf(stderr, "MMIOPROF %-22s n=%-8" PRIu64 " tot=%7.2fms "
+                    "avg=%6.0fns max=%7.0fns\n",
+                    gnw_prof[best].name, gnw_prof[best].count,
+                    gnw_prof[best].ns / 1e6,
+                    (double)gnw_prof[best].ns / gnw_prof[best].count,
+                    (double)gnw_prof[best].max_ns);
+            gnw_prof[best].count = 0;
+            gnw_prof[best].ns = 0;
+            gnw_prof[best].max_ns = 0;
+        }
+        fprintf(stderr, "MMIOPROF TOTAL accesses/s=%" PRIu64 " in-mmio=%.1fms "
+                "of %.1fms wall (%.1f%%) unattributed=%" PRIu64 " (%.1fms)\n",
+                gnw_prof_total_count, gnw_prof_total_ns / 1e6, window_ms,
+                100.0 * gnw_prof_total_ns / 1e6 / window_ms,
+                gnw_prof_unattributed, gnw_prof_unattr_ns / 1e6);
+        for (i = 0; i < GNW_PROF_SLOTS; i++) {
+            gnw_prof[i].count = 0;
+            gnw_prof[i].ns = 0;
+            gnw_prof[i].max_ns = 0;
+        }
+        gnw_prof_total_ns = 0;
+        gnw_prof_total_count = 0;
+        gnw_prof_unattributed = 0;
+        gnw_prof_unattr_ns = 0;
+        gnw_prof_t0 = now;
+    }
+}
+
 MemTxResult memory_region_dispatch_read(MemoryRegion *mr,
                                         hwaddr addr,
                                         uint64_t *pval,
@@ -1482,7 +1600,46 @@ MemTxResult memory_region_dispatch_read(MemoryRegion *mr,
         return MEMTX_DECODE_ERROR;
     }
 
-    r = memory_region_dispatch_read1(mr, addr, pval, size, attrs);
+    /*
+     * GNW_MMIO_OFF=1: per-register histogram for one device, to tell
+     * "draining data" apart from "spinning on a status bit". The
+     * retro-go launcher issues ~2.3M JPEG reads/sec; if most are the
+     * status register rather than the data register, the firmware is
+     * waiting on data our model has not published yet -- which would be
+     * ours to fix, unlike the raw per-access cost.
+     */
+    {
+        static int off_trace = -1;
+        if (off_trace < 0) {
+            const char *e = getenv("GNW_MMIO_OFF");
+            off_trace = (e && *e && strcmp(e, "0") != 0);
+        }
+        if (off_trace && mr->name && !strcmp(mr->name, "gnw-h7b0-jpeg")) {
+            static uint64_t hist[64];
+            static int64_t t0;
+            hist[((uint32_t)addr >> 2) & 63]++;
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            if (now - t0 >= 1000000000LL) {
+                fprintf(stderr, "JPEGOFF");
+                for (int i = 0; i < 64; i++) {
+                    if (hist[i] > 1000) {
+                        fprintf(stderr, " +0x%02x=%" PRIu64, i * 4, hist[i]);
+                    }
+                    hist[i] = 0;
+                }
+                fprintf(stderr, "\n");
+                t0 = now;
+            }
+        }
+    }
+
+    if (gnw_mmio_prof_enabled()) {
+        int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        r = memory_region_dispatch_read1(mr, addr, pval, size, attrs);
+        gnw_prof_account(mr, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0);
+    } else {
+        r = memory_region_dispatch_read1(mr, addr, pval, size, attrs);
+    }
     adjust_endianness(mr, pval, op);
     return r;
 }
@@ -1543,19 +1700,28 @@ MemTxResult memory_region_dispatch_write(MemoryRegion *mr,
         return MEMTX_OK;
     }
 
-    if (mr->ops->write) {
-        return access_with_adjusted_size(addr, &data, size,
-                                         mr->ops->impl.min_access_size,
-                                         mr->ops->impl.max_access_size,
-                                         memory_region_write_accessor, mr,
-                                         attrs);
-    } else {
-        return
-            access_with_adjusted_size(addr, &data, size,
+    {
+        MemTxResult wr;
+        int64_t t0 = gnw_mmio_prof_enabled() ?
+                     qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
+
+        if (mr->ops->write) {
+            wr = access_with_adjusted_size(addr, &data, size,
+                                           mr->ops->impl.min_access_size,
+                                           mr->ops->impl.max_access_size,
+                                           memory_region_write_accessor, mr,
+                                           attrs);
+        } else {
+            wr = access_with_adjusted_size(addr, &data, size,
                                       mr->ops->impl.min_access_size,
                                       mr->ops->impl.max_access_size,
                                       memory_region_write_with_attrs_accessor,
                                       mr, attrs);
+        }
+        if (t0) {
+            gnw_prof_account(mr, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0);
+        }
+        return wr;
     }
 }
 

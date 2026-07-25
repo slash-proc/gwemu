@@ -570,11 +570,61 @@ void rust_bql_mock_lock(void)
  * The BQL is taken from so many places that it is worth profiling the
  * callers directly, instead of funneling them all through a single function.
  */
+/*
+ * GNW_BQL_PROF=1: how long each thread waits to ACQUIRE the big lock,
+ * summarised once a second per thread.
+ *
+ * Motivation: on Windows and macOS this fork runs an audio-paced guest
+ * ~20-30% slower than Linux while the host CPU sits well below
+ * saturation, peripheral emulation costs the same (measured: 0.1% of
+ * wall time in MMIO), and device timers fire on schedule. A guest that
+ * is neither compute-bound nor pacing-starved but still cannot keep up
+ * is, by elimination, BLOCKED -- and the BQL is what every vCPU MMIO
+ * access and every main-loop iteration contends for.
+ */
+static bool gnw_bql_prof_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GNW_BQL_PROF");
+        v = (e && *e && strcmp(e, "0") != 0);
+    }
+    return v;
+}
+
 void bql_lock_impl(const char *file, int line)
 {
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
 
     g_assert(!bql_locked());
+
+    if (gnw_bql_prof_enabled()) {
+        static __thread uint64_t t_count, t_wait_ns, t_max_ns;
+        static __thread int64_t t_report;
+        int64_t w0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+        bql_lock_fn(&bql, file, line);
+
+        int64_t w1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        int64_t dt = w1 - w0;
+        t_count++;
+        t_wait_ns += dt;
+        if ((uint64_t)dt > t_max_ns) {
+            t_max_ns = dt;
+        }
+        if (w1 - t_report >= 1000000000LL) {
+            fprintf(stderr, "BQLPROF thread=%s locks/s=%" PRIu64
+                    " wait=%.1fms max=%.2fms\n",
+                    current_cpu ? "vcpu" : "other",
+                    t_count, t_wait_ns / 1e6, t_max_ns / 1e6);
+            t_report = w1;
+            t_count = 0;
+            t_wait_ns = 0;
+            t_max_ns = 0;
+        }
+        return;
+    }
+
     bql_lock_fn(&bql, file, line);
 }
 

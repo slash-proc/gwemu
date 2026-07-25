@@ -38,6 +38,9 @@
 #include <math.h>
 #include "hw/misc/gnw_env.h"
 
+static void gnw_jpeg_lat_decode_start(void);
+static void gnw_jpeg_lat_decode_done(void);
+
 /* getenv() is a locked linear scan on Windows (msvcrt) -- never call it
  * per-event in emulation-hot paths; resolve once and cache. */
 static bool gnw_jpeg_trace_enabled(void)
@@ -1453,6 +1456,7 @@ static void gnw_h7b0_jpeg_poll_worker(GnwH7B0JpegState *s)
     }
     s->decode_done = false;
     s->decode_busy = false;
+    gnw_jpeg_lat_decode_done();
     if (gnw_jpeg_trace_enabled()) {
         uint32_t sum = 0;
         if (s->pending_y) {
@@ -1592,8 +1596,92 @@ static void gnw_h7b0_jpeg_count_read(hwaddr addr)
     }
 }
 
+/*
+ * GNW_JPEG_LAT=1: per-decode guest-visible latency and poll count.
+ *
+ * The decode runs on a HOST worker thread, so how long it takes in
+ * GUEST time depends on how fast the host is. The firmware meanwhile
+ * busy-polls SR, and each poll is an MMIO exit that takes the BQL --
+ * measured at 2.3M/s on Linux and 1.0M/s on a slower Mac. That is a
+ * feedback loop: slower host -> longer guest-visible decode -> more
+ * polls -> more host work. Real silicon decodes in a fixed time that
+ * does not depend on any host, so these two numbers (guest-us per
+ * decode, polls per decode) are directly comparable against hardware
+ * and say whether the model is faithful.
+ */
+static uint64_t gnw_jpeg_decode_t0;
+static uint64_t gnw_jpeg_polls;
+static uint64_t gnw_jpeg_decodes;
+static uint64_t gnw_jpeg_lat_sum_us;
+static uint64_t gnw_jpeg_lat_max_us;
+static uint64_t gnw_jpeg_polls_total;
+static int64_t gnw_jpeg_report_t0;
+
+static bool gnw_jpeg_lat_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GNW_JPEG_LAT");
+        v = (e && *e && strcmp(e, "0") != 0);
+    }
+    return v;
+}
+
+static uint64_t gnw_jpeg_busy_ns;
+static uint64_t gnw_jpeg_host_t0;
+
+static void gnw_jpeg_lat_decode_start(void)
+{
+    if (!gnw_jpeg_lat_enabled()) {
+        return;
+    }
+    gnw_jpeg_decode_t0 = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    gnw_jpeg_host_t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    gnw_jpeg_polls = 0;
+}
+
+static void gnw_jpeg_lat_decode_done(void)
+{
+    if (!gnw_jpeg_lat_enabled() || !gnw_jpeg_decode_t0) {
+        return;
+    }
+    uint64_t us = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                   gnw_jpeg_decode_t0) / 1000;
+    if (gnw_jpeg_host_t0) {
+        gnw_jpeg_busy_ns += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
+                            gnw_jpeg_host_t0;
+        gnw_jpeg_host_t0 = 0;
+    }
+    gnw_jpeg_decodes++;
+    gnw_jpeg_lat_sum_us += us;
+    gnw_jpeg_polls_total += gnw_jpeg_polls;
+    if (us > gnw_jpeg_lat_max_us) {
+        gnw_jpeg_lat_max_us = us;
+    }
+    gnw_jpeg_decode_t0 = 0;
+
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (now - gnw_jpeg_report_t0 >= 1000000000LL && gnw_jpeg_decodes) {
+        fprintf(stderr, "JPEGLAT decodes/s=%" PRIu64 " busy_duty=%.1f%% "
+                "host_us_per_decode=%" PRIu64 " guest_us_max=%" PRIu64 "\n",
+                gnw_jpeg_decodes,
+                100.0 * gnw_jpeg_busy_ns / 1e9,
+                gnw_jpeg_busy_ns / 1000 / gnw_jpeg_decodes,
+                gnw_jpeg_lat_max_us);
+        gnw_jpeg_busy_ns = 0;
+        gnw_jpeg_report_t0 = now;
+        gnw_jpeg_decodes = 0;
+        gnw_jpeg_lat_sum_us = 0;
+        gnw_jpeg_lat_max_us = 0;
+        gnw_jpeg_polls_total = 0;
+    }
+}
+
 static uint64_t gnw_h7b0_jpeg_read(void *opaque, hwaddr addr, unsigned int size)
 {
+    if (gnw_jpeg_lat_enabled()) {
+        gnw_jpeg_polls++;
+    }
     gnw_h7b0_jpeg_count_read(addr);
     GnwH7B0JpegState *s = GNW_H7B0_JPEG(opaque);
     /* Opportunistically publish a completed background decode -- mirrors
@@ -2010,6 +2098,7 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
                         qatomic_store_release(&s->decode_done, true);
                         qemu_mutex_unlock(&s->thread_lock);
                         s->decode_busy = true;
+                        gnw_jpeg_lat_decode_start();
                         s->regs[GNW_H7B0_JPEG_SR_OFFSET >> 2] &=
                             ~(JPEG_SR_IFTF | JPEG_SR_IFNFF);
                         /* Publish immediately -- SR shows EOCF/OFNEF

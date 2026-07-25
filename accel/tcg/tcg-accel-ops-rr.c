@@ -105,13 +105,54 @@ static void rr_stop_kick_timer(void)
     }
 }
 
+extern const char *gnw_last_mmio_name;
+extern uint32_t gnw_last_mmio_off;
+
+/*
+ * GNW_IDLE_PROF=1: how much wall time the guest spends HALTED, and what
+ * MMIO register it touched last before halting.
+ *
+ * In gameplay the guest is idle ~65% of the time while the host CPU is
+ * far from saturated, device timers fire on schedule and MMIO costs
+ * 0.1% of wall -- so it is blocked on something, and this says on what.
+ */
 static void rr_wait_io_event(void)
 {
     CPUState *cpu;
+    static int prof = -1;
+    static int64_t t0, halted_ns;
+    static uint64_t halts;
+
+    if (prof < 0) {
+        const char *e = getenv("GNW_IDLE_PROF");
+        prof = (e && *e && strcmp(e, "0") != 0);
+    }
+
+    int64_t h0 = prof ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
+    bool did_halt = false;
 
     while (all_cpu_threads_idle()) {
+        did_halt = true;
         rr_stop_kick_timer();
         qemu_cond_wait_bql(first_cpu->halt_cond);
+    }
+
+    if (prof) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (did_halt) {
+            halted_ns += now - h0;
+            halts++;
+        }
+        if (now - t0 >= 1000000000LL) {
+            fprintf(stderr, "IDLEPROF halts/s=%llu halted=%.1fms/s (%.1f%%) "
+                    "last_mmio=%s+0x%x\n", (unsigned long long)halts,
+                    halted_ns / 1e6, 100.0 * halted_ns / (double)(now - t0),
+                    gnw_last_mmio_name ? gnw_last_mmio_name : "(none)",
+                    gnw_last_mmio_off);
+            t0 = now;
+            halts = 0;
+            halted_ns = 0;
+        }
     }
 
     rr_start_kick_timer();

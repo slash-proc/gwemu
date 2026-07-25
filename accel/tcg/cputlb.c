@@ -1280,7 +1280,46 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
     mr_offset = full->xlat_offset + addr;
     cpu->mem_io_pc = retaddr;
     if (!cpu->neg.can_do_io) {
-        cpu_io_recompile(cpu, retaddr);
+        /*
+         * GNW_IORECOMP=1: count these. Guest MMIO in the middle of a TB
+         * forces a retranslation so the access becomes the block's last
+         * instruction. A tight device-polling loop (the retro-go
+         * launcher does ~2M JPEG reads/sec) could hit this on every
+         * access, and the Linux profile of that workload is full of
+         * tcg_tb_lookup / cpu_restore_state_from_tb / g_tree_lookup /
+         * g_free -- exactly what TB churn looks like.
+         */
+        static int trace = -1;
+        if (trace < 0) {
+            const char *e = getenv("GNW_IORECOMP");
+            trace = (e && *e && strcmp(e, "0") != 0);
+        }
+        if (trace) {
+            static int64_t t0;
+            static uint64_t n;
+            n++;
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            if (now - t0 >= 1000000000LL) {
+                fprintf(stderr, "IORECOMP %llu/s\n", (unsigned long long)n);
+                t0 = now;
+                n = 0;
+            }
+        }
+        /*
+         * GNW_SKIP_IORECOMP=1: EXPERIMENT ONLY. Measures what the
+         * recompile costs by not doing it. Skipping it means the I/O
+         * instruction is no longer forced to be the TB's last, so
+         * interrupt/exception timing around the access loses precision
+         * -- fine for a measurement, NOT correct in general.
+         */
+        static int skip = -1;
+        if (skip < 0) {
+            const char *e = getenv("GNW_SKIP_IORECOMP");
+            skip = (e && *e && strcmp(e, "0") != 0);
+        }
+        if (!skip) {
+            cpu_io_recompile(cpu, retaddr);
+        }
     }
 
     *out_offset = mr_offset;

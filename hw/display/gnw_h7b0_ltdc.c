@@ -486,6 +486,50 @@ static void gnw_h7b0_ltdc_vblank_tick(void *opaque)
     gnw_timeline_notify_vblank();
 
     /*
+     * GNW_LTDC_STATE: once-a-second dump of the publish state machine.
+     * Added for the intermittent black-screen-on-return-to-menu bug,
+     * where the guest keeps swapping buffers (GUESTFPS stays live) and
+     * the UI keeps uploading, but this device stops publishing frames
+     * entirely -- so the host keeps re-uploading one stale buffer. Both
+     * capture sites (the SRCR VBR/IMR handlers) and the deferred retry
+     * below are gated on flags that are individually plausible to latch;
+     * this prints all of them so the stuck one names itself instead of
+     * being guessed at. Per-second only -- per-event output here would
+     * distort the very timing being diagnosed.
+     */
+    {
+        static int state_trace = -1;
+        if (state_trace < 0) {
+            state_trace = gnw_env_enabled("GNW_LTDC_STATE");
+        }
+        if (state_trace) {
+            static int64_t t0;
+            if (now - t0 >= 1000000000LL) {
+                bool job_busy, job_pending;
+
+                qemu_mutex_lock(&s->job_lock);
+                job_busy = s->job_busy;
+                job_pending = s->job_pending;
+                qemu_mutex_unlock(&s->job_lock);
+
+                fprintf(stderr, "LTC state content_dirty=%d deferred=%d "
+                        "vbr_active=%d vbr_pending=%d srcr_idle=%d "
+                        "job_busy=%d job_pending=%d staged_valid=%d "
+                        "compositor_running=%d invalidate=%d "
+                        "structural=%d quiesce=%d/%d shadow=%dx%d\n",
+                        s->content_dirty, s->vbr_deferred_capture,
+                        s->vbr_active, s->vbr_reload_pending,
+                        s->srcr_idle_ticks, job_busy, job_pending,
+                        s->staged_valid, s->compositor_running,
+                        s->invalidate, s->structural_transition_pending,
+                        s->fb_quiesce_pending, s->fb_quiesce_ticks,
+                        s->shadow_width, s->shadow_height);
+                t0 = now;
+            }
+        }
+    }
+
+    /*
      * Capture the fully composed frame just before VBR reload takes
      * effect and the next frame begins. This guarantees we don't catch
      * the guest in the middle of drawing overlays to the frontbuffer.
@@ -1908,9 +1952,35 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
             }
         }
         if (value & LTDC_SRCR_VBR) {
-            if (getenv("GNW_AUDIO_TRACE")) {
-                fprintf(stderr, "VBR %" PRId64 "\n",
-                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            /*
+             * VBR reload = the guest swapping display buffers, i.e. ONE
+             * emulated frame. Counting these per wall-clock second is the
+             * only guest-frame-rate measurement that is neither
+             * guest-relative (the firmware's own fps counter is derived
+             * from emulated time, and reads 30fps even when the guest is
+             * running at 65% of realtime) nor disk-bound (the frame
+             * recorder writes 36MB/s at 30fps, which perturbs what it
+             * measures). getenv() is resolved once -- it is a locked
+             * linear scan on Windows msvcrt.
+             */
+            {
+                static int trace = -1;
+                if (trace < 0) {
+                    const char *e = getenv("GNW_UI_FRAME_TRACE");
+                    trace = (e && *e && strcmp(e, "0") != 0);
+                }
+                if (trace) {
+                    static int64_t t0;
+                    static uint64_t frames;
+                    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                    frames++;
+                    if (now - t0 >= 1000000000LL) {
+                        fprintf(stderr, "GUESTFPS %.1f\n",
+                                frames * 1e9 / (double)(now - t0));
+                        t0 = now;
+                        frames = 0;
+                    }
+                }
             }
             s->vbr_reload_pending = true;
             s->vbr_active = true;

@@ -573,6 +573,8 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
  *
  * Called by softmmu_template.h, with iothread mutex not held.
  */
+bool gnw_note_io_pc(vaddr pc);
+
 void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 {
     TranslationBlock *tb;
@@ -606,6 +608,18 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
      * double instrument the instruction. Also don't let an IRQ sneak
      * in before we execute it.
      */
+    /*
+     * Remember this PC so the block is regenerated ending here and the
+     * loop stops taking this path every iteration -- see gnw_note_io_pc.
+     * The currently-cached block still has the access mid-stream, so it
+     * must be dropped, otherwise it keeps being executed and keeps
+     * faulting. Only on the first sighting: after that the regenerated
+     * block already ends at the access and no longer comes through here.
+     */
+    if (gnw_note_io_pc(cpu->cc->get_pc(cpu))) {
+        tb_phys_invalidate(tb, -1);
+    }
+
     cpu->cflags_next_tb = curr_cflags(cpu) | CF_MEMI_ONLY | CF_NOIRQ | n;
 
     if (qemu_loglevel_mask(CPU_LOG_EXEC)) {
