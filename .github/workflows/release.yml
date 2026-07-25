@@ -579,7 +579,7 @@ jobs:
           docker run --rm -v "$PWD":/src -w /src/build-win-static gwemu-win-static \
             bash -c 'x86_64-w64-mingw32.static-objdump -p gwemu.exe \
                        | grep "DLL Name" | awk "{print \$3}"' \
-            | grep -viE '^(ADVAPI32|CRYPT32|DNSAPI|GDI32|IMM32|IPHLPAPI|KERNEL32|SETUPAPI|SHELL32|SHLWAPI|Secur32|USER32|VERSION|WINMM|WLDAP32|WS2_32|bcrypt|msvcrt|ole32|OLEAUT32|api-ms-win-.*)\.dll$' \
+            | grep -viE '^(ADVAPI32|CRYPT32|DNSAPI|GDI32|IMM32|IPHLPAPI|KERNEL32|SETUPAPI|SHELL32|SHLWAPI|Secur32|USER32|VERSION|WININET|WINMM|WLDAP32|WS2_32|bcrypt|msvcrt|ole32|OLEAUT32|api-ms-win-.*)\.dll$' \
             && { echo "Unexpected non-system DLL import(s) above"; exit 1; } || true
 
       - name: Build NSIS installer

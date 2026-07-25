@@ -13,6 +13,7 @@
 #include "gwemu-hud.h"
 #include "../gwemu-profiles.hh"
 #include "../gwemu-sdcreate.h"
+#include "../gwemu-http.h"
 
 #include <glib.h>
 #include <glib/gstdio.h>
@@ -122,31 +123,19 @@ void ProfileWizard::StartPatchDownload(int gi)
     m_dl_error[gi].clear();
     m_dl_threads[gi] = std::thread([this, gi]() {
         const char *game = GnwBackupLibrary::GameName(gi);
-        std::string dir = CachePatchDir(game);
-        g_mkdir_with_parents(dir.c_str(), 0755);
-        std::string dst = dir + "/0x08032000.bin";
-        std::string tmp = dst + ".part";
+        std::string dst = CachePatchDir(game) + "/0x08032000.bin";
         std::string url = PatchBinaryUrl(game);
-        // TODO: replace the popen curl/wget chain with a proper
-        // cross-platform in-process fetch (owner accepts this jank on
-        // Linux for now; Windows static build has no shell tools).
-        std::string cmd = "curl -fsSL -o '" + tmp + "' '" + url +
-                          "' 2>/dev/null || wget -qO '" + tmp + "' '" + url + "'";
-        int rc = -1;
-        FILE *pf = popen(cmd.c_str(), "r");
-        if (pf) {
-            rc = pclose(pf);
-        }
-        GStatBuf st;
-        bool ok = rc == 0 && g_stat(tmp.c_str(), &st) == 0 && st.st_size > 0;
-        if (ok) {
-            ok = g_rename(tmp.c_str(), dst.c_str()) == 0;
-        }
+        // gwemu_http_download() is in-process, not a popen("curl ...").
+        // On Windows the shell-out both failed outright (POSIX quoting,
+        // /dev/null, no wget) and flashed a cmd.exe console window over
+        // the GUI -- see the header comment in ui/gwemu-http.c.
+        char *err = nullptr;
+        bool ok = gwemu_http_download(url.c_str(), dst.c_str(), &err);
         if (!ok) {
-            g_unlink(tmp.c_str());
-            m_dl_error[gi] = "download failed (check network); "
-                             "url: " + url;
+            m_dl_error[gi] = std::string("download failed: ") +
+                             (err ? err : "unknown error") + "; url: " + url;
         }
+        g_free(err);
         m_patchbin_check_ms[gi] = 0; // force re-resolution
         m_dl_state[gi].store(ok ? 2 : 3);
     });

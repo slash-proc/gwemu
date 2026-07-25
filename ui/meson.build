@@ -42,6 +42,7 @@ if sdl3.found()
     'gwemu-settings.cc',
     'gwemu-profiles.cc',
     'gwemu-sdcreate.c',
+    'gwemu-http.c',
     'gwemu.c',
   ))
   # In-process SD image creation (gwemu-sdcreate.c) formats through the
@@ -53,6 +54,9 @@ if sdl3.found()
     gnw_gui_ss.add([gtk, files('gwemu-os-utils-linux.c')])
   elif host_os == 'windows'
     gnw_gui_ss.add(files('gwemu-os-utils-windows.c'))
+    # wininet: gwemu-http.c's Windows backend. A system DLL, so this
+    # doesn't compromise the fully-static Windows build.
+    gnw_gui_ss.add(cc.find_library('wininet', required: true))
   elif host_os == 'darwin'
     gnw_gui_ss.add(files('gwemu-os-utils-macos.m'))
     gnw_gui_cocoa = dependency('appleframeworks', modules: 'Cocoa')

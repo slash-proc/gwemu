@@ -1,3 +1,16 @@
+2026-07-25  Windows: gnwmanager patch-binary download rewritten
+            in-process (ui/gwemu-http.c, WinINet). The popen("curl ...")
+            chain could never have worked there -- POSIX 'quoting',
+            /dev/null, and a wget fallback the static build doesn't ship
+            -- and each attempt also flashed a cmd.exe console window
+            over the GUI. Both symptoms reported from a real Windows 11
+            run of the profile wizard; fixed together, since removing
+            the child process removes the window. Verified on Windows 11
+            (downloads the mario patch binary byte-identically,
+            sha1 b70cd02e..., and reports real HTTP status on failure).
+            WININET.dll added to release.yml's self-contained-exe
+            whitelist.
+
 2026-07-25  Release pipeline: Linux arm64 (Raspberry Pi 4/5) + two real
             packaging bugs. build-linux is now a matrix shipping
             gwemu-<v>-x86_64.AppImage and gwemu-<v>-aarch64.AppImage,
