@@ -26,6 +26,8 @@ public:
 
     // Reset to page 0 and rescan the backup library, then open.
     void Open();
+    // Open the wizard populated with an existing profile's configuration for editing.
+    void OpenForEdit(const std::string &profile_id);
     void Draw();
     // True once a profile was actually created this session (used by the
     // settings-window host to decide whether closing the wizard should
@@ -139,6 +141,7 @@ private:
     bool m_content_changed = false;
     unsigned m_last_sig = ~0u;
     bool m_assignments_open = false;
+    std::string m_edit_profile_id;
     // Cached existence of the gnwmanager patch binary (per game),
     // rechecked at most once a second -- g_file_test ran every frame
     // from ValidSources()/DrawForm() before.

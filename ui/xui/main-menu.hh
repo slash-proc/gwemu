@@ -15,22 +15,19 @@
 #include "scene.hh"
 #include "viewport-manager.hh"
 
-class GnwFlashStorageView; // flash-storage-view.hh, forward-declared to
-                            // avoid a circular include (it includes this
-                            // header for MainMenuTabView)
-class GnwSdCardView;       // sdcard-view.hh, same reason
+
 
 class MainMenuTabView
 {
 public:
     virtual ~MainMenuTabView() = default;
     virtual void Draw() = 0;
+    virtual float DesiredWidth() { return 800.0f * g_viewport_mgr.m_scale; }
+    virtual float DesiredHeight() { return 600.0f * g_viewport_mgr.m_scale; }
 };
 
 // display-view.hh/audio-view.hh inherit from MainMenuTabView above, so they
-// must be included after its definition, not before (same circular-include
-// hazard as GnwFlashStorageView, just resolved with include-order instead
-// of a forward-declared pointer since these two are small/self-contained).
+// must be included after its definition, not before.
 #include "display-view.hh"
 #include "audio-view.hh"
 
@@ -44,6 +41,17 @@ class MainMenuSystemView : public virtual MainMenuTabView
 {
 public:
     void Draw() override;
+};
+
+class MainMenuProfilesView : public virtual MainMenuTabView
+{
+public:
+    MainMenuProfilesView();
+    void Draw() override;
+    float DesiredWidth() override;
+    float DesiredHeight() override;
+private:
+    std::string m_selected_profile_id;
 };
 
 class MainMenuInputView : public virtual MainMenuTabView
@@ -81,13 +89,12 @@ protected:
     std::vector<MainMenuTabView*>   m_views;
     MainMenuGeneralView             m_general_view;
     MainMenuSystemView              m_system_view;
+    MainMenuProfilesView            m_profiles_view;
     MainMenuInputView               m_input_view;
     MainMenuDisplayView             m_display_view;
     MainMenuAudioView               m_audio_view;
     MainMenuAboutView               m_about_view;
     MainMenuSnapshotsView            m_snapshots_view;
-    GnwFlashStorageView            *m_flash_storage_view; // flash-storage-view.hh
-    GnwSdCardView                  *m_sdcard_view;         // sdcard-view.hh
 
 public:
     MainMenuScene();
@@ -101,6 +108,18 @@ public:
     void Hide() override;
     bool IsAnimating() override;
     bool Draw() override;
+    
+    bool TakeContentChanged() {
+        bool res = m_content_changed_flag;
+        m_content_changed_flag = false;
+        return res;
+    }
+    
+    float DesiredWidth();
+    float DesiredHeight();
+
+protected:
+    bool m_content_changed_flag = true;
 };
 
 extern MainMenuScene g_main_menu;

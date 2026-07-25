@@ -442,7 +442,23 @@ void gwemu_settings_hud_show(void)
         }
         SDL_ShowWindow(g_settings_window);
         SDL_RaiseWindow(g_settings_window);
+        if (!g_profile_wizard.is_open) {
+            g_main_menu.Show();
+        }
     }
+}
+
+extern "C" void gwemu_auto_launch_active_profile(void)
+{
+    if (!g_config.general.active_profile || !g_config.general.active_profile[0]) return;
+    g_profile_store.Scan();
+    GwProfile *p = g_profile_store.Find(g_config.general.active_profile);
+    if (!p) return;
+    std::string sdp = p->SdPath();
+    gwemu_relaunch_with_flash_images(p->Bank1Path().c_str(),
+                                     p->Bank2Path().c_str(),
+                                     p->ExtflashPath().c_str(),
+                                     sdp.empty() ? NULL : sdp.c_str());
 }
 
 void gwemu_settings_hud_process_sdl_events(SDL_Event *event)
@@ -504,11 +520,20 @@ void gwemu_settings_hud_update(void)
                 }
             }
 
-            if (!g_profile_wizard.is_open && g_profile_wizard.WasCompleted()) {
-                SDL_HideWindow(g_settings_window);
-            }
+
         } else {
             bool is_open = g_main_menu.Draw();
+            if (g_main_menu.TakeContentChanged()) {
+                int cur_w, cur_h;
+                SDL_GetWindowSize(g_settings_window, &cur_w, &cur_h);
+                int want_w = (int)(g_main_menu.DesiredWidth() + 0.5f);
+                int want_h = (int)(g_main_menu.DesiredHeight() + 0.5f);
+                if (want_w < cur_w) want_w = cur_w;
+                if (want_h < cur_h) want_h = cur_h;
+                if (want_w != cur_w || want_h != cur_h) {
+                    SDL_SetWindowSize(g_settings_window, want_w, want_h);
+                }
+            }
 
             if (!is_open) {
                 SDL_HideWindow(g_settings_window);

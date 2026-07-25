@@ -217,12 +217,71 @@ void ProfileWizard::Open()
     is_open = true;
 }
 
+void ProfileWizard::OpenForEdit(const std::string &profile_id)
+{
+    GwProfile *p = g_profile_store.Find(profile_id);
+    if (!p) return;
+    
+    m_library.Rescan();
+    g_profile_store.Scan();
+    m_stage = StageProfile;
+    m_folder_chosen = false;
+    m_completed = false;
+    m_content_changed = true;
+    m_edit_profile_id = profile_id;
+    m_s2_visited = true; // prevent EnterProfileStage defaults from overriding
+    
+    g_strlcpy(m_name, p->display_name.c_str(), sizeof(m_name));
+    m_name_hint = p->display_name;
+    
+    // We always set Custom template because otherwise we can't represent arbitrary paths
+    m_template = TplCustom;
+    m_patched = (p->prov_bank1.find("patched-") == 0);
+    
+    if (p->prov_bank1 == "blank") m_bank1_choice = B1Blank;
+    else if (p->prov_bank1 == "ofw-mario") m_bank1_choice = B1OfwMario;
+    else if (p->prov_bank1 == "ofw-zelda") m_bank1_choice = B1OfwZelda;
+    else { m_bank1_choice = B1File; m_bank1_path = p->Bank1Path(); }
+    
+    if (p->prov_bank2 == "blank") m_bank2_choice = B2Blank;
+    else { m_bank2_choice = B2File; m_bank2_path = p->Bank2Path(); }
+    
+    if (p->prov_extflash == "blank") m_ext_choice = ExtBlank;
+    else if (p->prov_extflash == "ofw-mario") m_ext_choice = ExtOfwMario;
+    else if (p->prov_extflash == "ofw-zelda") m_ext_choice = ExtOfwZelda;
+    else { m_ext_choice = ExtFile; m_ext_path = p->ExtflashPath(); }
+    
+    m_ext_size_mib = (int)(p->disk_bytes >> 20); // rough estimate
+    if (m_ext_size_mib < 1) m_ext_size_mib = 64; // default
+    
+    m_sd_mode = SdNone;
+    if (p->sd.mode == GwSdMode::Bundled) {
+        m_sd_mode = SdImport;
+        m_sd_import_path = p->SdPath();
+        m_sd_storage = 0;
+        m_sd_transfer = 0;
+    } else if (p->sd.mode == GwSdMode::Shared) {
+        m_sd_mode = SdShared;
+        m_sd_shared_image = p->sd.image;
+    }
+    
+    m_assignments_open = true; // show assignments
+    
+    is_open = true;
+}
+
+
 /* ------------------------------------------------------------------ */
 /* Build worker                                                        */
 
 static bool copy_padded(const std::string &src, const std::string &dst,
                         uint64_t pad_to, std::string &err)
 {
+    if (src == dst) {
+        // Edit-in-place: no-op to prevent truncating the file to 0.
+        return true;
+    }
+
     FILE *in = g_fopen(src.c_str(), "rb");
     if (!in) {
         err = "cannot open " + src;
@@ -309,9 +368,22 @@ bool ProfileWizard::BuildWorker(std::string &err)
     // Step 0: create the profile dir + toml
     m_build_step.store(0);
     std::string name = m_name[0] ? m_name : m_name_hint;
-    std::string id = g_profile_store.Create(name, err);
-    if (id.empty()) {
-        return false;
+    std::string id;
+    if (m_edit_profile_id.empty()) {
+        id = g_profile_store.Create(name, err);
+        if (id.empty()) {
+            return false;
+        }
+    } else {
+        id = m_edit_profile_id;
+        GwProfile *p = g_profile_store.Find(id);
+        if (p) {
+            p->display_name = name;
+            g_profile_store.Save(*p, err);
+        } else {
+            err = "editing profile not found";
+            return false;
+        }
     }
     GwProfile *p = g_profile_store.Find(id);
 
@@ -509,16 +581,18 @@ bool ProfileWizard::BuildWorker(std::string &err)
             p->sd.mode = GwSdMode::Shared;
             p->sd.image = sd_name;
         }
-        if (m_sd_transfer == 1) {
-            // Move: rename when possible, copy+unlink across filesystems.
-            if (g_rename(m_sd_import_path.c_str(), dst.c_str()) != 0) {
-                ok = copy_padded(m_sd_import_path, dst, 0, err);
-                if (ok) {
-                    g_unlink(m_sd_import_path.c_str());
+        if (m_sd_import_path != dst) {
+            if (m_sd_transfer == 1) {
+                // Move: rename when possible, copy+unlink across filesystems.
+                if (g_rename(m_sd_import_path.c_str(), dst.c_str()) != 0) {
+                    ok = copy_padded(m_sd_import_path, dst, 0, err);
+                    if (ok) {
+                        g_unlink(m_sd_import_path.c_str());
+                    }
                 }
+            } else {
+                ok = copy_padded(m_sd_import_path, dst, 0, err);
             }
-        } else {
-            ok = copy_padded(m_sd_import_path, dst, 0, err);
         }
         if (ok && p->sd.mode == GwSdMode::Shared) {
             std::string sidecar = dst.substr(0, dst.size() - 6) + ".toml";
@@ -688,6 +762,23 @@ bool ProfileWizard::ValidSources(std::string *why) const
         if (why) *why = "extflash: Zelda content needs at least 4 MiB";
         return false;
     }
+    
+    // Check uniqueness among file selections
+    const std::string *paths[3] = {nullptr, nullptr, nullptr};
+    if (m_bank1_choice == B1File) paths[0] = &m_bank1_path;
+    if (m_bank2_choice == B2File) paths[1] = &m_bank2_path;
+    if (m_ext_choice == ExtFile) paths[2] = &m_ext_path;
+
+    for (int i = 0; i < 3; i++) {
+        if (!paths[i]) continue;
+        for (int j = i + 1; j < 3; j++) {
+            if (paths[j] && *paths[i] == *paths[j]) {
+                if (why) *why = "All selected custom files must be unique";
+                return false;
+            }
+        }
+    }
+    
     return true;
 }
 
@@ -1370,7 +1461,7 @@ void ProfileWizard::DrawSdSection()
     const char *mode_label =
         m_sd_mode == SdNone   ? "None" :
         m_sd_mode == SdNew    ? "New card" :
-        m_sd_mode == SdImport ? "Import file..." : "Shared card...";
+        m_sd_mode == SdImport ? "File..." : "Shared card...";
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
     if (ImGui::BeginCombo("##sdmode", mode_label)) {
         if (ImGui::Selectable("None", m_sd_mode == SdNone)) {
@@ -1381,7 +1472,7 @@ void ProfileWizard::DrawSdSection()
                 m_sd_mode = SdNew;
             }
         }
-        if (ImGui::Selectable("Import file...", m_sd_mode == SdImport)) {
+        if (ImGui::Selectable("File...", m_sd_mode == SdImport)) {
             if (m_sd_mode != SdImport) {
                 m_sd_mode = SdImport;
                 ShowOpenFileDialog(kQcow2Filter, 2, m_sd_import_path.c_str(),
@@ -1406,8 +1497,9 @@ void ProfileWizard::DrawSdSection()
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Storage");
         ImGui::SameLine(120 * sc);
+        float radio_x = ImGui::GetCursorPosX();
         ImGui::RadioButton("Bundled with profile", &m_sd_storage, 0);
-        ImGui::SameLine();
+        ImGui::SetCursorPosX(radio_x);
         ImGui::RadioButton("Shared (other profiles can attach)", &m_sd_storage, 1);
     };
 
@@ -1429,8 +1521,7 @@ void ProfileWizard::DrawSdSection()
         ImGui::EndDisabled();
 
         storage_radios();
-        ImGui::TextDisabled("%d GiB card, sparse -- takes almost no disk "
-                            "until written.", m_sd_new_size_gib);
+        ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight()));
     } else if (m_sd_mode == SdImport) {
         ImGui::SameLine(0, 10 * sc);
         InlineFileField("##sdimport", m_sd_import_path.c_str(), kQcow2Filter, 2, false,

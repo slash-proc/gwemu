@@ -111,6 +111,9 @@ public:
     /* Rewrite <dir>/profile.toml from p. */
     bool Save(const GwProfile &p, std::string &err);
 
+    /* Duplicate an existing profile. */
+    std::string Duplicate(const std::string &source_id, std::string &err);
+
     /* Recursively delete the profile directory. Never touches a Shared
      * SD image. */
     bool Delete(const std::string &id, std::string &err);

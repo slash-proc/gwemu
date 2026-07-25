@@ -1515,7 +1515,7 @@ static void display_very_early_init(DisplayOptions *o)
     /* Comfortable default, but never larger than the desktop's usable
      * area -- a window that opens bigger than the screen leaves no
      * reachable edge to resize it with. */
-    int set_w = 900, set_h = 700;
+    int set_w = 1100, set_h = 700;
     SDL_Rect usable;
     if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable)) {
         set_w = MIN(set_w, usable.w * 9 / 10);
@@ -2079,6 +2079,18 @@ int main(int argc, char **argv)
     atexit(gwemu_settings_save);
     gnw_input_load();
     atexit(gnw_input_save);
+
+    bool has_flash_images = false;
+    for (int i = 1; i < g_orig_argc; i++) {
+        if (strcmp(g_orig_argv[i], "-global") == 0 && i + 1 < g_orig_argc &&
+            is_flash_image_global(g_orig_argv[i + 1])) {
+            has_flash_images = true;
+            break;
+        }
+    }
+    if (!has_flash_images) {
+        gwemu_auto_launch_active_profile();
+    }
 
     display_very_early_init(NULL);
 

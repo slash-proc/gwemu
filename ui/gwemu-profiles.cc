@@ -320,6 +320,86 @@ std::string GwProfileStore::Create(const std::string &display_name, std::string 
     return "";
 }
 
+std::string GwProfileStore::Duplicate(const std::string &source_id_ref, std::string &err)
+{
+    std::string source_id = source_id_ref; // Copy to avoid dangling ref if m_profiles reallocates
+    GwProfile *src = Find(source_id);
+    if (!src) {
+        err = "Source profile not found";
+        return "";
+    }
+    
+    std::string base_name = src->display_name;
+    // Strip trailing "(copy X)" if present
+    size_t copy_pos = base_name.find(" (copy ");
+    if (copy_pos != std::string::npos && base_name.back() == ')') {
+        base_name = base_name.substr(0, copy_pos);
+    }
+    
+    std::string test_name;
+    for (int i = 1; i < 1000; i++) {
+        test_name = base_name + " (copy " + std::to_string(i) + ")";
+        bool exists = false;
+        for (const auto &p : m_profiles) {
+            if (p.display_name == test_name) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) break;
+    }
+    
+    std::string new_id = Create(test_name, err);
+    if (new_id.empty()) return "";
+    
+    // Re-fetch src since Create might have reallocated m_profiles
+    src = Find(source_id);
+    GwProfile *dst = Find(new_id);
+    if (!src || !dst) return ""; // should not happen
+
+    // Copy contents of directory
+    GDir *d = g_dir_open(src->dir.c_str(), 0, NULL);
+    if (d) {
+        const char *name;
+        while ((name = g_dir_read_name(d)) != NULL) {
+            if (strcmp(name, "profile.toml") == 0) continue; // Skip toml, Save() writes it later
+            std::string src_file = src->dir + "/" + name;
+            std::string dst_file = dst->dir + "/" + name;
+            
+            // Fast synchronous copy
+            FILE *in = g_fopen(src_file.c_str(), "rb");
+            if (in) {
+                FILE *out = g_fopen(dst_file.c_str(), "wb");
+                if (out) {
+                    const size_t kChunk = 1 << 20;
+                    std::vector<uint8_t> buf(kChunk);
+                    size_t n;
+                    while ((n = fread(buf.data(), 1, kChunk, in)) > 0) {
+                        if (fwrite(buf.data(), 1, n, out) != n) break;
+                    }
+                    fclose(out);
+                }
+                fclose(in);
+            }
+        }
+        g_dir_close(d);
+    }
+    
+    // Mirror the metadata from source, but keep the new ID, dir, created, display_name
+    dst->bank1 = src->bank1;
+    dst->bank2 = src->bank2;
+    dst->extflash = src->extflash;
+    dst->prov_bank1 = src->prov_bank1;
+    dst->prov_bank2 = src->prov_bank2;
+    dst->prov_extflash = src->prov_extflash;
+    dst->sd = src->sd;
+    
+    Save(*dst, err);
+    RecalcDiskUsage(*dst);
+    
+    return new_id;
+}
+
 bool GwProfileStore::Delete(const std::string &id, std::string &err)
 {
     GwProfile *p = Find(id);

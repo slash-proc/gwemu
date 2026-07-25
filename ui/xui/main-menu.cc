@@ -3,12 +3,14 @@
 //
 #include "common.hh"
 #include "main-menu.hh"
-#include "flash-storage-view.hh"
-#include "sdcard-view.hh"
+#include "../gwemu-profiles.hh"
+#include "profile-wizard.hh"
 #include "snapshot-manager.hh"
+#include "font-manager.hh"
 #include "widgets.hh"
 #include "monitor.hh"
 #include "../gwemu-gnw-input.h"
+#include "gwemu-hud.h"
 extern "C" {
 #include "qemu-version.h"
 void gnw_h7b0_rtc_set_sync_host(bool sync_host);
@@ -129,6 +131,145 @@ void MainMenuSnapshotsView::Draw()
     g_snapshot_mgr.Draw();
 }
 
+MainMenuProfilesView::MainMenuProfilesView()
+{
+}
+
+void MainMenuProfilesView::Draw()
+{
+    float pad = 16.0f * g_viewport_mgr.m_scale;
+    
+    ImGui::Columns(2, "ProfilesColumns", false);
+    ImGui::SetColumnWidth(0, ImGui::GetWindowWidth() * 0.35f);
+    
+    // LEFT PANE: List of profiles
+    ImGui::BeginChild("ProfileListPane", ImVec2(0, 0), true);
+    
+    const auto &profiles = g_profile_store.Profiles();
+    for (const auto &p : profiles) {
+        std::string label = p.display_name;
+        if (p.id == g_config.general.active_profile) {
+            label += " (Active)";
+        }
+        
+        if (ImGui::Selectable(label.c_str(), m_selected_profile_id == p.id)) {
+            m_selected_profile_id = p.id;
+        }
+    }
+    
+    ImGui::Dummy(ImVec2(0, pad));
+    if (ImGui::Button("+ Create New Profile", ImVec2(-1, 0))) {
+        g_profile_wizard.Open();
+    }
+    
+    ImGui::EndChild();
+    
+    // RIGHT PANE: Details & Actions
+    ImGui::NextColumn();
+    
+    ImGui::BeginChild("ProfileDetailPane", ImVec2(0, 0), true);
+    if (!m_selected_profile_id.empty()) {
+        GwProfile *p = g_profile_store.Find(m_selected_profile_id);
+        if (p) {
+            ImGui::PushFont(g_font_mgr.m_menu_font_medium);
+            ImGui::TextUnformatted(p->display_name.c_str());
+            ImGui::PopFont();
+            ImGui::Spacing();
+            
+            // Read-only info
+            ImGui::Text("Created: %s", p->created.c_str());
+            ImGui::Text("Storage: %.1f MiB", p->disk_bytes / 1048576.0f);
+            if (p->sd.mode != GwSdMode::None) {
+                ImGui::Text("SD Card: %s", p->sd.mode == GwSdMode::Bundled ? "Bundled" : "Shared");
+            }
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            
+            // Action Row
+            if (ImGui::Button("Launch", ImVec2(120 * g_viewport_mgr.m_scale, 40 * g_viewport_mgr.m_scale))) {
+                gwemu_settings_set_string(&g_config.general.active_profile, p->id.c_str());
+                gwemu_settings_save();
+                std::string sdp = p->SdPath();
+                gwemu_relaunch_with_flash_images(p->Bank1Path().c_str(),
+                                                 p->Bank2Path().c_str(),
+                                                 p->ExtflashPath().c_str(),
+                                                 sdp.empty() ? NULL : sdp.c_str());
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Modify", ImVec2(0, 40 * g_viewport_mgr.m_scale))) {
+                g_profile_wizard.OpenForEdit(p->id);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Duplicate", ImVec2(0, 40 * g_viewport_mgr.m_scale))) {
+                std::string err;
+                std::string new_id = g_profile_store.Duplicate(p->id, err);
+                if (!new_id.empty()) {
+                    m_selected_profile_id = new_id;
+                } else {
+                    fprintf(stderr, "Duplicate failed: %s\n", err.c_str());
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Delete", ImVec2(0, 40 * g_viewport_mgr.m_scale))) {
+                ImGui::OpenPopup("Delete Profile?");
+            }
+            
+            if (ImGui::BeginPopupModal("Delete Profile?", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("Are you sure you want to delete profile '%s'?", p->display_name.c_str());
+                ImGui::Separator();
+                if (ImGui::Button("Yes, Delete", ImVec2(120, 0))) {
+                    std::string err;
+                    if (g_profile_store.Delete(p->id, err)) {
+                        m_selected_profile_id.clear();
+                    }
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SetItemDefaultFocus();
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+        } else {
+            m_selected_profile_id.clear();
+        }
+    } else {
+        ImGui::TextDisabled("Select a profile from the left.");
+    }
+    ImGui::EndChild();
+    
+    ImGui::Columns(1);
+}
+
+float MainMenuProfilesView::DesiredWidth()
+{
+    float pad = 20 * g_viewport_mgr.m_scale;
+    float max_left = 300 * g_viewport_mgr.m_scale;
+    ImGui::PushFont(g_font_mgr.m_menu_font);
+    for (const auto& p : g_profile_store.Profiles()) {
+        max_left = std::max(max_left, ImGui::CalcTextSize(p.display_name.c_str()).x + pad * 2);
+    }
+    ImGui::PopFont();
+    
+    float max_right = 450 * g_viewport_mgr.m_scale; // action buttons inline space
+    if (!m_selected_profile_id.empty()) {
+        GwProfile* p = g_profile_store.Find(m_selected_profile_id);
+        if (p) {
+            ImGui::PushFont(g_font_mgr.m_menu_font_medium);
+            max_right = std::max(max_right, ImGui::CalcTextSize(p->display_name.c_str()).x + pad * 2);
+            ImGui::PopFont();
+        }
+    }
+    return max_left + max_right;
+}
+
+float MainMenuProfilesView::DesiredHeight()
+{
+    return 650.0f * g_viewport_mgr.m_scale;
+}
+
 bool MainMenuTabButton::Draw(bool selected)
 {
     return ImGui::Selectable(m_text.c_str(), selected);
@@ -137,22 +278,18 @@ bool MainMenuTabButton::Draw(bool selected)
 MainMenuScene::MainMenuScene()
     : m_current_view_index(0)
 {
-    m_flash_storage_view = new GnwFlashStorageView();
-    m_sdcard_view = new GnwSdCardView();
-
     m_tabs.push_back(new MainMenuTabButton("General"));
     m_tabs.push_back(new MainMenuTabButton("System"));
-    m_tabs.push_back(new MainMenuTabButton("Flash"));
-    m_tabs.push_back(new MainMenuTabButton("SD Card"));
+    m_tabs.push_back(new MainMenuTabButton("Profiles"));
     m_tabs.push_back(new MainMenuTabButton("Input"));
     m_tabs.push_back(new MainMenuTabButton("Display"));
     m_tabs.push_back(new MainMenuTabButton("Audio"));
     m_tabs.push_back(new MainMenuTabButton("Snapshots"));
     m_tabs.push_back(new MainMenuTabButton("About"));
+    
     m_views.push_back(&m_general_view);
     m_views.push_back(&m_system_view);
-    m_views.push_back(m_flash_storage_view);
-    m_views.push_back(m_sdcard_view);
+    m_views.push_back(&m_profiles_view);
     m_views.push_back(&m_input_view);
     m_views.push_back(&m_display_view);
     m_views.push_back(&m_audio_view);
@@ -173,7 +310,27 @@ bool MainMenuScene::ConsumeRebindEvent(SDL_Event *event) { return gnw_input_is_r
 
 void MainMenuScene::Show()
 {
+    m_content_changed_flag = true;
     Scene::Show();
+}
+
+float MainMenuScene::DesiredWidth()
+{
+    float tabs_w = 120.0f * g_viewport_mgr.m_scale;
+    float view_w = 800.0f * g_viewport_mgr.m_scale;
+    if (m_current_view_index >= 0 && m_current_view_index < (int)m_views.size()) {
+        view_w = m_views[m_current_view_index]->DesiredWidth();
+    }
+    return tabs_w + view_w + 32.0f * g_viewport_mgr.m_scale; // window padding
+}
+
+float MainMenuScene::DesiredHeight()
+{
+    float view_h = 600.0f * g_viewport_mgr.m_scale;
+    if (m_current_view_index >= 0 && m_current_view_index < (int)m_views.size()) {
+        view_h = m_views[m_current_view_index]->DesiredHeight();
+    }
+    return view_h + 32.0f * g_viewport_mgr.m_scale; // window padding
 }
 
 void MainMenuScene::Hide()
@@ -205,6 +362,9 @@ bool MainMenuScene::Draw()
                        true);
     for (size_t i = 0; i < m_tabs.size(); i++) {
         if (m_tabs[i]->Draw((int)i == m_current_view_index)) {
+            if (m_current_view_index != (int)i) {
+                m_content_changed_flag = true;
+            }
             m_current_view_index = (int)i;
         }
     }

@@ -80,6 +80,8 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
                                       const char *extflash_image,
                                       const char *sdcard_qcow2);
 
+void gwemu_auto_launch_active_profile(void);
+
 #ifdef __cplusplus
 }
 #endif
