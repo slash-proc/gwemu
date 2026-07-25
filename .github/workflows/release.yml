@@ -10,10 +10,13 @@ name: Release build
 # library the eventual GUI imports directly instead of shelling out; do
 # not build anything here that assumes today's packaging is permanent):
 #
-# - Linux: ONE direct asset, gwemu-<version>-x86_64.AppImage
-#   (contrib/appimage/build-appimage.sh) -- the zero-argument GUI binary
-#   plus bundled libs in a single executable file. It accepts explicit
-#   -M/-display arguments too, so no separate qemu-system-arm asset.
+# - Linux: ONE direct asset PER ARCH, gwemu-<version>-x86_64.AppImage and
+#   gwemu-<version>-aarch64.AppImage (contrib/appimage/build-appimage.sh)
+#   -- the zero-argument GUI binary plus bundled libs in a single
+#   executable file. It accepts explicit -M/-display arguments too, so no
+#   separate qemu-system-arm asset. The aarch64 leg targets 64-bit
+#   Raspberry Pi OS on a Pi 4/5 and builds natively on GitHub's
+#   ubuntu-24.04-arm runner.
 # - macOS: ONE direct asset, gwemu-<version>-macos-universal.dmg -- a
 #   universal (arm64+x86_64 lipo-merged) self-contained gwemu.app
 #   (dylibs in Contents/Frameworks, ad-hoc signed; per-arch recipe
@@ -46,7 +49,23 @@ env:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    strategy:
+      # Independent legs -- don't let one arch's failure cancel the
+      # other's real pass/fail signal (same rationale as build-macos).
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+            appimagetool_arch: x86_64
+          # Native aarch64 GitHub-hosted runner (free for public repos) --
+          # this is the Raspberry Pi 4/5 target. Native, not qemu-user
+          # emulated: a full QEMU+SDL3 build under binfmt emulation takes
+          # hours and has its own toolchain quirks.
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            appimagetool_arch: aarch64
+    runs-on: ${{ matrix.runner }}
     # Build inside an older-LTS container for a lower glibc floor than
     # ubuntu-latest's own base image would give us -- glibc's forward-only
     # symbol versioning means a binary built against a newer glibc won't
@@ -86,10 +105,16 @@ jobs:
           apt-get install -y --no-install-recommends \
             ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev \
             python3 python3-pip build-essential zip \
-            cmake libepoxy-dev liblzma-dev \
+            cmake libepoxy-dev liblzma-dev libpng-dev \
             libx11-dev libxext-dev libxrandr-dev libxi-dev libxfixes-dev \
             libxcursor-dev libxss-dev libwayland-dev libxkbcommon-dev \
             wayland-protocols libdecor-0-dev libdbus-1-dev libudev-dev
+          # libpng-dev: without it QEMU's screendump has no PNG encoder,
+          # and the headless timeline's `screenshot` action fails at
+          # runtime with "Enable PNG support with libpng for screendump"
+          # -- i.e. the shipped AppImage could run a timeline but never
+          # capture from it. Found on a real Raspberry Pi 4 headless run
+          # of the aarch64 asset; the x86_64 asset had the same gap.
           # liblzma-dev: contrib/gnw-tools/gnw_lzma.c (part of the CFW
           # patch-engine port, predates this GUI-wiring change but was
           # apparently never added to this workflow before) links system
@@ -151,7 +176,7 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get install -y --no-install-recommends curl file
           curl -fsSL -o /usr/local/bin/appimagetool \
-            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.appimagetool_arch }}.AppImage"
           chmod +x /usr/local/bin/appimagetool
           # No FUSE inside the container -- run appimagetool extracted.
           printf '%s\n' '#!/bin/sh' \
@@ -164,15 +189,17 @@ jobs:
             find build -maxdepth 2 >&2
             exit 1
           fi
-          # Conventional AppImage naming: gwemu-<version>-x86_64.AppImage
+          # Conventional AppImage naming: gwemu-<version>-<arch>.AppImage
           # (workflow_dispatch runs have no tag -- fall back to the sha).
           VERSION="${GITHUB_REF_NAME#v}"
           case "$GITHUB_REF_NAME" in v*) ;; *) VERSION="${GITHUB_SHA::8}" ;; esac
-          APPIMAGETOOL=/usr/local/bin/appimagetool-wrapped \
-            contrib/appimage/build-appimage.sh "$src" "gwemu-$VERSION-x86_64.AppImage"
-          mkdir linux-bin && mv "gwemu-$VERSION-x86_64.AppImage" linux-bin/
+          NAME="gwemu-$VERSION-${{ matrix.arch }}.AppImage"
+          APPIMAGETOOL=/usr/local/bin/appimagetool-wrapped ARCH=${{ matrix.arch }} \
+            contrib/appimage/build-appimage.sh "$src" "$NAME"
+          mkdir linux-bin && mv "$NAME" linux-bin/
 
-      - name: Stage scripts artifact (once, from this job only)
+      - name: Stage scripts artifact (once, from the x86_64 leg only)
+        if: matrix.arch == 'x86_64'
         run: |
           set -euo pipefail
           # Owner's call (2026-07-24): the per-platform zips are pure
@@ -185,6 +212,7 @@ jobs:
           done
 
       - uses: actions/upload-artifact@v4
+        if: matrix.arch == 'x86_64'
         with:
           name: scripts
           path: scripts-pkg/
@@ -194,7 +222,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gwemu-linux-bin
+          name: gwemu-linux-${{ matrix.arch }}-bin
           path: linux-bin/
           # Single-file direct asset (like the Windows exes):
           # publish-release moves it out un-zipped and restores its exec
@@ -228,7 +256,11 @@ jobs:
       - name: Install build dependencies (arm64 leg)
         if: matrix.arch == 'arm64'
         run: |
-          brew install ninja pkg-config glib pixman sdl2 meson dylibbundler cmake libepoxy xz
+          # libpng: QEMU's screendump has no PNG encoder without it, so
+          # the headless timeline's `screenshot` action fails at runtime
+          # ("Enable PNG support with libpng for screendump"). Confirmed
+          # missing from the shipped 0.0.14 universal DMG.
+          brew install ninja pkg-config glib pixman sdl2 meson dylibbundler cmake libepoxy xz libpng
           # pyyaml: subprojects/genconfig/gen_config.py needs it; mkvenv's
           # venv is non-isolated so a system/user install is enough.
           pip3 install --user --break-system-packages pyyaml || pip3 install --user pyyaml
@@ -246,7 +278,7 @@ jobs:
           # tools, never linked into the target binary).
           brew install ninja meson cmake dylibbundler pkg-config
           arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
-          arch -x86_64 /usr/local/bin/brew install pkg-config glib pixman sdl2 libepoxy xz
+          arch -x86_64 /usr/local/bin/brew install pkg-config glib pixman sdl2 libepoxy xz libpng
           # pyyaml: subprojects/genconfig/gen_config.py needs it; mkvenv's
           # venv is non-isolated so a system/user install is enough. This
           # leg still runs meson/mkvenv under the arm64 (host) Python.
@@ -659,11 +691,12 @@ jobs:
             mv gwemu-windows-exes/* ..
             rm -rf gwemu-windows-exes
           fi
-          if [ -d gwemu-linux-bin ]; then
-            chmod +x gwemu-linux-bin/*
-            mv gwemu-linux-bin/* ..
-            rm -rf gwemu-linux-bin
-          fi
+          for d in gwemu-linux-*-bin; do
+            [ -d "$d" ] || continue
+            chmod +x "$d"/*
+            mv "$d"/* ..
+            rm -rf "$d"
+          done
           for d in gwemu-macos-*-dmg; do
             [ -d "$d" ] || continue
             mv "$d"/*.dmg ..

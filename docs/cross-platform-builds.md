@@ -25,6 +25,26 @@ Standard build (see CLAUDE.md "Build"). Notes:
   automatically.
 - `scripts/boot_qemu.sh` auto-picks `sdl3` as the audiodev.
 
+### Linux aarch64 (Raspberry Pi 4/5)
+
+Same native build — no cross-compilation, no source changes. The release
+pipeline builds it on GitHub's native `ubuntu-24.04-arm` runner and ships
+`gwemu-<version>-aarch64.AppImage` alongside the x86_64 one;
+`contrib/appimage/build-appimage.sh` picks its `ARCH` from `uname -m`
+unless overridden.
+
+To reproduce the release leg locally on an x86_64 dev box, run it under
+qemu-user binfmt (correctness check only — emulated, so it's slow):
+
+```
+docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src ubuntu:22.04 ...
+```
+
+Note this validates that the build and packaging work; it says nothing
+about runtime performance on real Pi hardware (TCG throughput, and the
+Vulkan/GL/software renderer fallback chain on the Pi's VideoCore driver,
+both need testing on a real device).
+
 ## Windows (cross-compiled from Linux, Docker)
 
 No MSYS2 and no Windows machine needed to *build* (only to run/test).

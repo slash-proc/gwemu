@@ -12,7 +12,13 @@ on:
 
 jobs:
   build-check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04-arm is a native aarch64 GitHub-hosted runner (free
+        # for public repos) -- covers the Raspberry Pi 4/5 target.
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 

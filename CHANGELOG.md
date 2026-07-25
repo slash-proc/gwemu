@@ -1,3 +1,17 @@
+2026-07-25  Release pipeline: Linux arm64 (Raspberry Pi 4/5) + two real
+            packaging bugs. build-linux is now a matrix shipping
+            gwemu-<v>-x86_64.AppImage and gwemu-<v>-aarch64.AppImage,
+            built natively on ubuntu-24.04-arm (free aarch64 runner);
+            build-appimage.sh picks ARCH from uname -m; build-check.yml
+            covers arm64 too. Validated end to end on a real Pi 4:
+            boots stock Mario headless with no SD card, steady ~59.6fps
+            (1800 vblanks in 30423ms), ~41% of one core. Fixes found by
+            testing rather than review: libpng was missing from ALL
+            THREE release legs, so the shipped binaries could run a
+            headless timeline but never capture from it ("Enable PNG
+            support with libpng for screendump" -- confirmed on the Pi
+            and on the 0.0.14 macOS universal DMG).
+
 2026-07-24  GUI: device-profile system Phases 1-2 + staged firmware wizard.
             Profile store backend (ui/gwemu-profiles: per-profile dirs
             with owned flash copies + profile.toml via tomlplusplus,

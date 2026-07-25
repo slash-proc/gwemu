@@ -44,5 +44,6 @@ GTAGS
 *.7z
 # local build trees / logs (gwemu)
 build-win/
+build-win-static/
 build-docker/
 gwemu.log

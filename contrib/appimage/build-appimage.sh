@@ -71,6 +71,17 @@ open(sys.argv[1], 'wb').write(png)
 EOF
 ln -sf gwemu.png "$APPDIR/.DirIcon"
 
-ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "$OUT"
+# appimagetool needs ARCH set explicitly (it only auto-detects from the
+# bundled binaries in some cases, and guesses wrong inside containers).
+# Default to the host arch so the same script serves the x86_64 and the
+# aarch64 (Raspberry Pi 4/5) release legs; override with ARCH= to
+# cross-package.
+case "${ARCH:-$(uname -m)}" in
+  aarch64|arm64) APPIMAGE_ARCH=aarch64 ;;
+  x86_64|amd64)  APPIMAGE_ARCH=x86_64 ;;
+  *)             APPIMAGE_ARCH="$(uname -m)" ;;
+esac
+
+ARCH="$APPIMAGE_ARCH" "$APPIMAGETOOL" "$APPDIR" "$OUT"
 rm -rf "$(dirname "$APPDIR")"
 echo "built: $OUT"
