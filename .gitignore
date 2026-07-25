@@ -46,4 +46,5 @@ GTAGS
 build-win/
 build-win-static/
 build-docker/
+build-arm64*/
 gwemu.log

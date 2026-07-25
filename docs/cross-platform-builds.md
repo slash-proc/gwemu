@@ -34,11 +34,46 @@ pipeline builds it on GitHub's native `ubuntu-24.04-arm` runner and ships
 unless overridden.
 
 To reproduce the release leg locally on an x86_64 dev box, run it under
-qemu-user binfmt (correctness check only — emulated, so it's slow):
+qemu-user binfmt (correctness check only — emulated, so it's slow;
+~50 min for a full build). Verified working 2026-07-26:
 
 ```
-docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src ubuntu:22.04 ...
+docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src/build-arm64 ubuntu:22.04 bash -c '
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq ninja-build build-essential pkg-config libglib2.0-dev libpixman-1-dev \
+  python3 python3-pip python3-venv cmake liblzma-dev zlib1g-dev libpng-dev \
+  libx11-dev libxext-dev libxrandr-dev libxi-dev libxcursor-dev libxfixes-dev libxss-dev libxkbcommon-dev \
+  libwayland-dev wayland-protocols libdecor-0-dev libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
+  libasound2-dev libpulse-dev libpipewire-0.3-dev libdbus-1-dev libudev-dev libibus-1.0-dev \
+  libdrm-dev libgbm-dev libxkbcommon-x11-dev
+pyvenv/bin/python -m pip install --no-index --find-links /src/python/wheels meson
+pyvenv/bin/python -m pip install PyYAML
+pyvenv/bin/meson setup --reconfigure /src .
+ninja -j12 qemu-system-arm'
 ```
+
+Three non-obvious dependencies, each of which fails in a way that points
+somewhere else:
+
+- **`liblzma-dev`** — `contrib/gnw-tools/meson.build` hard-errors without
+  it. This surfaces *after* a wall of SDL3 configure output and reads as
+  an SDL3 failure; it isn't.
+- **`PyYAML` in the build dir's venv** — `subprojects/genconfig/gen_config.py`
+  dies with `ModuleNotFoundError: No module named 'yaml'`. NOT vendored in
+  `python/wheels`, so this step needs network pip.
+- **`libpng-dev`** — without it the build silently sets `#undef CONFIG_PNG`
+  and `screendump` then refuses to write PNGs, which breaks headless
+  screenshot validation while the build itself looks fine. Installing the
+  package is not enough on an existing build dir: ninja will not re-probe,
+  so `meson setup --reconfigure` is required.
+
+A build dir created inside the container is root-owned, so a later
+`ninja` run from the host fails on `.ninja_lock`, and its `pyvenv/`
+interpreters are aarch64 binaries that the host cannot execute
+(`meson: not found` / `ModuleNotFoundError: mesonbuild`). Keep rebuilding
+it through the same container, and pass the commands inline via
+`bash -c` rather than dropping a script into the build dir.
 
 Note this validates that the build and packaging work; it says nothing
 about runtime performance on real Pi hardware (TCG throughput, and the

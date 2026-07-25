@@ -31,6 +31,7 @@
 #include "system/replay.h"
 #include "system/cpus.h"
 #include "hw/core/cpu.h"
+#include "hw/misc/gnw_env.h"
 
 #ifdef CONFIG_POSIX
 #include <pthread.h>
@@ -321,11 +322,281 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 }
 
 
+#if defined(__APPLE__) && !defined(CONFIG_PPOLL)
+/*
+ * Sub-millisecond wait for hosts that have no ppoll().
+ *
+ * g_poll()'s timeout is whole milliseconds and qemu_timeout_ns_to_ms()
+ * deliberately rounds UP, so on a ppoll-less host every timer deadline
+ * closer than 1ms overshoots. That measurably starves the main loop:
+ * 2095 wakeups/s on Linux vs 1223/s on a ppoll-less host for the same
+ * workload, and the guest then renders roughly two thirds of its frames
+ * (Celeste: 30.0 fps on Linux, 27.1 on macOS).
+ *
+ * macOS does have pselect(), whose struct timespec timeout is honoured
+ * at nanosecond resolution, so use it to get the true bounded wait that
+ * ppoll() would have given us. Only the timeout mechanism differs; the
+ * fd set, the revents written back and the return value all keep
+ * g_poll()'s exact semantics.
+ *
+ * Returns the number of ready fds, 0 on timeout, -1 with errno set on
+ * error, or -2 if the request cannot be expressed as a select() call
+ * (an fd at or above FD_SETSIZE) -- in which case the caller must fall
+ * back to g_poll() rather than silently dropping an fd.
+ */
+static int qemu_pselect_ns(GPollFD *fds, guint nfds, int64_t timeout)
+{
+    fd_set rfds, wfds, xfds;
+    struct timespec ts;
+    int nsel = 0;
+    int ret, count;
+    guint i;
+
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    FD_ZERO(&xfds);
+
+    for (i = 0; i < nfds; i++) {
+        int fd = fds[i].fd;
+
+        fds[i].revents = 0;
+        if (fd < 0) {
+            continue;
+        }
+        if (fd >= FD_SETSIZE) {
+            return -2;
+        }
+        if (fds[i].events & (G_IO_IN | G_IO_HUP | G_IO_ERR)) {
+            FD_SET(fd, &rfds);
+        }
+        if (fds[i].events & G_IO_OUT) {
+            FD_SET(fd, &wfds);
+        }
+        if (fds[i].events & G_IO_PRI) {
+            FD_SET(fd, &xfds);
+        }
+        if (fd >= nsel) {
+            nsel = fd + 1;
+        }
+    }
+
+    ts.tv_sec = timeout / 1000000000LL;
+    ts.tv_nsec = timeout % 1000000000LL;
+
+    ret = pselect(nsel, &rfds, &wfds, &xfds, &ts, NULL);
+    if (ret <= 0) {
+        /* 0 == timed out, -1 == error with errno already set */
+        return ret;
+    }
+
+    /*
+     * pselect() counts an fd once per set it is ready in; g_poll() counts
+     * each fd at most once, so recount rather than forwarding pselect()'s
+     * return value.
+     */
+    count = 0;
+    for (i = 0; i < nfds; i++) {
+        int fd = fds[i].fd;
+
+        if (fd < 0) {
+            continue;
+        }
+        if (FD_ISSET(fd, &rfds)) {
+            /*
+             * select() folds EOF and error conditions into "readable",
+             * so report plain G_IO_IN and let the caller's read discover
+             * which it was -- never synthesise G_IO_HUP/G_IO_ERR, which
+             * callers treat as "tear this channel down".
+             */
+            fds[i].revents |= G_IO_IN;
+        }
+        if (FD_ISSET(fd, &wfds)) {
+            fds[i].revents |= G_IO_OUT;
+        }
+        if (FD_ISSET(fd, &xfds)) {
+            fds[i].revents |= G_IO_PRI;
+        }
+        if (fds[i].revents) {
+            count++;
+        }
+    }
+    return count;
+}
+#endif /* __APPLE__ && !CONFIG_PPOLL */
+
+#if defined(_WIN32) && !defined(CONFIG_PPOLL)
+/*
+ * Sub-millisecond wait for Windows, which has no ppoll().
+ *
+ * Same disease as macOS (see qemu_pselect_ns above): g_poll()'s timeout is
+ * whole milliseconds and qemu_timeout_ns_to_ms() rounds UP, so every timer
+ * deadline closer than 1ms overshoots, the main loop's wakeup rate collapses
+ * (2095/s on Linux vs 1223/s on Windows for the same workload) and the guest
+ * drops frames -- measured 20.0 fps on Windows vs 30.0 on Linux on the same
+ * physical CPU running Celeste.
+ *
+ * The macOS cure does NOT port. Winsock select() only understands sockets,
+ * whereas the fds this function is handed on win32 are Windows HANDLEs
+ * (glib's win32 g_poll is built on MsgWaitForMultipleObjectsEx). So instead
+ * of replacing the wait, we express the timeout AS a member of the wait set:
+ * a high-resolution waitable timer (100ns granularity) armed to the exact
+ * deadline, appended to the caller's fds, and then g_poll() with an infinite
+ * timeout. The timer firing *is* the timeout. glib still does the actual
+ * wait, so all the win32 handle/message semantics stay exactly as they were;
+ * only the rounding disappears. No spinning, no extra wakeups.
+ *
+ * The timer handle is created once per thread and reused -- creating one per
+ * call would cost a kernel object per main-loop iteration.
+ * CREATE_WAITABLE_TIMER_HIGH_RESOLUTION needs Windows 10 1803+; if it is
+ * refused we probe once, cache the answer and fall back to a plain waitable
+ * timer (millisecond-ish, i.e. no worse than today), and if even that fails
+ * we return -2 so the caller uses the old rounded g_poll() path.
+ *
+ * Returns g_poll() semantics: ready fd count, 0 on timeout, -1 with errno
+ * set on error; or -2 if this mechanism is unavailable for this call.
+ */
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+static __thread HANDLE gnw_wait_timer;
+static __thread bool gnw_wait_timer_failed;
+
+static HANDLE qemu_get_wait_timer(void)
+{
+    if (gnw_wait_timer || gnw_wait_timer_failed) {
+        return gnw_wait_timer;
+    }
+    /* Auto-reset: the wait consumes the signal, and SetWaitableTimer()
+     * re-arms (and cancels any previous arming) on every call anyway. */
+    gnw_wait_timer = CreateWaitableTimerExW(NULL, NULL,
+                                            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+    if (!gnw_wait_timer) {
+        gnw_wait_timer = CreateWaitableTimerExW(NULL, NULL, 0,
+                                                TIMER_ALL_ACCESS);
+    }
+    if (!gnw_wait_timer) {
+        gnw_wait_timer_failed = true;
+    }
+    return gnw_wait_timer;
+}
+
+static int qemu_timed_wait_ns(GPollFD *fds, guint nfds, int64_t timeout)
+{
+    GPollFD local[MAXIMUM_WAIT_OBJECTS + 1];
+    LARGE_INTEGER due;
+    HANDLE timer;
+    int ret, count;
+    guint i;
+
+    /*
+     * We add one handle to the wait set; if that would exceed what a single
+     * MsgWaitForMultipleObjectsEx() can hold, don't risk glib's overflow
+     * handling -- just take the old rounded path for that (rare) iteration.
+     */
+    if (nfds + 1 > MAXIMUM_WAIT_OBJECTS) {
+        return -2;
+    }
+
+    timer = qemu_get_wait_timer();
+    if (!timer) {
+        return -2;
+    }
+
+    /* Negative == relative, in 100ns units. Round up to a whole unit so a
+     * sub-100ns timeout can never be armed as "fire immediately, forever". */
+    due.QuadPart = -DIV_ROUND_UP(timeout, 100);
+    if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+        return -2;
+    }
+
+    for (i = 0; i < nfds; i++) {
+        local[i] = fds[i];
+        local[i].revents = 0;
+    }
+    local[nfds].fd = (gintptr)timer;
+    local[nfds].events = G_IO_IN;
+    local[nfds].revents = 0;
+
+    ret = g_poll(local, nfds + 1, -1);
+
+    CancelWaitableTimer(timer);
+
+    if (ret < 0) {
+        return ret;
+    }
+
+    /* Copy back only the caller's fds, and recount: the timer is our own
+     * private member of the wait set and must never be reported as ready. */
+    count = 0;
+    for (i = 0; i < nfds; i++) {
+        fds[i].revents = local[i].revents;
+        if (fds[i].revents) {
+            count++;
+        }
+    }
+    return count;
+}
+#endif /* _WIN32 && !CONFIG_PPOLL */
+
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
 int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
 {
+#ifndef CONFIG_PPOLL
+    /*
+     * DIAGNOSTIC (GNW_POLL_SPIN): hosts without ppoll -- macOS and
+     * Windows -- fall through to the g_poll() path below, whose timeout
+     * is whole milliseconds and is deliberately rounded UP. Every timer
+     * deadline closer than 1ms therefore overshoots, which measurably
+     * cuts the main loop's wakeup rate (2095/s on Linux vs 1223/s on
+     * Windows for the same workload) and with it the guest's frame rate.
+     * Spin on a zero-timeout poll instead, to measure how much of the
+     * macOS/Windows deficit that rounding accounts for. Burns a core
+     * while it spins -- diagnostic only, never a default.
+     */
+    if (timeout > 0 && timeout < SCALE_MS && gnw_env_enabled("GNW_POLL_SPIN")) {
+        int64_t deadline = get_clock() + timeout;
+        int ret;
+        do {
+            ret = g_poll(fds, nfds, 0);
+        } while (ret == 0 && get_clock() < deadline);
+        return ret;
+    }
+#endif
+#if defined(__APPLE__) && !defined(CONFIG_PPOLL)
+    /*
+     * Default path on macOS: any positive timeout goes through pselect()
+     * so it is honoured at nanosecond rather than rounded-up millisecond
+     * resolution (see qemu_pselect_ns above). GNW_POLL_MS_ONLY=1 forces
+     * the old g_poll() behaviour back, for A/B measurement.
+     */
+    if (timeout > 0 && !gnw_env_enabled("GNW_POLL_MS_ONLY")) {
+        int ret = qemu_pselect_ns(fds, nfds, timeout);
+        if (ret != -2) {
+            return ret;
+        }
+        /* fd >= FD_SETSIZE: not expressible as select(), fall through */
+    }
+#endif
+#if defined(_WIN32) && !defined(CONFIG_PPOLL)
+    /*
+     * Default path on Windows: any positive timeout is armed as a
+     * high-resolution waitable timer inside the wait set instead of being
+     * rounded up to a whole millisecond (see qemu_timed_wait_ns above).
+     * GNW_POLL_MS_ONLY=1 forces the old g_poll() behaviour back, for A/B
+     * measurement.
+     */
+    if (timeout > 0 && !gnw_env_enabled("GNW_POLL_MS_ONLY")) {
+        int ret = qemu_timed_wait_ns(fds, nfds, timeout);
+        if (ret != -2) {
+            return ret;
+        }
+        /* mechanism unavailable for this call, fall through */
+    }
+#endif
 #ifdef CONFIG_PPOLL
     if (timeout < 0) {
         return ppoll((struct pollfd *)fds, nfds, NULL, NULL);

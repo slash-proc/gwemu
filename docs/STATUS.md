@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-07-24
+Last updated: 2026-07-25
 
 Fork of upstream QEMU (`qemu/qemu`), pinned to tag `v11.0.2`. Working
 branch `gnw-h7b0`.
@@ -51,15 +51,28 @@ audio, gamepad input, SD card, save/flash persistence.
   the addressable overhead (per-pixel MMIO translation calls) has already
   been batched away. Remaining gap is generic TCG cost, not a device-model
   bug.
-- JPEG-streaming firmware paths (retro-go launcher coverflow; the stock-
-  side zelda3/GB games, which decode background JPEGs continuously) are
-  bound by per-MMIO-access cost on every host (~2-4.4M register reads/s
-  depending on machine; fps tracks that rate). Decode latency and all
-  cheap per-access overhead already optimized away (2026-07-24 CHANGELOG);
-  two deeper approaches tried and reverted (blocking SR poll, lockless
-  MMIO -- see warning comments in hw/misc/gnw_h7b0_jpeg.c). Wine runs the
-  Windows build at ~0.1fps for a separate unresolved reason (GUI-thread
-  yield storm).
+- JPEG-streaming firmware paths (retro-go launcher coverflow; stock-side
+  zelda3/GB games) are bound by per-MMIO-access cost on every host (~2.3M
+  register reads/s; fps tracks that rate). Root cause measured
+  2026-07-25: QEMU forces an MMIO access to be its translation block's
+  last instruction, so each one takes `cpu_io_recompile()` and never
+  caches that -- 2.68M recompiles/s, ~60% of wall time. The polling is
+  AUTHENTIC (verified on the real device: no MDMA, codec at 22% duty).
+  Four approaches tried and rejected on measurement. Full analysis,
+  per-platform primitive costs, diagnostic env vars and measurement
+  pitfalls: `docs/emulation-performance.md`. Wine runs the Windows build
+  at ~0.1fps for a separate unresolved reason (GUI-thread yield storm).
+- SOLVED 2026-07-26: the in-game macOS/Windows deficit (worse than the
+  10-17% previously believed -- up to 45% once wall-clock lag is counted,
+  not just fps). Off Linux the main loop cannot wait less than 1ms:
+  qemu_poll_ns() only uses ns-resolution ppoll() under CONFIG_PPOLL,
+  which macOS/Windows lack, and the g_poll() fallback's timeout is
+  rounded UP. Gameplay is ~92% idle, so wakeup promptness sets the frame
+  rate. Celeste, five hosts: Win11 VM 20.0 -> 30.0fps, Win11 laptop
+  24.7 -> 30.0 and 53.7s -> 29.1s wall, macOS 27.1 -> 30.0; both Linux
+  hosts were already at Celeste's 30fps cap. Fixed: macOS via pselect(),
+  Windows via a high-resolution waitable timer added to the wait set.
+  `docs/emulation-performance.md`.
 - Real subsampled chroma storage was traded for full-resolution internal
   storage in the JPEG model (a documented scope decision, not a bug).
 
@@ -74,24 +87,16 @@ audio, gamepad input, SD card, save/flash persistence.
   `memory_region_init_ram_from_file()` being POSIX-only — Windows now gets
   genuine persistent flash-image backing via `CreateFileMapping`, not a
   silent ephemeral-RAM fallback).
-- GUI (`gwemu`, see `CLAUDE.md`'s "GUI" section for build/workflow specifics):
-  device-PROFILE-centric restructure underway (plan:
-  Phases 1-2 landed 2026-07-24: profile store backend
-  (`ui/gwemu-profiles`, per-profile dirs + profile.toml under app data),
-  the staged Add Firmware -> New Device Profile wizard hosted in the
-  settings window (game-status cards, firmware strip, template radios,
-  Bank Assignments accordion, in-process CFW patching, gnwmanager patch
-  auto-download, SD Card section with import/attach live), and launch
-  wiring incl. the SD -drive. Remaining: Phase 3 (Profiles top-level tab,
-  Flash/SD tab demotion, CLI-adopt toast) and the qcow2-create glue that
-  un-gates "New card".
-- `contrib/gnw-tools/`: C ports of `make_boot_images.py`,
-  `make_cfw_images.py` (full patch pipeline, byte-exact verified, now a
-  linkable library `gnw_cfw_build` -- the GUI patches in-process, no
-  popen), and NEW 2026-07-24: `gnw-make-sd-image` (MBR+FAT32 SD image
-  builder behind a sector-write callback, fsck-clean and tree-identical
-  to the Python oracle via mtools). `make_sdcard_image.py` is now a test
-  oracle only.
+- GUI (`gwemu`, see `CLAUDE.md`'s "GUI" section): device-PROFILE-centric
+  restructure, Phases 1-2 landed 2026-07-24 (profile store, staged
+  wizard, in-process CFW patching, SD wiring). Remaining: Phase 3
+  (Profiles top-level tab, Flash/SD tab demotion, CLI-adopt toast).
+- `contrib/gnw-tools/`: C ports of the boot-image, CFW-patch and SD-image
+  builders; the CFW driver is a linkable library the GUI calls in-process.
+- Render path: framebuffer texture now uploaded only when the guest
+  redraws, and the GPU upload moved out of the BQL -- lock contention
+  from rendering 130ms/s -> 1.7ms/s (2026-07-25). Uncommitted alongside
+  an SAI output-queue latency cap (Windows backlog 1.5s -> 110ms).
 
 ## Tooling notes worth keeping in mind
 
@@ -106,3 +111,17 @@ audio, gamepad input, SD card, save/flash persistence.
   model source (rebuilt via `ninja qemu-system-arm`) are the fastest way to
   see internal QEMU device state that guest-side gdb reads can't reach at
   all — always remove them again once their diagnostic purpose is served.
+  BUT: per-event prints distort what they measure. One line per DMA half
+  (60/s) slowed a Windows guest 3x and produced a fabricated finding;
+  clock-reads-per-MMIO cost Linux 42% of its frame rate at 2.3M
+  accesses/s. Summarise once a second, gate per-event output behind `=2`,
+  and re-check any surprising result with the probe switched off.
+- Guest-reported metrics (firmware fps counters, LTDC vblank counts, DMA
+  tick rates) are derived from emulated time and read "correct" while the
+  game visibly crawls. Only wall-clock-anchored counters mean anything
+  for speed — see `GNW_UI_FRAME_TRACE`'s `GUESTFPS` and the env-var table
+  in `docs/emulation-performance.md`.
+- `gnwmanager`'s OpenOCD backend reads device memory without halting the
+  CPU (~3000 reads/s), which makes real-hardware peripheral duty cycles
+  directly comparable against the emulator. That is the fastest way to
+  settle "is this firmware behaviour or a modelling bug?".
