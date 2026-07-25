@@ -233,6 +233,8 @@ struct GnwH7B0RccState {
 };
 
 uint32_t gnw_h7b0_rcc_get_pll2p_hz(GnwH7B0RccState *s);
+/* True while RCC_APB2ENR.SAI1EN is set, i.e. SAI1 is clocked at all. */
+bool gnw_h7b0_rcc_sai1_clock_enabled(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_pll1p_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_pll3r_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_sysclk_hz(GnwH7B0RccState *s);

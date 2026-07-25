@@ -52,6 +52,27 @@ typedef void (*GnwH7B0DmaStreamNotifier)(void *opaque, bool half,
  * know right now", falling back to the flat assumption. */
 typedef uint32_t (*GnwH7B0DmaStreamRateFn)(void *opaque);
 
+/*
+ * "Is the peripheral this stream is wired to actually requesting DMA
+ * right now?"
+ *
+ * On real hardware a peripheral-flow stream transfers only when the
+ * peripheral asserts its DMA request line (RM0455 DMA chapter, stream
+ * configuration: the stream is a slave to the peripheral request), and
+ * HTIF/TCIF are set purely as a consequence of data actually moving.
+ * Kill the peripheral -- disable it, or take away its kernel clock --
+ * and the stream simply stops making progress with SxCR.EN still set
+ * and no further flags, indefinitely.
+ *
+ * This controller instead paces flags off a QEMUTimer keyed only on
+ * SxCR.EN, which is the whole reason this hook exists: without it we
+ * keep manufacturing half/full-transfer interrupts for a peripheral
+ * firmware has already shut down. Returning false makes the stream
+ * stall (no flag, no IRQ) exactly like hardware; the stream resumes
+ * where it left off if the request source comes back.
+ */
+typedef bool (*GnwH7B0DmaStreamActiveFn)(void *opaque);
+
 /* One request-ID-based registration slot -- see GnwH7B0DmaState's
  * req_reg[] comment for why this is an array, not a single set of
  * fields. */
@@ -61,6 +82,8 @@ typedef struct GnwH7B0DmaReqReg {
     void *notifier_opaque;
     GnwH7B0DmaStreamRateFn rate_fn;
     void *rate_opaque;
+    GnwH7B0DmaStreamActiveFn active_fn;
+    void *active_opaque;
     /* See gnw_h7b0_dma_set_request_notifier()'s low_latency parameter. */
     bool low_latency;
     int bound_stream; /* -1 = unbound */
@@ -93,11 +116,19 @@ struct GnwH7B0DmaState {
      * callback jitter. */
     int64_t stream_deadline_ns[GNW_H7B0_DMA_STREAM_COUNT];
 
+    /* Virtual time this stream's timer last ran, for accounting the
+     * time a stalled stream spends making no progress -- see
+     * GnwH7B0DmaStreamActiveFn and gnw_h7b0_dma_stream_tick(). */
+    int64_t stream_last_tick_ns[GNW_H7B0_DMA_STREAM_COUNT];
+
     GnwH7B0DmaStreamNotifier stream_notifier[GNW_H7B0_DMA_STREAM_COUNT];
     void *stream_notifier_opaque[GNW_H7B0_DMA_STREAM_COUNT];
 
     GnwH7B0DmaStreamRateFn stream_rate_fn[GNW_H7B0_DMA_STREAM_COUNT];
     void *stream_rate_fn_opaque[GNW_H7B0_DMA_STREAM_COUNT];
+    /* See GnwH7B0DmaStreamActiveFn. NULL = always requesting. */
+    GnwH7B0DmaStreamActiveFn stream_active_fn[GNW_H7B0_DMA_STREAM_COUNT];
+    void *stream_active_fn_opaque[GNW_H7B0_DMA_STREAM_COUNT];
 
     /* Per-stream mirror of the owning request registration's
      * low_latency flag (see gnw_h7b0_dma_set_request_notifier()) --
@@ -164,11 +195,27 @@ void gnw_h7b0_dma_set_stream_rate_fn(GnwH7B0DmaState *s, int stream,
  * false for perceptually-paced consumers like SAI1 where the floor is
  * the intended behavior.
  */
+/* GNW_DMA_TRACE diagnostics -- see gnw_h7b0_dma.c. */
+int gnw_dma_trace_level(void);
+void gnw_dma_trace_event(const char *what, const char *fmt, ...)
+    G_GNUC_PRINTF(2, 3);
+
 void gnw_h7b0_dma_set_request_notifier(GnwH7B0DmaState *s, int request,
                                         GnwH7B0DmaStreamNotifier cb,
                                         void *cb_opaque,
                                         GnwH7B0DmaStreamRateFn rate_fn,
                                         void *rate_opaque,
                                         bool low_latency);
+
+/*
+ * Attach a request-activity predicate (see GnwH7B0DmaStreamActiveFn) to
+ * an already-registered request id. Separate from the call above so the
+ * consumers that don't need it are untouched; must be called after each
+ * gnw_h7b0_dma_set_request_notifier() for the same id, since clearing a
+ * registration frees the whole slot.
+ */
+void gnw_h7b0_dma_set_request_active_fn(GnwH7B0DmaState *s, int request,
+                                         GnwH7B0DmaStreamActiveFn fn,
+                                         void *opaque);
 
 #endif

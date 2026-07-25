@@ -62,6 +62,65 @@ static bool gnw_timer_late_enabled(void)
     return v;
 }
 
+/*
+ * GNW_DMA_TRACE: DMA1-stream-0 (SAI1 audio) event trace, for diagnosing
+ * the "IRQ storm after quitting a retro-go game" class of bug.
+ *   =1  once-a-second summary counts only (safe to leave on)
+ *   =2  one line per event (only for offline headless capture -- this
+ *       project has repeatedly perturbed its own measurements with
+ *       per-event stderr; never default it on)
+ */
+int gnw_dma_trace_level(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GNW_DMA_TRACE");
+        v = (e && *e && *e != '0') ? atoi(e) : 0;
+    }
+    return v;
+}
+
+#define GNW_DMA_TRACE_STREAM 0
+
+static struct {
+    unsigned set_ht, set_tc, clr_ht, clr_tc, cr_writes, irq_hi, irq_lo;
+    int64_t t0;
+} gnw_dma_trace_acc;
+
+void gnw_dma_trace_event(const char *what, const char *fmt, ...)
+{
+    if (gnw_dma_trace_level() < 2) {
+        return;
+    }
+    va_list ap;
+    fprintf(stderr, "DMATRACE %12" PRId64 " %-6s ",
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), what);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static void gnw_dma_trace_tick_summary(void)
+{
+    if (gnw_dma_trace_level() < 1) {
+        return;
+    }
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (now - gnw_dma_trace_acc.t0 < 1000000000LL) {
+        return;
+    }
+    gnw_dma_trace_acc.t0 = now;
+    fprintf(stderr, "DMASUM s0 setHT=%u setTC=%u clrHT=%u clrTC=%u "
+            "crw=%u irq+=%u irq-=%u\n",
+            gnw_dma_trace_acc.set_ht, gnw_dma_trace_acc.set_tc,
+            gnw_dma_trace_acc.clr_ht, gnw_dma_trace_acc.clr_tc,
+            gnw_dma_trace_acc.cr_writes, gnw_dma_trace_acc.irq_hi,
+            gnw_dma_trace_acc.irq_lo);
+    memset(&gnw_dma_trace_acc, 0, sizeof(gnw_dma_trace_acc));
+    gnw_dma_trace_acc.t0 = now;
+}
+
 #define GNW_H7B0_DMA_CTRL_SIZE      0x400
 #define GNW_H7B0_DMA_STREAM_STRIDE  0x18
 #define GNW_H7B0_DMA_S0CR_OFFSET    GNW_H7B0_DMA1_S0CR_OFFSET
@@ -113,6 +172,20 @@ static void gnw_h7b0_dma_update_irq(GnwH7B0DmaState *s, int stream)
     bool pending = (htif && (cr & DMA_SxCR_HTIE)) ||
                    (tcif && (cr & DMA_SxCR_TCIE));
 
+    if (stream == GNW_DMA_TRACE_STREAM && gnw_dma_trace_level()) {
+        static int last = -1;
+        if (last != (int)pending) {
+            last = pending;
+            if (pending) {
+                gnw_dma_trace_acc.irq_hi++;
+            } else {
+                gnw_dma_trace_acc.irq_lo++;
+            }
+            gnw_dma_trace_event("IRQ", "%s isr=0x%08x cr=0x%08x",
+                                pending ? "ASSERT" : "deassert", isr, cr);
+        }
+    }
+
     qemu_set_irq(s->irq[stream], pending);
 }
 
@@ -126,6 +199,15 @@ static void gnw_h7b0_dma_set_isr_bit(GnwH7B0DmaState *s, int stream,
                                                : GNW_H7B0_DMA1_HISR_OFFSET);
     int bit_base = gnw_h7b0_dma_isr_bit_base(local);
     uint32_t bit = 1U << (bit_base + (half ? 4 : 5));
+
+    if (stream == GNW_DMA_TRACE_STREAM && gnw_dma_trace_level()) {
+        if (half) {
+            gnw_dma_trace_acc.set_ht++;
+        } else {
+            gnw_dma_trace_acc.set_tc++;
+        }
+        gnw_dma_trace_event("SET", "%s", half ? "HTIF" : "TCIF");
+    }
 
     s->regs[isr_off >> 2] |= bit;
     gnw_h7b0_dma_update_irq(s, stream);
@@ -210,6 +292,8 @@ static void gnw_h7b0_dma_rebind_request(GnwH7B0DmaState *s)
             gnw_h7b0_dma_set_stream_notifier(s, reg->bound_stream, NULL, NULL);
             gnw_h7b0_dma_set_stream_rate_fn(s, reg->bound_stream, NULL, NULL);
             s->stream_low_latency[reg->bound_stream] = false;
+            s->stream_active_fn[reg->bound_stream] = NULL;
+            s->stream_active_fn_opaque[reg->bound_stream] = NULL;
         }
         if (stream >= 0) {
             gnw_h7b0_dma_set_stream_notifier(s, stream, reg->notifier,
@@ -217,6 +301,8 @@ static void gnw_h7b0_dma_rebind_request(GnwH7B0DmaState *s)
             gnw_h7b0_dma_set_stream_rate_fn(s, stream, reg->rate_fn,
                                              reg->rate_opaque);
             s->stream_low_latency[stream] = reg->low_latency;
+            s->stream_active_fn[stream] = reg->active_fn;
+            s->stream_active_fn_opaque[stream] = reg->active_opaque;
         }
         reg->bound_stream = stream;
     }
@@ -263,7 +349,11 @@ void gnw_h7b0_dma_set_request_notifier(GnwH7B0DmaState *s, int request,
             gnw_h7b0_dma_set_stream_notifier(s, reg->bound_stream, NULL, NULL);
             gnw_h7b0_dma_set_stream_rate_fn(s, reg->bound_stream, NULL, NULL);
             s->stream_low_latency[reg->bound_stream] = false;
+            s->stream_active_fn[reg->bound_stream] = NULL;
+            s->stream_active_fn_opaque[reg->bound_stream] = NULL;
         }
+        reg->active_fn = NULL;
+        reg->active_opaque = NULL;
         reg->req_id = -1;
         reg->notifier = NULL;
         reg->notifier_opaque = NULL;
@@ -281,6 +371,24 @@ void gnw_h7b0_dma_set_request_notifier(GnwH7B0DmaState *s, int request,
     reg->rate_opaque = rate_opaque;
     reg->low_latency = low_latency;
     gnw_h7b0_dma_rebind_request(s);
+}
+
+void gnw_h7b0_dma_set_request_active_fn(GnwH7B0DmaState *s, int request,
+                                         GnwH7B0DmaStreamActiveFn fn,
+                                         void *opaque)
+{
+    for (int slot = 0; slot < GNW_H7B0_DMA_REQ_REG_COUNT; slot++) {
+        if (s->req_reg[slot].req_id == request) {
+            s->req_reg[slot].active_fn = fn;
+            s->req_reg[slot].active_opaque = opaque;
+            if (s->req_reg[slot].bound_stream >= 0) {
+                s->stream_active_fn[s->req_reg[slot].bound_stream] = fn;
+                s->stream_active_fn_opaque[s->req_reg[slot].bound_stream] =
+                    opaque;
+            }
+            return;
+        }
+    }
 }
 
 static uint64_t gnw_h7b0_dma_half_delay_ns(GnwH7B0DmaState *s, int stream)
@@ -340,6 +448,10 @@ static uint64_t gnw_h7b0_dma_half_delay_ns(GnwH7B0DmaState *s, int stream)
     uint64_t half_delay_ns = (uint64_t)(ndtr / 2) * NANOSECONDS_PER_SECOND /
                               item_rate;
 
+    if (stream == GNW_DMA_TRACE_STREAM) {
+        gnw_dma_trace_event("PACE", "ndtr=%u rate=%u", ndtr, item_rate);
+    }
+
     half_delay_ns = MAX(half_delay_ns, GNW_H7B0_DMA_MIN_HALF_DELAY_NS);
     half_delay_ns = MIN(half_delay_ns, GNW_H7B0_DMA_MAX_HALF_DELAY_NS);
     return half_delay_ns;
@@ -358,6 +470,35 @@ static uint64_t gnw_h7b0_dma_half_delay_ns(GnwH7B0DmaState *s, int stream)
  * catch-up burst after e.g. a host stall (debugger attach, disk I/O),
  * while still not resetting the phase on every ordinary tick.
  */
+/*
+ * Streams with a request-activity predicate need the timer to run ahead
+ * of their deadline, because a stall that starts and ends entirely
+ * between two half-transfer ticks would otherwise go unnoticed: real
+ * hardware loses that whole interval of transfer progress (and pushes
+ * every subsequent HTIF/TCIF back by it), while a deadline-only timer
+ * would sail straight through as if nothing had happened. retro-go's
+ * SAI clock reconfiguration is ~1.4ms against a 33ms half-transfer
+ * period, so this is exactly the case in practice.
+ *
+ * Only armed for streams that actually registered a predicate (SAI1's
+ * audio stream today), so nothing else pays for it.
+ */
+#define GNW_H7B0_DMA_REQ_POLL_NS (250 * SCALE_US)
+
+static void gnw_h7b0_dma_arm(GnwH7B0DmaState *s, int stream)
+{
+    int64_t at = s->stream_deadline_ns[stream];
+
+    if (s->stream_active_fn[stream]) {
+        int64_t poll = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                        GNW_H7B0_DMA_REQ_POLL_NS;
+        if (poll < at) {
+            at = poll;
+        }
+    }
+    timer_mod(s->stream_timer[stream], at);
+}
+
 static void gnw_h7b0_dma_schedule_next(GnwH7B0DmaState *s, int stream,
                                         int64_t delay_ns)
 {
@@ -368,7 +509,7 @@ static void gnw_h7b0_dma_schedule_next(GnwH7B0DmaState *s, int stream,
         next = now;
     }
     s->stream_deadline_ns[stream] = next;
-    timer_mod(s->stream_timer[stream], next);
+    gnw_h7b0_dma_arm(s, stream);
 }
 
 static void gnw_h7b0_dma_stream_tick(void *opaque)
@@ -378,10 +519,43 @@ static void gnw_h7b0_dma_stream_tick(void *opaque)
     int stream = ctx->stream;
 
     if (gnw_timer_late_enabled()) {
-        fprintf(stderr, "DMA%d late=%0.2fms\n", stream,
-                (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
-                 s->stream_deadline_ns[stream]) / 1e6);
+        /*
+         * Per-tick printing perturbs the guest badly on Windows (msvcrt
+         * stderr is slow enough that 30-60 lines/s measurably slows
+         * emulation -- it produced a completely bogus reading once).
+         * Summarise once a second instead; the per-tick line is still
+         * available at GNW_TIMER_LATE=2.
+         */
+        int64_t late = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                       s->stream_deadline_ns[stream];
+        static int64_t t0;
+        static uint64_t ticks;
+        static int64_t late_sum, late_max;
+        static int verbose = -1;
+        if (verbose < 0) {
+            const char *e = getenv("GNW_TIMER_LATE");
+            verbose = (e && *e && atoi(e) >= 2);
+        }
+        if (verbose) {
+            fprintf(stderr, "DMA%d late=%0.2fms\n", stream, late / 1e6);
+        }
+        ticks++;
+        late_sum += late;
+        if (late > late_max) {
+            late_max = late;
+        }
+        int64_t now_rt = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (now_rt - t0 >= 1000000000LL) {
+            fprintf(stderr, "DMALATE ticks/s=%" PRIu64 " avg=%.2fms "
+                    "max=%.2fms\n", ticks,
+                    ticks ? late_sum / 1e6 / ticks : 0.0, late_max / 1e6);
+            t0 = now_rt;
+            ticks = 0;
+            late_sum = late_max = 0;
+        }
     }
+    gnw_dma_trace_tick_summary();
+
     int ctrl = stream / GNW_H7B0_DMA_STREAMS_PER_CTRL;
     int local = stream % GNW_H7B0_DMA_STREAMS_PER_CTRL;
     hwaddr ctrl_base = (hwaddr)ctrl * GNW_H7B0_DMA_CTRL_SIZE;
@@ -391,6 +565,51 @@ static void gnw_h7b0_dma_stream_tick(void *opaque)
 
     if (!(cr & DMA_SxCR_EN)) {
         return;
+    }
+
+    /*
+     * The peripheral feeding this stream has stopped requesting (it was
+     * disabled, or -- the case this exists for -- its kernel clock was
+     * taken away). Real hardware's stream then simply makes no
+     * progress: SxCR.EN stays set, NDTR stops decrementing, and no
+     * HTIF/TCIF is raised until requests resume, at which point the
+     * transfer picks up where it left off. Model that by sliding the
+     * deadline forward by however long the stall lasted, rather than
+     * letting virtual time run the transfer on regardless.
+     *
+     * Getting this wrong wedges the guest permanently: retro-go's
+     * "quit to main menu" reprograms PLL2 (the SAI kernel clock source)
+     * -- which per RCCEx_PLL2_Config() means switching PLL2 off, here
+     * for ~1.4ms -- a couple of milliseconds before it disables the
+     * stream and clears the flags, and its DMA1_Stream0 ISR no longer
+     * acknowledges anything in that window. One manufactured
+     * half-transfer interrupt there latches the level-triggered line
+     * forever and the CPU tail-chains exception 27 for the rest of the
+     * session: permanent black screen.
+     */
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t elapsed = now - s->stream_last_tick_ns[stream];
+
+    s->stream_last_tick_ns[stream] = now;
+    if (elapsed < 0) {
+        elapsed = 0;
+    }
+
+    if (s->stream_active_fn[stream]) {
+        if (!s->stream_active_fn[stream](s->stream_active_fn_opaque[stream])) {
+            s->stream_deadline_ns[stream] += elapsed;
+            if (stream == GNW_DMA_TRACE_STREAM) {
+                gnw_dma_trace_event("STALL", "no request; deadline +%" PRId64
+                                    "us", elapsed / 1000);
+            }
+            gnw_h7b0_dma_arm(s, stream);
+            return;
+        }
+        if (now < s->stream_deadline_ns[stream]) {
+            /* Just a poll: still requesting, not time for a flag yet. */
+            gnw_h7b0_dma_arm(s, stream);
+            return;
+        }
     }
 
     if (s->stream_half_pending[stream]) {
@@ -538,6 +757,7 @@ static void gnw_h7b0_dma_start_stream(GnwH7B0DmaState *s, int stream)
 
     s->stream_half_pending[stream] = true;
     s->stream_deadline_ns[stream] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->stream_last_tick_ns[stream] = s->stream_deadline_ns[stream];
     gnw_h7b0_dma_schedule_next(s, stream,
                                 gnw_h7b0_dma_half_delay_ns(s, stream));
 }
@@ -601,6 +821,13 @@ static void gnw_h7b0_dma_write(void *opaque, hwaddr addr, uint64_t val64, unsign
         return;
     }
 
+    if (ctrl == 0 && local_addr >= GNW_H7B0_DMA_S0CR_OFFSET &&
+        local_addr < GNW_H7B0_DMA_S0CR_OFFSET + GNW_H7B0_DMA_STREAM_STRIDE &&
+        local_addr != GNW_H7B0_DMA_S0CR_OFFSET && gnw_dma_trace_level()) {
+        gnw_dma_trace_event("SREG", "off=0x%02x old=0x%08x new=0x%08x",
+                            local_addr, old_value, s->regs[addr >> 2]);
+    }
+
     if (local_addr == GNW_H7B0_DMA1_LIFCR_OFFSET ||
         local_addr == GNW_H7B0_DMA1_HIFCR_OFFSET) {
         /* Write-1-to-clear: LIFCR/HIFCR bit positions mirror
@@ -608,6 +835,18 @@ static void gnw_h7b0_dma_write(void *opaque, hwaddr addr, uint64_t val64, unsign
         hwaddr isr_off = (hwaddr)ctrl * GNW_H7B0_DMA_CTRL_SIZE +
             (local_addr == GNW_H7B0_DMA1_LIFCR_OFFSET
              ? GNW_H7B0_DMA1_LISR_OFFSET : GNW_H7B0_DMA1_HISR_OFFSET);
+        if (ctrl == 0 && local_addr == GNW_H7B0_DMA1_LIFCR_OFFSET &&
+            gnw_dma_trace_level()) {
+            uint32_t cleared = s->regs[isr_off >> 2] & (uint32_t)val64 & 0x3f;
+            if (cleared & (1U << 4)) {
+                gnw_dma_trace_acc.clr_ht++;
+            }
+            if (cleared & (1U << 5)) {
+                gnw_dma_trace_acc.clr_tc++;
+            }
+            gnw_dma_trace_event("IFCR", "wr=0x%08x cleared_s0=0x%02x",
+                                (uint32_t)val64, cleared);
+        }
         s->regs[isr_off >> 2] &= ~(uint32_t)val64;
         int base_stream = ctrl * GNW_H7B0_DMA_STREAMS_PER_CTRL +
                            (local_addr == GNW_H7B0_DMA1_LIFCR_OFFSET ? 0 : 4);
@@ -625,6 +864,16 @@ static void gnw_h7b0_dma_write(void *opaque, hwaddr addr, uint64_t val64, unsign
             int stream = ctrl * GNW_H7B0_DMA_STREAMS_PER_CTRL + local_stream;
             bool new_en = (val64 & DMA_SxCR_EN) != 0;
             bool old_en = (old_value & DMA_SxCR_EN) != 0;
+
+            if (stream == GNW_DMA_TRACE_STREAM && gnw_dma_trace_level()) {
+                uint32_t nv = s->regs[addr >> 2];
+                gnw_dma_trace_acc.cr_writes++;
+                gnw_dma_trace_event("CRW",
+                    "old=0x%08x new=0x%08x EN %d->%d HTIE %d->%d TCIE %d->%d",
+                    old_value, nv, old_en, new_en,
+                    !!(old_value & DMA_SxCR_HTIE), !!(nv & DMA_SxCR_HTIE),
+                    !!(old_value & DMA_SxCR_TCIE), !!(nv & DMA_SxCR_TCIE));
+            }
 
             if (new_en && !old_en) {
                 gnw_h7b0_dma_start_stream(s, stream);

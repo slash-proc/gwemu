@@ -1,3 +1,134 @@
+2026-07-26  DMA/RCC/SAI1: largely fixed the long-standing intermittent black
+            screen on retro-go's "quit to main menu". The DMA1 Stream0
+            (SAI1 audio) IRQ line latched high forever and the CPU
+            tail-chained exception 27 (IRQ 11) for the rest of the
+            session; the display was a victim, not the cause. Root
+            cause: retro-go reprograms PLL2 -- which per the HAL's
+            RCCEx_PLL2_Config() means switching PLL2 *off* for ~1.4ms
+            -- a couple of milliseconds before it disables the stream
+            and clears its flags, and its ISR no longer acknowledges
+            anything in that window. Real hardware raises nothing there
+            (no SAI kernel clock -> no DMA requests -> the stream makes
+            no progress at all), but this model paced HTIF/TCIF off a
+            timer keyed only on SxCR.EN and manufactured an interrupt
+            firmware could never clear. Three parts: RCC now reports
+            pll2_p_ck as 0 while CR.PLL2ON is clear; the DMA controller
+            gained an optional per-stream "is the peripheral actually
+            requesting?" predicate (GnwH7B0DmaStreamActiveFn) which
+            stalls the stream and slides its deadline instead of
+            raising a flag; and SAI1 supplies that predicate and now
+            keeps its DMAMUX request registration for the life of the
+            machine rather than tearing it down on SAIEN 1->0 (that
+            unbinding conflated the host audio voice with firmware's
+            DMAMUX routing and left the stream free-running at the
+            generic 48kHz fallback during exactly the teardown window
+            that matters). Measured headlessly with an automated
+            quit-to-menu timeline, legacy and fixed runs interleaved in
+            the same parallel batches so host load is identical:
+            12/132 black screens before, 4/132 after. Reduced, NOT
+            eliminated -- the remaining ~1.7ms of the danger window
+            runs from PLL2 coming back up to firmware writing
+            SxCR.EN=0, and in that sub-window our model does what real
+            hardware appears to do (SAI enabled and clocked, so a
+            half-transfer interrupt is legitimately due), so whatever
+            still differs there is not yet identified. Do not read a
+            single clean run as a fix; the base rate is only ~10%.
+            New GNW_DMA_TRACE={1,2} diagnostic (per-second summary /
+            per-event) for DMA1 stream 0.
+
+2026-07-26  Build: documented a working aarch64-under-binfmt container
+            build (docs/cross-platform-builds.md). Three dependencies
+            fail misleadingly: liblzma-dev (gnw-tools hard-errors, but
+            after SDL3's configure output so it reads as an SDL3 bug),
+            PyYAML in the build dir's venv (genconfig; not vendored in
+            python/wheels), and libpng-dev (its absence silently
+            #undefs CONFIG_PNG, so screendump refuses to write PNGs and
+            headless screenshot validation breaks while the build looks
+            fine -- and ninja will not re-probe, so it needs
+            `meson setup --reconfigure`). Verified by building and
+            benchmarking on a real Pi 4: holds full realtime, 29.9fps
+            steady-state on the Celeste bench.
+
+2026-07-26  Found and fixed the in-game macOS/Windows slowdown that the
+            2026-07-25 entry left open: off Linux, QEMU's main loop
+            cannot wait for less than a millisecond. qemu_poll_ns()
+            uses nanosecond ppoll() only under CONFIG_PPOLL, which
+            macOS and Windows lack; they fall through to g_poll() with
+            a timeout that qemu_timeout_ns_to_ms() deliberately rounds
+            UP, so every sub-millisecond timer deadline overshoots.
+            The guest is ~92% idle in gameplay, so its frame rate is
+            set by wakeup promptness, not throughput: 2095 main-loop
+            wakeups/s on Linux vs 1223/s on Windows, and the guest then
+            renders two thirds of its frames. Emulated vblanks fired at
+            the same rate on both hosts (~1720 in 29s), which is why
+            this hid behind a healthy-looking display timer. Measured
+            on Celeste across five machines with one binary per host
+            and an A/B env var: Win11 VM 20.0 -> 30.0fps, Win11 laptop
+            24.7 -> 30.0 AND 53.7s -> 29.1s wall for a 29-guest-second
+            run (55% of realtime -> realtime), macOS 27.1 -> 30.0;
+            both Linux hosts already sat at Celeste's 30fps cap and
+            were unaffected. The VM and its own Linux hypervisor share
+            a physical CPU (20.0 vs 30.0), so this is not CPU age.
+            macOS fix: qemu_pselect_ns() in util/qemu-timer.c, whose
+            struct timespec is honoured at ns resolution -- +7% CPU for
+            +3fps. Windows fix: qemu_timed_wait_ns(), which appends a
+            cached CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timer (100ns)
+            to the wait set and lets g_poll() wait forever -- the timer
+            firing IS the timeout, so glib's win32 handle/message
+            semantics are untouched and only the rounding goes away
+            (Winsock select() handles sockets only, so the macOS cure
+            does not port); +34% CPU for a 20 -> 30fps recovery. Both
+            beat the GNW_POLL_SPIN diagnostic that proved the cause,
+            which cost 3.8-4.4x the CPU for identical fps. New env vars
+            GNW_POLL_SPIN (diagnostic, spins -- never a default) and
+            GNW_POLL_MS_ONLY (forces the old rounding back to A/B).
+            Also learned: ranking hosts by fps alone is wrong, since a
+            struggling host either drops frames at realtime or lets the
+            virtual clock lag -- always report wall time for a
+            fixed-length timeline too. See docs/emulation-performance.md.
+
+2026-07-25  Emulation performance: measured why MMIO-heavy firmware
+            paths are slow, and why macOS/Windows suffer more. The
+            retro-go launcher issues ~2.3M JPEG register reads/sec;
+            QEMU forces each MMIO access to be its translation block's
+            LAST instruction, so every one takes cpu_io_recompile()
+            (tree lookup, state unwind, longjmp, one-insn TB) and that
+            decision is never cached -- 2.68M recompiles/sec, ~60% of
+            wall time (skipping it: 53 -> 129fps in the launcher).
+            Verified on the real device that the polling is authentic
+            firmware behaviour, not a modelling bug: no MDMA channel is
+            ever enabled and the JPEG codec sits at 22% duty
+            (gnwmanager's OpenOCD backend reads device memory without
+            halting the CPU). Four fixes tried and rejected on
+            measurement: blocking SR poll, one-insn-per-tb (53->19fps),
+            skipping the recompile (incorrect -- loses interrupt
+            precision), and caching which PCs do I/O (recompiles -29x
+            but only +5-10% fps; shorter blocks cost back the saving).
+            Platform costs quantified: macOS pthread_mutex is 8.1x
+            Linux's (18.7 vs 2.3ns) and QEMU takes the BQL once per
+            MMIO access; macOS additionally pays _longjmp (4.5% of
+            samples -- Darwin saves the sigmask) and _tlv_get_addr
+            (2.0% -- TLS via a dyld call) in that same path. New
+            diagnostic env vars (GNW_MMIO_PROF, GNW_BQL_PROF,
+            GNW_IDLE_PROF, GNW_IORECOMP, GNW_MMIO_OFF, GNW_JPEG_LAT,
+            plus GUESTFPS/DMALATE under GNW_UI_FRAME_TRACE) and the
+            measurement pitfalls that produced several wrong
+            conclusions along the way are in
+            docs/emulation-performance.md. STILL OPEN: a 10-17% in-game
+            deficit on macOS/Windows that none of the above explains.
+
+2026-07-25  Render path: the framebuffer texture is now uploaded only
+            when the guest has actually redrawn (dirty flag set from
+            graphic_hw_update), and the GPU upload itself moved OUT of
+            the BQL -- the lock only covers a memcpy into a staging
+            buffer now. BQL contention from rendering fell 130ms/s ->
+            1.7ms/s (98%). On a 120Hz host driving a ~59Hz guest this
+            also halves uploads (120/s -> 60/s), which was pure waste.
+            Confirmed by ear on Linux across several games. Found by
+            instrumenting both lock regions in gl_render_frame after
+            the user observed that hiding the window made emulation
+            speed up -- the existing "FIXME: Don't upload if notdirty".
+
 2026-07-25  Windows: gnwmanager patch-binary download rewritten
             in-process (ui/gwemu-http.c, WinINet). The popen("curl ...")
             chain could never have worked there -- POSIX 'quoting',

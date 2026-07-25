@@ -280,6 +280,28 @@ uint32_t gnw_h7b0_rcc_get_pll2p_hz(GnwH7B0RccState *s)
         ((fracr & RCC_PLL2FRACR_FRACN2_MASK) >> RCC_PLL2FRACR_FRACN2_SHIFT) : 0;
     uint32_t osc_hz = gnw_h7b0_rcc_get_osc_hz(s);
 
+    /*
+     * A stopped PLL produces no output clock -- pll2_p_ck is dead while
+     * CR.PLL2ON is clear (RM0455 RCC: PLL2ON enables PLL2; PLL2RDY, which
+     * this model already mirrors from it, reports the PLL locked).
+     *
+     * This is not a pedantic detail: RCCEx_PLL2_Config() (the path
+     * HAL_RCCEx_PeriphCLKConfig() takes for RCC_PERIPHCLK_SAI1) *always*
+     * disables PLL2 and spins on PLL2RDY going 0 before rewriting the
+     * dividers, so any firmware that changes its SAI sample rate --
+     * retro-go does exactly this every time it enters or leaves a game
+     * core -- has a real window where the SAI kernel clock is stopped.
+     * Reporting the newly-programmed frequency straight through that
+     * window made the SAI look like it was still clocking and requesting
+     * DMA, which kept gnw_h7b0_dma.c manufacturing half/full-transfer
+     * interrupts into firmware that was mid-teardown and no longer
+     * acknowledging them -- a permanent DMA1_Stream0 interrupt storm and
+     * a black screen on "quit to main menu".
+     */
+    if (!(s->regs[GNW_H7B0_RCC_CR_OFFSET >> 2] & RCC_CR_PLL2ON)) {
+        return 0;
+    }
+
     if (divm2 == 0) {
         return 0;
     }
@@ -466,6 +488,16 @@ static void gnw_h7b0_rcc_update_sysclk_clock(GnwH7B0RccState *s)
     if (s->sysclk) {
         clock_update_hz(s->sysclk, gnw_h7b0_rcc_get_sysclk_hz(s));
     }
+}
+
+/* RCC_APB2ENR.SAI1EN (bit 22, RM0455 RCC register map) -- the SAI1
+ * peripheral's own bus/kernel clock enable. */
+#define RCC_APB2ENR_SAI1EN (1U << 22)
+
+bool gnw_h7b0_rcc_sai1_clock_enabled(GnwH7B0RccState *s)
+{
+    return (s->regs[GNW_H7B0_RCC_APB2ENR_OFFSET >> 2]
+             & RCC_APB2ENR_SAI1EN) != 0;
 }
 
 uint32_t gnw_h7b0_rcc_get_sai1_kernel_hz(GnwH7B0RccState *s)

@@ -38,6 +38,24 @@ static bool gnw_audio_trace_enabled(void)
     return v;
 }
 
+/*
+ * Per-event (per-DMA-half) tracing only. Measured on Windows: printing
+ * one line per half -- 60/s for a 22kHz retro-go core -- slowed the
+ * emulated guest to a THIRD of realtime, i.e. the trace changed the
+ * thing it was measuring (83% of the host audio buffer was silence
+ * purely because of it). Keep the once-a-second summaries on
+ * GNW_AUDIO_TRACE=1 and put anything per-event behind =2.
+ */
+static bool gnw_audio_trace_verbose(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("GNW_AUDIO_TRACE");
+        v = (e && *e && atoi(e) >= 2);
+    }
+    return v;
+}
+
 #define SAI_xCR1_SAIEN  (1U << 16)
 #define SAI_xCR1_DMAEN  (1U << 17)
 #define SAI_xCR1_MCKDIV_SHIFT 20
@@ -172,22 +190,53 @@ static void gnw_h7b0_sai1_dma_notify(void *opaque, bool half,
         half_bytes = GNW_H7B0_SAI1_FIFO_CAPACITY;
     }
 
-    if (half_bytes > fifo8_num_free(&s->fifo)) {
-        /*
-         * Queue has backed up (guest producing faster than the real
-         * backend is draining, e.g. after a host hiccup) -- drop the
-         * oldest queued audio to make room rather than growing latency
-         * unboundedly or overflowing fifo8_push_all().
-         */
-        if (gnw_audio_trace_enabled()) {
-            fprintf(stderr, "DROP %u %" PRId64 "\n",
-                    half_bytes - fifo8_num_free(&s->fifo),
+    /*
+     * Bound the queue by LATENCY, not by the raw FIFO capacity.
+     *
+     * The queue only grows when the host backend drains slower than the
+     * guest produces. Measured on a Windows guest whose (emulated HDA)
+     * audio device services its callback irregularly -- up to 90ms
+     * between calls where Linux never exceeds 11ms -- the device
+     * accepted only ~94% of realtime. Letting the surplus accumulate to
+     * the 64KB capacity meant ~1.5 SECONDS of audio backlog, and then
+     * permanent large drops once saturated: a 6% rate deficit turned
+     * into gross, continuous corruption plus enormous latency.
+     *
+     * Capping at a small multiple of the real-time rate keeps latency
+     * bounded and makes the unavoidable loss small and frequent
+     * (proportional to the actual deficit) instead of catastrophic.
+     * Costs nothing on a well-behaved host: Linux measured fifo=0
+     * steady-state, i.e. this path never triggers there.
+     */
+    uint32_t rate = gnw_h7b0_sai1_get_rate_hz(s);
+    uint32_t max_queued = rate * sizeof(int16_t) *
+                          GNW_H7B0_SAI1_MAX_QUEUE_MS / 1000;
+    if (max_queued > GNW_H7B0_SAI1_FIFO_CAPACITY) {
+        max_queued = GNW_H7B0_SAI1_FIFO_CAPACITY;
+    }
+    if (max_queued < half_bytes * 2) {
+        max_queued = half_bytes * 2;   /* never below one full DMA cycle */
+    }
+
+    uint32_t queued = fifo8_num_used(&s->fifo);
+    if (queued + half_bytes > max_queued) {
+        uint32_t excess = queued + half_bytes - max_queued;
+        if (excess > queued) {
+            excess = queued;
+        }
+        if (gnw_audio_trace_verbose()) {
+            fprintf(stderr, "DROP %u %" PRId64 "\n", excess,
                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         }
+        fifo8_drop(&s->fifo, excess);
+    }
+
+    if (half_bytes > fifo8_num_free(&s->fifo)) {
+        /* Defensive: keep fifo8_push_all()'s precondition regardless. */
         fifo8_drop(&s->fifo, half_bytes - fifo8_num_free(&s->fifo));
     }
 
-    if (gnw_audio_trace_enabled()) {
+    if (gnw_audio_trace_verbose()) {
         fprintf(stderr, "DN %d %" PRId64 "\n", half,
                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
@@ -220,6 +269,7 @@ static void gnw_h7b0_sai1_dma_notify(void *opaque, bool half,
 static void gnw_h7b0_sai1_voice_cb(void *opaque, int avail)
 {
     GnwH7B0Sai1State *s = opaque;
+    int wanted = avail;
 
     while (avail > 0 && !fifo8_is_empty(&s->fifo)) {
         uint32_t chunk;
@@ -240,6 +290,31 @@ static void gnw_h7b0_sai1_voice_cb(void *opaque, int avail)
         }
         avail -= n;
     }
+
+    /*
+     * GNW_AUDIO_TRACE: how often QEMU's audio_run() actually pulls from
+     * us, and how much it could take. `cb` is that call rate -- if it is
+     * far below the backend's own callback rate, the mixer buffer starves
+     * and audio/sdl3audio.c ends up injecting silence regardless of how
+     * perfectly the guest produced its samples.
+     */
+    if (gnw_audio_trace_enabled() && s->voice_open) {
+        static int64_t t0;
+        static uint64_t cb, taken, empty;
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        cb++;
+        taken += (uint64_t)(wanted - avail);
+        if (avail > 0) {
+            empty++;
+        }
+        if (now - t0 >= 1000000000LL) {
+            fprintf(stderr, "SAIPULL cb=%" PRIu64 " took=%" PRIu64 "B "
+                    "ranout=%" PRIu64 " fifo=%u\n",
+                    cb, taken, empty, fifo8_num_used(&s->fifo));
+            t0 = now;
+            cb = taken = empty = 0;
+        }
+    }
 }
 
 /* Wrapper matching GnwH7B0DmaStreamRateFn's signature, registered with
@@ -249,6 +324,59 @@ static void gnw_h7b0_sai1_voice_cb(void *opaque, int avail)
 static uint32_t gnw_h7b0_sai1_dma_rate_fn(void *opaque)
 {
     return gnw_h7b0_sai1_get_rate_hz(opaque);
+}
+
+/*
+ * GnwH7B0DmaStreamActiveFn for the SAI1_A audio stream: is the SAI block
+ * actually pulling data out of the DMA right now?
+ *
+ * Three things must hold on real silicon for SAI_A to assert its DMA
+ * request line (RM0455 SAI chapter: the audio block shifts data on
+ * sai_a_ck derived from sai_x_ker_ck, and only requests DMA service
+ * when enabled with DMA output enabled):
+ *   - ACR1.SAIEN: the audio block is enabled,
+ *   - ACR1.DMAEN: it is served by DMA rather than by CPU writes,
+ *   - a live kernel clock: with sai_x_ker_ck stopped (RCC gating the
+ *     peripheral, or PLL2 -- the SAI1SEL source retro-go uses -- turned
+ *     off), the block's bit clock stops, no FIFO slot ever drains, and
+ *     no request is ever made.
+ *
+ * The last one is the one that matters here: retro-go's "quit to main
+ * menu" tears the audio clock down BEFORE it disables DMA1 Stream0 and
+ * clears its flags, and in that window its DMA1_Stream0 ISR no longer
+ * acknowledges anything. Real hardware raises no interrupt there
+ * because the stream has quietly stalled; we used to raise one anyway
+ * and wedge the guest in a permanent exception-27 storm.
+ */
+static bool gnw_h7b0_sai1_dma_request_active(void *opaque)
+{
+    GnwH7B0Sai1State *s = opaque;
+    uint32_t acr1 = s->regs[GNW_H7B0_SAI1_SAI_ACR1_OFFSET >> 2];
+
+    if (!(acr1 & SAI_xCR1_SAIEN) || !(acr1 & SAI_xCR1_DMAEN)) {
+        return false;
+    }
+    /* No RCC wired up at all: can't tell, assume clocked (the old
+     * behavior) rather than silently killing audio. */
+    if (s->rcc && gnw_h7b0_rcc_get_sai1_kernel_hz(s->rcc) == 0) {
+        return false;
+    }
+    return true;
+}
+
+/* Registration and its activity predicate always travel together --
+ * clearing a registration frees the whole slot, so the predicate has to
+ * be (re)attached after every set_request_notifier() call. */
+static void gnw_h7b0_sai1_bind_dma(GnwH7B0Sai1State *s)
+{
+    if (!s->dma) {
+        return;
+    }
+    gnw_h7b0_dma_set_request_notifier(s->dma, GNW_H7B0_SAI1_DMA_REQUEST,
+                                       gnw_h7b0_sai1_dma_notify, s,
+                                       gnw_h7b0_sai1_dma_rate_fn, s, false);
+    gnw_h7b0_dma_set_request_active_fn(s->dma, GNW_H7B0_SAI1_DMA_REQUEST,
+                                        gnw_h7b0_sai1_dma_request_active, s);
 }
 
 static void gnw_h7b0_sai1_update_voice(GnwH7B0Sai1State *s)
@@ -269,31 +397,33 @@ static void gnw_h7b0_sai1_update_voice(GnwH7B0Sai1State *s)
         if (s->voice) {
             audio_be_set_active_out(s->audio_be, s->voice, true);
             s->voice_open = true;
-            if (s->dma) {
-                gnw_h7b0_dma_set_request_notifier(s->dma,
-                    GNW_H7B0_SAI1_DMA_REQUEST, gnw_h7b0_sai1_dma_notify, s,
-                    gnw_h7b0_sai1_dma_rate_fn, s, false);
-            }
         }
     } else if (!want_enabled && s->voice_open) {
         audio_be_set_active_out(s->audio_be, s->voice, false);
         s->voice_open = false;
         fifo8_reset(&s->fifo);
-        if (s->dma) {
-            gnw_h7b0_dma_set_request_notifier(s->dma,
-                GNW_H7B0_SAI1_DMA_REQUEST, NULL, NULL, NULL, NULL, false);
-        }
     }
 }
 
 void gnw_h7b0_sai1_set_dma(GnwH7B0Sai1State *s, GnwH7B0DmaState *dma)
 {
     s->dma = dma;
-    if (s->voice_open) {
-        gnw_h7b0_dma_set_request_notifier(s->dma, GNW_H7B0_SAI1_DMA_REQUEST,
-                                           gnw_h7b0_sai1_dma_notify, s,
-                                           gnw_h7b0_sai1_dma_rate_fn, s, false);
-    }
+    /*
+     * Bind once, for the life of the machine -- NOT tied to SAIEN.
+     *
+     * This registration is what tells the DMA controller "DMAMUX request
+     * 87 is me": it supplies the transfer notifier, the real sample-rate
+     * fn, and the request-activity predicate. It used to be registered
+     * on SAIEN 0->1 and *cleared* on SAIEN 1->0, which conflated the
+     * host-side audio voice with firmware's DMAMUX routing, and left the
+     * DMA stream with no predicate and no rate fn during exactly the
+     * teardown window this all matters in: the stream then free-ran at
+     * the generic 48kHz fallback, firing half/full-transfer interrupts
+     * at a SAI that was already switched off. All three callbacks
+     * already no-op or report inactive when SAIEN is clear, so there is
+     * nothing to gain by unbinding.
+     */
+    gnw_h7b0_sai1_bind_dma(s);
 }
 
 void gnw_h7b0_sai1_set_rcc(GnwH7B0Sai1State *s, GnwH7B0RccState *rcc)
@@ -311,10 +441,6 @@ static void gnw_h7b0_sai1_reset(DeviceState *dev)
         audio_be_set_active_out(s->audio_be, s->voice, false);
         s->voice_open = false;
         fifo8_reset(&s->fifo);
-        if (s->dma) {
-            gnw_h7b0_dma_set_request_notifier(s->dma,
-                GNW_H7B0_SAI1_DMA_REQUEST, NULL, NULL, NULL, NULL, false);
-        }
     }
 }
 
@@ -361,6 +487,12 @@ static void gnw_h7b0_sai1_write(void *opaque, hwaddr addr, uint64_t val64, unsig
     s->regs[addr >> 2] = (s->regs[addr >> 2] & ~mask) | ((uint32_t)val64 & mask);
 
     if (addr == GNW_H7B0_SAI1_SAI_ACR1_OFFSET) {
+        if (gnw_dma_trace_level()) {
+            uint32_t nv = s->regs[addr >> 2];
+            gnw_dma_trace_event("ACR1", "0x%08x SAIEN=%d DMAEN=%d", nv,
+                                !!(nv & SAI_xCR1_SAIEN),
+                                !!(nv & SAI_xCR1_DMAEN));
+        }
         gnw_h7b0_sai1_update_voice(s);
     }
 }

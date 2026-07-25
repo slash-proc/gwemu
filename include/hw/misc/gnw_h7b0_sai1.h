@@ -50,6 +50,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0Sai1State, GNW_H7B0_SAI1)
  */
 #define GNW_H7B0_SAI1_FIFO_CAPACITY (64 * 1024)
 
+/*
+ * Maximum queued audio, in milliseconds of real time. This is the
+ * output-latency ceiling: past it, the oldest samples are dropped (see
+ * gnw_h7b0_sai1_dma_notify). 64KB of capacity is ~1.5s at 22kHz, which
+ * is a latency disaster on any host whose audio device drains slower
+ * than realtime -- the cap must be a latency, not a byte count.
+ */
+#define GNW_H7B0_SAI1_MAX_QUEUE_MS 150
+
 struct GnwH7B0Sai1State {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
