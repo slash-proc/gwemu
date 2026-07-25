@@ -58,8 +58,15 @@ typedef struct {
     char *err;
 } Fat32Ctx;
 
-static void set_err(char **err, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+#if defined(__MINGW32__)
+#define GNW_PRINTF_ATTR(f, a) __attribute__((format(gnu_printf, f, a)))
+#elif defined(__GNUC__) || defined(__clang__)
+#define GNW_PRINTF_ATTR(f, a) __attribute__((format(printf, f, a)))
+#else
+#define GNW_PRINTF_ATTR(f, a)
+#endif
+
+static void set_err(char **err, const char *fmt, ...) GNW_PRINTF_ATTR(2, 3);
 
 static void set_err(char **err, const char *fmt, ...)
 {
@@ -149,7 +156,16 @@ static bool dir_append(DirBuf *d, const uint8_t entry[32], char **err)
 static void fat_times(time_t t, uint16_t *fdate, uint16_t *ftime)
 {
     struct tm tm;
+#ifdef _WIN32
+    struct tm *tm_ptr = localtime(&t);
+    if (tm_ptr) {
+        tm = *tm_ptr;
+    } else {
+        memset(&tm, 0, sizeof(tm));
+    }
+#else
     localtime_r(&t, &tm);
+#endif
     int year = tm.tm_year + 1900;
     if (year < 1980) {
         year = 1980;
