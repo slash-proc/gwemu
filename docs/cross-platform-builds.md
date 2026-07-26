@@ -27,15 +27,97 @@ Standard build (see CLAUDE.md "Build"). Notes:
 
 ### Linux aarch64 (Raspberry Pi 4/5)
 
-Same native build — no cross-compilation, no source changes. The release
-pipeline builds it on GitHub's native `ubuntu-24.04-arm` runner and ships
+No source changes are needed for aarch64. The release pipeline builds it
+on GitHub's native `ubuntu-24.04-arm` runner and ships
 `gwemu-<version>-aarch64.AppImage` alongside the x86_64 one;
 `contrib/appimage/build-appimage.sh` picks its `ARCH` from `uname -m`
 unless overridden.
 
-To reproduce the release leg locally on an x86_64 dev box, run it under
-qemu-user binfmt (correctness check only — emulated, so it's slow;
-~50 min for a full build). Verified working 2026-07-26:
+#### Cross-compiled from x86_64 (Docker) — preferred
+
+`contrib/docker-arm64-cross/` is a **true** cross toolchain: the
+compiler runs natively on the x86_64 host and emits ARM binaries. A full
+clean build (configure + `ninja -j12`) takes **~1m45s**, versus ~50 min
+for the emulated method below. Verified 2026-07-26 (full GUI build,
+running Celeste under retro-go on a real Pi 4).
+
+1. One-time image setup:
+
+   ```
+   docker build -t gwemu-arm64-cross contrib/docker-arm64-cross/
+   ```
+
+2. Configure + build (from the repo root; `build-arm64/` is gitignored):
+
+   ```
+   mkdir -p build-arm64
+   docker run --rm -v "$PWD":/src -w /src/build-arm64 gwemu-arm64-cross \
+     gwemu-arm64-build
+   ```
+
+   `gwemu-arm64-build` is the small wrapper baked into the image
+   (`contrib/docker-arm64-cross/build.sh`): it runs `../configure
+   --target-list=arm-softmmu --cross-prefix=aarch64-linux-gnu-
+   --disable-sdl --disable-sdl-image --disable-gtk` on a fresh dir,
+   pip-installs PyYAML into the build's venv, then
+   `ninja -j12 qemu-system-arm gwemu`. Extra args are passed through to
+   `configure`; re-running it on an existing dir skips configure and just
+   builds. Run the commands by hand instead if you want something
+   different — nothing depends on the wrapper.
+
+How the traps are handled (all inside the image, the host is untouched —
+no `dpkg --add-architecture` and no apt-source edits on the host):
+
+- **Debian, not Ubuntu**: Debian serves every architecture from one
+  mirror so `dpkg --add-architecture arm64` just works; Ubuntu splits
+  arm64 onto ports.ubuntu.com and needs hand-edited sources.
+- **pkg-config must not see host x86 `.pc` files** — the image sets
+  `PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig`
+  (LIBDIR, not just PATH, is what excludes the defaults). Getting this
+  wrong produces link failures against host libs that read as missing
+  dependencies. `--cross-prefix=` also makes configure use
+  `aarch64-linux-gnu-pkg-config`.
+- **The SDL3 subproject is CMake-driven**, and this was expected to be
+  the hard part — it isn't. meson's `cmake` module generates its own
+  CMake toolchain file out of configure's `config-meson.cross`
+  (`[host_machine]` + the `aarch64-linux-gnu-*` binaries), and SDL3 then
+  finds the `:arm64` X11/wayland/audio libs through `PKG_CONFIG_LIBDIR`.
+  No hand-written toolchain file is needed. **`GNW_ALLOW_NO_GUI=1` is not
+  used and should not be** — this recipe produces a full GUI build
+  (`#define CONFIG_GWEMU_GUI` in `config-host.h`).
+- **`liblzma-dev` / `libpng-dev` / PyYAML**: same three traps as the
+  emulated recipe (see below) — the `:arm64` dev packages are in the
+  Dockerfile and the PyYAML wheel is staged at `/opt/pywheels` so the
+  build needs no network.
+
+Sanity checks after a build:
+
+```
+file build-arm64/qemu-system-arm            # ELF 64-bit ... ARM aarch64
+grep -c 'define CONFIG_PPOLL' build-arm64/config-host.h   # 1
+grep -c 'define CONFIG_PNG'   build-arm64/config-host.h   # 1
+grep -c 'define CONFIG_GWEMU_GUI' build-arm64/config-host.h  # 1
+```
+
+Deploying to a Pi: `objdump -p build-arm64/qemu-system-arm | grep NEEDED`
+lists only Debian-bookworm system libraries plus **`libepoxy.so.0`**,
+which is a subproject built in-tree. Copy it alongside the binary with
+`rsync -aL` (the `-L` matters — `subprojects/libepoxy-*/src/libepoxy.so.0`
+is a symlink, and copying it without dereferencing lands a dangling
+link) and run with `LD_LIBRARY_PATH` pointing at it.
+
+The build dir is created by a root-running container, so a later host
+`ninja` fails on `.ninja_lock` and even `rm -rf build-arm64` from the
+host hits permission errors. Keep driving it through the same container
+(`docker run ... bash -c 'rm -rf build-arm64 && ...'`), and pass commands
+inline via `bash -c` rather than dropping a script into the build dir.
+
+#### Emulated under qemu-user binfmt — fallback
+
+The older method: run an arm64 container under binfmt so the *compiler
+itself* is emulated. Correct, but **~50 min for a full build** versus
+~1m45s above — keep it only as a cross-check of the native-runner
+release leg. Verified working 2026-07-26:
 
 ```
 docker run --rm --platform linux/arm64 -v "$PWD":/src -w /src/build-arm64 ubuntu:22.04 bash -c '
@@ -78,7 +160,8 @@ it through the same container, and pass the commands inline via
 Note this validates that the build and packaging work; it says nothing
 about runtime performance on real Pi hardware (TCG throughput, and the
 Vulkan/GL/software renderer fallback chain on the Pi's VideoCore driver,
-both need testing on a real device).
+both need testing on a real device) — same caveat applies to the
+cross-compiled recipe above.
 
 ## Windows (cross-compiled from Linux, Docker)
 
