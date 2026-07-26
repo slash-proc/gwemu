@@ -74,6 +74,12 @@ struct NVICState {
      */
     bool vectpending_is_s_banked;
     int exception_prio; /* group prio of the highest prio active exception */
+    /* gwemu: guest hit a v7M Lockup condition; stop delivering exceptions
+     * instead of aborting the process. Cleared on reset. */
+    bool locked_up;
+    bool lockup_reported;        /* one warning per process, not per lockup */
+    bool lockup_debugger_seen;   /* a debugger has taken over: stop resetting */
+    QEMUTimer *lockup_timer;     /* paces the blank-flash reset loop */
     int vectpending_prio; /* group prio of the exception in vectpending */
 
     MemoryRegion sysregmem;
@@ -191,5 +197,19 @@ int armv7m_nvic_raw_execution_priority(NVICState *s);
  */
 bool armv7m_nvic_neg_prio_requested(NVICState *s, bool secure);
 bool armv7m_nvic_can_take_pending_exception(NVICState *s);
+
+/**
+ * armv7m_nvic_is_locked_up: true once the guest has hit a Lockup condition.
+ * gwemu halts the CPU and re-resets the machine on a timer (like real
+ * hardware with blank flash) rather than aborting the process as upstream
+ * QEMU does.
+ */
+bool armv7m_nvic_is_locked_up(NVICState *s);
+
+/**
+ * armv7m_nvic_take_lockup_notice: one-shot "a lockup loop has started" flag
+ * for the GUI to surface. Clears itself when read.
+ */
+bool armv7m_nvic_take_lockup_notice(void);
 
 #endif

@@ -263,6 +263,17 @@ void ProfileWizard::OpenForEdit(const std::string &profile_id)
 /* ------------------------------------------------------------------ */
 /* Build worker                                                        */
 
+/*
+ * Copy `src` to `dst`, 0xFF-padding out to `pad_to` bytes.
+ *
+ * Writes to `dst`.tmp and renames into place only on full success: a failed
+ * or partial copy must never destroy the image already bound to the profile.
+ * The profile store holds copies, not references, so clobbering the
+ * destination in place (or unlinking it on error, as this used to do) loses
+ * the user's data permanently -- and a missing image is worse than useless,
+ * because QEMU's file-backed RAM silently (re)creates it as a 256K hole of
+ * zeros, which locks the guest CPU up on the next boot.
+ */
 static bool copy_padded(const std::string &src, const std::string &dst,
                         uint64_t pad_to, std::string &err)
 {
@@ -276,10 +287,11 @@ static bool copy_padded(const std::string &src, const std::string &dst,
         err = "cannot open " + src;
         return false;
     }
-    FILE *out = g_fopen(dst.c_str(), "wb");
+    std::string tmp = dst + ".tmp";
+    FILE *out = g_fopen(tmp.c_str(), "wb");
     if (!out) {
         fclose(in);
-        err = "cannot create " + dst;
+        err = "cannot create " + tmp;
         return false;
     }
     const size_t kChunk = 1 << 20;
@@ -289,7 +301,7 @@ static bool copy_padded(const std::string &src, const std::string &dst,
     size_t n;
     while ((n = fread(buf.data(), 1, kChunk, in)) > 0) {
         if (fwrite(buf.data(), 1, n, out) != n) {
-            err = "short write to " + dst;
+            err = "short write to " + tmp;
             ok = false;
             break;
         }
@@ -300,6 +312,11 @@ static bool copy_padded(const std::string &src, const std::string &dst,
         ok = false;
     }
     fclose(in);
+    if (ok && written == 0) {
+        /* An empty source would leave a pad-only image that cannot boot. */
+        err = "source is empty: " + src;
+        ok = false;
+    }
     if (ok && written < pad_to) {
         std::vector<uint8_t> pad(kChunk, 0xFF);
         uint64_t left = pad_to - written;
@@ -309,24 +326,30 @@ static bool copy_padded(const std::string &src, const std::string &dst,
             left -= c;
         }
         if (!ok) {
-            err = "short pad write to " + dst;
+            err = "short pad write to " + tmp;
         }
     }
     if (fclose(out) != 0 && ok) {
-        err = "close failed on " + dst;
+        err = "close failed on " + tmp;
+        ok = false;
+    }
+    if (ok && g_rename(tmp.c_str(), dst.c_str()) != 0) {
+        err = "cannot replace " + dst;
         ok = false;
     }
     if (!ok) {
-        g_unlink(dst.c_str());
+        g_unlink(tmp.c_str()); /* never touch the existing dst on failure */
     }
     return ok;
 }
 
+/* Same temp-then-rename discipline as copy_padded(). */
 static bool write_blank(const std::string &dst, uint64_t size, std::string &err)
 {
-    FILE *out = g_fopen(dst.c_str(), "wb");
+    std::string tmp = dst + ".tmp";
+    FILE *out = g_fopen(tmp.c_str(), "wb");
     if (!out) {
-        err = "cannot create " + dst;
+        err = "cannot create " + tmp;
         return false;
     }
     const size_t kChunk = 1 << 20;
@@ -336,18 +359,22 @@ static bool write_blank(const std::string &dst, uint64_t size, std::string &err)
     while (left > 0) {
         size_t n = left < kChunk ? (size_t)left : kChunk;
         if (fwrite(buf.data(), 1, n, out) != n) {
-            err = "short write to " + dst;
+            err = "short write to " + tmp;
             ok = false;
             break;
         }
         left -= n;
     }
     if (fclose(out) != 0 && ok) {
-        err = "close failed on " + dst;
+        err = "close failed on " + tmp;
+        ok = false;
+    }
+    if (ok && g_rename(tmp.c_str(), dst.c_str()) != 0) {
+        err = "cannot replace " + dst;
         ok = false;
     }
     if (!ok) {
-        g_unlink(dst.c_str());
+        g_unlink(tmp.c_str());
     }
     return ok;
 }

@@ -1,3 +1,42 @@
+2026-07-26  blank internal flash is a supported state, not a crash. A guest
+            with no valid vector table faults immediately, cannot escalate
+            to HardFault at priority -1, and locks up -- and armv7m_nvic.c
+            handled v7M Lockup with cpu_abort(), which abort()s the whole
+            process. So binding a blank or missing bank1 killed the GUI on
+            every start, before it was usable. That is backwards: blank
+            flash is exactly what real hardware looks like before it has
+            been flashed, and gnwmanager/GDB attaching to flash the device
+            is a workflow we support. Lockup now models the silicon
+            instead: clear the stuck exception state, drop the NVIC line,
+            clear the latched CPU_INTERRUPT_HARD and env->event_register
+            (all four needed, or arm_cpu_has_work() stays true and the
+            vCPU spins a full core re-faulting), halt, and re-reset the
+            machine every 250ms off a QEMU_CLOCK_VIRTUAL_RT timer.
+            Measured: 0.8% of one core over 30s, flat RSS, one log line
+            total. The loop stands down under RUN_STATE_DEBUG and a
+            vm-state-change handler unhalts and kicks the vCPU on resume,
+            which is what lets a debugger load a loader into RAM and
+            actually run it -- verified with a real gdb client: attach,
+            system_reset, memory read/write, a 4-instruction Thumb loader
+            written to RAM and single-stepped, and breakpoint + continue.
+            (Whoever drives this must set the xPSR T-bit; writing PC alone
+            leaves thumb at its reset value and the code faults at once.)
+
+            Alongside it, the profile image-copy path could destroy an
+            image it failed to replace: copy_padded() opened the
+            destination "wb" -- truncating the live file before reading a
+            byte of the source -- and g_unlink()ed it on error, so an
+            interrupted re-bind (including one interrupted by the
+            Flash-Apply execv() restart) left the profile with no bank1
+            and no way back. QEMU then silently materialised the slot via
+            memory_region_init_ram_from_file()'s ftruncate, which is where
+            the all-zero, fully-sparse 256K bank1 that prompted all this
+            came from. Copies now write a temp file and rename on success
+            only, so a failure never touches the existing image, and an
+            empty source is rejected rather than written as a pad-only
+            image. The SoC reports image creation/extension as info rather
+            than passing it over in silence.
+
 2026-07-26  ltdc: publish once per guest frame, not twice. Stock firmware
             swaps buffers with two SRCR writes ~5us apart -- SRCR=IMR
             (HAL_LTDC_SetAddress's immediate reload, which already flips

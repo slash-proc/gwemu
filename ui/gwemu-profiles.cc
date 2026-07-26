@@ -495,10 +495,13 @@ bool GwProfileAsyncOp::StartCopy(const std::string &src, const std::string &dst)
             err = "cannot open " + src;
             return false;
         }
-        FILE *out = g_fopen(dst.c_str(), "wb");
+        /* Temp-then-rename: a failed copy must not destroy the file already
+         * bound to the profile (the store holds copies, not references). */
+        std::string tmp = dst + ".tmp";
+        FILE *out = g_fopen(tmp.c_str(), "wb");
         if (!out) {
             fclose(in);
-            err = "cannot create " + dst;
+            err = "cannot create " + tmp;
             return false;
         }
         fseek(in, 0, SEEK_END);
@@ -511,7 +514,7 @@ bool GwProfileAsyncOp::StartCopy(const std::string &src, const std::string &dst)
         size_t n;
         while ((n = fread(buf.data(), 1, kChunk, in)) > 0) {
             if (fwrite(buf.data(), 1, n, out) != n) {
-                err = "short write to " + dst;
+                err = "short write to " + tmp;
                 ok = false;
                 break;
             }
@@ -523,11 +526,15 @@ bool GwProfileAsyncOp::StartCopy(const std::string &src, const std::string &dst)
         }
         fclose(in);
         if (fclose(out) != 0 && ok) {
-            err = "close failed on " + dst;
+            err = "close failed on " + tmp;
+            ok = false;
+        }
+        if (ok && g_rename(tmp.c_str(), dst.c_str()) != 0) {
+            err = "cannot replace " + dst;
             ok = false;
         }
         if (!ok) {
-            g_unlink(dst.c_str());
+            g_unlink(tmp.c_str());
         }
         return ok;
     });
@@ -536,9 +543,10 @@ bool GwProfileAsyncOp::StartCopy(const std::string &src, const std::string &dst)
 bool GwProfileAsyncOp::StartBlank(const std::string &dst, uint64_t size)
 {
     return StartWorker([dst, size](GwProfileAsyncOp *op, std::string &err) {
-        FILE *out = g_fopen(dst.c_str(), "wb");
+        std::string tmp = dst + ".tmp";
+        FILE *out = g_fopen(tmp.c_str(), "wb");
         if (!out) {
-            err = "cannot create " + dst;
+            err = "cannot create " + tmp;
             return false;
         }
         op->m_total.store(size);
@@ -549,7 +557,7 @@ bool GwProfileAsyncOp::StartBlank(const std::string &dst, uint64_t size)
         while (left > 0) {
             size_t n = left < kChunk ? (size_t)left : kChunk;
             if (fwrite(buf.data(), 1, n, out) != n) {
-                err = "short write to " + dst;
+                err = "short write to " + tmp;
                 ok = false;
                 break;
             }
@@ -557,11 +565,15 @@ bool GwProfileAsyncOp::StartBlank(const std::string &dst, uint64_t size)
             op->m_done.fetch_add(n);
         }
         if (fclose(out) != 0 && ok) {
-            err = "close failed on " + dst;
+            err = "close failed on " + tmp;
+            ok = false;
+        }
+        if (ok && g_rename(tmp.c_str(), dst.c_str()) != 0) {
+            err = "cannot replace " + dst;
             ok = false;
         }
         if (!ok) {
-            g_unlink(dst.c_str());
+            g_unlink(tmp.c_str());
         }
         return ok;
     });

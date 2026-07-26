@@ -184,6 +184,23 @@ static bool gnw_h7b0_init_ram_or_file(MemoryRegion *mr, Object *owner,
                                        const char *image_path, Error **errp)
 {
     if (image_path != NULL && image_path[0] != '\0') {
+        /*
+         * Both backends below silently create the file (and extend a short
+         * one) as a hole of zeros. Booting blank flash is legitimate -- the
+         * machine then just resets in a loop until a debugger flashes it,
+         * exactly like real hardware -- but silently manufacturing a
+         * profile's missing image is worth a word, since "my device went
+         * blank" is otherwise indistinguishable from a lost file.
+         */
+        struct stat st;
+        if (stat(image_path, &st) != 0) {
+            info_report("%s: flash image \"%s\" does not exist yet -- "
+                        "creating it blank", name, image_path);
+        } else if ((uint64_t)st.st_size < size) {
+            info_report("%s: flash image \"%s\" is %" PRIu64 " bytes, shorter "
+                        "than the %" PRIu64 "-byte region -- extending it",
+                        name, image_path, (uint64_t)st.st_size, size);
+        }
 #ifdef CONFIG_POSIX
         return memory_region_init_ram_from_file(mr, owner, name, size, 0,
                                                  RAM_SHARED, image_path, 0,

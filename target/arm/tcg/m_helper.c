@@ -847,6 +847,19 @@ static void v7m_exception_taken(ARMCPU *cpu, uint32_t lr, bool dotailchain,
     int exc;
     bool push_failed = false;
 
+    if (armv7m_nvic_is_locked_up(env->nvic)) {
+        /*
+         * gwemu: the guest has hit a Lockup condition (see
+         * nvic_guest_lockup()). Upstream aborts the process there; we halt
+         * the CPU and stop the VM instead, so we must also refuse to take
+         * any further exception rather than falling through into
+         * armv7m_nvic_acknowledge_irq(), whose priority assertions no
+         * longer hold once we have declined the escalation.
+         */
+        CPU(cpu)->halted = 1;
+        return;
+    }
+
     armv7m_nvic_get_pending_irq_info(env->nvic, &exc, &targets_secure);
     qemu_log_mask(CPU_LOG_INT, "...taking pending %s exception %d\n",
                   targets_secure ? "secure" : "nonsecure", exc);

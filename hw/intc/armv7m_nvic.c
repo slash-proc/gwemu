@@ -25,6 +25,7 @@
 #include "exec/cputlb.h"
 #include "exec/memop.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "trace.h"
 
@@ -78,6 +79,145 @@ static void signal_sysresetreq(NVICState *s)
          */
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
+}
+
+/*
+ * v7M Lockup handling (gwemu).
+ *
+ * Upstream QEMU reports Lockup with cpu_abort(), which abort()s the whole
+ * process. That is unacceptable here: a Game & Watch with blank internal
+ * flash is a legitimate, supported state -- it is exactly what real silicon
+ * looks like before it has been flashed, and the user is expected to attach
+ * gnwmanager/GDB and flash the virtual device just like a real one. A blank
+ * vector table faults immediately, escalates, and locks up; real hardware
+ * then just resets and does it all again, forever, until something flashes
+ * it.
+ *
+ * So we model that: halt the CPU, and let a timer re-reset the machine at a
+ * sane cadence (NOT as fast as the host can go -- that would burn a core and
+ * flood the log). One message when the loop starts, then silence.
+ *
+ * The loop stands down permanently once a debugger takes control of the VM
+ * (RUN_STATE_DEBUG): from then on the CPU stays halted between resets so a
+ * debugger can load a flash loader into RAM and run it without us yanking
+ * the machine out from under it. It can issue its own resets.
+ */
+#define NVIC_LOCKUP_RESET_MS 250
+
+static void nvic_irq_update(NVICState *s);
+static void nvic_recompute_state(NVICState *s);
+
+static bool nvic_lockup_notice; /* one-shot, read by the GUI */
+
+bool armv7m_nvic_take_lockup_notice(void)
+{
+    bool v = nvic_lockup_notice;
+    nvic_lockup_notice = false;
+    return v;
+}
+
+static void nvic_lockup_timer(void *opaque)
+{
+    NVICState *s = opaque;
+
+    if (!s->locked_up) {
+        return; /* something cleared it: loop over */
+    }
+    if (runstate_check(RUN_STATE_DEBUG)) {
+        /* A debugger is driving; it owns the machine from here. */
+        s->lockup_debugger_seen = true;
+        return;
+    }
+    if (s->lockup_debugger_seen) {
+        return;
+    }
+    if (!runstate_is_running()) {
+        /* Paused by the user; look again later rather than resetting. */
+        timer_mod(s->lockup_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL_RT) +
+                  NVIC_LOCKUP_RESET_MS);
+        return;
+    }
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+/*
+ * Whoever just resumed the VM (a GDB "continue" after loading a flash loader
+ * into RAM, or the user un-pausing) wants the CPU to execute. Drop out of the
+ * locked-up state so it can: if there is still nothing valid to run, it will
+ * lock up again within microseconds and settle back into the paced loop.
+ */
+static void nvic_lockup_vm_state_change(void *opaque, bool running,
+                                        RunState state)
+{
+    NVICState *s = opaque;
+
+    if (running && s->locked_up) {
+        s->locked_up = false;
+        CPU(s->cpu)->halted = 0;
+        /* Don't let a pending reset yank the machine out from under the
+         * code that was just loaded (e.g. a debugger's RAM flash loader). */
+        timer_del(s->lockup_timer);
+        nvic_irq_update(s);
+        /* The vCPU may already have gone back to sleep in this resume: kick
+         * it so it re-evaluates now that it is no longer halted. */
+        qemu_cpu_kick(CPU(s->cpu));
+    }
+}
+
+static void nvic_guest_lockup(NVICState *s, const char *reason)
+{
+    CPUState *cs = CPU(s->cpu);
+
+    if (!s->locked_up) {
+        s->locked_up = true;
+        if (!s->lockup_reported) {
+            s->lockup_reported = true;
+            nvic_lockup_notice = true;
+            warn_report("guest CPU lockup (%s) -- no valid firmware in "
+                        "internal flash? The machine will keep resetting "
+                        "every %d ms, like real hardware with blank flash. "
+                        "Attach a debugger (gnwmanager / GDB) to flash it. "
+                        "This message is not repeated.",
+                        reason, NVIC_LOCKUP_RESET_MS);
+        }
+        if (s->lockup_timer) {
+            timer_mod(s->lockup_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL_RT) +
+                      NVIC_LOCKUP_RESET_MS);
+        }
+    }
+
+    /*
+     * Idle the CPU until the timer resets us. Both halves matter: without
+     * dropping the NVIC's exception line (and the CPU's latched HARD
+     * interrupt) arm_cpu_has_work() stays true, the halt is undone on the
+     * next loop iteration, and the CPU spins at full host speed re-faulting
+     * on the same instruction -- measured as a full core burned.
+     */
+    /*
+     * Drop the stuck exception state. Nothing can ever be delivered from
+     * here (that is what Lockup means), and leaving HardFault pending/active
+     * would have the CPU re-take it the moment anything resumes it -- which
+     * is exactly what a debugger does after loading a flash loader.
+     */
+    for (int i = 0; i < s->num_irq; i++) {
+        s->vectors[i].pending = 0;
+        s->vectors[i].active = 0;
+    }
+    for (int i = 0; i < NVIC_INTERNAL_VECTORS; i++) {
+        s->sec_vectors[i].pending = 0;
+        s->sec_vectors[i].active = 0;
+    }
+    s->cpu->env.v7m.hfsr = 0;
+    nvic_recompute_state(s);
+
+    qemu_set_irq(s->excpout, 0);
+    cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+    /* An earlier exception entry set this; it also keeps has_work() true. */
+    s->cpu->env.event_register = false;
+    cs->halted = 1;
+    cpu_interrupt(cs, CPU_INTERRUPT_HALT);
 }
 
 static int nvic_pending_prio(NVICState *s)
@@ -443,7 +583,15 @@ bool armv7m_nvic_neg_prio_requested(NVICState *s, bool secure)
 
 bool armv7m_nvic_can_take_pending_exception(NVICState *s)
 {
+    if (s->locked_up) {
+        return false;
+    }
     return nvic_exec_prio(s) > nvic_pending_prio(s);
+}
+
+bool armv7m_nvic_is_locked_up(NVICState *s)
+{
+    return s->locked_up;
 }
 
 int armv7m_nvic_raw_execution_priority(NVICState *s)
@@ -509,6 +657,11 @@ static void nvic_irq_update(NVICState *s)
      * pending info.
      */
     lvl = (pend_prio < s->exception_prio);
+    if (s->locked_up) {
+        /* Locked-up guest: never deliver another exception (see
+         * nvic_guest_lockup()). */
+        lvl = 0;
+    }
     trace_nvic_irq_update(s->vectpending, pend_prio, s->exception_prio, lvl);
     qemu_set_irq(s->excpout, lvl);
 }
@@ -602,10 +755,7 @@ static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
              * which saves having to have an extra argument is_terminal
              * that we'd only use in one place.
              */
-            cpu_abort(CPU(s->cpu),
-                      "Lockup: can't take terminal derived exception "
-                      "(original exception priority %d)\n",
-                      s->vectpending_prio);
+            nvic_guest_lockup(s, "can't take terminal derived exception");
         }
         /* We now continue with the same code as for a normal pending
          * exception, which will cause us to pend the derived exception.
@@ -668,9 +818,7 @@ static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
                  * Lockup condition due to a guest bug. We don't model
                  * Lockup, so report via cpu_abort() instead.
                  */
-                cpu_abort(CPU(s->cpu),
-                          "Lockup: can't escalate %d to HardFault "
-                          "(current priority %d)\n", irq, running);
+                nvic_guest_lockup(s, "can't escalate to HardFault");
             }
 
             /* HF may be banked but there is only one shared HFSR */
@@ -766,9 +914,9 @@ void armv7m_nvic_set_pending_lazyfp(NVICState *s, int irq, bool secure)
              * We want to escalate to HardFault but the context the
              * FP state belongs to prevents the exception pre-empting.
              */
-            cpu_abort(CPU(s->cpu),
-                      "Lockup: can't escalate to HardFault during "
-                      "lazy FP register stacking\n");
+            nvic_guest_lockup(s,
+                              "can't escalate to HardFault during lazy FP "
+                              "register stacking");
         }
     }
 
@@ -2628,6 +2776,10 @@ static void armv7m_nvic_reset(DeviceState *dev)
     int resetprio;
     NVICState *s = NVIC(dev);
 
+    s->locked_up = false;
+    if (s->lockup_timer) {
+        timer_del(s->lockup_timer);
+    }
     memset(s->vectors, 0, sizeof(s->vectors));
     memset(s->sec_vectors, 0, sizeof(s->sec_vectors));
     s->prigroup[M_REG_NS] = 0;
@@ -2729,6 +2881,11 @@ static void armv7m_nvic_realize(DeviceState *dev, Error **errp)
     }
 
     qdev_init_gpio_in(dev, set_irq_level, s->num_irq);
+
+    /* Paces the blank-flash reset loop; see nvic_guest_lockup(). */
+    s->lockup_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL_RT,
+                                   nvic_lockup_timer, s);
+    qemu_add_vm_change_state_handler(nvic_lockup_vm_state_change, s);
 
     /* include space for internal exception vectors */
     s->num_irq += NVIC_FIRST_IRQ;

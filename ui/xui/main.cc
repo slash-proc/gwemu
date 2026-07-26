@@ -27,6 +27,7 @@
 
 extern "C" {
 void gnw_h7b0_rtc_set_sync_host(bool sync_host);
+bool armv7m_nvic_take_lockup_notice(void);
 }
 
 #include <deque>
@@ -225,6 +226,18 @@ void gwemu_hud_update(void)
 {
     ImGuiIO& io = ImGui::GetIO();
     uint32_t now = SDL_GetTicks();
+
+    /*
+     * Blank/absent internal flash is a supported state (that is what real
+     * hardware looks like before it is flashed): the machine just keeps
+     * resetting. Say so once, neutrally -- it is not an error.
+     */
+    if (armv7m_nvic_take_lockup_notice()) {
+        gwemu_queue_notification(
+            "No valid firmware in internal flash -- the device is resetting "
+            "continuously, like real hardware with blank flash. Attach "
+            "gnwmanager or GDB to flash it.");
+    }
 
     GdbSettingsTick();
     g_viewport_mgr.Update();
