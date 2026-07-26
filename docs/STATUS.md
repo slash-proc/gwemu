@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-07-25
+Last updated: 2026-07-26
 
 Fork of upstream QEMU (`qemu/qemu`), pinned to tag `v11.0.2`. Working
 branch `gnw-h7b0`.
@@ -33,7 +33,10 @@ audio, gamepad input, SD card, save/flash persistence.
 - Cross-platform: one rendering+audio stack (SDL_Renderer + sdl3
   audiodev, no OpenGL requirement) verified live on Linux (Vulkan),
   Windows (D3D11/software; VM-tested incl. sound) and macOS Intel
-  (Metal). Local Windows cross-build via Docker and Mac-over-SSH
+  (Metal), plus Linux aarch64 (Raspberry Pi 4, verified running Celeste
+  under retro-go). Local Windows and aarch64 cross-builds via Docker
+  (aarch64 is a TRUE cross-compile now: ~1m45s vs ~50 min emulated) and
+  Mac-over-SSH
   workflows in `docs/cross-platform-builds.md`; `start.bat` is the
   Windows launch path.
 - Headless capture appliance for CI/test suites: truly windowless
@@ -43,6 +46,22 @@ audio, gamepad input, SD card, save/flash persistence.
 
 ## Known issues (open)
 
+- **Black screen on retro-go's "quit to main menu", second cause still
+  open.** The DMA half is FIXED (2026-07-26: peripheral resets are now
+  modelled; 24/118 -> 0/119 across interleaved runs). A second,
+  independent bug with the same symptom remains: the CPU wedges in the
+  LTDC interrupt (exception 104 / IRQ 88) while DMA1 is clean and at its
+  reset value. Present in ~65% of non-storm runs on a slow host and
+  unaffected by the DMA fix. Prime suspect is the same class of bug one
+  bus over -- LTDC is on APB3 and `HAL_DeInit()` resets APB3RSTR bit 3
+  (LTDCRST), which we deliberately do not model yet: unverified, and an
+  LTDC reset would blank live display config, so it needs its own
+  measurement before being added.
+- Failure rates for this family of bug track HOST SPEED (idle Linux 3%,
+  loaded Linux 17%, older Intel Mac 34%, Pi 4 worse still): the
+  vulnerable window is a fixed number of guest instructions while
+  peripheral events are paced by wall time, so a slower host widens it.
+  Reproduce on a SLOW or loaded host; a fast x86 box will hide it.
 - Native Wayland disabled by default on Linux (x11/XWayland instead) --
   three real breakages documented in `ui/gwemu.c`; revisit when SDL3's
   Wayland fractional-scale handling stabilizes.
@@ -95,8 +114,12 @@ audio, gamepad input, SD card, save/flash persistence.
   builders; the CFW driver is a linkable library the GUI calls in-process.
 - Render path: framebuffer texture now uploaded only when the guest
   redraws, and the GPU upload moved out of the BQL -- lock contention
-  from rendering 130ms/s -> 1.7ms/s (2026-07-25). Uncommitted alongside
-  an SAI output-queue latency cap (Windows backlog 1.5s -> 110ms).
+  from rendering 130ms/s -> 1.7ms/s (2026-07-25), landed alongside an
+  SAI output-queue latency cap (Windows backlog 1.5s -> 110ms).
+- NEXT: Raspberry Pi 4 performance. Celeste is already playable there
+  (30.0fps, 0 dropped frames) but the pinned core sits at only ~60%
+  busy, so the guest is not CPU-bound and there is headroom unaccounted
+  for. Real hardware sits at ~30% for the same workload.
 
 ## Tooling notes worth keeping in mind
 

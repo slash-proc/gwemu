@@ -33,6 +33,8 @@
 #include "hw/core/clock.h"
 #include "hw/misc/gnw_h7b0_rcc.h"
 #include "hw/misc/gnw_h7b0_regs_rcc.h"
+#include "hw/core/qdev.h"
+#include "hw/misc/gnw_h7b0_dma.h"
 
 static void gnw_h7b0_rcc_update_sysclk_clock(GnwH7B0RccState *s);
 
@@ -68,6 +70,69 @@ static uint64_t gnw_h7b0_rcc_read(void *opaque, hwaddr addr, unsigned int size)
     return s->regs[addr >> 2];
 }
 
+void gnw_h7b0_rcc_add_reset_target(GnwH7B0RccState *s, hwaddr rstr_offset,
+                                    unsigned bit, DeviceState *dev)
+{
+    if (s->n_reset_targets >= GNW_H7B0_RCC_RESET_TARGET_MAX) {
+        qemu_log_mask(LOG_UNIMP, "%s: reset-target table full\n", __func__);
+        return;
+    }
+    s->reset_targets[s->n_reset_targets].rstr_offset = rstr_offset;
+    s->reset_targets[s->n_reset_targets].bit = bit;
+    s->reset_targets[s->n_reset_targets].dev = dev;
+    s->n_reset_targets++;
+}
+
+/*
+ * Apply peripheral resets for any xxxRSTR bit going 0->1.
+ *
+ * Real silicon holds the peripheral in reset while the bit is set and
+ * releases it when cleared; every user of this (HAL's
+ * __HAL_RCC_xxx_FORCE_RESET/RELEASE_RESET pairs, including HAL_DeInit())
+ * sets and immediately clears it, so asserting the whole reset on the
+ * 0->1 edge is indistinguishable from the outside and avoids having to
+ * model a held-in-reset state.
+ *
+ * Note DMA1 and DMA2 share one device object here, so either of their
+ * reset bits resets both controllers. The only caller that matters,
+ * HAL_DeInit(), sets every bit on the bus at once anyway.
+ *
+ * Only the buses whose peripherals we actually model a reset for are
+ * routed here (AHB1 -> DMA1/DMA2, APB2 -> SAI1). HAL_DeInit() also
+ * force-resets AHB2/3/4 and APB1L/1H/3/4 (see
+ * sdk/stm32h7xx-hal-driver/Src/stm32h7xx_hal.c); those stay inert
+ * register shadows until something is shown to need them.
+ */
+static void gnw_h7b0_rcc_apply_periph_reset(GnwH7B0RccState *s, hwaddr addr,
+                                             uint32_t old, uint32_t value)
+{
+    uint32_t rising = ~old & value;
+
+    /*
+     * Under GNW_DMA_TRACE=2 this is the reliable marker that firmware
+     * really reached HAL_DeInit -- i.e. that a headless quit-to-menu
+     * timeline actually got as far as quitting, rather than the guest
+     * having been too slow to react to the scripted button presses.
+     * Every quit-to-menu statistic this fix was measured against filters
+     * on it; keep it.
+     */
+    if (rising) {
+        gnw_dma_trace_event("RSTR", "0x%02x rising=0x%08x", (unsigned)addr,
+                            rising);
+    }
+
+    for (int i = 0; i < s->n_reset_targets; i++) {
+        GnwH7B0RccResetTarget *t = &s->reset_targets[i];
+
+        if (t->rstr_offset == addr && (rising & (1U << t->bit))) {
+            gnw_dma_trace_event("PRST", "rstr 0x%02x bit %u -> reset %s",
+                                (unsigned)addr, t->bit,
+                                object_get_typename(OBJECT(t->dev)));
+            device_cold_reset(t->dev);
+        }
+    }
+}
+
 static void gnw_h7b0_rcc_write(void *opaque, hwaddr addr,
                                 uint64_t val64, unsigned int size)
 {
@@ -81,7 +146,16 @@ static void gnw_h7b0_rcc_write(void *opaque, hwaddr addr,
     }
 
     uint32_t mask = get_rcc_write_mask(addr);
-    value = (s->regs[addr >> 2] & ~mask) | (value & mask);
+    uint32_t old_value = s->regs[addr >> 2];
+    value = (old_value & ~mask) | (value & mask);
+
+    if (addr == GNW_H7B0_RCC_AHB1RSTR_OFFSET ||
+        addr == GNW_H7B0_RCC_APB2RSTR_OFFSET) {
+        /* Store first: device_cold_reset() must not see a stale RSTR. */
+        s->regs[addr >> 2] = value;
+        gnw_h7b0_rcc_apply_periph_reset(s, addr, old_value, value);
+        return;
+    }
 
     switch (addr) {
     case GNW_H7B0_RCC_CR:

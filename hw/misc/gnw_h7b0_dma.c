@@ -84,6 +84,7 @@ int gnw_dma_trace_level(void)
 
 static struct {
     unsigned set_ht, set_tc, clr_ht, clr_tc, cr_writes, irq_hi, irq_lo;
+    unsigned have_actfn;   /* traced stream had a request predicate bound */
     int64_t t0;
 } gnw_dma_trace_acc;
 
@@ -112,11 +113,11 @@ static void gnw_dma_trace_tick_summary(void)
     }
     gnw_dma_trace_acc.t0 = now;
     fprintf(stderr, "DMASUM s0 setHT=%u setTC=%u clrHT=%u clrTC=%u "
-            "crw=%u irq+=%u irq-=%u\n",
+            "crw=%u irq+=%u irq-=%u actfn=%u\n",
             gnw_dma_trace_acc.set_ht, gnw_dma_trace_acc.set_tc,
             gnw_dma_trace_acc.clr_ht, gnw_dma_trace_acc.clr_tc,
             gnw_dma_trace_acc.cr_writes, gnw_dma_trace_acc.irq_hi,
-            gnw_dma_trace_acc.irq_lo);
+            gnw_dma_trace_acc.irq_lo, gnw_dma_trace_acc.have_actfn);
     memset(&gnw_dma_trace_acc, 0, sizeof(gnw_dma_trace_acc));
     gnw_dma_trace_acc.t0 = now;
 }
@@ -303,6 +304,12 @@ static void gnw_h7b0_dma_rebind_request(GnwH7B0DmaState *s)
             s->stream_low_latency[stream] = reg->low_latency;
             s->stream_active_fn[stream] = reg->active_fn;
             s->stream_active_fn_opaque[stream] = reg->active_opaque;
+        }
+        if (gnw_dma_trace_level() &&
+            (stream == GNW_DMA_TRACE_STREAM ||
+             reg->bound_stream == GNW_DMA_TRACE_STREAM)) {
+            gnw_dma_trace_event("BIND", "req %d: stream %d -> %d",
+                                reg->req_id, reg->bound_stream, stream);
         }
         reg->bound_stream = stream;
     }
@@ -554,6 +561,9 @@ static void gnw_h7b0_dma_stream_tick(void *opaque)
             late_sum = late_max = 0;
         }
     }
+    if (stream == GNW_DMA_TRACE_STREAM) {
+        gnw_dma_trace_acc.have_actfn = s->stream_active_fn[stream] ? 1 : 0;
+    }
     gnw_dma_trace_tick_summary();
 
     int ctrl = stream / GNW_H7B0_DMA_STREAMS_PER_CTRL;
@@ -800,9 +810,19 @@ static void gnw_h7b0_dma_write(void *opaque, hwaddr addr, uint64_t val64, unsign
      * write so a request-registered peripheral (SAI1) tracks firmware's
      * actual routing. */
     if (addr >= GNW_H7B0_DMAMUX_BLOCK_OFFSET) {
+        uint32_t mux_old = s->regs[addr >> 2];
         s->regs[addr >> 2] = (uint32_t)val64;
         if (addr < GNW_H7B0_DMAMUX_BLOCK_OFFSET +
                     4 * GNW_H7B0_DMA_STREAM_COUNT) {
+            int ch = (int)((addr - GNW_H7B0_DMAMUX_BLOCK_OFFSET) / 4);
+            if (ch == GNW_DMA_TRACE_STREAM && gnw_dma_trace_level()) {
+                gnw_dma_trace_event("MUX", "ch%d old=0x%08x new=0x%08x "
+                                    "reqid %u->%u", ch, mux_old,
+                                    (uint32_t)val64,
+                                    mux_old & GNW_H7B0_DMAMUX_REQ_ID_MASK,
+                                    (uint32_t)val64 &
+                                     GNW_H7B0_DMAMUX_REQ_ID_MASK);
+            }
             gnw_h7b0_dma_rebind_request(s);
         }
         return;

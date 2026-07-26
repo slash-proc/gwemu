@@ -36,6 +36,7 @@
 #include "hw/core/qdev-properties-system.h"
 #include "system/system.h"
 #include "hw/misc/unimp.h"
+#include "hw/misc/gnw_h7b0_regs_rcc.h"
 
 static void gnw_h7b0_soc_initfn(Object *obj)
 {
@@ -669,6 +670,22 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->sai1), 0, SAI1_BASE_ADDRESS);
     gnw_h7b0_sai1_set_dma(&s->sai1, &s->dma);
     gnw_h7b0_sai1_set_rcc(&s->sai1, &s->rcc);
+
+    /*
+     * Peripheral resets. HAL_DeInit() force-resets every bus, and
+     * retro-go calls it on the way out of a game right before jumping
+     * back to the launcher -- without these the game's still-armed
+     * SAI1/DMA1 audio stream survives into the launcher's fresh boot
+     * and storms an interrupt it can never acknowledge.
+     * RM0455: AHB1RSTR bit0 = DMA1RST, bit1 = DMA2RST;
+     *         APB2RSTR bit22 = SAI1RST.
+     */
+    gnw_h7b0_rcc_add_reset_target(&s->rcc, GNW_H7B0_RCC_AHB1RSTR_OFFSET, 0,
+                                   DEVICE(&s->dma));
+    gnw_h7b0_rcc_add_reset_target(&s->rcc, GNW_H7B0_RCC_AHB1RSTR_OFFSET, 1,
+                                   DEVICE(&s->dma));
+    gnw_h7b0_rcc_add_reset_target(&s->rcc, GNW_H7B0_RCC_APB2RSTR_OFFSET, 22,
+                                   DEVICE(&s->sai1));
     gnw_h7b0_hash_set_dma(&s->hash, &s->dma);
     gnw_h7b0_adc_set_dma(&s->adc, &s->dma);
 

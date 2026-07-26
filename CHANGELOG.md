@@ -1,3 +1,57 @@
+2026-07-26  RCC/DMA/SAI1: model peripheral resets, eliminating the DMA
+            half of the retro-go quit-to-main-menu black screen. The
+            2026-07-26 entry below reduced it 9.1% -> 3.0% but could
+            not explain the rest. The rest was this: retro-go calls
+            HAL_DeInit() on the way out of a game, which (sdk/.../
+            stm32h7xx_hal.c) does __HAL_RCC_<bus>_FORCE_RESET() /
+            RELEASE_RESET() for all nine buses. We modelled every
+            xxxRSTR write as inert, so the game's still-armed SAI1/DMA1
+            audio stream survived into the freshly booted launcher --
+            whose HAL handles are zeroed .bss -- and the first
+            half-transfer interrupt it raised could never be
+            acknowledged, latching the IRQ line high forever.
+            RCC writes to AHB1RSTR/APB2RSTR now device_cold_reset() the
+            registered devices on a 0->1 edge (asserting the whole
+            reset on the rising edge is indistinguishable from outside,
+            since every HAL user sets and immediately clears the bit).
+            Confirmed on real hardware before writing the fix: 99,287
+            samples read over SWD without halting the CPU showed
+            DMA1_LISR == 0 in every one -- silicon never sits with a
+            flag latched -- and S0CR dropping to 0x00000000, its reset
+            value, at several quit points. Measured across 237
+            interleaved runs on two hosts: 24/118 storms before,
+            **0/119** after (Fisher exact p = 1.5e-8). Audio survives
+            the reset (HT/TC pairs continue through quit and re-entry).
+            The failure rate tracks HOST SPEED, exactly as the user
+            observed: idle Linux 3%, loaded Linux 17%, an older Intel
+            Mac 34% -- the vulnerable window is a fixed number of guest
+            instructions while our DMA events are paced by wall time,
+            so a slower host widens it.
+            STILL OPEN, a SECOND and independent bug with the same
+            symptom: the CPU can instead wedge in the LTDC interrupt
+            (exception 104 / IRQ 88) with DMA1 clean and at its reset
+            value. Unaffected by this fix (68% vs 65% of non-storm
+            runs). LTDC sits on APB3 and HAL_DeInit() resets APB3RSTR
+            bit 3 (LTDCRST), which we deliberately do NOT model yet --
+            it is unverified and an LTDC reset would blank live display
+            config, so it needs its own measurement.
+
+2026-07-26  build: true aarch64 cross-compile (contrib/docker-arm64-cross/),
+            replacing the emulated qemu-user binfmt recipe as the primary
+            way to build for a Raspberry Pi from an x86_64 dev box. The
+            compiler now runs natively and emits ARM, so a full clean
+            build is ~1m45s instead of ~50 min. Debian base (one mirror
+            for all architectures) + `dpkg --add-architecture arm64` +
+            the `:arm64` dev packages, with PKG_CONFIG_LIBDIR pinned to
+            the aarch64 multiarch dir so pkg-config can't see host .pc
+            files. No hand-written CMake toolchain file was needed:
+            meson's cmake module derives one from configure's
+            config-meson.cross, so the SDL3 subproject cross-builds and
+            the result is a full GUI build (no GNW_ALLOW_NO_GUI).
+            Verified on a real Pi 4 running Celeste under retro-go.
+            docs/cross-platform-builds.md rewritten accordingly; the
+            emulated method stays documented as a fallback.
+
 2026-07-26  DMA/RCC/SAI1: largely fixed the long-standing intermittent black
             screen on retro-go's "quit to main menu". The DMA1 Stream0
             (SAI1 audio) IRQ line latched high forever and the CPU

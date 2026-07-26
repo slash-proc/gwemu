@@ -232,7 +232,7 @@ guest-seconds, so 29s == realtime:
 |---|---|---|---|
 | Linux laptop (Ryzen AI 7 350) | 30.0 | 29s | at Celeste's 30fps cap |
 | Linux hypervisor (7800X3D) | 30.0 | 29s | at cap |
-| Linux Pi 4 (aarch64) | 29.9 | 29s | at cap; holds realtime |
+| Linux Pi 4 (aarch64) | 29.9 | 29s | at cap; ~60% of one core busy |
 | macOS (i5-10210U) | 27.1 -> **30.0** | 29s | fixed by `pselect` |
 | Win11 VM (on that 7800X3D) | 20.0 -> **30.0** | 29s | drops frames, holds realtime |
 | Win11 laptop (i7-6820HK) | 24.7 -> **30.0** | 53.7 -> **29.1s** | also lags the clock |

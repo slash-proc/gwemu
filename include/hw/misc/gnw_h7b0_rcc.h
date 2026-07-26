@@ -216,11 +216,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
  * guest ever did switch to it transiently. */
 #define GNW_H7B0_RCC_CSI_HZ  4000000U
 
+/* See gnw_h7b0_rcc_add_reset_target(). */
+typedef struct GnwH7B0RccResetTarget {
+    hwaddr rstr_offset;
+    unsigned bit;
+    DeviceState *dev;
+} GnwH7B0RccResetTarget;
+
+#define GNW_H7B0_RCC_RESET_TARGET_MAX 8
+
 struct GnwH7B0RccState {
     SysBusDevice parent_obj;
 
     MemoryRegion mmio;
     uint32_t regs[GNW_H7B0_RCC_SIZE / 4];
+    GnwH7B0RccResetTarget reset_targets[GNW_H7B0_RCC_RESET_TARGET_MAX];
+    int n_reset_targets;
 
     /* Not owned; set by the board via gnw_h7b0_rcc_set_sysclk() so PLL1/
      * SYSCLK register writes can push a live recompute out through the
@@ -235,6 +246,22 @@ struct GnwH7B0RccState {
 uint32_t gnw_h7b0_rcc_get_pll2p_hz(GnwH7B0RccState *s);
 /* True while RCC_APB2ENR.SAI1EN is set, i.e. SAI1 is clocked at all. */
 bool gnw_h7b0_rcc_sai1_clock_enabled(GnwH7B0RccState *s);
+
+/*
+ * Register a device to be held in reset by one of RCC's peripheral-reset
+ * (xxxRSTR) bits: writing the bit to 1 asserts the peripheral's reset,
+ * which on real silicon returns all of its registers to their reset
+ * values (RM0455 RCC, "peripheral reset registers").
+ *
+ * This is not academic. `HAL_DeInit()` force-resets *every* bus, and
+ * retro-go calls it on the way out of a game, immediately before
+ * jumping back to the launcher (odroid_system.c's boot path). Without
+ * it, a DMA stream armed by the game survives into the freshly started
+ * launcher -- whose HAL handles are zeroed .bss -- and the first
+ * half-transfer interrupt it raises can never be acknowledged.
+ */
+void gnw_h7b0_rcc_add_reset_target(GnwH7B0RccState *s, hwaddr rstr_offset,
+                                    unsigned bit, DeviceState *dev);
 uint32_t gnw_h7b0_rcc_get_pll1p_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_pll3r_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_sysclk_hz(GnwH7B0RccState *s);
