@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-07-26
+Last updated: 2026-07-26 (`v0.0.16`)
 
 Fork of upstream QEMU (`qemu/qemu`), pinned to tag `v11.0.2`. Working
 branch `gnw-h7b0`.
@@ -16,135 +16,105 @@ audio, gamepad input, SD card, save/flash persistence.
 
 - Core CPU, memory map, NVIC, real clock tree (HSI/HSE/PLL1-3, live-derived
   SYSCLK/HCLK/LTDC-pixel-clock — see `docs/h7b0-clock-tree-findings.md`),
-  dynamic CPU-overclock support.
+  dynamic CPU-overclock support. RCC models real peripheral resets
+  (AHB1RSTR/APB2RSTR) so `HAL_DeInit()` behaves as on silicon.
 - SPI/OSPI flash (dual-bank, see `docs/h7b0-flash-discrepancy.md`), SD card
-  (SPI-based), RTC, DMA, TIM1/TIM2/LPTIM1, ADC, PWR, CRC, CRYP
-  (AES-ECB/CBC/CTR/GCM/CCM), OTFDEC (real AES-128-CTR extflash decryption),
-  HASH, FLASH_R, TAMP, and the rest of the boot-path peripheral set.
-- LTDC: real per-layer compositing (correct layer order, pixel formats,
-  color key, window-clip, blend, dithering, per-layer CLUTs, real
-  reload/vblank timing).
-- DMA2D: real per-pixel fetch for every format firmware uses, real
-  blend/fixed-color modes.
-- JPEG: real polled output-register pipeline with correct chroma
-  subsampling.
-- Audio: confirmed solid across every core tested. Backend is the fork's
-  own `sdl3` audiodev (default on every host; WASAPI/CoreAudio/PipeWire).
-- Cross-platform: one rendering+audio stack (SDL_Renderer + sdl3
-  audiodev, no OpenGL requirement) verified live on Linux (Vulkan),
-  Windows (D3D11/software; VM-tested incl. sound) and macOS Intel
-  (Metal), plus Linux aarch64 (Raspberry Pi 4, verified running Celeste
-  under retro-go). Local Windows and aarch64 cross-builds via Docker
-  (aarch64 is a TRUE cross-compile now: ~1m45s vs ~50 min emulated) and
-  Mac-over-SSH
-  workflows in `docs/cross-platform-builds.md`; `start.bat` is the
-  Windows launch path.
+  (SPI-based), RTC, DMA, TIM1/TIM2/LPTIM1, ADC, PWR, CRC, CRYP, OTFDEC
+  (real AES-128-CTR extflash decryption), HASH, FLASH_R, TAMP, and the
+  rest of the boot-path peripheral set — index in
+  `docs/peripheral-coverage.md`.
+- LTDC (real per-layer compositing, reload/vblank timing, one publish per
+  guest frame), DMA2D (real per-pixel fetch and blend), JPEG (real polled
+  output-register pipeline).
+- Cross-platform: one rendering+audio stack (SDL_Renderer + the fork's
+  own `sdl3` audiodev, no OpenGL anywhere) verified live on Linux
+  (Vulkan), Windows (D3D11/software) and macOS Intel (Metal), plus Linux
+  aarch64 (Raspberry Pi 4, Celeste under retro-go). Audio is solid across
+  every core tested. Local Windows and aarch64 cross-builds via Docker
+  (aarch64 is a true cross-compile: ~1m45s vs ~50 min emulated) and a
+  Mac-over-SSH workflow — `docs/cross-platform-builds.md`. `start.bat` is
+  the Windows launch path.
 - Headless capture appliance for CI/test suites: truly windowless
-  `-display none`, virtual-clock timeline scripts (repeatable to the
-  byte), whole-session A/V recording, Docker packaging — see
-  `docs/headless-capture.md` and `contrib/docker-headless/`.
+  `-display none`, virtual-clock timeline scripts, whole-session A/V
+  recording, Docker packaging — `docs/headless-capture.md`.
+- GUI (`gwemu`): profile-centric ImGui front end — device profiles and
+  staged wizard, in-process CFW patching, in-process SD-card creation
+  from a content folder, and GDB-stub configuration (`sys.gdb.*`, applied
+  at runtime, loopback by default because the stub is unauthenticated
+  full guest-memory access).
+- Blank internal flash is a **supported state**: v7M Lockup halts and
+  re-resets the machine every 250ms instead of aborting the process, and
+  stands down under `RUN_STATE_DEBUG` so gnwmanager or GDB can load and
+  run a flash loader from RAM.
 
 ## Known issues (open)
 
 - **Black screen on retro-go's "quit to main menu", second cause still
-  open.** The DMA half is FIXED (2026-07-26: peripheral resets are now
-  modelled; 24/118 -> 0/119 across interleaved runs). A second,
-  independent bug with the same symptom remains: the CPU wedges in the
-  LTDC interrupt (exception 104 / IRQ 88) while DMA1 is clean and at its
-  reset value. Present in ~65% of non-storm runs on a slow host and
-  unaffected by the DMA fix. Prime suspect is the same class of bug one
-  bus over -- LTDC is on APB3 and `HAL_DeInit()` resets APB3RSTR bit 3
-  (LTDCRST), which we deliberately do not model yet: unverified, and an
-  LTDC reset would blank live display config, so it needs its own
-  measurement before being added.
-- Failure rates for this family of bug track HOST SPEED (idle Linux 3%,
+  open.** The DMA half is fixed (peripheral resets are modelled; 24/118
+  -> 0/119 across interleaved runs). A second, independent bug with the
+  same symptom remains: the CPU wedges in the LTDC interrupt (exception
+  104 / IRQ 88) while DMA1 is clean and at its reset value. Unaffected by
+  any of the render or reset work. Prime suspect is the same class of bug
+  one bus over — LTDC is on APB3 and `HAL_DeInit()` resets APB3RSTR bit 3
+  (LTDCRST), deliberately not modelled: unverified, and an LTDC reset
+  would blank live display config, so it needs its own measurement first.
+  Failure rates for this family of bug track HOST SPEED (idle Linux 3%,
   loaded Linux 17%, older Intel Mac 34%, Pi 4 worse still): the
   vulnerable window is a fixed number of guest instructions while
-  peripheral events are paced by wall time, so a slower host widens it.
-  Reproduce on a SLOW or loaded host; a fast x86 box will hide it.
-- Native Wayland disabled by default on Linux (x11/XWayland instead) --
+  peripheral events are paced by wall time. Reproduce on a slow or loaded
+  host; a fast x86 box will hide it.
+- **~5% windowed-vs-headless frame-rate gap on the Pi 4.** Not CPU
+  starvation — the vCPU thread sits at ~81% of one core with most of the
+  machine idle — and not present cost (18.6 ms/s). That leaves a
+  serialisation or scheduling effect: BQL hand-off or vblank timing.
+- **The SD Card tab has never been visually verified.** A view only draws
+  when its tab is selected, so its `Draw()` has not executed. Layout, the
+  attach-to-profile checkbox and the settings round-trip are unconfirmed.
+- **GUI behaviour on the Pi is unconfirmed.** The app starts, picks the
+  `opengl` SDL_Renderer and guest rendering is correct, but nobody has
+  confirmed what the window actually shows.
+- Native Wayland disabled by default on Linux (x11/XWayland instead) —
   three real breakages documented in `ui/gwemu.c`; revisit when SDL3's
-  Wayland fractional-scale handling stabilizes.
-- QEMU/TCG instruction-interpretation overhead means gameplay is not
-  perfectly real-time-matched to real hardware in every scenario; most of
-  the addressable overhead (per-pixel MMIO translation calls) has already
-  been batched away. Remaining gap is generic TCG cost, not a device-model
-  bug.
+  Wayland fractional-scale handling stabilises.
 - JPEG-streaming firmware paths (retro-go launcher coverflow; stock-side
-  zelda3/GB games) are bound by per-MMIO-access cost on every host (~2.3M
-  register reads/s; fps tracks that rate). Root cause measured
-  2026-07-25: QEMU forces an MMIO access to be its translation block's
-  last instruction, so each one takes `cpu_io_recompile()` and never
-  caches that -- 2.68M recompiles/s, ~60% of wall time. The polling is
-  AUTHENTIC (verified on the real device: no MDMA, codec at 22% duty).
-  Four approaches tried and rejected on measurement. Full analysis,
-  per-platform primitive costs, diagnostic env vars and measurement
-  pitfalls: `docs/emulation-performance.md`. Wine runs the Windows build
-  at ~0.1fps for a separate unresolved reason (GUI-thread yield storm).
-- SOLVED 2026-07-26: the in-game macOS/Windows deficit (worse than the
-  10-17% previously believed -- up to 45% once wall-clock lag is counted,
-  not just fps). Off Linux the main loop cannot wait less than 1ms:
-  qemu_poll_ns() only uses ns-resolution ppoll() under CONFIG_PPOLL,
-  which macOS/Windows lack, and the g_poll() fallback's timeout is
-  rounded UP. Gameplay is ~92% idle, so wakeup promptness sets the frame
-  rate. Celeste, five hosts: Win11 VM 20.0 -> 30.0fps, Win11 laptop
-  24.7 -> 30.0 and 53.7s -> 29.1s wall, macOS 27.1 -> 30.0; both Linux
-  hosts were already at Celeste's 30fps cap. Fixed: macOS via pselect(),
-  Windows via a high-resolution waitable timer added to the wait set.
-  `docs/emulation-performance.md`.
+  zelda3/GB games) are bound by per-MMIO-access cost on every host: QEMU
+  forces an MMIO access to end its translation block, so each takes
+  `cpu_io_recompile()` — ~60% of wall time. The polling is authentic
+  (verified on the real device); four fixes tried and rejected on
+  measurement (`docs/emulation-performance.md`).
 - Real subsampled chroma storage was traded for full-resolution internal
   storage in the JPEG model (a documented scope decision, not a bug).
 
 ## Now / next
 
-- Repo cleanup pass (docs, sibling-repo references, script portability,
-  automated first-run/SD-card setup) — done.
-- CI is up: `.github/workflows/build-check.yml` (Linux, every push/PR) and
-  `release.yml` (Linux/Mac-arm64/Mac-x86_64/Windows, tags + manual dispatch).
-  Confirmed green end-to-end via real test-tag runs, including two real
-  cross-platform bugs this surfaced and fixed (`timegm()`/MinGW,
-  `memory_region_init_ram_from_file()` being POSIX-only — Windows now gets
-  genuine persistent flash-image backing via `CreateFileMapping`, not a
-  silent ephemeral-RAM fallback).
-- GUI (`gwemu`, see `CLAUDE.md`'s "GUI" section): device-PROFILE-centric
-  restructure, Phases 1-2 landed 2026-07-24 (profile store, staged
-  wizard, in-process CFW patching, SD wiring). Remaining: Phase 3
-  (Profiles top-level tab, Flash/SD tab demotion, CLI-adopt toast).
-- `contrib/gnw-tools/`: C ports of the boot-image, CFW-patch and SD-image
-  builders; the CFW driver is a linkable library the GUI calls in-process.
-- Render path: framebuffer texture now uploaded only when the guest
-  redraws, and the GPU upload moved out of the BQL -- lock contention
-  from rendering 130ms/s -> 1.7ms/s (2026-07-25), landed alongside an
-  SAI output-queue latency cap (Windows backlog 1.5s -> 110ms).
-- NEXT: Raspberry Pi 4 performance. Celeste is already playable there
-  (30.0fps, 0 dropped frames) but the pinned core sits at only ~60%
-  busy, so the guest is not CPU-bound and there is headroom unaccounted
-  for. Real hardware sits at ~30% for the same workload.
+Raspberry Pi 4 render-path performance is done (system-wide CPU 199.7% ->
+129.3% of a core, renders/sec 118 -> 29 matching guest frame production
+1:1; `docs/emulation-performance.md`). Next, in rough order:
+
+- Get eyes on the GUI on a Pi and on the SD Card tab — both are the
+  unverified items above, and both are cheap to close.
+- The LTDC-side black screen: measure what APB3RSTR/LTDCRST actually does
+  on hardware before modelling it.
+- GUI profile restructure Phase 3: Profiles as a top-level tab,
+  Flash/SD tab demotion, CLI-adopt toast.
 
 ## Tooling notes worth keeping in mind
 
 - QEMU's gdbstub halts the whole VM (including peripheral input-event
   delivery) on client *connect*, and for any command besides memory
-  read/write. Reading peripheral state right after connecting can show
-  stale pre-input values.
-- `scripts/gdb_tap.py` (a logging GDB-RSP proxy) is the fastest way to see
-  what a real client is actually sending when debugging an integration
-  that talks to this QEMU over GDB RSP.
-- Temporary `fprintf(stderr, ...)` debug prints added directly to device
-  model source (rebuilt via `ninja qemu-system-arm`) are the fastest way to
-  see internal QEMU device state that guest-side gdb reads can't reach at
-  all — always remove them again once their diagnostic purpose is served.
-  BUT: per-event prints distort what they measure. One line per DMA half
-  (60/s) slowed a Windows guest 3x and produced a fabricated finding;
-  clock-reads-per-MMIO cost Linux 42% of its frame rate at 2.3M
-  accesses/s. Summarise once a second, gate per-event output behind `=2`,
-  and re-check any surprising result with the probe switched off.
+  read/write — state read right after connecting can be stale.
+  `scripts/gdb_tap.py` logs what a client is actually sending over RSP.
+- Temporary `fprintf(stderr, ...)` prints in device-model source reach
+  state guest-side gdb can't — but per-event prints distort what they
+  measure (one line per DMA half slowed a Windows guest 3x and produced a
+  fabricated finding). Summarise once a second, gate per-event output
+  behind `=2`, re-check with the probe off.
 - Guest-reported metrics (firmware fps counters, LTDC vblank counts, DMA
   tick rates) are derived from emulated time and read "correct" while the
-  game visibly crawls. Only wall-clock-anchored counters mean anything
-  for speed — see `GNW_UI_FRAME_TRACE`'s `GUESTFPS` and the env-var table
-  in `docs/emulation-performance.md`.
+  game visibly crawls. Only wall-clock-anchored counters mean anything.
+  Likewise a process-only CPU reading understates any render-path cost: a
+  third of the last saving was in the X server and window manager.
 - `gnwmanager`'s OpenOCD backend reads device memory without halting the
-  CPU (~3000 reads/s), which makes real-hardware peripheral duty cycles
-  directly comparable against the emulator. That is the fastest way to
-  settle "is this firmware behaviour or a modelling bug?".
+  CPU (~3000 reads/s), making real-hardware peripheral duty cycles
+  directly comparable — the fastest way to settle "is this firmware
+  behaviour or a modelling bug?".

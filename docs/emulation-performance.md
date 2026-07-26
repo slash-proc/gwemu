@@ -132,6 +132,59 @@ Two traps if you re-measure this:
 - **Celeste caps at 30 guest-fps**, so 30.0 is a ceiling, not a score.
   Linux hosts sit at it and cannot show improvement.
 
+## The render path: two publishes per guest frame (solved 2026-07-26)
+
+The observation that started this: a Pi 4 held Celeste's 30fps cap with
+only ~60% of one core busy, so the guest was not CPU-bound and the
+missing time was unaccounted for. It was not in the guest at all -- it
+was in the host render path, and it was two separate bugs.
+
+**The device published every frame twice.** Stock firmware writes SRCR
+twice per frame, a few microseconds apart: `SRCR.IMR` then `SRCR.VBR`.
+`HAL_LTDC_SetAddress()` does the immediate reload, so `L1CFBAR` is
+already flipped by the time the vblank reload request arrives and the
+shadow registers are byte-identical to the set the IMR reload just
+committed. Real silicon latches nothing on that second reload. The model
+treated each reload as a frame boundary, so every guest frame cost two
+full 320x240 composites, two surface blits and two `dpy_gfx_update()`
+calls for two bit-identical images -- traced on Super Mario World as 944
+IMR + 941 deferred captures for ~870 guest frames over 29s. The IMR
+capture is now skipped when a VBR reload has arrived since the previous
+IMR and nothing structural changed.
+
+**The host render loop was free-running.** Nothing paced it but the
+blocking vsync inside `SDL_RenderPresent()`, and `m_fb_dirty` was set on
+every vblank pump because the display listener registered no
+`dpy_gfx_update` op -- so the flag meant "we pumped the device", not
+"the guest drew". The op is wired up now and rendering is gated on new
+content, with a 60Hz ceiling while the UI is busy and a 10Hz heartbeat
+otherwise so time-driven HUD animations still advance. Input activity
+raises the floor but never removes the ceiling: treating recent input as
+"render freely" reinstates the whole bug the moment a direction key is
+held, since SDL key-repeat keeps the activity window fresh.
+
+Raspberry Pi 4 (4-core aarch64 @ 1.8GHz), Super Mario World attract
+demo, windowed, interleaved A/B:
+
+| | before | after |
+|---|---|---|
+| GUESTFPS | 26.28 | 28.45 |
+| renders/sec | 118.0 | 29.0 |
+| texture uploads/sec | 59.7 | 29.0 |
+| `SDL_RenderPresent` | 715.8 ms/s | 18.6 ms/s |
+| process CPU | 157.8% | 118.7% of a core |
+| X server + WM CPU | 41.8% | 10.6% of a core |
+| **system-wide CPU** | **199.7%** | **129.3%** of a core |
+
+Renders/sec now matches device publishes 1:1. Headless is unregressed
+and still holds the 30fps cap (29.77 -> 29.83).
+
+A ~5% windowed/headless frame-rate gap remains on the Pi. It is **not**
+CPU starvation -- the vCPU thread sits at ~81% of one core with most of
+the machine idle -- and it is not present cost, which is now 18.6ms/s.
+That leaves a serialisation or scheduling effect (BQL hand-off or
+vblank timing) and it needs its own investigation.
+
 ## Comparing against real hardware
 
 The device is the arbiter for "is this firmware behaviour or a
@@ -184,6 +237,13 @@ investigation. They are listed in the order they cost the most time.
   (the compositor withholds swapchain images), so the whole render loop
   drops to 1 iteration/sec. Check `UI trace` present times before
   trusting anything measured with a window up.
+- **A process-only CPU measurement understates a render-path cost.**
+  Fixing the double-publish above saved 70 points of system-wide CPU on
+  the Pi, but only 39 of them were inside the QEMU process -- the rest
+  was the X server and window manager doing work our extra presents
+  asked for. Reading `top` on the emulator alone reported little more
+  than half the real saving. Measure the whole system for anything that
+  crosses into the display server.
 - **Concurrent load.** A `ninja -j12` in the background invalidates any
   listening test and any fps measurement on the same box.
 - **Disk.** The frame recorder writes 36MB/s at 30fps. Filling the disk
@@ -232,7 +292,7 @@ guest-seconds, so 29s == realtime:
 |---|---|---|---|
 | Linux laptop (Ryzen AI 7 350) | 30.0 | 29s | at Celeste's 30fps cap |
 | Linux hypervisor (7800X3D) | 30.0 | 29s | at cap |
-| Linux Pi 4 (aarch64) | 29.9 | 29s | at cap; ~60% of one core busy |
+| Linux Pi 4 (aarch64) | 29.9 | 29s | at cap headless; the "~60% of one core busy" reading here started the render-path investigation above |
 | macOS (i5-10210U) | 27.1 -> **30.0** | 29s | fixed by `pselect` |
 | Win11 VM (on that 7800X3D) | 20.0 -> **30.0** | 29s | drops frames, holds realtime |
 | Win11 laptop (i7-6820HK) | 24.7 -> **30.0** | 53.7 -> **29.1s** | also lags the clock |

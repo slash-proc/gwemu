@@ -21,9 +21,11 @@ NV2A GPU behavior instead of a slow stand-in.
 ## Decisions
 
 - **GPU accel scope**: both a native DMA2D device model (real semantics, no
-  fault-trap overhead) *and* a GPU-backed display output path (host OpenGL
-  texture upload for the framebuffer) — emulate real hardware precisely,
-  but push pixel work onto the host efficiently, same as xemu.
+  fault-trap overhead) *and* a hardware-accelerated display output path
+  (framebuffer as a host texture) — emulate real hardware precisely, but
+  push pixel work onto the host efficiently, same as xemu. Revised
+  2026-07-23: that path is SDL_Renderer, not OpenGL, and OpenGL is no
+  longer a dependency anywhere in this project (see Phase 3).
 - **SoC completeness**: broad, not minimal. Real memory map, flash/QSPI XIP
   boot path, and enough of the RCC/clock tree that unmodified retro-go
   firmware images can eventually boot the way they do on real hardware —
@@ -86,12 +88,31 @@ soft ordering, not a strict gate.
 - Test against minicraft-gnw's real `src/dma2d.c`, comparing rendered
   output to the known-good MPS2+fault-trap output as a regression baseline.
 
-### Phase 3 — GPU-accelerated display output
-- Upload the DMA2D-produced framebuffer as a texture via QEMU's existing
-  GL-backed UI backends (`-display sdl,gl=on` / `gtk,gl=on`) instead of a
-  software blit — additive on top of Phase 2, not blocking it.
-- Decide whether the pygame `gnw_qemu_viewer.py` bridge is still needed once
-  the framebuffer is a native QEMU display device (likely not).
+### Phase 3 — Efficient display output (no OpenGL)
+- **Superseded in scope, not in goal.** The original plan was a GL-backed
+  texture upload via `-display sdl,gl=on` / `gtk,gl=on`. That is dead: the
+  hard OpenGL requirement was removed after a real "Unable to create
+  OpenGL context" failure on Windows, and the `gwemu` GUI now renders
+  through SDL_Renderer (D3D11/Metal/Vulkan per platform, software
+  fallback) with ImGui's `imgui_impl_sdlrenderer3` backend. Don't
+  reintroduce GL calls, GL context creation or epoxy into `ui/` — see
+  `CLAUDE.md`. The goal that survives is the one GL was only ever a means
+  to: get the framebuffer to the screen without the host render path
+  costing more than the emulation.
+- **Largely delivered** (2026-07-25/26): the framebuffer texture is
+  uploaded only when the guest actually redraws, the upload moved out of
+  the BQL (rendering's lock contention 130ms/s -> 1.7ms/s), the LTDC
+  model stopped treating firmware's second `SRCR` reload as a frame
+  boundary, and the host render loop is content-gated instead of
+  free-running. Measured on a Raspberry Pi 4: system-wide CPU 199.7% ->
+  129.3% of a core, renders/sec 118 -> 29 (1:1 with guest frame
+  production), `SDL_RenderPresent` 715.8 -> 18.6 ms/s. Details and the
+  measurement pitfalls in `docs/emulation-performance.md`.
+- Remaining: a ~5% windowed-vs-headless frame-rate gap on the Pi, now
+  characterised as a serialisation/scheduling effect (BQL hand-off or
+  vblank timing) rather than CPU starvation.
+- The pygame `gnw_qemu_viewer.py` bridge is gone — the framebuffer is a
+  native QEMU display device and `-display gwemu` is the GUI backend.
 
 ### Phase 4 — Remaining peripherals for real-firmware boot
 - GPIO (buttons), UART/USART, SysTick, and whatever else real firmware
@@ -113,7 +134,10 @@ soft ordering, not a strict gate.
   (`backup_init`/`audio_init`/`input_init`/`screen_init`).
 - Phase 2: visually compare rendered title/about screens against the
   existing MPS2+fault-trap harness's known-good output.
-- Phase 3: confirm GL-backed display renders identical frames, measure
-  frame-time improvement vs Phase 2's software path.
+- Phase 3: confirm the SDL_Renderer path shows frames identical to the
+  software blit, and measure host-side cost — renders/sec against guest
+  frame production, present time, and **system-wide** CPU, not the
+  emulator process alone (a process-only view understated the last
+  render-path saving by more than half).
 - Ongoing: keep minicraft-gnw's MPS2 fault-trap harness working and
   untouched as the regression baseline throughout.
