@@ -6,6 +6,7 @@ gnw_gui_ss.add(files(
   'flash-backups.cc',
   'flash-storage-view.cc',
   'font-manager.cc',
+  'gdb-view.cc',
   'gl-helpers.cc',
   'input-manager.cc',
   'main-menu.cc',

@@ -46,6 +46,7 @@ void gnw_h7b0_rtc_set_sync_host(bool sync_host);
 #include "scene.hh"
 #include "scene-manager.hh"
 #include "main-menu.hh"
+#include "gdb-view.hh"
 #include "popup-menu.hh"
 #include "notifications.hh"
 #include "monitor.hh"
@@ -172,6 +173,7 @@ void gwemu_hud_init(SDL_Window* window, SDL_Renderer* renderer)
         g_config.general.show_welcome = false;
     }
     gnw_h7b0_rtc_set_sync_host(g_config.sys.rtc_sync_host);
+    ApplyGdbSettingsAtStartup();
 }
 
 void gwemu_hud_cleanup(void)
@@ -224,6 +226,7 @@ void gwemu_hud_update(void)
     ImGuiIO& io = ImGui::GetIO();
     uint32_t now = SDL_GetTicks();
 
+    GdbSettingsTick();
     g_viewport_mgr.Update();
     g_font_mgr.Update();
     if (g_last_scale != g_viewport_mgr.m_scale) {

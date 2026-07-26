@@ -9,6 +9,7 @@
 #include "font-manager.hh"
 #include "widgets.hh"
 #include "monitor.hh"
+#include "gdb-view.hh"
 #include "../gwemu-gnw-input.h"
 #include "gwemu-hud.h"
 extern "C" {
@@ -102,6 +103,9 @@ void MainMenuSystemView::Draw()
             monitor_window.is_open = false;
         }
     }
+
+    ImGui::Spacing();
+    DrawGdbSettings();
 }
 
 void MainMenuAboutView::Draw()

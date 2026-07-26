@@ -1,3 +1,13 @@
+2026-07-26  GUI: GDB stub settings (System tab). Enable/disable, listen
+            address and port, persisted as sys.gdb.* and applied at
+            runtime via gdbserver_start() -- "none" is the supported
+            teardown (it destroys the socket chardev), so the toggle
+            takes effect immediately with no restart and no leaked
+            listener. Startup application is deferred to the first HUD
+            frame with a CPU, since the HUD initialises before machine
+            init. Address defaults to loopback: the stub is
+            unauthenticated full guest-memory access.
+
 2026-07-26  RCC/DMA/SAI1: model peripheral resets, eliminating the DMA
             half of the retro-go quit-to-main-menu black screen. The
             2026-07-26 entry below reduced it 9.1% -> 3.0% but could

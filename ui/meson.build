@@ -38,6 +38,7 @@ if sdl3.found()
     'gwemu-input.c',
     'gwemu-gnw-input.c',
     'gwemu-monitor.c',
+    'gwemu-gdbstub.c',
     'gwemu-data.c',
     'gwemu-settings.cc',
     'gwemu-profiles.cc',

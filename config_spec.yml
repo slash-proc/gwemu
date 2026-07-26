@@ -361,6 +361,20 @@ sys:
   rtc_sync_host:
     type: bool
     default: true
+  # QEMU gdbstub (see ui/gwemu-gdbstub.c). Generated fields:
+  # g_config.sys.gdb.{enable,address,port}. Loopback by default -- the
+  # stub grants unauthenticated full guest memory read/write to anyone
+  # who can reach the port.
+  gdb:
+    enable:
+      type: bool
+      default: false
+    address:
+      type: string
+      default: 127.0.0.1
+    port:
+      type: integer
+      default: 1234
   avpack:
     type: enum
     values: [scart, hdtv, vga, rfu, svideo, composite, none]
