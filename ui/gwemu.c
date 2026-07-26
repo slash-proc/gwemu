@@ -756,25 +756,52 @@ static void mouse_define(DisplayChangeListener *dcl,
  * every other display backend in this tree).
  */
 /*
- * Set whenever the guest surface can have changed -- i.e. right after
- * graphic_hw_update() in process_vblank(), which is the ONLY thing that
- * redraws it (no dpy_gfx_update op is registered). Consumed by
- * gl_render_frame, which otherwise reuses the texture it already has.
+ * Set when the guest surface has ACTUALLY changed: driven by the
+ * dpy_gfx_update DisplayChangeListener op (gl_update below), which the
+ * LTDC model only issues from gnw_h7b0_ltdc_update_display() when the
+ * compositor has published a genuinely new frame. Consumed by
+ * gl_render_frame, which otherwise reuses the texture it already has,
+ * and by the main loop's content gate, which otherwise doesn't render
+ * at all.
  *
- * This is the FIXME below ("Don't upload if notdirty"). It matters more
- * than it looks: the upload holds the BQL, and the render loop runs at
- * the host refresh rate (120/s on a 120Hz panel) while the guest panel
- * is ~59Hz, so we were re-uploading a 1.2MB texture roughly twice per
- * actual new frame. Measured cost before this change: 130ms of BQL held
- * per second (13% of wall time) that the vCPU and every device timer
- * were contending for -- audible as periodic audio rips that vanish the
- * moment the window is hidden and rendering stops.
+ * It used to be set unconditionally after every graphic_hw_update() in
+ * process_vblank() -- i.e. once per 60Hz vblank pump regardless of
+ * whether the guest had drawn anything. That is why a 30fps guest still
+ * produced 60 texture uploads per second (field-measured on a Pi 400):
+ * the flag was a "we asked" signal, not a "there is new content" signal.
+ * Registering the real dpy_gfx_update op makes it the latter.
+ *
+ * This matters more than it looks: the staging half of the upload holds
+ * the BQL, which the vCPU and every device timer contend for -- audible
+ * as periodic audio rips that vanish the moment the window is hidden and
+ * rendering stops.
  */
 static int m_fb_dirty = 1;
+/* Count of dpy_gfx_update calls, i.e. frames the device published --
+ * reported once per second by GNW_UI_FRAME_TRACE. Distinguishing this
+ * from the render rate is what separates "the device is publishing each
+ * frame twice" from "the UI is spinning"; they look identical from the
+ * outside. */
+static int m_fb_dirty_sets;
 static void *m_fb_stage;
 static size_t m_fb_stage_size;
 static size_t m_fb_stage_stride;
 
+/*
+ * Stages the guest surface for upload under the caller's BQL.
+ *
+ * There used to be a memcmp against the previously staged bytes here, to
+ * drop byte-identical republishes: the LTDC model published every guest
+ * frame twice (the SRCR.IMR capture and the SRCR.VBR capture of the same
+ * frame, whose shadow registers are already identical), so a 30fps guest
+ * drove ~45 dpy_gfx_update calls and ~45 HUD rebuilds per second. That
+ * was a workaround at the UI boundary for a device-model bug, and the
+ * bug is fixed device-side now (gnw_h7b0_ltdc.c gates the IMR capture
+ * when a non-structural VBR reload already covered it) -- publishes now
+ * match the guest frame rate exactly. Don't reintroduce the compare: it
+ * would be a full-surface scan on ~95% of frames to catch ~5%, and it
+ * costs BQL time the vCPU and every device timer contend for.
+ */
 static SDL_Texture *gwemu_update_fb_texture(DisplaySurface *surface)
 {
     SDL_PixelFormat fmt;
@@ -868,6 +895,21 @@ static void gl_switch(DisplayChangeListener *dcl,
 {
     struct gwemu_console *scon = container_of(dcl, struct gwemu_console, dcl);
     scon->surface = new_surface;
+    /* New surface => the cached texture is stale/wrong-sized, and the
+     * content gate must let the next frame through. */
+    qatomic_set(&m_fb_dirty, 1);
+}
+
+/*
+ * The real "guest drew something" signal. Called (under the BQL) from
+ * dpy_gfx_update(), i.e. from the LTDC model's update_display once the
+ * compositor thread has published a new frame -- NOT once per vblank
+ * pump. See the m_fb_dirty comment above.
+ */
+static void gl_update(DisplayChangeListener *dcl, int x, int y, int w, int h)
+{
+    qatomic_set(&m_fb_dirty, 1);
+    qatomic_inc(&m_fb_dirty_sets);
 }
 
 static float update_avg(float avg, float ms, float r) {
@@ -907,8 +949,9 @@ static void process_vblank(struct gwemu_console *scon)
     last_ns = now_ns;
 #endif
 
+    /* Pumps the display device; m_fb_dirty is set from gl_update() only
+     * if this actually produced a new frame. */
     graphic_hw_update(scon->dcl.con);
-    qatomic_set(&m_fb_dirty, 1);
 }
 
 static void vblank_timer_callback(void *opaque)
@@ -932,7 +975,14 @@ static void *vblank_timer_thread(void *opaque)
         // Wait until deadline
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
         if (now < next_vblank) {
-            SDL_DelayPrecise(next_vblank - now);
+            /* SDL_DelayPrecise() busy-spins the tail of the wait to hit
+             * sub-microsecond accuracy. This thread only pumps
+             * graphic_hw_update() -- nothing downstream cares about
+             * jitter of a few hundred microseconds, and the absolute
+             * deadline below corrects any drift -- so the spin was pure
+             * CPU burn (measured ~9-10% of a core on a Pi 400).
+             * SDL_DelayNS() is a plain nanosleep. */
+            SDL_DelayNS(next_vblank - now);
         } else if (now > next_vblank + vblank_interval_ns) {
             // We've fallen behind by more than one frame, reset to avoid
             // rapid-fire catch-up
@@ -1006,10 +1056,17 @@ static struct {
     uint64_t settings_present_ns, settings_present_max_ns;
     uint32_t main_rendered, main_skipped;
     uint32_t iters;
+    uint32_t idle_skipped;
     uint32_t throttle_retries;
     uint64_t fb_wait_ns, fb_held_ns, hud_held_ns;
     uint32_t fb_uploads;
     uint64_t last_report;
+    /* Content-gate attribution: which condition admitted each frame, and
+     * (via m_fb_dirty_sets) how many device publishes arrived. Kept (not
+     * scratch instrumentation) because "renders > guest frames" is
+     * otherwise indistinguishable from "the UI is spinning", and telling
+     * those apart took a full diagnosis session. */
+    uint32_t gate_content, gate_probe, gate_active, gate_heartbeat;
 } ui_trace;
 
 /* Adaptive present-stall throttle (self-clocking; needed because some
@@ -1041,6 +1098,74 @@ static struct {
 /* Set from poll_events when a visibility-suggesting event hits the main
  * window; consumed (cleared) by gl_render_frame to exit throttled mode. */
 static bool m_main_window_resume_evt;
+
+/*
+ * Content gate (the reason the render loop no longer free-runs).
+ *
+ * The main loop is `while (!exiting) { poll_events(); gl_render_frame(); }`
+ * with nothing pacing it but the blocking vsync inside the main window's
+ * SDL_RenderPresent. That means the GUI rendered and presented at the
+ * HOST refresh rate -- field-measured 117-121/s on a Pi 400 and 119.7/s
+ * here -- for a guest producing 30 (Celeste) to 60 frames per second.
+ * Up to 4x redundant presents, each one a full HUD rebuild plus a
+ * present that costs real CPU on a GLES/vulkan driver that busy-waits
+ * for the swap.
+ *
+ * So: render only when there is something new to show. "Something new"
+ * deliberately is NOT "a fixed 30Hz cap" -- that would make the menus
+ * feel awful. It is the union of:
+ *
+ *   - a new guest frame (m_fb_dirty, now a real dpy_gfx_update signal),
+ *   - the settings window being visible (it is the interactive surface
+ *     and always renders at full rate),
+ *   - recent input/window activity (any SDL event refreshes a linger
+ *     window, so drags, scrolls, hovers and scene transitions stay
+ *     smooth for LINGER after the last event),
+ *   - ImGui reporting that it wants the keyboard or mouse (a menu is
+ *     open/hovered), and
+ *   - a 10Hz idle heartbeat, so time-driven HUD animations (the
+ *     menubar's 5s auto-hide fade in particular) still advance even
+ *     with a completely idle guest and no input at all.
+ *
+ * Note what the last three are and are NOT: they raise the FLOOR, they
+ * do not remove the ceiling. "UI is busy" renders at up to 60Hz, not at
+ * whatever the host panel runs at. Letting activity mean "render freely"
+ * would have quietly reinstated the whole bug the moment a user held a
+ * key down, because SDL key-repeat would keep the activity window fresh
+ * for the entire time they were playing. (The timeline harness injects
+ * input on the guest side, so a scripted benchmark would never have
+ * caught that -- only a human holding a direction key would.)
+ *
+ * When nothing is due, the loop sleeps 2ms and skips the frame entirely
+ * -- it keeps polling events, so input latency is bounded by that 2ms,
+ * not by the gate.
+ *
+ * This composes with (rather than duplicating) the occluded-window
+ * throttle below: the gate runs first and is a superset -- a throttle
+ * probe is explicitly allowed through it so the 5s failsafe still fires.
+ *
+ * This used to be followed by a second, content-based subtraction (a
+ * memcmp of the staged framebuffer, dropping byte-identical republishes)
+ * because the LTDC model published every guest frame twice. That is
+ * fixed in the device model now -- see gwemu_update_fb_texture() -- so
+ * one device publish means one genuinely new frame and the gate's
+ * "content" arm needs no second opinion.
+ */
+#define GNW_UI_ACTIVITY_LINGER_NS   400000000ull   /* 400 ms */
+#define GNW_UI_ACTIVE_INTERVAL_NS    16666666ull   /*  60 Hz */
+#define GNW_UI_IDLE_HEARTBEAT_NS    100000000ull   /*  10 Hz */
+#define GNW_UI_IDLE_SLEEP_NS          2000000ull   /*   2 ms */
+/* Refreshed by poll_events()/event_watch_callback() on any SDL event. */
+static uint64_t m_ui_activity_until_ns;
+/* When gl_render_frame last drew. Every frame the gate admits now goes
+ * on to actually render, so stamping it at admission time is the same
+ * thing as stamping it at draw time. */
+static uint64_t m_ui_last_frame_ns;
+
+static void gwemu_ui_note_activity(void)
+{
+    m_ui_activity_until_ns = SDL_GetTicksNS() + GNW_UI_ACTIVITY_LINGER_NS;
+}
 
 static void gl_render_frame(struct gwemu_console *scon)
 {
@@ -1088,6 +1213,53 @@ static void gl_render_frame(struct gwemu_console *scon)
     bool skip_main = settings_visible &&
         (main_occluded || (ui_throttle.throttled && !throttle_retry));
 
+    /*
+     * Content gate -- see the block comment above GNW_UI_ACTIVITY_LINGER_NS.
+     * Runs before any rendering, including the settings window's -- a
+     * visible settings window counts as UI-busy, so it renders at the
+     * 60Hz active rate and still presents FIRST when it does.
+     */
+    {
+        bool dirty_now = qatomic_read(&m_fb_dirty);
+        bool ui_busy = settings_visible ||
+            frame_now < m_ui_activity_until_ns;
+        if (!ui_busy) {
+            /* A menu open/hovered under the cursor wants continuous
+             * redraw even with no event traffic. Two atomic bool reads
+             * off ImGuiIO -- cheap enough to evaluate every iteration. */
+            int kbd = 0, mouse = 0;
+            gwemu_hud_should_capture_kbd_mouse(&kbd, &mouse);
+            ui_busy = kbd || mouse;
+        }
+        bool interval_due = frame_now - m_ui_last_frame_ns >=
+            (ui_busy ? GNW_UI_ACTIVE_INTERVAL_NS
+                     : GNW_UI_IDLE_HEARTBEAT_NS);
+        bool due = throttle_retry || dirty_now || interval_due;
+        if (trace && due) {
+            if (throttle_retry) {
+                ui_trace.gate_probe++;
+            } else if (dirty_now) {
+                ui_trace.gate_content++;
+            } else if (ui_busy) {
+                ui_trace.gate_active++;
+            } else {
+                ui_trace.gate_heartbeat++;
+            }
+        }
+        if (!due) {
+            if (trace) {
+                ui_trace.iters++;
+                ui_trace.idle_skipped++;
+            }
+            /* Nothing pacing the loop now that we're not presenting --
+             * sleep, but short enough that input latency is unaffected. */
+            SDL_DelayNS(GNW_UI_IDLE_SLEEP_NS);
+            qatomic_set(&rendering, false);
+            return;
+        }
+        m_ui_last_frame_ns = frame_now;
+    }
+
     gwemu_main_loop_lock();
     gwemu_settings_hud_update();
     gwemu_main_loop_unlock();
@@ -1122,7 +1294,7 @@ static void gl_render_frame(struct gwemu_console *scon)
                     "UI trace: main present %.1fms sum/%.1fms max, "
                     "settings present %.1fms sum/%.1fms max, "
                     "occluded flag=%d evt=%d, main rendered=%u skipped=%u, "
-                    "throttled=%d retries=%u iters=%u, "
+                    "throttled=%d retries=%u iters=%u idle=%u, "
                     "fb wait=%.1fms held=%.1fms uploads=%u, hud=%.1fms\n",
                     ui_trace.main_present_ns / 1e6,
                     ui_trace.main_present_max_ns / 1e6,
@@ -1132,9 +1304,15 @@ static void gl_render_frame(struct gwemu_console *scon)
                     m_main_window_occluded,
                     ui_trace.main_rendered, ui_trace.main_skipped,
                     ui_throttle.throttled, ui_trace.throttle_retries,
-                    ui_trace.iters,
+                    ui_trace.iters, ui_trace.idle_skipped,
                     ui_trace.fb_wait_ns / 1e6, ui_trace.fb_held_ns / 1e6,
                     ui_trace.fb_uploads, ui_trace.hud_held_ns / 1e6);
+            fprintf(stderr,
+                    "UI gate: publishes=%d, admitted by "
+                    "content=%u probe=%u active=%u heartbeat=%u\n",
+                    qatomic_xchg(&m_fb_dirty_sets, 0),
+                    ui_trace.gate_content, ui_trace.gate_probe,
+                    ui_trace.gate_active, ui_trace.gate_heartbeat);
             memset(&ui_trace, 0, sizeof(ui_trace));
             ui_trace.last_report = now;
         }
@@ -1258,6 +1436,10 @@ static bool event_watch_callback(void *userdata, SDL_Event *event)
 
     if (event->type == SDL_EVENT_WINDOW_EXPOSED ||
         event->type == SDL_EVENT_WINDOW_RESIZED) {
+        /* This path exists precisely because SDL_PollEvent can block for
+         * the duration of a resize/drag -- it must never be content-gated
+         * away, so mark activity before rendering. */
+        gwemu_ui_note_activity();
         gl_render_frame(scon);
     }
 
@@ -1273,6 +1455,9 @@ static void poll_events(struct gwemu_console *scon)
     gwemu_hud_should_capture_kbd_mouse(&kbd, &mouse);
 
     while (SDL_PollEvent(ev)) {
+        /* Any event at all -- input, window, controller -- counts as UI
+         * activity for the content gate in gl_render_frame(). */
+        gwemu_ui_note_activity();
 
         if (m_settings_window && get_window_id_from_event(ev) == SDL_GetWindowID(m_settings_window)) {
             gwemu_settings_hud_process_sdl_events(ev);
@@ -1720,6 +1905,7 @@ static void display_early_init(DisplayOptions *o)
 static const DisplayChangeListenerOps dcl_gl_ops = {
     .dpy_name                = "gwemu",
     .dpy_gfx_switch          = gl_switch,
+    .dpy_gfx_update          = gl_update,
     .dpy_gfx_check_format    = xb_console_gl_check_format,
     .dpy_mouse_set           = mouse_warp,
     .dpy_cursor_define       = mouse_define,

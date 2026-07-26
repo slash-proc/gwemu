@@ -1,3 +1,68 @@
+2026-07-26  ltdc: publish once per guest frame, not twice. Stock firmware
+            swaps buffers with two SRCR writes ~5us apart -- SRCR=IMR
+            (HAL_LTDC_SetAddress's immediate reload, which already flips
+            L1CFBAR to the other buffer) then SRCR=VBR -- and the model
+            captured, composited, blitted and dpy_gfx_update()'d on both,
+            for two bit-identical images. Traced on a 29s Super Mario
+            World run: 1876 captures for ~870 guest frames, 46 device
+            publishes/s against a 30fps guest. On real hardware the
+            second reload latches nothing (the shadow registers are
+            unchanged since the immediate one) and the panel keeps
+            scanning out one image, so this was a modelling artifact, not
+            two real frames. The IMR path now skips its capture when a
+            VBR reload has arrived since the previous IMR (i.e. this
+            firmware is VBR-paced, so the VBR write microseconds later
+            will capture the same configuration) and the reload isn't
+            structural; guests that double-buffer with IMR alone, and the
+            HAL's format/geometry reloads, are unaffected. Measured, 3
+            runs each: captures 1870-1876 -> 949-966, device blits/s
+            46.3-47.6 -> 30.3, publishes/s 44.6-45.8 -> 30.5-30.7 (the
+            guest rate exactly). GUESTFPS unchanged at 29.98 windowed
+            and headless. This also retires an earlier UI-side workaround
+            for the same bug -- gwemu_update_fb_texture used to memcmp
+            the guest surface against the bytes already staged and drop
+            byte-identical republishes; with the device publishing once
+            per frame its hit rate collapsed from 15.7-16.7/s to 1.6/s,
+            i.e. a full-surface compare under the BQL on ~95% of frames
+            to catch ~5%, so it is gone. The per-second "UI gate:" trace
+            line stays (publishes and admission reason), minus its dup
+            field. Validated together with the content gate below on a
+            Pi 400 (Super Mario World attract demo under retro-go,
+            interleaved A/B against the tip of the branch, 7 valid
+            "before" and 4 valid "after" windowed runs, 4+4 headless):
+            windowed GUESTFPS 26.28 [25.72-27.08] -> 28.45 [28.34-28.62],
+            renders/s 118.0 -> 29.0, texture uploads/s 59.7 -> 29.0,
+            SDL_RenderPresent 716ms/s -> 19ms/s, HUD 33ms/s -> 8ms/s, and
+            CPU 157.8% -> 118.7% in-process plus Xorg 31.1% -> 8.1% and
+            the window manager 10.7% -> 2.5%, i.e. 199.7% -> 129.3% of a
+            core system-wide. Headless is unregressed at the 30fps cap
+            (GUESTFPS 29.77 -> 29.83, 106.2% -> 100.7%). retro-go's own
+            menu and its modal dialog were confirmed to still render
+            correctly -- neither takes the new IMR path.
+
+2026-07-26  GUI: render only when there is something new to show. The
+            render loop was free-running at the host refresh rate
+            (measured 119.7 presents/s here, 117-121/s on a Pi 400) for a
+            guest producing 30-60 frames/s, and m_fb_dirty was set once
+            per 60Hz vblank pump rather than per actual guest frame, so a
+            30fps guest still did 60 texture uploads/s. Two fixes: the
+            dcl now registers a real dpy_gfx_update op, so the dirty flag
+            means "the LTDC published a new frame"; and a content gate in
+            gl_render_frame renders only on new guest content, with a
+            60Hz ceiling while the UI is busy (settings window visible,
+            input within the last 400ms, or ImGui wanting kbd/mouse) and
+            a 10Hz heartbeat otherwise so time-driven HUD animations
+            still advance. It composes with the occluded-window throttle
+            (probes bypass the gate). Windowed: 119.7 -> 60.1 presents/s
+            and 985ms -> 3.9ms/s spent inside SDL_RenderPresent, with
+            guest fps and timeline wall time unchanged. The vblank pump
+            thread also stopped using SDL_DelayPrecise, whose busy-spin
+            tail bought accuracy nothing downstream needs. Headless
+            unchanged (45.02s wall, 59.6 GUESTFPS, 3 runs). On a Pi 400
+            this is the larger half of the combined saving above: nearly
+            all of the 697ms/s of SDL_RenderPresent and of the 23-point
+            Xorg drop comes from no longer presenting 118 times a second.
+
 2026-07-26  GUI: GDB stub settings (System tab). Enable/disable, listen
             address and port, persisted as sys.gdb.* and applied at
             runtime via gdbserver_start() -- "none" is the supported

@@ -1909,6 +1909,22 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
              * latch or a timeout).
              */
             bool composition_changed = gnw_h7b0_ltdc_reload_is_composition_change(s);
+            /*
+             * True when a SRCR.VBR reload has happened since the *last*
+             * IMR reload -- vbr_active is set only by the VBR path below
+             * and cleared unconditionally three lines down, so reading it
+             * here is exactly that predicate, and needs no extra state.
+             *
+             * That is the signature of the IMR-then-VBR frame-swap
+             * sequence stock firmware uses (traced on Super Mario World:
+             * SRCR=IMR then SRCR=VBR ~5us later, once per guest frame,
+             * with L1CFBAR already flipped to the other buffer at the
+             * IMR write) -- HAL_LTDC_SetAddress() does an immediate
+             * reload, and the vblank reload request follows. See the
+             * capture comment below for why it matters.
+             */
+            bool vbr_paced = s->vbr_active;
+            bool structural = gnw_h7b0_ltdc_reload_is_structural_change(s);
             s->vbr_active = false;
             gnw_h7b0_ltdc_reload_active(s);
             s->regs[GNW_H7B0_LTDC_ISR >> 2] |= LTDC_ISR_RRIF;
@@ -1943,7 +1959,37 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
              * IMR-triggered geometry/format change is exactly the kind
              * of update that must not silently get lost.
              */
-            if (composition_changed || s->content_dirty) {
+            /*
+             * Also skip it when this immediate reload is just the first
+             * half of a VBR-paced frame swap (vbr_paced, and nothing
+             * structural changed -- i.e. at most a framebuffer-address
+             * flip and friends): the SRCR.VBR write that follows a few
+             * microseconds later captures the very same active
+             * configuration, so capturing here as well composited and
+             * published every guest frame twice. Measured on stock Super
+             * Mario World: 944 "imr" + 941 "deferred" captures for ~870
+             * guest frames over 29s, i.e. two full 320x240 composites,
+             * two surface blits and two dpy_gfx_update() calls per frame
+             * for two bit-identical images -- which is also what drove
+             * the host UI to render at ~45Hz for a 30fps guest.
+             *
+             * Real hardware does not show two frames here either: the
+             * shadow registers are unchanged between the immediate
+             * reload and the vblank reload, so the second reload latches
+             * nothing new and the panel keeps scanning out one image.
+             * RM0455's SRCR description says only that a reload copies
+             * the shadow registers; it is silent on a reload that copies
+             * identical values, and there is nothing in it that would
+             * make the second one visible.
+             *
+             * Deliberately gated on vbr_paced rather than "address-only
+             * change", so a guest that double-buffers with IMR reloads
+             * *alone* (no VBR at all) keeps capturing here exactly as
+             * before -- vbr_active can only be true if a VBR reload
+             * really did arrive since the previous IMR.
+             */
+            if ((composition_changed || s->content_dirty) &&
+                !(vbr_paced && !structural)) {
                 if (gnw_h7b0_ltdc_capture_if_enabled(s)) {
                     GNW_LTDC_TRACE_CAP(s, "imr");
                 } else {
@@ -2015,6 +2061,36 @@ static void gnw_h7b0_ltdc_write(void *opaque, hwaddr addr,
              * thread was still busy with a previous frame (see
              * gnw_h7b0_ltdc_capture_if_enabled()'s doc comment) -- not just
              * when content_dirty was already true. */
+            /*
+             * ...but not when this VBR reload has nothing left to apply
+             * and a capture of exactly that configuration is already
+             * staged and unpublished (content_dirty). Stock Super Mario
+             * World -- and, from the HAL, anything that goes through
+             * HAL_LTDC_SetAddress() (which does an IMR reload) before
+             * requesting the vblank swap -- writes SRCR twice per frame,
+             * a few microseconds apart: SRCR=IMR first (which already
+             * copied the new CFBAR into the active set and captured the
+             * frame right above), then SRCR=VBR. On real hardware the
+             * second reload is a no-op: the shadow registers are
+             * unchanged since the immediate reload, so nothing new is
+             * latched and the panel keeps scanning out the same image.
+             * Modelling it as another capture made the device publish
+             * every guest frame twice (measured: 944 "imr" + 941
+             * "deferred" captures for ~870 guest frames over 29s), which
+             * dragged the whole host render path -- composite, blit,
+             * dpy_gfx_update(), texture upload and present -- to ~45Hz
+             * for a 30fps guest, for two byte-identical images.
+             *
+             * The composition-change test is what keeps this safe: a
+             * guest that genuinely double-buffers has a fresh CFBAR
+             * pending at its VBR write (composition_changed true) and
+             * still captures here, and a guest that never uses VBR at
+             * all is served by the RAM-dirty fallback in
+             * gnw_h7b0_ltdc_vblank_tick(). Only the "reload the exact
+             * same active configuration a second time" case is dropped,
+             * and only while an unpublished capture of it already
+             * exists.
+             */
             if (!s->content_dirty && gnw_h7b0_ltdc_capture_if_enabled(s)) {
                 GNW_LTDC_TRACE_CAP(s, "vbr");
                 s->vbr_deferred_capture = false;
