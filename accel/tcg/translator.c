@@ -47,7 +47,22 @@ static vaddr gnw_io_pc[GNW_IOPC_SIZE];
 
 static inline uint32_t gnw_io_pc_hash(vaddr pc)
 {
-    return (uint32_t)((pc >> 2) & (GNW_IOPC_SIZE - 1));
+    /*
+     * Mix the whole PC into the slot index. The obvious (pc >> 2) mask
+     * is wrong for Thumb: PCs step by 2, so two *adjacent* instructions
+     * land in the same slot and two back-to-back MMIO accesses evict
+     * each other forever -- every hit re-learns, re-invalidates the TB
+     * and retranslates it. Measured over a 39s retro-go/SMW run:
+     * 757k learns / 756k evictions and ~19.7k retranslations per second
+     * with the plain mask, versus 2.0k learns / 427 evictions and ~350
+     * retranslations/s with this hash (only ~2k distinct MMIO PCs ever
+     * exist, so the 4096-entry table is amply sized -- the hash was the
+     * whole problem). Worth +2.3% GUESTFPS on a Pi 400, headless SMW,
+     * 6 interleaved runs per arm (26.54 -> 27.15, sd 0.08 both arms).
+     */
+    uint64_t h = (uint64_t)pc >> 1;
+    h *= 0x9E3779B97F4A7C15ULL;
+    return (uint32_t)((h >> 40) & (GNW_IOPC_SIZE - 1));
 }
 
 bool gnw_note_io_pc(vaddr pc);
