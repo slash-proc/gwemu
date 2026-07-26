@@ -1,3 +1,22 @@
+2026-07-26  ui: GNW_VBLANK_HZ, a host-side vblank pump rate knob. The GUI
+            paces process_vblank() -- framebuffer blit plus
+            dpy_gfx_update() -- at a fixed 60Hz. Raising it to 120Hz
+            measured +25.6% guest frame rate on 60Hz content on a
+            Raspberry Pi 4 (37.9 -> 47.6 GUESTFPS), and the identical
+            +25.6% on both a 60Hz and a 120Hz panel, so it is
+            frame-delivery latency rather than panel alignment: total BQL
+            hold time is unchanged, but splitting it into smaller, more
+            frequent slices means a ready guest frame waits ~8.3ms instead
+            of ~16.7ms to be published. Above 120Hz gains nothing -- only
+            ~42 pumps/s ever find new guest content and the rest are
+            sub-50us no-ops, which dilute the mean hold without shrinking
+            the real work (measured flat from 120 to 720Hz). Host-side
+            only: the guest-visible LTDC vblank is a separate
+            QEMU_CLOCK_VIRTUAL timer derived from PLL3R, and an 8x change
+            here moves guest LTDC ticks/s by under 1%. The default is
+            unchanged for now, pending the same measurement on other
+            hosts and on 30fps-capped content.
+
 2026-07-26  build/ui: stop defining bare DEBUG across the whole vendored
             SDL3 build. meson builds SDL3 as a CMake subproject and, since
             QEMU's own meson buildtype is "debug", meson's cmake module was

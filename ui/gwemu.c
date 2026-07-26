@@ -1989,6 +1989,43 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     // Register event watch to handle rendering during these operations.
     SDL_AddEventWatch(event_watch_callback, &scon_list[0]);
 
+    /* GNW_VBLANK_HZ: host-side vblank pump rate, in Hz. Diagnostic and
+     * tuning knob; unset means the 60Hz default above.
+     *
+     * This paces process_vblank() -- the framebuffer blit plus
+     * dpy_gfx_update() -- and is HOST-SIDE ONLY. It does not touch the
+     * guest-visible LTDC vblank, which is a separate QEMU_CLOCK_VIRTUAL
+     * timer derived from the live PLL3R frequency; an 8x change here
+     * moves guest LTDC ticks/s by under 1% (measured).
+     *
+     * Why it is worth tuning: raising the pump to 120Hz measured +25.6%
+     * guest frame rate on 60Hz content on a Raspberry Pi 4, and the same
+     * +25.6% on both a 60Hz and a 120Hz panel -- so it is frame-delivery
+     * latency, not panel alignment. The total BQL hold time is unchanged;
+     * splitting it into smaller, more frequent slices just means a ready
+     * guest frame waits ~8.3ms rather than ~16.7ms to be published. Above
+     * 120Hz gains nothing: only ~42 pumps/s ever find new guest content,
+     * and the rest are sub-50us no-ops that dilute the mean hold without
+     * shrinking the real work.
+     *
+     * Kept in-tree deliberately rather than as throwaway scratch, so that
+     * measurements taken on different hosts and at different times use
+     * identical instrumentation. */
+    {
+        const char *hz_env = getenv("GNW_VBLANK_HZ");
+        if (hz_env && *hz_env) {
+            double hz = atof(hz_env);
+            if (hz >= 1.0 && hz <= 2000.0) {
+                vblank_interval_ns = (uint64_t)(1000000000.0 / hz);
+                fprintf(stderr, "GNW_VBLANK_HZ: pump at %.1f Hz "
+                        "(interval %" PRIu64 " ns)\n", hz, vblank_interval_ns);
+            } else {
+                fprintf(stderr, "GNW_VBLANK_HZ: ignoring out-of-range '%s'\n",
+                        hz_env);
+            }
+        }
+    }
+
     if (use_vblank_timer_thread) {
         qemu_thread_create(&vblank_thread, "vblank-timer", vblank_timer_thread,
                            &scon_list[0], QEMU_THREAD_JOINABLE);
