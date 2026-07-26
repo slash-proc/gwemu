@@ -1650,6 +1650,66 @@ sdl3 = not_found
 if true
   sdl3_cmake_opts = cmake.subproject_options()
   sdl3_cmake_opts.add_cmake_defines({
+    # Configure SDL3 with NO CMake build type at all -- specifically not
+    # Debug, and deliberately not Release either.
+    #
+    # Empty is the right answer rather than "Release": Release would also
+    # pull in CMAKE_C_FLAGS_RELEASE, which meson does extract, silently
+    # swapping our -O2 for -O3 and adding -DNDEBUG. That trades one
+    # unintended flag change for two more. An empty build type makes
+    # $<CONFIG:Debug> false and contributes no CMAKE_C_FLAGS_<CONFIG> at
+    # all, so the only thing that changes is the one thing we intended.
+    #
+    # QEMU's own meson buildtype is "debug", and meson's cmake module
+    # mirrors that into the subproject: it appends
+    # -DCMAKE_BUILD_TYPE=Debug unless we pass a CMAKE_BUILD_TYPE
+    # ourselves (mesonbuild/cmake/interpreter.py: "if not any(arg
+    # .startswith('-DCMAKE_BUILD_TYPE=') for arg in cmake_args)"), so
+    # setting it here genuinely wins -- our defines are placed in
+    # cmake_args before that check runs.
+    #
+    # What that bought us: SDL3's CMakeLists.txt has
+    #   target_compile_definitions(SDL3-static PRIVATE
+    #                              "$<$<CONFIG:Debug>:DEBUG>")
+    # so every SDL3 object was compiled with a bare -DDEBUG, and
+    # SDL_assert.h selects the assert level straight off that macro
+    # (#if defined(_DEBUG) || defined(DEBUG) -> SDL_ASSERT_LEVEL 2).
+    # Every release we shipped therefore had SDL's internal debug
+    # assertions live. Defining a name as generic as DEBUG across a
+    # whole dependency is the actual defect; fixing the build type
+    # removes it at the source rather than papering over one symptom
+    # with SDL_ASSERTIONS=release.
+    #
+    # This is a correctness/hygiene fix, not a performance one. On the
+    # platforms we build, bare DEBUG has exactly one live use: the
+    # assert level. (SDL_internal.h's use is behind
+    # SDL_DISABLE_INVALID_PARAMS, which we do not set; SDL_malloc.c's
+    # dlmalloc consistency-checking is behind #ifndef HAVE_MALLOC, and
+    # HAVE_MALLOC is 1 here. Everything else matching "DEBUG" in the
+    # tree is a different macro -- DEBUG_JOYSTICK, DEBUG_XEVENTS,
+    # DEBUG_AUDIO ... -- that -DDEBUG does not enable.)
+    #
+    # It is -DDEBUG that did this, NOT a missing -O. These sources are
+    # compiled -O2: meson's cmake.subproject() does not hand compilation
+    # to CMake, it runs CMake configure-only to extract each target's
+    # sources/includes/defines and then builds them as native meson
+    # targets under meson's own optimization=2. CMakeCache.txt's
+    # CMAKE_C_FLAGS_DEBUG="-g" describes a configure step that compiles
+    # nothing, and misreading it as "SDL3 ships unoptimised" already
+    # cost one wasted investigation -- do not repeat it.
+    #
+    # Why it mattered in practice: a user on a Raspberry Pi hit the
+    # SDL_assert in SDL_AddAudioDevice() (a duplicate device handle
+    # from SDL's own pipewire backend -- upstream's problem, harmless in
+    # itself), and SDL answers an assert with a modal dialog: on Linux
+    # an external `zenity` process that outlives the window, blocking
+    # the audio hotplug thread that SDL_Quit()'s teardown then waits on.
+    # gwemu never exited, while still holding the flash images mapped
+    # WRITABLE. Same failure class as per-frame stderr spam wedging a
+    # Windows console: a diagnostic aid turning into a denial of
+    # service. See also the SDL_HINT_ASSERT belt-and-braces in
+    # ui/gwemu.c.
+    'CMAKE_BUILD_TYPE': '',
     'SDL_CAMERA': 'OFF',
     'SDL_DISKAUDIO': 'OFF',
     'SDL_DUMMYVIDEO': 'OFF',

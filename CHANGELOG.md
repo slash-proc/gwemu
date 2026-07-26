@@ -1,3 +1,62 @@
+2026-07-26  build/ui: stop defining bare DEBUG across the whole vendored
+            SDL3 build. meson builds SDL3 as a CMake subproject and, since
+            QEMU's own meson buildtype is "debug", meson's cmake module was
+            passing -DCMAKE_BUILD_TYPE=Debug; SDL3's CMakeLists.txt turns
+            that into target_compile_definitions(... $<$<CONFIG:Debug>:DEBUG>),
+            so every SDL3 object was compiled with -DDEBUG. Pass an explicit
+            (empty) CMAKE_BUILD_TYPE instead -- meson only appends its own
+            when we have not supplied one, so ours wins -- which drops
+            -DDEBUG without adding anything in its place. Verified against
+            `ninja -t commands`: the only change to the SDL3 compile lines
+            is -DDEBUG going away; -O2 is unchanged and the generated
+            SDL_build_config.h is byte-identical. (CMAKE_BUILD_TYPE=Release
+            also works but silently swaps in -O3 -DNDEBUG, so it was not
+            used.)
+
+            The visible consequence was that every release shipped with
+            SDL's internal debug assertions live: SDL_assert.h picks
+            SDL_ASSERT_LEVEL 2 straight off `defined(DEBUG)`. A user on a
+            Raspberry Pi (PulseAudio-on-PipeWire) hit the SDL_assert in
+            SDL_AddAudioDevice() on a duplicate device handle; SDL answers
+            an assert with a modal dialog, which on Linux is an external
+            zenity process that outlives the window and blocks the audio
+            hotplug thread that SDL_Quit()'s teardown then waits on -- so
+            gwemu never exited, while still holding the flash images mapped
+            WRITABLE, and the next launch was blocked. libSDL3_static.a
+            drops 35.3MB -> 34.2MB and the assertion string is now absent
+            from both it and qemu-system-arm.
+
+            Scope of what DEBUG actually gated, on the platforms we build:
+            only the assert level. SDL_internal.h's use is behind
+            SDL_DISABLE_INVALID_PARAMS (not set) and SDL_malloc.c's
+            dlmalloc consistency checks are behind #ifndef HAVE_MALLOC
+            (HAVE_MALLOC is 1). Everything else matching "DEBUG" in the
+            tree is a distinct macro (DEBUG_JOYSTICK, DEBUG_XEVENTS, ...)
+            that -DDEBUG does not enable. So this is correctness/hygiene,
+            not a performance fix.
+
+            Belt and braces in ui/gwemu.c: set SDL_HINT_ASSERT to "ignore"
+            before SDL_Init unless the user set SDL_ASSERT, so a non-fatal
+            internal inconsistency degrades to a log line rather than a
+            blocking modal on any platform -- also covering a locally built
+            debug SDL and SDL_assert_release(). SDL_ASSERT=abort restores
+            the debugging behaviour.
+
+            The duplicate registration itself is an SDL3 upstream issue,
+            not ours: the pipewire backend derives handles from recyclable
+            node ids while device removal is asynchronous, so a node
+            re-announce can collide with a zombie device still holding that
+            handle. Nothing here calls SDL_AddAudioDevice. The vendored
+            SDL3 tree is deliberately left unpatched.
+
+            NOT an issue, contrary to a first diagnosis: SDL3 is not
+            shipped unoptimised. meson's cmake.subproject() does not hand
+            compilation to CMake -- it runs CMake configure-only and builds
+            the extracted sources as native meson targets under
+            optimization=2. All SDL3 objects carry -O2, none carry -O0;
+            CMakeCache.txt's CMAKE_C_FLAGS_DEBUG="-g" describes a configure
+            step that compiles nothing.
+
 2026-07-26  ltdc: fix an intermittent SIGSEGV on slow hosts (seen on the
             Raspberry Pi 4, windowed only). gnw_h7b0_ltdc_fb_range_dirty()
             checked section->mr, then re-read it after calling

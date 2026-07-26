@@ -1644,6 +1644,32 @@ static void display_very_early_init(DisplayOptions *o)
     }
 #endif
 
+    /*
+     * An SDL assertion must degrade to a log line, never to a blocking
+     * modal dialog.
+     *
+     * SDL's default assertion handler pops a message box; on Linux with
+     * zenity installed that is an *external* process, so it outlives the
+     * window it came from, and the SDL thread that asserted stays blocked
+     * waiting for the answer -- if that thread is a backend hotplug
+     * thread, SDL_Quit()'s teardown then waits on it and gwemu never
+     * exits, while still holding the writable, persistent flash mappings.
+     * Observed for real on a Raspberry Pi, via the duplicate-audio-device
+     * SDL_assert in SDL_AddAudioDevice().
+     *
+     * The vendored SDL3 is now configured as a CMake Release build, so
+     * bare -DDEBUG is no longer defined and SDL_assert() compiles out
+     * (see the CMAKE_BUILD_TYPE comment in meson.build). This is the
+     * second line of defence: it also covers a locally built debug SDL,
+     * SDL_assert_release(), and the non-Linux dialog paths. "ignore"
+     * makes SDL print the assertion to stderr and continue. Set SDL_ASSERT
+     * in the environment (e.g. SDL_ASSERT=abort) to get the debugging
+     * behaviour back.
+     */
+    if (getenv("SDL_ASSERT") == NULL) {
+        SDL_SetHint(SDL_HINT_ASSERT, "ignore");
+    }
+
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "Failed to initialize SDL video subsystem: %s\n",
                 SDL_GetError());
