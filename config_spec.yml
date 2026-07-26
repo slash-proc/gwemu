@@ -12,6 +12,14 @@ general:
       default: true
   screenshot_dir: string
   games_dir: string
+  # SD Card tab (ui/xui/sdcard-view.cc): the folder whose contents become
+  # the card root, and the index into its card-size preset table.
+  # Generated fields: g_config.general.sdcard.{content_dir,size_index}.
+  sdcard:
+    content_dir: string
+    size_index:
+      type: integer
+      default: 0
   skip_boot_anim: bool
   # throttle_io: bool
   last_viewed_menu_index: integer

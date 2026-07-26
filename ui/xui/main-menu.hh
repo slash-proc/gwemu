@@ -30,6 +30,7 @@ public:
 // must be included after its definition, not before.
 #include "display-view.hh"
 #include "audio-view.hh"
+#include "sdcard-view.hh"
 
 class MainMenuGeneralView : public virtual MainMenuTabView
 {
@@ -90,6 +91,7 @@ protected:
     MainMenuGeneralView             m_general_view;
     MainMenuSystemView              m_system_view;
     MainMenuProfilesView            m_profiles_view;
+    GnwSdCardView                   m_sdcard_view;
     MainMenuInputView               m_input_view;
     MainMenuDisplayView             m_display_view;
     MainMenuAudioView               m_audio_view;

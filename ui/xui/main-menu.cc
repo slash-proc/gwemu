@@ -285,6 +285,7 @@ MainMenuScene::MainMenuScene()
     m_tabs.push_back(new MainMenuTabButton("General"));
     m_tabs.push_back(new MainMenuTabButton("System"));
     m_tabs.push_back(new MainMenuTabButton("Profiles"));
+    m_tabs.push_back(new MainMenuTabButton("SD Card"));
     m_tabs.push_back(new MainMenuTabButton("Input"));
     m_tabs.push_back(new MainMenuTabButton("Display"));
     m_tabs.push_back(new MainMenuTabButton("Audio"));
@@ -294,6 +295,7 @@ MainMenuScene::MainMenuScene()
     m_views.push_back(&m_general_view);
     m_views.push_back(&m_system_view);
     m_views.push_back(&m_profiles_view);
+    m_views.push_back(&m_sdcard_view);
     m_views.push_back(&m_input_view);
     m_views.push_back(&m_display_view);
     m_views.push_back(&m_audio_view);
@@ -303,8 +305,8 @@ MainMenuScene::MainMenuScene()
 
 void MainMenuScene::ShowSettings() { m_current_view_index = 0; Show(); }
 void MainMenuScene::ShowSystem() { m_current_view_index = 1; Show(); }
-void MainMenuScene::ShowAbout() { m_current_view_index = 7; Show(); }
-void MainMenuScene::ShowSnapshots() { m_current_view_index = 6; Show(); }
+void MainMenuScene::ShowAbout() { m_current_view_index = 8; Show(); }
+void MainMenuScene::ShowSnapshots() { m_current_view_index = 7; Show(); }
 
 // gnw_input_process_sdl_event() is called exactly once per event, from
 // ui/gwemu.c's poll_events() -- these only report/gate on pending-rebind

@@ -1,3 +1,37 @@
+2026-07-26  ui: finish the SD-card creation feature -- pick a folder, get a
+            card. The SD Card tab (previously compiled but never
+            registered in MainMenuScene, so unreachable) is now a real tab
+            after Profiles. It calls gnw_sdimg_build() in-process via
+            gwemu_sdcreate_qcow2_progress() instead of popen()-ing
+            "python3 scripts/make_sdcard_image.py" against a
+            working-directory-relative path -- that shell-out, its
+            ShellQuote() helper and the hardcoded
+            backup/qemu-images/sdcard.qcow2 output are gone, along with
+            the whole class of bug it caused for installed/portable
+            builds. Output lands in the shared-SD registry
+            (<app data>/sd-cards/<name>.qcow2 + a shareable=true sidecar),
+            which is exactly what the profile wizard's "Shared" SD picker
+            enumerates, so a card built here is attachable from any
+            profile; an opt-in checkbox also points the active profile at
+            it directly. The folder picker is a folder picker now (the
+            actual feature gap), the content folder is scanned on a worker
+            thread for a real size/count readout and a fits/doesn't-fit
+            check against the chosen card (capacity math mirrors
+            gnw_fat32.c's own cluster table and FAT-size formula, so it
+            cannot disagree with the builder), the size preset auto-steps
+            up to the smallest one that fits, and the build shows real
+            byte-level progress from the sector-write callback rather than
+            a static "this can take a few minutes". Colors/spacing route
+            through gnw-style-tokens.hh; icons stay inside the compiled
+            55-glyph FontAwesome subset. gwemu-sdcreate.c now takes the
+            BQL per block-layer call instead of once around the whole
+            build: blk_pwrite() needs it held (AIO_WAIT_WHILE's
+            home-thread test for the main AioContext is literally
+            bql_locked()), but holding it across a multi-GB content copy
+            would freeze the UI and the machine for minutes -- the exact
+            failure this feature caused before. New settings:
+            general.sdcard.{content_dir,size_index}, saved on change.
+
 2026-07-26  blank internal flash is a supported state, not a crash. A guest
             with no valid vector table faults immediately, cannot escalate
             to HardFault at priority -1, and locks up -- and armv7m_nvic.c
