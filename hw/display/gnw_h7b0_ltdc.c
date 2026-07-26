@@ -859,6 +859,7 @@ static bool gnw_h7b0_ltdc_fb_range_dirty(MemoryRegionSection *section,
                                           hwaddr len)
 {
     DirtyBitmapSnapshot *snap;
+    MemoryRegion *mr;
     hwaddr addr;
     bool dirty;
 
@@ -877,18 +878,50 @@ static bool gnw_h7b0_ltdc_fb_range_dirty(MemoryRegionSection *section,
      * runtime check that can't be compiled away, instead of trusting
      * QEMU's own assert to catch this.
      */
-    if (!section->mr || !memory_region_is_ram(section->mr)) {
+    mr = section->mr;
+    if (!mr || !memory_region_is_ram(mr)) {
         return true;
     }
-
     addr = section->offset_within_region;
-    snap = memory_region_snapshot_and_clear_dirty(section->mr, addr, len,
+
+    /*
+     * *section must NOT be re-read across the snapshot call below.
+     * memory_region_snapshot_and_clear_dirty() ends in
+     * memory_global_after_dirty_log_sync() -> (TCG's log_global_after_sync
+     * listener) -> do_run_on_cpu(), which *drops the BQL* while it waits
+     * on qemu_work_cond for the vCPU to run the queued work item. In that
+     * window the vCPU thread takes the BQL and can service a guest LTDC
+     * register write; gnw_h7b0_ltdc_write()'s VBR-teardown path calls
+     * gnw_h7b0_ltdc_fb_track_range(..., 0, 0), which unrefs the region
+     * and sets section->mr = NULL right underneath us. Re-reading
+     * section->mr afterwards then passed NULL to
+     * memory_region_snapshot_get_dirty() -> SIGSEGV.
+     *
+     * Diagnosed on a Raspberry Pi 400 (4-core aarch64, where the vCPU
+     * thread is very likely to be parked on the BQL exactly then):
+     * confirmed with a hardware watchpoint on section->mr naming the
+     * "CPU 0/TCG" thread as the writer, and with breakpoints proving the
+     * pointer changes non-NULL -> NULL *inside* the snapshot call.
+     *
+     * So: keep our own reference to the region for the duration (it may
+     * be unref'd to death otherwise), and if the tracking was retargeted
+     * or torn down under us, report dirty -- per this function's
+     * "anything we can't positively prove clean is dirty" rule.
+     */
+    memory_region_ref(mr);
+    snap = memory_region_snapshot_and_clear_dirty(mr, addr, len,
                                                    DIRTY_MEMORY_VGA);
     if (!snap) {
+        memory_region_unref(mr);
         return true;
     }
-    dirty = memory_region_snapshot_get_dirty(section->mr, snap, addr, len);
+    if (section->mr != mr) {
+        dirty = true;
+    } else {
+        dirty = memory_region_snapshot_get_dirty(mr, snap, addr, len);
+    }
     g_free(snap);
+    memory_region_unref(mr);
     return dirty;
 }
 

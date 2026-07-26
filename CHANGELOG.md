@@ -1,3 +1,25 @@
+2026-07-26  ltdc: fix an intermittent SIGSEGV on slow hosts (seen on the
+            Raspberry Pi 4, windowed only). gnw_h7b0_ltdc_fb_range_dirty()
+            checked section->mr, then re-read it after calling
+            memory_region_snapshot_and_clear_dirty() -- but that call is
+            not BQL-atomic: it reaches do_run_on_cpu(), which
+            qemu_cond_wait()s on qemu_work_cond and releases the BQL. In
+            that window the vCPU thread services a guest LTDC register
+            write whose VBR teardown sets section->mr = NULL, and the main
+            loop resumes to pass NULL into
+            memory_region_snapshot_get_dirty(). Confirmed with a hardware
+            watchpoint naming the writing thread and stack, and with
+            breakpoints showing the pointer flip inside the call. Latch mr
+            and offset before the snapshot, hold a real reference for its
+            duration (otherwise the NULL deref is a use-after-free), and
+            report dirty if it changed on return -- the function's own
+            "not provably clean is dirty" rule. Windowed-only because
+            -display none never drives the fallback capture path; Pi-only
+            because four slow cores make the vCPU far likelier to be
+            parked on the BQL at that instant. Repro 7/13 before, 0/12
+            after (Fisher p ~ 0.0006); an intermittent race, so absence
+            cannot be proven.
+
 2026-07-26  ui: finish the SD-card creation feature -- pick a folder, get a
             card. The SD Card tab (previously compiled but never
             registered in MainMenuScene, so unreachable) is now a real tab
