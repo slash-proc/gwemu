@@ -124,6 +124,41 @@
 #endif
 
 /*
+ * Opt a function out of the compiler's hardening prologue/epilogue.
+ *
+ * For functions called millions of times per second, the hardening
+ * QEMU builds with is disproportionately expensive relative to the work
+ * inside: -fstack-protector-strong adds a GOT-indirect canary load, a
+ * store and a check, and -fzero-call-used-regs=used-gpr adds ten
+ * register-clearing stores to every return. On the TB-dispatch path
+ * (~8M calls/sec on an interpreter-shaped guest) that measured as an
+ * 8-11% throughput loss on a Raspberry Pi 4.
+ *
+ * Neither attribute changes semantics; they only remove code the
+ * compiler wraps around the function body. Use extremely sparingly, and
+ * only where profiling shows the call rate justifies giving up the
+ * hardening on that one function -- see GNW_TB_DISPATCH_HOT in
+ * accel/tcg/cpu-exec.c for the only current users.
+ *
+ * Both attributes are optional: clang and older GCC may lack either, in
+ * which case the function simply keeps its hardening.
+ */
+#if __has_attribute(no_stack_protector)
+# define QEMU_NO_STACK_PROTECTOR __attribute__((no_stack_protector))
+#else
+# define QEMU_NO_STACK_PROTECTOR
+#endif
+
+#if __has_attribute(zero_call_used_regs)
+# define QEMU_NO_ZERO_CALL_USED_REGS __attribute__((zero_call_used_regs("skip")))
+#else
+# define QEMU_NO_ZERO_CALL_USED_REGS
+#endif
+
+#define QEMU_HOT_NO_HARDENING \
+    QEMU_NO_STACK_PROTECTOR QEMU_NO_ZERO_CALL_USED_REGS
+
+/*
  * If __attribute__((error)) is present, use it to produce an error at
  * compile time.  Otherwise, one must wait for the linker to diagnose
  * the missing symbol.

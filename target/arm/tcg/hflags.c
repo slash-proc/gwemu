@@ -617,6 +617,8 @@ static bool mve_no_pred(CPUARMState *env)
     return true;
 }
 
+/* See GNW_TB_DISPATCH_HOT in accel/tcg/cpu-exec.c. */
+QEMU_HOT_NO_HARDENING
 TCGTBCPUState arm_get_tb_cpu_state(CPUState *cs)
 {
     CPUARMState *env = cpu_env(cs);

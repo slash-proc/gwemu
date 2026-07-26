@@ -1,3 +1,37 @@
+2026-07-26  tcg: exempt the three TB-dispatch hot functions from compiler
+            hardening. helper_lookup_tb_ptr(), curr_cflags() and
+            arm_get_tb_cpu_state() run once per indirect guest branch --
+            ~8M times/sec under retro-go's tgbdual, where perf attributes
+            ~47% of the vCPU thread to them. The cost is almost entirely
+            C-ABI and code shape, not algorithm: ~24% of the helper is
+            prologue (a 144-byte frame with four callee-saved register
+            pairs spilled on the fast path), and QEMU's default hardening
+            is disproportionate at that call rate --
+            -fstack-protector-strong adds a GOT-indirect canary load,
+            store and check, -fzero-call-used-regs=used-gpr adds ten
+            register-clearing stores per return. Exempting just these
+            three measured +7.9% guest throughput on a Raspberry Pi 4
+            (~75% of the +8.1-10.6% available from dropping both flags
+            binary-wide), with hardening left on everywhere else: 7344
+            stack-canary sites remain in the binary and none are in the
+            three functions. Neither attribute changes semantics. Routed
+            through QEMU_HOT_NO_HARDENING in include/qemu/compiler.h,
+            __has_attribute-guarded so clang and older GCC simply keep the
+            hardening rather than failing the build.
+
+            Measured, and rejected: the jump cache is NOT the problem
+            (98.84% hit rate, better than SMW's 98.0%; 2K entries drops it
+            to 74%, 16K is neutral, 64K pathological). tgbdual is
+            expensive because 41.2% of its TB exits are indirect versus
+            SMW's 12.6% -- an interpreter dispatching every opcode through
+            a table -- so it pays 3.3x more lookups per unit of work. None
+            of those exits are chainable-but-unchained; the targets are
+            data-dependent by construction. LTO was bimodal and not worth
+            the build cost; devirtualising get_tb_cpu_state gained 1.3%;
+            noinline on the slow path gained 0.6%. Upstream has nothing to
+            adopt: tb-jmp-cache.h and tb-hash.h are byte-identical between
+            our pinned v11.0.2 and current master.
+
 2026-07-26  ui: GNW_VBLANK_HZ, a host-side vblank pump rate knob. The GUI
             paces process_vblank() -- framebuffer blit plus
             dpy_gfx_update() -- at a fixed 60Hz. Raising it to 120Hz

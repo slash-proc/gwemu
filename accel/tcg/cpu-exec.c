@@ -371,6 +371,24 @@ static inline bool check_for_breakpoints(CPUState *cpu, vaddr pc,
  * If found, return the code pointer.  If not found, return
  * the tcg epilogue so that we return into cpu_tb_exec.
  */
+
+/*
+ * TB-dispatch hot path.  helper_lookup_tb_ptr() and the two functions it
+ * calls run once per indirect guest branch -- ~8M times/sec on an
+ * interpreter-shaped guest (retro-go's tgbdual), where perf attributes
+ * ~47% of the vCPU thread to them.  QEMU's default hardening flags are
+ * unusually expensive at that call rate: -fstack-protector-strong adds a
+ * canary load (via the GOT), store and check, and
+ * -fzero-call-used-regs=used-gpr adds ten register-clearing stores to
+ * every return.  Exempt just these three functions; hardening stays on
+ * everywhere else in the binary.
+ *
+ * Neither attribute changes semantics -- they only remove code the
+ * compiler adds around the function body.
+ */
+#define GNW_TB_DISPATCH_HOT QEMU_HOT_NO_HARDENING
+
+GNW_TB_DISPATCH_HOT
 const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
 {
     CPUState *cpu = env_cpu(env);

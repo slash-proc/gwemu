@@ -35,6 +35,8 @@ void tcg_cflags_set(CPUState *cpu, uint32_t flags)
     cpu->tcg_cflags |= flags;
 }
 
+/* See GNW_TB_DISPATCH_HOT in accel/tcg/cpu-exec.c. */
+QEMU_HOT_NO_HARDENING
 uint32_t curr_cflags(CPUState *cpu)
 {
     uint32_t cflags = cpu->tcg_cflags;
