@@ -344,7 +344,14 @@ jobs:
           # tools, never linked into the target binary).
           brew install ninja meson cmake dylibbundler pkg-config
           arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
-          arch -x86_64 /usr/local/bin/brew install pkg-config glib pixman sdl2 libepoxy xz libpng
+          # zlib: libpng.pc has `Requires: zlib`, so pkg-config resolves
+          # libpng only if a zlib.pc is visible. PKG_CONFIG_LIBDIR below
+          # REPLACES the default search path, which hides the SDK's own
+          # zlib.pc -- so an x86_64 zlib must exist under /usr/local or
+          # libpng silently fails to resolve and configure now hard-errors
+          # (v0.0.17). Homebrew's zlib is keg-only, hence the explicit
+          # opt/zlib pkgconfig dir in PKG_CONFIG_PATH.
+          arch -x86_64 /usr/local/bin/brew install pkg-config glib pixman sdl2 libepoxy xz libpng zlib
           # pyyaml: subprojects/genconfig/gen_config.py needs it; mkvenv's
           # venv is non-isolated so a system/user install is enough. This
           # leg still runs meson/mkvenv under the arm64 (host) Python.
@@ -363,8 +370,14 @@ jobs:
             # pkg-config at the x86_64 Homebrew prefix (/usr/local) so it
             # resolves glib/pixman/sdl2/libepoxy/liblzma to real x86_64
             # libs instead of the arm64 ones under /opt/homebrew.
-            export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig"
-            export PKG_CONFIG_LIBDIR="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig"
+            # /usr/local/opt/zlib/lib/pkgconfig: Homebrew's zlib is
+            # keg-only, so it is never symlinked into /usr/local/lib/
+            # pkgconfig. libpng.pc `Requires: zlib`, and LIBDIR below
+            # replaces the default search path (hiding the SDK's zlib.pc),
+            # so without this entry libpng does not resolve and configure
+            # hard-errors. This exact failure broke the v0.0.17 run.
+            export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/local/opt/zlib/lib/pkgconfig"
+            export PKG_CONFIG_LIBDIR="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/local/opt/zlib/lib/pkgconfig"
             # --cross-prefix= (even empty) is what actually flips
             # configure's own cross_compile flag to "yes" -- without it,
             # --cpu=x86_64 alone never triggers writing a real
