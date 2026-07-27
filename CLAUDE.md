@@ -101,13 +101,24 @@ mkdir build && cd build
 ninja
 ```
 Needs the usual QEMU build prerequisites (`ninja`, `pkg-config`,
-`libglib2.0-dev`, `libpixman-1-dev` at minimum) plus a display backend
+`libglib2.0-dev`, `libpixman-1-dev`, `libpng-dev` at minimum) plus a display backend
 dev package (`libsdl2-dev` or `libgtk-3-dev`) — without one, `configure`
 succeeds silently but produces a QEMU binary with no display backend at
 all, and the failure only surfaces later at `boot_qemu.sh` launch time
 ("no usable display backend"), disconnected from its actual cause. This
 whole section is a placeholder for a real README once we write one (see
 "Outsider workflow" below) — not yet gnw-specific beyond the note above.
+
+**`libpng-dev` is mandatory in this fork, not optional.** Without it
+QEMU's `screendump` has no encoder and the headless timeline's
+`screenshot` action fails at *run* time ("Enable PNG support with libpng
+for screendump"), silently disabling the screenshot-based validation used
+for benchmark/regression comparison — a build that already shipped that
+way once (the 0.0.14 universal DMG). `configure` therefore hard-errors
+when libpng is missing (fork-local check next to the `png` dependency in
+`meson.build`); `--disable-png` is the deliberate opt-out. Add
+`libpng-dev`/`libpng-devel`/`brew install libpng` to any NEW build
+recipe, container image, or CI leg you create.
 
 ## GUI (`gwemu`, Item 5 of the cleanup/roadmap effort)
 

@@ -319,17 +319,24 @@ jobs:
               --disable-sdl \
               --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
               --disable-curl --disable-libssh --disable-curses --disable-libusb \
-              --disable-zstd --disable-dbus-display --disable-png --disable-gio
+              --disable-zstd --disable-dbus-display --disable-gio
           else
             ../configure --target-list=arm-softmmu --disable-sdl \
               --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
               --disable-curl --disable-libssh --disable-curses --disable-libusb \
-              --disable-zstd --disable-dbus-display --disable-png --disable-gio
+              --disable-zstd --disable-dbus-display --disable-gio
           fi
-          # The --disable-vnc..--disable-png block pins the OPTIONAL
+          # NOTE: png is deliberately NOT disabled here. Both legs
+          # `brew install libpng` above, so the dylib sets still match
+          # for the universal lipo merge, and PNG screendump is a
+          # hard requirement of this fork (configure now errors without
+          # it -- see the fork-local check in meson.build). The v0.0.14
+          # universal DMG shipped with --disable-png and could not take
+          # a screenshot at all; that is what this omission fixes.
+          # The --disable-vnc..--disable-gio block pins the OPTIONAL
           # feature set identically on both legs: the arm64 runner's
           # preinstalled Homebrew otherwise auto-enables a pile of
-          # features (gnutls+its chain, vnc jpeg/png, libusb, zstd,
+          # features (gnutls+its chain, vnc, libusb, zstd,
           # gio) the minimal x86_64 prefix doesn't have, and the
           # universal merge job (correctly) refuses to lipo two apps
           # with different dylib sets -- exactly how v0.0.12's first

@@ -1,3 +1,14 @@
+2026-07-27  build: make libpng non-optional and its absence loud. configure
+            now hard-errors when libpng is missing (fork-local check next
+            to the png dependency in meson.build) instead of silently
+            #undef'ing CONFIG_PNG and shipping a build whose screendump
+            -- and hence the headless timeline's `screenshot` action and
+            every screenshot-based benchmark comparison -- fails only at
+            run time; --disable-png is the deliberate opt-out. Added
+            libpng-dev to build-check.yml, dropped the --disable-png that
+            shipped the 0.0.14 universal DMG unable to screenshot, and
+            documented the requirement in CLAUDE.md.
+
 2026-07-26  tcg: exempt the three TB-dispatch hot functions from compiler
             hardening. helper_lookup_tb_ptr(), curr_cflags() and
             arm_get_tb_cpu_state() run once per indirect guest branch --

@@ -2187,6 +2187,37 @@ if get_option('png').allowed() and have_system
    png = dependency('libpng', version: '>=1.6.34', required: get_option('png'),
                     method: 'pkg-config')
 endif
+# gwemu fork-local: PNG is NOT optional for this fork's own workflows.
+# Without libpng, CONFIG_PNG is silently #undef'd, the build succeeds,
+# an artifact ships -- and only at run time does `screendump` (and hence
+# the headless timeline's `screenshot` action, and every benchmark/
+# regression comparison that relies on it) fail with "Enable PNG support
+# with libpng for screendump". That silent gap has already shipped in a
+# release asset (the 0.0.14 universal DMG) and been rediscovered on a
+# real Raspberry Pi 4 run. So: 'auto' means REQUIRED here.
+# Deliberate opt-out for someone who genuinely wants a PNG-less build:
+# configure with --disable-png (meson -Dpng=disabled).
+if have_system and not png.found() and get_option('png').auto()
+  error('''libpng not found -- refusing to build a PNG-less gwemu.
+
+    Without libpng, `screendump` has no encoder, so the headless
+    timeline's `screenshot` action fails at RUN time (long after this
+    build looks successful) with:
+        "Enable PNG support with libpng for screendump"
+    That silently disables the screenshot-based validation this project
+    uses to check benchmark and regression runs.
+
+    Install the dev package for your environment:
+      Debian/Ubuntu      apt-get install libpng-dev
+      Fedora/RHEL        dnf install libpng-devel
+      macOS (Homebrew)   brew install libpng
+      MSYS2/MinGW        pacman -S ${MINGW_PACKAGE_PREFIX}-libpng
+    then re-run configure (an existing build dir will NOT re-probe;
+    use `meson setup --reconfigure` or a fresh build dir).
+
+    If you really want a build that cannot take screenshots, say so
+    explicitly: configure --disable-png''')
+endif
 vnc = not_found
 jpeg = not_found
 sasl = not_found

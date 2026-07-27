@@ -26,7 +26,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev liblzma-dev
+            ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev liblzma-dev \
+            libpng-dev
+          # libpng-dev: PNG screendump support. configure now hard-errors
+          # without it (see the fork-local check in meson.build) precisely
+          # so a PNG-less build can never ship silently again.
 
       - uses: actions/setup-python@v5
         with:
