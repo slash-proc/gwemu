@@ -326,7 +326,15 @@ jobs:
           # the headless timeline's `screenshot` action fails at runtime
           # ("Enable PNG support with libpng for screendump"). Confirmed
           # missing from the shipped 0.0.14 universal DMG.
-          brew install ninja pkg-config glib pixman sdl2 meson dylibbundler cmake libepoxy xz libpng
+          # zlib: MUST be installed and used on BOTH legs. libpng.pc
+          # `Requires: zlib`, and the x86_64 leg has to use Homebrew's
+          # zlib (its PKG_CONFIG_LIBDIR hides the SDK's zlib.pc). If this
+          # leg instead resolved the SDK's zlib, the two arches would link
+          # different zlibs, only x86_64 would bundle libz.<ver>.dylib,
+          # and the universal merge job would (correctly) refuse to lipo
+          # apps with mismatched Frameworks sets -- which is exactly how
+          # the first v0.0.17 merge failed.
+          brew install ninja pkg-config glib pixman sdl2 meson dylibbundler cmake libepoxy xz libpng zlib
           # pyyaml: subprojects/genconfig/gen_config.py needs it; mkvenv's
           # venv is non-isolated so a system/user install is enough.
           pip3 install --user --break-system-packages pyyaml || pip3 install --user pyyaml
@@ -400,6 +408,13 @@ jobs:
               --disable-curl --disable-libssh --disable-curses --disable-libusb \
               --disable-zstd --disable-dbus-display --disable-gio
           else
+            # Point at Homebrew's keg-only zlib so this leg links the SAME
+            # zlib as the x86_64 leg. Without it, arm64 resolves the SDK's
+            # /usr/lib/pkgconfig/zlib.pc, links the system libz, bundles no
+            # libz dylib, and the universal merge fails on mismatched
+            # Frameworks sets. PKG_CONFIG_PATH (not LIBDIR) so the default
+            # search path is kept for everything else on this leg.
+            export PKG_CONFIG_PATH="/opt/homebrew/opt/zlib/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
             ../configure --target-list=arm-softmmu --disable-sdl \
               --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
               --disable-curl --disable-libssh --disable-curses --disable-libusb \
