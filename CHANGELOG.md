@@ -1,3 +1,17 @@
+2026-07-27  build: enable LTO on the shipped aarch64 Linux release asset.
+            release.yml's build-linux aarch64 leg builds natively, not
+            via contrib/docker-arm64-cross/build.sh, so that recipe's
+            --enable-lto never reached the AppImage users download; the
+            matrix now carries a per-arch extra_configure passing
+            --enable-lto --disable-sdl --disable-sdl-image there, plus a
+            b_lto assertion against meson-info so a silently non-LTO
+            asset can't ship again. Measured +8.0% guest fps on a
+            Cortex-A72 (an earlier +11.8% did not reproduce). Left off
+            deliberately, with the reasoning recorded in each file, on
+            x86_64 Linux (measured null, and would cost ui/sdl2.c),
+            macOS, the static Windows exe, docker-headless and
+            build-check.
+
 2026-07-27  build: make libpng non-optional and its absence loud. configure
             now hard-errors when libpng is missing (fork-local check next
             to the png dependency in meson.build) instead of silently

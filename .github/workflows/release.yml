@@ -58,6 +58,22 @@ jobs:
           - runner: ubuntu-latest
             arch: x86_64
             appimagetool_arch: x86_64
+            # Deliberately NO --enable-lto on x86_64. Do not "fix" this.
+            # Two independent reasons, both measured:
+            #  1. LTO is a null result on x86-64 (~0.9% on the retro-go
+            #     Link's Awakening DX workload, i.e. inside run-to-run
+            #     noise), unlike aarch64 where it is a real +8.0%.
+            #  2. It cannot even link here without also passing
+            #     --disable-sdl --disable-sdl-image: this leg links BOTH
+            #     the system SDL2 (QEMU's legacy `-display sdl`) and the
+            #     vendored static SDL3 (our GUI), and LTO correctly
+            #     rejects their clashing declarations of the same symbol
+            #     names (SDL_OpenAudioDevice differs in its *parameters*
+            #     -- one symbol, two call ABIs; SDL_Init/SDL_PollEvent/
+            #     ~20 more differ int vs bool).
+            # So enabling it would mean dropping upstream QEMU's ui/sdl2.c
+            # from the x86_64 asset in exchange for nothing measurable.
+            extra_configure: ''
           # Native aarch64 GitHub-hosted runner (free for public repos) --
           # this is the Raspberry Pi 4/5 target. Native, not qemu-user
           # emulated: a full QEMU+SDL3 build under binfmt emulation takes
@@ -65,6 +81,32 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: aarch64
             appimagetool_arch: aarch64
+            # --enable-lto: measured +8.0% guest fps on a Cortex-A72 (Pi
+            # 400) running the retro-go Link's Awakening DX workload
+            # (10.92 -> 11.79 GUESTFPS), stock LA vCPU duty 57.8% ->
+            # 54.8%, stripped binary *smaller* (133MB vs 141MB), build
+            # time unchanged within noise. Soaked over 20 runs / 10
+            # timelines including the PICO-8/Celeste core, zero faults.
+            # (An earlier +11.8% figure did not reproduce; +8.0% is the
+            # number.) Keep every hardening flag -- removing them is not
+            # additive with LTO. Do NOT add -O3: it is ~1% slower alone
+            # and only +2% on top of LTO at the cost of -Werror
+            # suppressions.
+            #
+            # This leg builds NATIVELY here, it does NOT go through
+            # contrib/docker-arm64-cross/build.sh -- so that recipe's own
+            # --enable-lto never reached this shipped asset. That is what
+            # this line fixes.
+            #
+            # --disable-sdl --disable-sdl-image is REQUIRED for LTO to
+            # link at all (see the x86_64 leg's note above for why), and
+            # is what the aarch64 cross recipe already does. It drops
+            # upstream QEMU's legacy `-display sdl` backend from the
+            # aarch64 asset; our own GUI (`-display gwemu`, SDL3, built
+            # static in-tree) supersedes it, and the macOS and Windows
+            # assets have shipped without it for some time already.
+            extra_configure: >-
+              --enable-lto --disable-sdl --disable-sdl-image
     runs-on: ${{ matrix.runner }}
     # Build inside an older-LTS container for a lower glibc floor than
     # ubuntu-latest's own base image would give us -- glibc's forward-only
@@ -154,7 +196,18 @@ jobs:
         run: |
           mkdir build
           cd build
-          ../configure --target-list=arm-softmmu
+          # ${{ matrix.extra_configure }} is per-arch (see the matrix
+          # above): empty on x86_64, --enable-lto plus the SDL flags LTO
+          # needs on aarch64. Unquoted on purpose -- it must word-split.
+          ../configure --target-list=arm-softmmu ${{ matrix.extra_configure }}
+          # Fail loudly rather than silently shipping a non-LTO aarch64
+          # asset if the flag ever stops taking effect (exactly how a
+          # first "LTO build" of the cross recipe turned out to be
+          # nothing at all -- the edited build.sh was COPY'd into a stale
+          # docker image).
+          if [ "${{ matrix.arch }}" = "aarch64" ]; then
+            python3 -c 'import json,sys; o=json.load(open("meson-info/intro-buildoptions.json")); sys.exit(0 if any(x["name"]=="b_lto" and x["value"] is True for x in o) else "b_lto is not true in meson-info -- LTO did not take effect")'
+          fi
 
       - name: Build
         run: ninja -C build
@@ -242,6 +295,19 @@ jobs:
             arch: arm64
           - runner: macos-14
             arch: x86_64
+        # No --enable-lto on either macOS leg, deliberately. LTO is
+        # measured and soaked on aarch64 *Linux* only (+8.0%); on macOS
+        # it is entirely unmeasured, nobody on this project has a Mac to
+        # soak it on, and the x86_64 leg is already an unusual
+        # cross-compile (-arch x86_64 from an arm64 runner, two Homebrew
+        # prefixes) whose output then gets lipo-merged -- adding an
+        # untested whole-program optimisation under that is how silent
+        # breakage ships. Both legs already pass --disable-sdl, so the
+        # SDL2/SDL3 link conflict that blocks LTO elsewhere would not
+        # apply; the blocker here is purely "unmeasured and untestable
+        # by us", so this is a reasonable thing to revisit the moment
+        # someone can benchmark an Apple Silicon build.
+        #
         # Both legs run on macos-14 (arm64 host). The x86_64 leg used to
         # run on a native macos-13 (Intel) runner, but those have been
         # observed stuck queued for 6+ hours with no runner ever picking
@@ -550,6 +616,16 @@ jobs:
     # qemu-system-arm.exe -- owner's call, Windows users don't use them.
     # --disable-sdl/--disable-sdl-image: QEMU's legacy SDL2 display, not
     # our SDL3 GUI (statically built via its cmake subproject).
+    #
+    # No --enable-lto here either, deliberately. Same reasoning as the
+    # macOS legs: LTO's +8.0% is an aarch64-Linux measurement, it is a
+    # measured null on x86-64 (and this is an x86-64 target), and this
+    # particular link is the most fragile one in the project -- a fully
+    # static MXE/mingw toolchain where every dependency including glib is
+    # a .a, guarded by a self-containedness check that only catches DLL
+    # imports, not miscompiles. The only Windows validation this project
+    # has is the owner running the exe by hand. Not worth it for a gain
+    # we have no evidence exists on this arch.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

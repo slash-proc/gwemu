@@ -32,6 +32,13 @@ WORKDIR /src
 # build cache). Keep .dockerignore in sync when adding large artifacts.
 COPY . .
 
+# No --enable-lto: this image is x86-64, where LTO measured as a null
+# result (~0.9% on the retro-go Link's Awakening DX workload, inside
+# noise) -- the +8.0% is an aarch64-only win, see release.yml's matrix.
+# It would link fine here (--disable-sdl is already passed, so the
+# system-SDL2-vs-vendored-SDL3 symbol clash that blocks LTO elsewhere
+# can't arise), it just wouldn't buy anything, and this image's job is
+# reproducible capture rather than throughput.
 RUN mkdir build-docker && cd build-docker \
     && ../configure --target-list=arm-softmmu --disable-gtk --disable-sdl \
         --disable-sdl-image --disable-opengl \

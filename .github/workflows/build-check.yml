@@ -43,6 +43,15 @@ jobs:
         run: |
           mkdir build
           cd build
+          # Deliberately NO --enable-lto, on either arch, even though the
+          # shipped aarch64 release asset does use it (release.yml). This
+          # job is the cheap per-push "does it still build" check: LTO
+          # makes the link substantially slower for no signal this job
+          # cares about, and it would not even configure the same way --
+          # LTO can't link while system SDL2 and the vendored SDL3 are
+          # both present, so this job would have to drop --disable-sdl's
+          # worth of coverage to use it. Keeping this build closest to a
+          # plain default-configure is the point.
           ../configure --target-list=arm-softmmu
 
       - name: Build
