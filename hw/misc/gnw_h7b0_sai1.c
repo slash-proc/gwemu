@@ -38,6 +38,8 @@ static bool gnw_audio_trace_enabled(void)
     return v;
 }
 
+int64_t gnw_h7b0_audio_first_sample_ns = -1;
+
 /*
  * Per-event (per-DMA-half) tracing only. Measured on Windows: printing
  * one line per half -- 60/s for a 22kHz retro-go core -- slowed the
@@ -284,6 +286,10 @@ static void gnw_h7b0_sai1_voice_cb(void *opaque, int avail)
         uint32_t max = MIN((uint32_t)avail, fifo8_num_used(&s->fifo));
         const uint8_t *ptr = fifo8_pop_bufptr(&s->fifo, max, &chunk);
         int n = audio_be_write(s->audio_be, s->voice, (void *)ptr, chunk);
+
+        if (n > 0 && gnw_h7b0_audio_first_sample_ns < 0) {
+            gnw_h7b0_audio_first_sample_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
 
         if (n <= 0) {
             break;

@@ -113,5 +113,6 @@ struct GnwH7B0GpioState {
 int gnw_h7b0_gpio_button_from_name(const char *name);
 void gnw_h7b0_gpio_inject_button(GnwH7B0GpioState *s, int button,
                                  bool pressed);
+void gnw_timeline_record_quit(void);
 
 #endif

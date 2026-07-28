@@ -37,5 +37,6 @@ void gnw_timeline_init(GnwH7B0GpioState *gpio);
  * Drives entries using @NNN frame-number addressing.
  */
 void gnw_timeline_notify_vblank(void);
+uint64_t gnw_timeline_get_frame_count(void);
 
 #endif

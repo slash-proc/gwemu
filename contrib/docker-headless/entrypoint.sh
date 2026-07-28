@@ -12,7 +12,7 @@ QEMU="${GWEMU_BIN:-/usr/local/bin/qemu-system-arm}"
 IMAGES="${GWEMU_IMAGES:-/images}"
 OUT="${GWEMU_OUT:-/out}"
 BANK1= BANK2= EXTFLASH= SD=
-TIMELINE= RECORD= FPS=60 DETERMINISTIC=0 KEEP_RAW=0 QMP_PORT=
+TIMELINE= RECORD_TIMELINE= RECORD= FPS=60 DETERMINISTIC=0 KEEP_RAW=0 QMP_PORT=
 EXTRA_ARGS=()
 
 usage() {
@@ -24,6 +24,8 @@ usage: entrypoint [options]
   --timeline F                       timeline script (see docs) -- the only
                                      control surface; without it the run goes
                                      until killed
+  --record-timeline F                file to record live keystrokes into as a
+                                     timeline script
   --record NAME.mp4|.mkv|.flac|...   whole-session capture, muxed on exit
   --fps N                            recording frame rate (default 60)
   --deterministic                    -icount shift=auto,sleep=off (experimental)
@@ -41,6 +43,7 @@ while [ $# -gt 0 ]; do
     --extflash) EXTFLASH=$2; shift 2;;
     --sd) SD=$2; shift 2;;
     --timeline) TIMELINE=$2; shift 2;;
+    --record-timeline) RECORD_TIMELINE=$2; shift 2;;
     --record) RECORD=$2; shift 2;;
     --fps) FPS=$2; shift 2;;
     --deterministic) DETERMINISTIC=1; shift;;
@@ -93,6 +96,7 @@ ARGS=(-M gnw-h7b0 -display none
 
 export GNW_OUT="$OUT"
 [ -n "$TIMELINE" ] && export GNW_TIMELINE="$TIMELINE"
+[ -n "$RECORD_TIMELINE" ] && export GNW_TIMELINE_RECORD="$RECORD_TIMELINE"
 
 BASENAME=
 if [ -n "$RECORD" ]; then
@@ -131,7 +135,11 @@ if [ -n "$RECORD" ]; then
             # us, so v1 anchors it at 0 (see docs for the caveat).
             AUDIO_ARGS=()
             if [ -s "$BASENAME.wav" ]; then
-                AUDIO_ARGS=(-i "$BASENAME.wav" -c:a aac -af apad)
+                if [ -n "${audio_delay:-}" ]; then
+                    AUDIO_ARGS=(-itsoffset "$audio_delay" -i "$BASENAME.wav" -c:a aac -af apad)
+                else
+                    AUDIO_ARGS=(-i "$BASENAME.wav" -c:a aac -af apad)
+                fi
             fi
             ffmpeg -y -loglevel error \
                 -f rawvideo -pix_fmt "$pix_fmt" -s "${width}x${height}" \

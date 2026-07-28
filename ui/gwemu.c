@@ -41,6 +41,7 @@
 #include "qobject/qdict.h"
 #include "ui/console.h"
 #include "ui/input.h"
+#include "hw/misc/gnw_h7b0_gpio.h"
 #include "ui/kbd-state.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
@@ -675,6 +676,7 @@ static void handle_windowevent(SDL_Event *ev)
             }
             if (allow_close) {
                 shutdown_action = SHUTDOWN_ACTION_POWEROFF;
+                gnw_timeline_record_quit();
                 qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
             }
         } else {
@@ -1520,6 +1522,7 @@ static void poll_events(struct gwemu_console *scon)
             }
             if (allow_close) {
                 shutdown_action = SHUTDOWN_ACTION_POWEROFF;
+                gnw_timeline_record_quit();
                 qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
             }
             break;

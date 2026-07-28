@@ -2,15 +2,25 @@
 # 8GB sdcard image, firmware backups, reference PDFs/SDK and both build
 # trees into every layer (real incident: 100GB of build cache, host disk
 # at 97%).
+
+# Build trees (all variants)
 backup/
-build/
-build-win/
-build-docker/
+build*/
+bf-*/
 sdk/
 retro-go-temp/
+
+# Large binary blobs and media
+*.bin
 *.img
 *.qcow2
+*.7z
+*.mp3
 *.pdf
-STM32H7B0.svd
+*.svd
+perf.data
 mac_report.log
+
+# Git metadata
 .git/
+

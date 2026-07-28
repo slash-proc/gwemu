@@ -103,15 +103,20 @@ static void gnw_timeline_timer_cb(void *opaque)
 
 void gnw_timeline_notify_vblank(void)
 {
+    tl_frame_count++;
     if (!tl_fevents) {
         return;
     }
-    tl_frame_count++;
     while (tl_next_frame < tl_nfevents &&
            tl_fevents[tl_next_frame].frame <= tl_frame_count) {
         gnw_timeline_exec(&tl_fevents[tl_next_frame]);
         tl_next_frame++;
     }
+}
+
+uint64_t gnw_timeline_get_frame_count(void)
+{
+    return tl_frame_count;
 }
 
 /* "[MM:]SS[.fff]" -> ns; returns -1 on parse failure. */
@@ -129,6 +134,9 @@ static int64_t gnw_timeline_parse_time(const char *tok)
         tok = colon + 1;
     }
     secs = g_ascii_strtod(tok, &end);
+    if (*end == 's' && end[1] == '\0') {
+        end++;
+    }
     if (*end != '\0' || secs < 0 || (colon && secs >= 60)) {
         return -1;
     }
@@ -251,8 +259,8 @@ void gnw_timeline_init(GnwH7B0GpioState *gpio)
         const char *act = tok[1];
         int btns[8], nbtns;
 
-        if (!strcmp(act, "press") || !strcmp(act, "hold") ||
-            !strcmp(act, "release")) {
+        if (!strcmp(act, "press") || !strcmp(act, "down") ||
+            !strcmp(act, "hold") || !strcmp(act, "release")) {
             if (ntok < 3) {
                 goto bad;
             }

@@ -25,12 +25,14 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "qapi/util.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "ui/console.h"
 #include "ui/input.h"
+#include "system/system.h"
 #include "hw/misc/gnw_h7b0_gpio.h"
 #include "hw/misc/gnw_timeline.h"
 #include "hw/misc/gnw_h7b0_regs_gpio.h"
@@ -161,12 +163,25 @@ static void gnw_h7b0_gpio_set_pin(GnwH7B0GpioState *s, int port,
     }
 }
 
-static const char *const gnw_h7b0_button_names[GNW_BTN__COUNT];
+static const char *const gnw_h7b0_button_names[GNW_BTN__COUNT] = {
+    [GNW_BTN_PAUSE]  = "pause",
+    [GNW_BTN_GAME]   = "game",
+    [GNW_BTN_TIME]   = "time",
+    [GNW_BTN_A]      = "a",
+    [GNW_BTN_B]      = "b",
+    [GNW_BTN_LEFT]   = "left",
+    [GNW_BTN_DOWN]   = "down",
+    [GNW_BTN_RIGHT]  = "right",
+    [GNW_BTN_UP]     = "up",
+    [GNW_BTN_PWR]    = "pwr",
+    [GNW_BTN_START]  = "start",
+    [GNW_BTN_SELECT] = "select",
+};
 
 int gnw_h7b0_gpio_button_from_name(const char *name)
 {
     for (int i = 0; i < GNW_BTN__COUNT; i++) {
-        if (!g_ascii_strcasecmp(name, gnw_h7b0_button_names[i])) {
+        if (gnw_h7b0_button_names[i] && !g_ascii_strcasecmp(name, gnw_h7b0_button_names[i])) {
             return i;
         }
     }
@@ -193,10 +208,38 @@ void gnw_h7b0_gpio_inject_button(GnwH7B0GpioState *s, int button,
     }
 }
 
+static FILE *rec_file = NULL;
+static bool rec_inited = false;
+
+void gnw_timeline_record_quit(void)
+{
+    if (rec_file) {
+        double t = (double)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000.0;
+        fprintf(rec_file, "%.3f quit\n", t + 0.5);
+        fclose(rec_file);
+        rec_file = NULL;
+    }
+}
+
 static void gnw_h7b0_gpio_input_event(DeviceState *dev, QemuConsole *src,
                                        InputEvent *evt)
 {
     GnwH7B0GpioState *s = GNW_H7B0_GPIO(dev);
+
+    if (!rec_inited) {
+        const char *rec_path = getenv("GNW_TIMELINE_RECORD");
+        if (rec_path) {
+            rec_file = fopen(rec_path, "w");
+            if (!rec_file) {
+                error_report("gnw-gpio: cannot open GNW_TIMELINE_RECORD=%s", rec_path);
+            } else {
+                fprintf(rec_file, "# Automatically recorded timeline\n");
+            }
+        }
+        rec_inited = true;
+    }
+
+    static bool btn_state[GNW_BTN__COUNT] = {false};
 
     switch (evt->type) {
     case INPUT_EVENT_KIND_KEY: {
@@ -205,7 +248,19 @@ static void gnw_h7b0_gpio_input_event(DeviceState *dev, QemuConsole *src,
 
         for (int i = 0; i < GNW_BTN__COUNT; i++) {
             if (s->key_map[i] == qcode) {
+                if (btn_state[i] == key->down) {
+                    /* Ignore key repeat */
+                    break;
+                }
+                btn_state[i] = key->down;
                 gnw_h7b0_gpio_set_button(s, i, key->down);
+                if (rec_file) {
+                    double t = (double)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000.0;
+                    fprintf(rec_file, "%.3f %s %s\n", t,
+                            key->down ? "down" : "release",
+                            gnw_h7b0_button_names[i]);
+                    fflush(rec_file);
+                }
                 break;
             }
         }
@@ -418,21 +473,6 @@ static void gnw_h7b0_gpio_init(Object *obj)
                                          gnw_h7b0_gpio_pa0_release, s);
 }
 
-/* Button names for the "keymap" property, indexed by GNW_BTN_*. */
-static const char *const gnw_h7b0_button_names[GNW_BTN__COUNT] = {
-    [GNW_BTN_PAUSE]  = "pause",
-    [GNW_BTN_GAME]   = "game",
-    [GNW_BTN_TIME]   = "time",
-    [GNW_BTN_A]      = "a",
-    [GNW_BTN_B]      = "b",
-    [GNW_BTN_LEFT]   = "left",
-    [GNW_BTN_DOWN]   = "down",
-    [GNW_BTN_RIGHT]  = "right",
-    [GNW_BTN_UP]     = "up",
-    [GNW_BTN_PWR]    = "pwr",
-    [GNW_BTN_START]  = "start",
-    [GNW_BTN_SELECT] = "select",
-};
 
 /*
  * Env-gated scripted input for automated testing: GNW_AUTO_INPUT=

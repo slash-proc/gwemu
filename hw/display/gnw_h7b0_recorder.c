@@ -32,6 +32,8 @@ static QemuConsole *rec_con;
 static int64_t rec_period_ns;
 static int rec_w, rec_h;
 static char *rec_basename;
+extern int64_t gnw_h7b0_audio_first_sample_ns;
+static int64_t rec_start_ns;
 static uint64_t rec_nframes;
 
 static void gnw_h7b0_recorder_write_meta(void)
@@ -43,6 +45,10 @@ static void gnw_h7b0_recorder_write_meta(void)
         fprintf(f, "width=%d\nheight=%d\nfps=%lld\npix_fmt=bgr0\n",
                 rec_w, rec_h,
                 (long long)(NANOSECONDS_PER_SECOND / rec_period_ns));
+        if (gnw_h7b0_audio_first_sample_ns > rec_start_ns) {
+            double delay = (double)(gnw_h7b0_audio_first_sample_ns - rec_start_ns) / 1e9;
+            fprintf(f, "audio_delay=%.3f\n", delay);
+        }
         fclose(f);
     }
 }
@@ -61,7 +67,14 @@ static void gnw_h7b0_recorder_tick(void *opaque)
             /* First frame fixes the stream geometry. */
             rec_w = w;
             rec_h = h;
+            rec_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
             gnw_h7b0_recorder_write_meta();
+        } else if (gnw_h7b0_audio_first_sample_ns > 0) {
+            static bool delay_written = false;
+            if (!delay_written) {
+                gnw_h7b0_recorder_write_meta();
+                delay_written = true;
+            }
         }
         if (w == rec_w && h == rec_h &&
             surface_bytes_per_pixel(surface) == 4) {
