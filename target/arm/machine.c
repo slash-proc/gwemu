@@ -528,6 +528,32 @@ static const VMStateDescription vmstate_event = {
     }
 };
 
+static bool m_mpu_rnr_invalid_needed(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    /*
+     * Only set between an UNPREDICTABLE MPU_RNR/MPU_RBAR write naming an
+     * unimplemented region and the next write that reselects a valid one,
+     * so for any well-behaved guest this subsection is never sent and
+     * migration to an older QEMU keeps working.
+     */
+    return cpu->env.v7m.mpu_rnr_invalid[M_REG_NS] ||
+           cpu->env.v7m.mpu_rnr_invalid[M_REG_S];
+}
+
+static const VMStateDescription vmstate_m_mpu_rnr_invalid = {
+    .name = "cpu/m/mpu-rnr-invalid",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = m_mpu_rnr_invalid_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(env.v7m.mpu_rnr_invalid[M_REG_NS], ARMCPU),
+        VMSTATE_BOOL(env.v7m.mpu_rnr_invalid[M_REG_S], ARMCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_m = {
     .name = "cpu/m",
     .version_id = 4,
@@ -555,6 +581,7 @@ static const VMStateDescription vmstate_m = {
         &vmstate_m_v8m,
         &vmstate_m_fp,
         &vmstate_m_mve,
+        &vmstate_m_mpu_rnr_invalid,
         NULL
     }
 };

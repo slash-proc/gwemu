@@ -624,6 +624,18 @@ typedef struct CPUArchState {
         uint32_t bfar; /* BusFault Address */
         uint32_t sfar; /* Secure Fault Address Register */
         unsigned mpu_ctrl[M_REG_NUM_BANKS]; /* MPU_CTRL */
+        /*
+         * True if the last write to MPU_RNR, or to MPU_RBAR with the VALID
+         * bit set, selected a region number that this CPU does not implement.
+         * Architecturally that write is UNPREDICTABLE; we discard it, which
+         * leaves MPU_RNR pointing at whatever region was selected before.
+         * A subsequent MPU_RASR write takes its region number solely from
+         * MPU_RNR, so without this flag it would land on that unrelated
+         * region and reprogram it -- turning two writes aimed at a
+         * nonexistent region into a real change to an existing one. We
+         * therefore discard the following MPU_RASR write too.
+         */
+        bool mpu_rnr_invalid[M_REG_NUM_BANKS];
         int exception;
         uint32_t primask[M_REG_NUM_BANKS];
         uint32_t faultmask[M_REG_NUM_BANKS];

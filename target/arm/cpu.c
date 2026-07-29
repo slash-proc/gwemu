@@ -531,6 +531,8 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
 
         env->pmsav7.rnr[M_REG_NS] = 0;
         env->pmsav7.rnr[M_REG_S] = 0;
+        env->v7m.mpu_rnr_invalid[M_REG_NS] = false;
+        env->v7m.mpu_rnr_invalid[M_REG_S] = false;
         env->pmsav8.mair0[M_REG_NS] = 0;
         env->pmsav8.mair0[M_REG_S] = 0;
         env->pmsav8.mair1[M_REG_NS] = 0;

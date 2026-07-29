@@ -2036,8 +2036,10 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
             qemu_log_mask(LOG_GUEST_ERROR, "MPU region out of range %"
                           PRIu32 "/%" PRIu32 "\n",
                           value, cpu->pmsav7_dregion);
+            cpu->env.v7m.mpu_rnr_invalid[attrs.secure] = true;
         } else {
             cpu->env.pmsav7.rnr[attrs.secure] = value;
+            cpu->env.v7m.mpu_rnr_invalid[attrs.secure] = false;
         }
         break;
     case 0xd9c: /* MPU_RBAR */
@@ -2076,10 +2078,16 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "MPU region out of range %u/%" PRIu32 "\n",
                               region, cpu->pmsav7_dregion);
+                cpu->env.v7m.mpu_rnr_invalid[attrs.secure] = true;
                 return;
             }
             cpu->env.pmsav7.rnr[attrs.secure] = region;
+            cpu->env.v7m.mpu_rnr_invalid[attrs.secure] = false;
         } else {
+            if (cpu->env.v7m.mpu_rnr_invalid[attrs.secure]) {
+                /* MPU_RNR does not select an implemented region */
+                return;
+            }
             region = cpu->env.pmsav7.rnr[attrs.secure];
         }
 
@@ -2117,7 +2125,8 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
             return;
         }
 
-        if (region >= cpu->pmsav7_dregion) {
+        if (region >= cpu->pmsav7_dregion ||
+            cpu->env.v7m.mpu_rnr_invalid[attrs.secure]) {
             return;
         }
 
