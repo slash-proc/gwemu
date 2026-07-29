@@ -1,3 +1,34 @@
+2026-07-29  docs: record that upstream's test suite has gone unrun since the
+            fork and should go into CI. `meson test --suite qtest-arm`
+            gives 28 ok / 10 fail / 3 timeout on gnw-h7b0; the failures
+            are all in boards this fork does not touch and predate the
+            MPU fix (verified by running the same suite with that fix
+            stashed -- identical results bar the new MPU test). Logged in
+            docs/STATUS.md under both Known issues and Now/next, with the
+            triage-then-baseline plan, since a permanently-red CI job
+            would just get ignored.
+
+2026-07-29  armv7m: stop an UNPREDICTABLE MPU region write from manufacturing
+            a no-access region. Writing MPU_RBAR with VALID=1 (or MPU_RNR)
+            naming a region the CPU does not implement is architecturally
+            UNPREDICTABLE; QEMU discarded the write but left MPU_RNR
+            pointing at the previously selected region, so the MPU_RASR
+            write that HAL_MPU_ConfigRegion() issues next -- which takes
+            its region number solely from MPU_RNR -- landed on that
+            unrelated region and enabled it at its reset base of 0. A
+            retro-go SD-card build passes an unaligned &_stack_redzone
+            straight through as the region base, so RBAR's low 5 bits are
+            accidentally VALID|REGION=8; that boots on real hardware but
+            took a MemManage fault in gwemu, because region 2 came up
+            enabled at address 0 with AP=0/XN=1 and itc_malloc()'s first
+            allocation is address 0. The offending RASR write is now
+            discarded too. Fixes a divergence found integrating gwemu
+            into retro-go's workflows; repro material in backup/memfault/.
+            This is stock upstream code (unchanged since 2017), so the
+            bug is upstream QEMU's, not fork-local. Covered by a new
+            tests/qtest/armv7m-mpu-test.c against mps2-an385, verified to
+            fail without the fix.
+
 2026-07-27  build: enable LTO on the shipped aarch64 Linux release asset.
             release.yml's build-linux aarch64 leg builds natively, not
             via contrib/docker-arm64-cross/build.sh, so that recipe's

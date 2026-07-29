@@ -84,6 +84,15 @@ audio, gamepad input, SD card, save/flash persistence.
   measurement (`docs/emulation-performance.md`).
 - Real subsampled chroma storage was traded for full-resolution internal
   storage in the JPEG model (a documented scope decision, not a bug).
+- **Upstream's own test suite has not been run since the fork, and 10 of
+  its ARM qtests fail.** Measured 2026-07-29 on `gnw-h7b0`: `meson test
+  --suite qtest-arm` gives 28 ok / 10 fail / 3 timeout. The failures are
+  in boards this fork does not touch (nRF51 timer, npcm7xx timer/adc/
+  watchdog, cmsdk-apb timers, pflash-cfi02, arm-mptimer, qos, qmp,
+  boot-serial), so they are unlikely to be gnw-specific, but nobody has
+  triaged them and some may be real damage from fork-local NVIC/timer
+  changes. Nothing runs them automatically: `build-check.yml` builds and
+  smoke-checks machine registration only.
 
 ## Now / next
 
@@ -97,6 +106,16 @@ Raspberry Pi 4 render-path performance is done (system-wide CPU 199.7% ->
   on hardware before modelling it.
 - GUI profile restructure Phase 3: Profiles as a top-level tab,
   Flash/SD tab demotion, CLI-adopt toast.
+- **Get back into the habit of running upstream's tests, and put them in
+  CI.** The MPU fix above was the first thing in this fork to come with a
+  qtest, and running the suite to check it for regressions is what
+  surfaced the 10 pre-existing failures listed under Known issues. Plan:
+  triage those 10 first (fork-local damage vs. upstream/environment), so
+  the suite has a known-good baseline; then add a `meson test --suite
+  qtest-arm` step to `build-check.yml`, allowing only that triaged
+  baseline to fail, so a new regression is loud instead of invisible.
+  Without the triage step a CI job would just be permanently red and get
+  ignored.
 
 ## Tooling notes worth keeping in mind
 
