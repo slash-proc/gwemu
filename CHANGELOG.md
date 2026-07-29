@@ -1,3 +1,18 @@
+2026-07-29  docker-headless: gate timeline recording out of the headless
+            entrypoint. --record-timeline (GNW_TIMELINE_RECORD) landed in
+            the entrypoint alongside the feature, but it records LIVE
+            keystrokes off the GPIO device's QEMU input handler, which
+            only sees events a display backend delivers -- and the
+            entrypoint hardcodes -display none, so no event ever arrives
+            and the script would come out empty. There is also no way to
+            watch a container's video live, so there is nothing to time
+            presses against: the feature is structurally GUI-only. The
+            flag now errors out pointing at the GUI rather than silently
+            producing nothing, and headless-capture.md documents the
+            record-with-a-window / replay-without-one split (the feature
+            was previously undocumented anywhere). Replay is untouched --
+            verified with a timeline+screenshot run.
+
 2026-07-29  docs: record that upstream's test suite has gone unrun since the
             fork and should go into CI. `meson test --suite qtest-arm`
             gives 28 ok / 10 fail / 3 timeout on gnw-h7b0; the failures

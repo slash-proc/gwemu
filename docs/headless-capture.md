@@ -75,6 +75,26 @@ Line-based; `#` comments; blank lines ignored.
 - `GNW_AUTO_INPUT` (the older `t:btn[:hold]` one-liner env) still works
   for quick interactive use.
 
+### Authoring a timeline by recording one (GUI only, not headless)
+
+`GNW_TIMELINE_RECORD=<file>` writes a timeline script from what you
+actually press, which is far easier than hand-timing a script. Run it
+under the GUI:
+
+```sh
+GNW_TIMELINE_RECORD=demo.tl ./build/qemu-system-arm -M gnw-h7b0 ... -display gwemu
+```
+
+then replay it here with `GNW_TIMELINE`/`--timeline`.
+
+**This is deliberately unavailable headless**, and the docker entrypoint
+rejects `--record-timeline` with an error rather than accepting it.
+Recording hangs off the GPIO device's QEMU input handler, so it only sees
+events a display backend delivers — under `-display none` nothing ever
+arrives and the output file would be empty. More to the point, there is
+no way to watch a container's video live, so there is nothing to time
+your presses against. Record with a window, replay without one.
+
 ## Recording
 
 `GNW_RECORD=<basename>` (the entrypoint's `--record` sets this) samples

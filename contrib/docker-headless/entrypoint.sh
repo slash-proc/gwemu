@@ -12,7 +12,7 @@ QEMU="${GWEMU_BIN:-/usr/local/bin/qemu-system-arm}"
 IMAGES="${GWEMU_IMAGES:-/images}"
 OUT="${GWEMU_OUT:-/out}"
 BANK1= BANK2= EXTFLASH= SD=
-TIMELINE= RECORD_TIMELINE= RECORD= FPS=60 DETERMINISTIC=0 KEEP_RAW=0 QMP_PORT=
+TIMELINE= RECORD= FPS=60 DETERMINISTIC=0 KEEP_RAW=0 QMP_PORT=
 EXTRA_ARGS=()
 
 usage() {
@@ -24,8 +24,6 @@ usage: entrypoint [options]
   --timeline F                       timeline script (see docs) -- the only
                                      control surface; without it the run goes
                                      until killed
-  --record-timeline F                file to record live keystrokes into as a
-                                     timeline script
   --record NAME.mp4|.mkv|.flac|...   whole-session capture, muxed on exit
   --fps N                            recording frame rate (default 60)
   --deterministic                    -icount shift=auto,sleep=off (experimental)
@@ -43,7 +41,19 @@ while [ $# -gt 0 ]; do
     --extflash) EXTFLASH=$2; shift 2;;
     --sd) SD=$2; shift 2;;
     --timeline) TIMELINE=$2; shift 2;;
-    --record-timeline) RECORD_TIMELINE=$2; shift 2;;
+    # Timeline recording (GNW_TIMELINE_RECORD) captures LIVE keystrokes, so it
+    # needs both a display backend delivering input events and a human watching
+    # the video to know when to press. This entrypoint hardcodes -display none
+    # below, and a container has no live video output to watch, so recording
+    # here can only ever write an empty file. Reject it loudly rather than let
+    # a run look like it captured something. Record timelines with the GUI
+    # (-display gwemu), then replay them here with --timeline.
+    --record-timeline)
+        echo "error: --record-timeline does not work headless -- it records live" \
+             "keystrokes, and this container runs -display none with no video to" \
+             "watch. Record with the GUI (-display gwemu, GNW_TIMELINE_RECORD=F)," \
+             "then replay the script here with --timeline." >&2
+        exit 1;;
     --record) RECORD=$2; shift 2;;
     --fps) FPS=$2; shift 2;;
     --deterministic) DETERMINISTIC=1; shift;;
@@ -96,7 +106,6 @@ ARGS=(-M gnw-h7b0 -display none
 
 export GNW_OUT="$OUT"
 [ -n "$TIMELINE" ] && export GNW_TIMELINE="$TIMELINE"
-[ -n "$RECORD_TIMELINE" ] && export GNW_TIMELINE_RECORD="$RECORD_TIMELINE"
 
 BASENAME=
 if [ -n "$RECORD" ]; then

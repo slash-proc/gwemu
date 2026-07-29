@@ -115,3 +115,9 @@ GWEMU_BIN=./build/qemu-system-arm GWEMU_OUT=./out \
 Or drive the binary directly — the features are env-gated
 (`GNW_TIMELINE`, `GNW_OUT`, `GNW_RECORD`, `GNW_RECORD_FPS`) and
 `-display none` is genuinely windowless; see the doc linked above.
+
+Timeline *recording* (`GNW_TIMELINE_RECORD`) is not among them: it
+captures live keystrokes, which needs a window to press into and live
+video to time the presses against, so it is a GUI-only feature and
+`--record-timeline` is rejected here. Record a script with `-display
+gwemu`, then replay it with `--timeline`.
