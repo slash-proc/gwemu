@@ -40,9 +40,10 @@ offset — so a 12-bit cache indexes on only 6 page bits, and a working set over
 so the whole effect is the single step 12 → 14 and larger caches only cost
 footprint. Costs 256KB/vCPU.
 
-### `perf/goto-tb-crosspage` — cross-page `goto_tb` chaining (OPT-IN, off by default)
+### `perf/goto-tb-crosspage` — cross-page `goto_tb` chaining (ON by default)
 
-`GNW_GOTO_TB_CROSSPAGE=1`. **−27% host CPU** on the DOS core (7.24s → 5.28s);
+**−27% host CPU** on the DOS core (7.24s → 5.28s). `GNW_GOTO_TB_CROSSPAGE=0`
+is the escape hatch;
 guest DWT agrees (cpu 22→14%/frame, idle 75→85%, cpi 52→33, blit 342→87µs).
 
 Cause, measured by histogramming the guest PC of all 412M TB lookups in a 30s
@@ -64,7 +65,12 @@ every TLB flush tears them all down. Same-page links are deliberately *not*
 recorded, so a flush-heavy guest keeps normal chaining. Code modification was
 already covered independently by `tb_phys_invalidate()` → `tb_jmp_unlink()`.
 
-**Why it stays opt-in.** The teardown is confirmed live (1970 links noted, 79
+**Why it shipped on despite an untested hazard.** Project decision: keep measured
+improvements unless obviously buggy, and validate them together in a broad
+cross-platform test round rather than holding each behind a knob indefinitely.
+What follows is therefore the watch-list for that round, not a blocker.
+
+The teardown is confirmed live (1970 links noted, 79
 flush events, 1444 torn down per run), and every M-profile MPU write that
 changes permissions does reach `tlb_flush`. But a negative control settled the
 question: **with the teardown deliberately neutered, the workload still produced
@@ -72,8 +78,8 @@ bit-for-bit correct output.** The guest's runtime MPU changes only alter
 cacheability and always keep `INSTRUCTION_ACCESS_ENABLE`, so it never revokes
 execute permission on a page it is executing from — the one case the teardown
 exists for. The hazard is therefore *untested*, not cleared, and passing runs
-are not evidence of safety. Enabling by default needs a guest that makes an
-executing page non-executable.
+are not evidence of safety. Fully clearing it needs a guest that makes an
+executing page non-executable — no existing timeline reaches that.
 
 Residual risks: links are compared on *physical* pages (fine where VA==PA, would
 under-record on an MMU target with aliasing); `tb_reset_jump()` does not clear
