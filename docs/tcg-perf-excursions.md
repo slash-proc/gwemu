@@ -1,4 +1,4 @@
-# TCG performance excursions
+# Performance excursions (TCG and compositor)
 
 Index of TCG/dispatch performance experiments run against this fork: what was
 tried, what it measured, and whether it was kept. Refuted experiments are listed
@@ -79,6 +79,38 @@ Residual risks: links are compared on *physical* pages (fine where VA==PA, would
 under-record on an MMU target with aliasing); `tb_reset_jump()` does not clear
 `jmp_dest`, so a torn-down link never re-links and the win decays on a guest
 that flushes the TLB constantly.
+
+### `perf/ltdc-blend-fastpath` — SSE2 row path for constant-alpha BFCR (ON)
+
+**−53% host CPU on the render-bound launcher** (1.62s → 0.76s); −2.4% on the DOS
+core, which is L8 and never enters the fast path.
+
+`gnw_h7b0_ltdc_blend_over` was 37% of launcher samples. The cause was the
+fast-path *gate*, not the blend maths: it required `LxBFCR` to be the PAxCA
+pair, and the launcher programs `L1BFCR = 0x405` (constant alpha), so every
+pixel of a fully opaque RGB565 Layer1 took the general scalar path.
+
+Dropping the BFCR term is exact: an RGB565 pixel always has `pa == 255`, so
+both of `blend_over()`'s factors collapse to `ca` in all four BF1/BF2 mode
+combinations, and the gate still requires `ca == 255` — i.e. "return fg
+unmodified" for any BFCR. The exclusions that would break that collapse are all
+still enforced (`!l1_colken` — a colour-key hit forces `pa = 0` — plus `!l1_l8`
+and `!dither_en`).
+
+Two premises in the recon that funded this excursion turned out to be **wrong**,
+which is worth remembering when reading recon: Layer2 is never active in any
+available scene (`l2_active == false` in all 3514 frames), and force-inlining
+`blend_over` measured within noise on its own. The entire win came from the BFCR
+term, which the recon had not identified.
+
+Correctness is **differential, not visual**: `GNW_LTDC_VERIFY_FASTPATH=1`
+composites every frame twice — with and without the fast path — and memcmps.
+3514 frames, zero mismatching pixels. Cross-build frame hashing was tried first
+and abandoned: the launcher scene contains a wall-clock-varying element, so its
+frames are not reproducible run to run. The verifier is retained behind the knob.
+
+Unexercised: the Layer2 second pass. No timeline activates Layer2, so that code
+has never run. The verifier will catch it the moment a Layer2 scene exists.
 
 ## Refuted
 
