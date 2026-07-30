@@ -1155,7 +1155,8 @@ static int gnw_h7b0_ltdc_capture_setup(GnwH7B0LtdcState *s)
  * so the result is the foreground pixel unmodified -- matching the
  * previous hardcoded behavior exactly.
  */
-static uint32_t gnw_h7b0_ltdc_blend_over(uint32_t fg, unsigned int fg_a,
+static inline __attribute__((always_inline))
+uint32_t gnw_h7b0_ltdc_blend_over(uint32_t fg, unsigned int fg_a,
                                           uint32_t bfcr, unsigned int ca,
                                           uint32_t bg)
 {
@@ -1584,9 +1585,10 @@ static void gnw_h7b0_ltdc_promote_staged(GnwH7B0LtdcState *s)
  * clip precompute (l1_x_in/l2_x_in) and gnw_h7b0_ltdc_blend_over()'s
  * fully-transparent/fully-opaque fast paths.
  */
-static void gnw_h7b0_ltdc_composite_from_job(GnwH7B0LtdcState *s,
-                                              GnwH7B0LtdcCaptureJob *job,
-                                              uint32_t *out)
+static void gnw_h7b0_ltdc_composite_from_job_inner(GnwH7B0LtdcState *s,
+                                                    GnwH7B0LtdcCaptureJob *job,
+                                                    uint32_t *out,
+                                                    bool allow_fast)
 {
     int cols = job->cols;
     uint32_t pfcr = job->active_l1pfcr & LTDC_LxPFCR_PF_MASK;
@@ -1648,27 +1650,83 @@ static void gnw_h7b0_ltdc_composite_from_job(GnwH7B0LtdcState *s,
      * with the default PAxCA blend factors and CACR==255 (so
      * gnw_h7b0_ltdc_blend_over()'s own fast path would just return fg
      * unmodified for every pixel), no color-key (which can force
-     * per-pixel transparency), no dithering, Layer2 either disabled or
-     * an unsupported/zero-bpp format, and the whole row's x-range inside
-     * Layer1's window (checked once here via the endpoints -- l1_x_in[]
-     * is monotonic in x since WHSTPOS<=WHSPPOS bounds a single
+     * per-pixel transparency), no dithering, and the whole row's x-range
+     * inside Layer1's window (checked once here via the endpoints --
+     * l1_x_in[] is monotonic in x since WHSTPOS<=WHSPPOS bounds a single
      * contiguous span).
+     *
+     * NOTE: this deliberately says nothing about Layer2. Under those
+     * conditions the Layer1 half of the general loop reduces exactly to
+     * "out = rgb565_to_argb8888(src)" -- resolve_layer returns the raw
+     * pixel with alpha 255, and blend_over's PAxCA fast path then returns
+     * that foreground unmodified, discarding BCCR. So when Layer2 IS up we
+     * can still vectorise the Layer1 unpack for the whole row and then run
+     * a second, Layer2-only pass over [0, l2_cols) that blends the overlay
+     * on top of it -- bit-identical to the fused loop, because Layer2's own
+     * per-pixel work in the fused loop reads nothing but `below` (which is
+     * precisely what pass 1 wrote) and columns >= l2_cols are untouched by
+     * either version. dither_en is excluded from the fast gate entirely, so
+     * the post-blend dither step cannot be split across the two passes.
+     *
+     * The gate deliberately does NOT test LxBFCR. It used to require the
+     * PAxCA pair, but that was over-restrictive and cost real time: an
+     * RGB565 Layer1 pixel always has pa==255, so blend_over()'s
+     *   factor1     = (bf1 & PA) ? (pa * ca)/255 : ca   ==  ca
+     *   factor2base = (bf2 & PA) ? (pa * ca)/255 : ca   ==  ca
+     * collapse to `ca` in ALL FOUR BF1/BF2 mode combinations. With
+     * ca == 255 that is factor1 == 255 / factor2 == 0, i.e. "return fg
+     * unmodified", for any BFCR whatsoever. Requiring PA mode therefore
+     * excluded nothing unsafe and did exclude the real retro-go launcher,
+     * which programs L1BFCR = 0x405 (constant-alpha mode) and so took the
+     * fully general scalar path for every pixel of an entirely opaque
+     * layer. CACR == 255 is still required, and !l1_colken still is too
+     * (a color-key hit forces pa to 0, breaking the collapse above).
      */
-    bool l1_fast_eligible = !l1_l8 && !l1_colken && l1_cacr == 255 &&
-        gnw_h7b0_ltdc_bfcr_is_pa_pa(l1_bfcr) && !(l2_en && l2_bpp > 0) &&
+    bool l1_fast_eligible = allow_fast && !l1_l8 && !l1_colken &&
+        l1_cacr == 255 &&
         !dither_en && cols > 0 && l1_x_in[0] && l1_x_in[cols - 1];
+    bool l2_active = l2_en && l2_bpp > 0;
 
     for (int y = 0; y < job->rows; y++) {
         int abs_y = avbp + y + 1;
         bool l1_row_in = abs_y >= l1_wvstpos && abs_y <= l1_wvsppos;
         bool l2_row_in = abs_y >= l2_wvstpos && abs_y <= l2_wvsppos;
         const uint8_t *linebuf = job->l1_raw + (size_t)y * src_width;
-        const uint8_t *l2_linebuf = (l2_en && l2_bpp > 0) ?
+        const uint8_t *l2_linebuf = l2_active ?
             job->l2_raw + (size_t)y * l2_src_width : NULL;
 
         if (l1_fast_eligible && l1_row_in) {
-            gnw_h7b0_ltdc_rgb565_row_to_argb8888(
-                linebuf, out + (hwaddr)y * cols, cols);
+            uint32_t *outrow = out + (hwaddr)y * cols;
+
+            gnw_h7b0_ltdc_rgb565_row_to_argb8888(linebuf, outrow, cols);
+
+            if (l2_active) {
+                /* Pass 2: Layer2 only, on top of what pass 1 just wrote. */
+                for (int x = 0; x < l2_cols; x++) {
+                    bool l2_in = l2_row_in && l2_x_in[x];
+                    uint32_t l2_raw;
+                    unsigned int l2_alpha;
+                    uint32_t l2_resolved;
+
+                    if (l2_l8) {
+                        l2_raw = job->clut2[l2_linebuf[x]];
+                    } else if (l2_al44) {
+                        uint8_t raw = l2_linebuf[x];
+                        unsigned int a8 = ((raw >> 4) & 0xF) * 0x11U;
+                        uint32_t clut_rgb =
+                            job->clut2[(raw & 0xF) * 0x11U] & 0x00FFFFFFU;
+                        l2_raw = (a8 << 24) | clut_rgb;
+                    } else {
+                        l2_raw = gnw_h7b0_ltdc_read_pixel_buf(
+                            l2_linebuf + x * l2_bpp, l2_pfcr);
+                    }
+
+                    l2_resolved = gnw_h7b0_ltdc_resolve_layer(
+                        l2_raw, l2_in, l2_dccr, l2_colken, l2_ckcr, &l2_alpha);
+                    outrow[x] = gnw_h7b0_ltdc_blend_over(
+                        l2_resolved, l2_alpha, l2_bfcr, l2_cacr, outrow[x]);
+                }
+            }
             continue;
         }
 
@@ -1685,7 +1743,7 @@ static void gnw_h7b0_ltdc_composite_from_job(GnwH7B0LtdcState *s,
             uint32_t below = gnw_h7b0_ltdc_blend_over(l1_resolved, l1_alpha,
                                                        l1_bfcr, l1_cacr, bccr);
 
-            if (l2_en && l2_bpp > 0 && x < l2_cols) {
+            if (l2_active && x < l2_cols) {
                 bool l2_in = l2_row_in && l2_x_in[x];
                 uint32_t l2_raw;
                 unsigned int l2_alpha;
@@ -1719,6 +1777,49 @@ static void gnw_h7b0_ltdc_composite_from_job(GnwH7B0LtdcState *s,
             }
 
             out[y * cols + x] = px;
+        }
+    }
+}
+
+/*
+ * GNW_LTDC_VERIFY_FASTPATH=1: composite every frame twice -- once with the
+ * row fast path enabled (the result that is actually published) and once
+ * with it forced off (the fully general per-pixel path) -- and log any
+ * mismatch. This is the differential proof that the fast path is
+ * pixel-exact; it is far stronger than comparing frame hashes across two
+ * builds, which the launcher scene defeats anyway (it contains a
+ * wall-clock-varying element, so its frames are not reproducible run to
+ * run). Off by default and roughly halves compositor throughput when on.
+ */
+static void gnw_h7b0_ltdc_composite_from_job(GnwH7B0LtdcState *s,
+                                              GnwH7B0LtdcCaptureJob *job,
+                                              uint32_t *out)
+{
+    static int verify = -1;
+
+    gnw_h7b0_ltdc_composite_from_job_inner(s, job, out, true);
+
+    if (verify < 0) {
+        verify = gnw_env_enabled("GNW_LTDC_VERIFY_FASTPATH");
+    }
+    if (verify) {
+        static unsigned long seq, bad;
+        size_t n = (size_t)job->cols * job->rows;
+        g_autofree uint32_t *ref = g_malloc(n * sizeof(uint32_t));
+
+        gnw_h7b0_ltdc_composite_from_job_inner(s, job, ref, false);
+        seq++;
+        if (memcmp(ref, out, n * sizeof(uint32_t)) != 0) {
+            size_t i;
+            for (i = 0; i < n && ref[i] == out[i]; i++) {
+                continue;
+            }
+            bad++;
+            fprintf(stderr, "LTDCVERIFY MISMATCH frame %lu px %zu "
+                    "fast=%08x ref=%08x (%lu bad of %lu)\n",
+                    seq, i, out[i], ref[i], bad, seq);
+        } else {
+            fprintf(stderr, "LTDCVERIFY ok frame %lu (%lu bad)\n", seq, bad);
         }
     }
 }
