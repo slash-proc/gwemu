@@ -118,6 +118,34 @@ frames are not reproducible run to run. The verifier is retained behind the knob
 Unexercised: the Layer2 second pass. No timeline activates Layer2, so that code
 has never run. The verifier will catch it the moment a Layer2 scene exists.
 
+### `perf/ltdc-l8-fastpath` — row fast path for an L8 Layer1 (ON)
+
+**−7.8% host CPU on the DOS core** (4.87s → 4.49s), which runs a LUT8 Layer1 and
+so was excluded from the RGB565 fast path by its `!l1_l8` gate. Matches the
+7.9% profile share almost exactly — the compositor cost is essentially gone.
+
+The collapse argument is **not** the RGB565 one and is strictly more general.
+RGB565 leans on `pa == 255` being structural; for L8 the alpha comes from the
+palette. But with the row wholly inside Layer1's window and dither off, the
+Layer1 half of the loop is a **pure function of the source byte** —
+`resolve_layer()`'s other inputs (dccr, colken, ckcr) and `blend_over()`'s
+(bfcr, cacr, bccr) are all per-job constants, and the source is one of 256
+values. So compose all 256 results once per job and gather: 256 evaluations
+replace 320×240, exact for every alpha, BFCR, CACR and colour-key, with **no
+opacity, CACR or `!colken` precondition at all**.
+
+Deliberately scalar — SSE2 has no gather, and the win is hoisting the
+`resolve_layer`/`blend_over` pair out of the pixel loop, not SIMD.
+
+**The instructive part:** the obvious gate — require all 256 CLUT entries opaque
+— was implemented first and measured **firing zero times in 1600 frames**, since
+the DOS core programs a 16-entry VGA palette and leaves 240 at reset. Sound but
+useless. A gate that is provably correct can still be worthless, and only
+measurement tells you which; the general argument is what made this pay.
+
+Verified differentially: 1746 DOS frames and 1770 launcher frames (RGB565
+regression check), zero mismatching pixels.
+
 ## Refuted
 
 Do not re-run these without new evidence.
