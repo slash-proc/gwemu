@@ -177,6 +177,50 @@ void gwemu_hud_init(SDL_Window* window, SDL_Renderer* renderer)
     ApplyGdbSettingsAtStartup();
 }
 
+/*
+ * Re-upload the main window's ImGui font atlas.
+ *
+ * On X11 with Mesa's v3d driver (Raspberry Pi 400) the atlas texture
+ * uploaded inside gwemu_hud_init() comes out blank: nothing fails and
+ * no SDL error is set, SDL_RenderGeometry keeps drawing, but every
+ * ImGui vertex is modulated against a texture whose pixels are
+ * undefined, so the whole HUD renders as one flat colour -- a solid
+ * black menu bar and dropdowns in one run, a solid white block over
+ * them in another. The guest framebuffer (a texture re-uploaded every
+ * frame) and untextured geometry are unaffected, which is why the
+ * emulator itself looks perfect while the menus do not.
+ *
+ * Proved on the Pi by blitting the atlas texture straight to the window
+ * with SDL_BLENDMODE_NONE: all-black as uploaded by gwemu_hud_init(),
+ * all-white (i.e. correct -- the atlas carries glyphs in alpha) once
+ * destroyed and re-uploaded after init. A red SDL_RenderGeometry
+ * triangle with no texture drew correctly in the same frame, ruling out
+ * geometry, vertex colours, clip rects and blending.
+ *
+ * Destroying the texture is all that is needed --
+ * ImGui_ImplSDLRenderer3_NewFrame() re-uploads it from the atlas on the
+ * next frame, and that copy survives. Why the first upload does not is
+ * a driver question that stops at the SDL boundary; both uploads are
+ * the same SDL_CreateTexture(STATIC) + SDL_UpdateTexture pair, the only
+ * difference being that the later one happens once the renderer has
+ * drawn a frame. Same family as the window/renderer creation-order bug
+ * fixed in 370258e033.
+ *
+ * NOT caused by the Settings window: the 0.0.15 build, whose Settings
+ * renderer never got created at all, shows the identical black menu bar
+ * on this host.
+ */
+void gwemu_hud_reset_font_texture(void)
+{
+    if (!g_ctx_main) {
+        return;
+    }
+    ImGuiContext *prev = ImGui::GetCurrentContext();
+    ImGui::SetCurrentContext(g_ctx_main);
+    ImGui_ImplSDLRenderer3_DestroyFontsTexture();
+    ImGui::SetCurrentContext(prev ? prev : g_ctx_main);
+}
+
 void gwemu_hud_cleanup(void)
 {
     ImGui_ImplSDLRenderer3_Shutdown();

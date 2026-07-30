@@ -2022,6 +2022,14 @@ static void display_early_init(DisplayOptions *o)
         gwemu_settings_hud_init(m_settings_window, m_settings_renderer);
     }
 
+    /*
+     * The main window's ImGui font atlas does not survive its upload on
+     * Mesa v3d (Raspberry Pi 400) and the entire HUD then draws as one
+     * flat colour. Re-upload it now that init is done -- see
+     * gwemu_hud_reset_font_texture() for the evidence. Unconditional: it
+     * costs one texture upload at startup on every other host.
+     */
+    gwemu_hud_reset_font_texture();
 }
 
 static const DisplayChangeListenerOps dcl_gl_ops = {
