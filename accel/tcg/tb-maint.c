@@ -127,7 +127,8 @@ void tb_htable_init(void)
 
     qht_init(&tb_ctx.htable, tb_cmp, CODE_GEN_HTABLE_SIZE, mode);
 
-    gnw_goto_tb_crosspage = gnw_env_enabled("GNW_GOTO_TB_CROSSPAGE");
+    /* ON by default; GNW_GOTO_TB_CROSSPAGE=0 is the escape hatch. */
+    gnw_goto_tb_crosspage = gnw_env_enabled_default_on("GNW_GOTO_TB_CROSSPAGE");
     gnw_linked_tbs = g_ptr_array_new();
     qemu_mutex_init(&gnw_link_lock);
 }
