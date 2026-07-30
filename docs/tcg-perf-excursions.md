@@ -95,18 +95,30 @@ Do not re-run these without new evidence.
 
 ## Scope of these wins — measured, not assumed
 
-Both wins are in generic TCG code, which invites the claim that they help every
-guest. **That claim was tested and is false as stated.**
+Both wins are in generic TCG code. Whether a given guest benefits is predictable
+from one number: `helper_lookup_tb_ptr`'s share of its profile.
 
-On the retro-go launcher (menu UI, no 8086 core), same fixed-work method:
-cross-page chaining is **−3.0%, inside noise**. The profile says why — the
-launcher is render-bound, not dispatch-bound: `gnw_h7b0_ltdc_blend_over` 37%,
-`gnw_h7b0_ltdc_compositor_thread_fn` 16%, and `helper_lookup_tb_ptr` only 2.5%.
-There is almost no dispatch cost there to remove.
+| Guest | `helper_lookup_tb_ptr` | Shape | Cross-page win |
+|---|---|---|---|
+| 8086tiny DOS core | 50% (13.9M lookups/s) | interpreter | **−27%** |
+| retro-go tgbdual | ~47% (~8M/s, see `accel/tcg/cpu-exec.c:375`) | interpreter | expected, unmeasured |
+| retro-go launcher | 2.5% | render-bound (LTDC blend 37%, compositor 16%) | −3.0%, inside noise |
 
-The honest claim is therefore: **these help interpreter/dispatch-bound guests,
-and are unmeasurable on render-bound ones.** Whether a given guest benefits is
-predictable from one number — `helper_lookup_tb_ptr`'s share of a profile.
+**The launcher is the outlier, not the rule.** It is a menu; every actual
+retro-go core is an emulator, i.e. an interpreter dispatching through a jump
+table, which is exactly the dispatch-bound shape that benefits. The fork already
+records ~47% dispatch on tgbdual, measured independently of this work and before
+it.
+
+So the claim "helps every guest" is wrong only in its edges: these help
+**interpreter/emulator cores — the workloads this machine exists to run** — and
+are unmeasurable on render-bound UI. Do not cite the launcher's −3% as evidence
+against the change; cite it as evidence that render-bound scenes need a
+different lever (the LTDC blend path, which is 53% there).
+
+Still unmeasured: an actual emulator core end to end. tgbdual's 47% is a strong
+prior but the cross-page A/B has not been run on it — that needs a recorded
+timeline that launches a GB core.
 
 Note also that on a scene with idle headroom these buy *headroom, not frames*:
 the guest requests a fixed instruction budget per frame and already gets it, so
