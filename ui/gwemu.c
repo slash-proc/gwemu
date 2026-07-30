@@ -1807,26 +1807,96 @@ static void display_very_early_init(DisplayOptions *o)
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     }
 
+    /*
+     * ORDERING (load-bearing): the Settings window AND its renderer are
+     * both created BEFORE the main window's renderer.
+     *
+     * On X11 with Mesa's v3d driver (Raspberry Pi 400) creating any
+     * further SDL window or renderer after the main window's accelerated
+     * renderer exists leaves the main window permanently unpainted --
+     * gwemu keeps compositing, uploading and presenting at 60fps (every
+     * GNW_UI_FRAME_TRACE counter stays healthy) but not one pixel ever
+     * reaches the window, which keeps showing whatever was on screen
+     * underneath it ("not even black"). Bisected on the Pi with xwd/
+     * ImageMagick pixel captures: skip the Settings window entirely and
+     * the main window renders; create it after m_renderer and the main
+     * window is dead whether the Settings window gets an opengl
+     * renderer, a software one, or none at all; create both before
+     * m_renderer and everything renders. Only the ordering matters.
+     *
+     * This is also why the bug only appeared with a6127a5e3d: before it
+     * the vulkan-only hint made the main renderer's first attempt fail
+     * on any non-Vulkan host, so the Settings window happened to be
+     * created before the main renderer that ultimately succeeded. That
+     * accident was load-bearing.
+     *
+     * Comfortable default size, but never larger than the desktop's
+     * usable area -- a window that opens bigger than the screen leaves
+     * no reachable edge to resize it with.
+     */
+    int set_w = 1100, set_h = 700;
+    SDL_Rect usable;
+    if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable)) {
+        set_w = MIN(set_w, usable.w * 9 / 10);
+        set_h = MIN(set_h, usable.h * 9 / 10);
+    }
+    m_settings_window = SDL_CreateWindow("Settings", set_w, set_h,
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN |
+        SDL_WINDOW_HIGH_PIXEL_DENSITY);
+
 #ifdef __linux__
     /* Prefer Vulkan over GL on Linux (project owner's call). NOTE: the
      * hint does NOT merely bias SDL's driver order -- when it is set,
      * SDL_CreateRenderer() tries ONLY the named drivers and fails
      * outright if none of them work (see the driver_name branch in
-     * SDL3's SDL_render.c). Hence the explicit fallback chain below;
-     * anything else created while this hint is in force needs the same
-     * treatment.
+     * SDL3's SDL_render.c). Hence the explicit fallback chains below.
      *
      * GNW_RENDER_DRIVER overrides the preference (any SDL driver name,
      * e.g. "software", "opengl", or a comma-separated list). Added
      * because the only way to test the non-Vulkan paths on a host where
      * Vulkan works was to edit this line and rebuild -- and those paths
-     * are exactly where the bugs are: see the Settings-window comment
-     * below, found on a packaged build whose host could create neither
-     * a Vulkan nor a GL renderer. */
+     * are exactly where the bugs are. */
     const char *render_driver = getenv("GNW_RENDER_DRIVER");
     SDL_SetHint(SDL_HINT_RENDER_DRIVER,
                 (render_driver && *render_driver) ? render_driver : "vulkan");
 #endif
+
+    /*
+     * Settings renderer, with the same two-step retreat the main window
+     * uses below. Getting this wrong made the Settings window
+     * unreachable -- not broken-looking, entirely absent: it used to be
+     * a single un-retried SDL_CreateRenderer() issued while the
+     * vulkan-only hint was in force, so on any host without Vulkan
+     * m_settings_renderer came back NULL, display_early_init() skipped
+     * gwemu_settings_hud_init(), and every Settings menu item silently
+     * did nothing (the menu bar lives on the main window's context and
+     * kept working, which is what made it look like a UI bug).
+     * Reproduced on the packaged 0.0.19 Linux build on a Radeon 860M
+     * host: "Couldn't create renderer vulkan:
+     * vkEnumeratePhysicalDevices(): VK_ERROR_INITIALIZATION_FAILED".
+     */
+    if (m_settings_window) {
+        m_settings_renderer = SDL_CreateRenderer(m_settings_window, NULL);
+        if (m_settings_renderer == NULL) {
+            SDL_ResetHint(SDL_HINT_RENDER_DRIVER);
+            m_settings_renderer = SDL_CreateRenderer(m_settings_window, NULL);
+        }
+        if (m_settings_renderer == NULL) {
+            m_settings_renderer = SDL_CreateRenderer(m_settings_window,
+                                                     SDL_SOFTWARE_RENDERER);
+        }
+    }
+
+    /*
+     * Pin the main window to whichever driver actually worked for the
+     * Settings window: there is no scenario where a driver that failed
+     * for one window succeeds for the other, and the main window must
+     * not end up on a different backend than the one already live.
+     */
+    if (m_settings_renderer) {
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER,
+                    SDL_GetRendererName(m_settings_renderer));
+    }
 
     m_renderer = SDL_CreateRenderer(m_window, NULL);
 
@@ -1853,55 +1923,6 @@ static void display_very_early_init(DisplayOptions *o)
         exit(1);
     }
 
-    /*
-     * Settings window. Created only AFTER the main renderer has resolved,
-     * and pinned to whichever driver actually worked for it, because this
-     * window has no fallback path of its own worth duplicating: if the
-     * main window needed to fall back, the Settings window would need the
-     * exact same fallback, and there is no scenario where a driver that
-     * failed for one succeeds for the other.
-     *
-     * Getting this wrong made the Settings window unreachable -- not
-     * broken-looking, entirely absent. It used to be created between the
-     * main renderer's first attempt and its fallback chain, i.e. while
-     * the vulkan-only hint above was still in force, with a single
-     * un-retried SDL_CreateRenderer(). On any host where Vulkan is
-     * unavailable, m_settings_renderer came back NULL, display_early_init()
-     * then skipped gwemu_settings_hud_init(), so the settings ImGui
-     * context and window handle were never registered and every
-     * Settings menu item silently did nothing -- the menu bar itself
-     * lives on the main window's context and kept working, which is what
-     * made it look like a UI bug rather than a renderer failure.
-     * Reproduced on the packaged 0.0.19 Linux build on a Radeon 860M
-     * host: "Couldn't create renderer vulkan:
-     * vkEnumeratePhysicalDevices(): VK_ERROR_INITIALIZATION_FAILED",
-     * main window fell back to software, Settings never appeared.
-     */
-    SDL_SetHint(SDL_HINT_RENDER_DRIVER, SDL_GetRendererName(m_renderer));
-
-    /* Comfortable default, but never larger than the desktop's usable
-     * area -- a window that opens bigger than the screen leaves no
-     * reachable edge to resize it with. */
-    int set_w = 1100, set_h = 700;
-    SDL_Rect usable;
-    if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable)) {
-        set_w = MIN(set_w, usable.w * 9 / 10);
-        set_h = MIN(set_h, usable.h * 9 / 10);
-    }
-    m_settings_window = SDL_CreateWindow("Settings", set_w, set_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    if (m_settings_window) {
-        m_settings_renderer = SDL_CreateRenderer(m_settings_window, NULL);
-        if (m_settings_renderer == NULL) {
-            /* Same two-step retreat as the main window above, in case a
-             * driver can serve one window but not a second one. */
-            SDL_ResetHint(SDL_HINT_RENDER_DRIVER);
-            m_settings_renderer = SDL_CreateRenderer(m_settings_window, NULL);
-        }
-        if (m_settings_renderer == NULL) {
-            m_settings_renderer = SDL_CreateRenderer(m_settings_window,
-                                                     SDL_SOFTWARE_RENDERER);
-        }
-    }
     SDL_ResetHint(SDL_HINT_RENDER_DRIVER);
 
     if (m_settings_window == NULL || m_settings_renderer == NULL) {
