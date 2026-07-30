@@ -725,6 +725,15 @@ static void tlb_flush_range_by_mmuidx_async_0(CPUState *cpu,
 {
     int mmu_idx;
 
+    /*
+     * Third TLB-flush entry point; see gnw_unlink_all_jumps() in tb-maint.c.
+     * Unreachable on this fork's M-profile target (this is the A-profile
+     * TLBI-range path), but leaving it unhooked would silently defeat the
+     * cross-page teardown on any target that does use it -- the teardown must
+     * cover *every* flush path or it covers none.
+     */
+    gnw_unlink_all_jumps();
+
     assert_cpu_is_self(cpu);
 
     tlb_debug("range: %016" VADDR_PRIx "/%u+%016" VADDR_PRIx " mmu_map:0x%x\n",
