@@ -1345,6 +1345,26 @@ static void gnw_h7b0_ltdc_rgb565_row_to_argb8888_scalar(const uint8_t *src,
 }
 #endif
 
+/*
+ * Row unpack for a CLUT-indexed (L8) Layer1: one table lookup per pixel.
+ * `table` is NOT the CLUT -- it is the per-job 256-entry table of
+ * *fully composited Layer1 results* built by
+ * gnw_h7b0_ltdc_build_l8_row_table() below, so this loop emits the final
+ * `below` value directly. Deliberately scalar: SSE2 has no gather, and a
+ * manual 4-wide gather issues the same four loads as this loop plus
+ * insert/shuffle overhead. The win is not SIMD, it is hoisting the
+ * resolve_layer()/blend_over() pair out of the per-pixel loop and into a
+ * 256-entry precompute.
+ */
+static void gnw_h7b0_ltdc_l8_row_to_argb8888(const uint8_t *src,
+                                              const uint32_t *table,
+                                              uint32_t *dst, int cols)
+{
+    for (int x = 0; x < cols; x++) {
+        dst[x] = table[src[x]];
+    }
+}
+
 static void gnw_h7b0_ltdc_rgb565_row_to_argb8888(const uint8_t *src,
                                                   uint32_t *dst, int cols)
 {
@@ -1645,8 +1665,8 @@ static void gnw_h7b0_ltdc_composite_from_job_inner(GnwH7B0LtdcState *s,
     }
 
     /*
-     * Row fast-path eligibility that doesn't depend on y: Layer1 must be
-     * RGB565 (not L8 -- CLUT gather isn't vectorized here), fully opaque
+     * Row fast-path eligibility that doesn't depend on y. For RGB565
+     * Layer1 (L8 has its own, more general gate just below): fully opaque
      * with the default PAxCA blend factors and CACR==255 (so
      * gnw_h7b0_ltdc_blend_over()'s own fast path would just return fg
      * unmodified for every pixel), no color-key (which can force
@@ -1685,6 +1705,48 @@ static void gnw_h7b0_ltdc_composite_from_job_inner(GnwH7B0LtdcState *s,
     bool l1_fast_eligible = allow_fast && !l1_l8 && !l1_colken &&
         l1_cacr == 255 &&
         !dither_en && cols > 0 && l1_x_in[0] && l1_x_in[cols - 1];
+
+    /*
+     * L8 takes a different -- and strictly more general -- route to the
+     * same row fast path. The RGB565 argument above leans on pa == 255
+     * being *structural* for the format; for L8 the alpha comes from the
+     * palette, and this device resets the whole CLUT to zero (alpha 0),
+     * so a firmware that programs only part of the palette (retro-go's
+     * DOS core programs a 16-entry VGA palette and leaves 240 entries at
+     * zero) genuinely has fully transparent indices whose correct result
+     * is the background, not the foreground. Demanding an all-opaque
+     * CLUT was tried first and rejects the real workload outright.
+     *
+     * What is true instead: with the row entirely inside Layer1's window
+     * and dithering off, the Layer1 half of the general loop is a PURE
+     * FUNCTION OF THE SOURCE BYTE. resolve_layer()'s inputs besides the
+     * raw pixel (dccr, colken, ckcr) and blend_over()'s (bfcr, cacr, and
+     * the bccr background) are all per-job constants, and the source
+     * pixel itself is one of only 256 values. So build the composed
+     * result for all 256 indices once per job and gather -- exact for
+     * every alpha, every BFCR, every CACR, color-key included, with no
+     * opacity, CACR or color-key precondition at all. 256 evaluations
+     * per frame replace 320x240 of them.
+     *
+     * Dithering stays excluded (it depends on x/y, so it is not a
+     * function of the pixel value), as does a row that straddles the
+     * window edge (in_window varies along the row). Layer2 is untouched:
+     * pass 1 writes exactly the `below` the fused loop would have, and
+     * the existing pass-2 loop blends on top of it as before.
+     */
+    g_autofree uint32_t *l1_l8_table = NULL;
+    if (allow_fast && l1_l8 && !dither_en && cols > 0 &&
+        l1_x_in[0] && l1_x_in[cols - 1]) {
+        l1_l8_table = g_malloc(256 * sizeof(uint32_t));
+        for (int i = 0; i < 256; i++) {
+            unsigned int a;
+            uint32_t resolved = gnw_h7b0_ltdc_resolve_layer(
+                job->clut[i], true, l1_dccr, l1_colken, l1_ckcr, &a);
+            l1_l8_table[i] = gnw_h7b0_ltdc_blend_over(resolved, a, l1_bfcr,
+                                                      l1_cacr, bccr);
+        }
+        l1_fast_eligible = true;
+    }
     bool l2_active = l2_en && l2_bpp > 0;
 
     for (int y = 0; y < job->rows; y++) {
@@ -1698,7 +1760,12 @@ static void gnw_h7b0_ltdc_composite_from_job_inner(GnwH7B0LtdcState *s,
         if (l1_fast_eligible && l1_row_in) {
             uint32_t *outrow = out + (hwaddr)y * cols;
 
-            gnw_h7b0_ltdc_rgb565_row_to_argb8888(linebuf, outrow, cols);
+            if (l1_l8) {
+                gnw_h7b0_ltdc_l8_row_to_argb8888(linebuf, l1_l8_table,
+                                                 outrow, cols);
+            } else {
+                gnw_h7b0_ltdc_rgb565_row_to_argb8888(linebuf, outrow, cols);
+            }
 
             if (l2_active) {
                 /* Pass 2: Layer2 only, on top of what pass 1 just wrote. */
