@@ -838,6 +838,34 @@ static void gnw_h7b0_ltdc_fb_track_range(MemoryRegionSection *section,
         return;
     }
 
+    /*
+     * GNW_LTDC_NO_DIRTY_LOG=1: skip DIRTY_MEMORY_VGA tracking entirely and
+     * treat every frame as dirty (gnw_h7b0_ltdc_fb_range_dirty() already
+     * returns true for a NULL section->mr, by its "cannot prove clean =>
+     * dirty" rule). A/B knob for the cost of the tracking itself.
+     *
+     * Why it can be expensive here: framebuffer_update_memory_section()
+     * enables logging on the whole MemoryRegion backing the framebuffer
+     * (hw/display/framebuffer.c), and this SoC maps ALL 1MB of AXI SRAM as
+     * a single region (gnw_h7b0_soc.c). So tracking the framebuffer marks
+     * every AXI SRAM page VGA-clean, physical_memory_is_clean() then
+     * reports the whole region clean, and tlb_set_page() sets TLB_NOTDIRTY
+     * on all of it -- putting every guest store to emulator RAM through
+     * notdirty_write() + page_collection_lock() (which allocates and frees
+     * a GTree per store). Measured on the 8086tiny DOS core: 65% of host
+     * cycles in that path.
+     */
+    if (gnw_env_enabled("GNW_LTDC_NO_DIRTY_LOG")) {
+        if (section->mr) {
+            memory_region_set_log(section->mr, false, DIRTY_MEMORY_VGA);
+            memory_region_unref(section->mr);
+            section->mr = NULL;
+        }
+        *cur_base = base;
+        *cur_len = len;
+        return;
+    }
+
     framebuffer_update_memory_section(section, get_system_memory(), base, 1,
                                        len);
     *cur_base = base;
