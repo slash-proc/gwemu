@@ -1,3 +1,28 @@
+2026-07-30  ui: fix the Settings window never opening when Vulkan is
+            unavailable. SDL3's SDL_HINT_RENDER_DRIVER is a whitelist,
+            not a preference -- with it set, SDL_CreateRenderer() tries
+            only the named drivers and fails outright otherwise. The
+            Settings window was created while the Linux-only vulkan-only
+            hint was in force, between the main renderer's first attempt
+            and its fallback chain, with a single un-retried call: on any
+            host where Vulkan can't initialize, its renderer came back
+            NULL, display_early_init() skipped
+            gwemu_settings_hud_init(), and every Settings menu item
+            silently did nothing (the menu bar itself lives on the main
+            window's context, so the app looked fine otherwise). Broken
+            since the dedicated Settings window landed on 2026-07-24;
+            found on the packaged 0.0.19 Linux build on a Radeon 860M
+            host (VK_ERROR_INITIALIZATION_FAILED, GL unavailable too, so
+            the main window fell back to software). The window is now
+            created after the main renderer resolves and pinned to
+            whichever driver actually worked for it, with the same
+            reset-hint/software retreat as a backstop, and a failure
+            reports itself (stderr + message box) instead of leaving dead
+            menu items. New GNW_RENDER_DRIVER env var overrides the
+            driver preference, since the only way to exercise the
+            non-Vulkan paths on a Vulkan-capable host was to edit the
+            source and rebuild.
+
 2026-07-30  rtc: make SSR a real sub-second counter instead of a constant.
             RTC_SSR was a read-only shadow of its 0 reset value that
             nothing ever wrote, and with PRER's reset PREDIV_S of 255
