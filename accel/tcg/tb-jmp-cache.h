@@ -13,7 +13,7 @@
 #include "exec/cpu-common.h"
 
 /*
- * Fork-local: 12 -> 16 (4096 -> 65536 entries).
+ * Fork-local: 12 -> 14 (4096 -> 16384 entries).
  *
  * QEMU's default of 12 assumes 4KB pages. This target is ARM M-profile, which
  * forces TARGET_PAGE_BITS = 10 (1KB pages) to model sub-4K MPU regions --
@@ -23,13 +23,20 @@
  * aliases hard in a direct-mapped cache, and every miss falls through to
  * tb_htable_lookup().
  *
- * Measured on the 8086tiny DOS core (backup/dos-perf, fixed 30s timeline):
- * host CPU 8.73s -> 6.97s median, a 20% reduction, against a ~+-2% noise floor.
- * helper_lookup_tb_ptr was ~32-35% of on-CPU samples before the change.
+ * Measured on the 8086tiny DOS core (backup/dos-perf, fixed 30s timeline), as
+ * an interleaved 4-round A/B on one build tree, host CPU-seconds:
+ *   BITS=12  8.91 8.92 8.95 9.15  median 8.935
+ *   BITS=14  6.81 6.93 6.78 6.77  median 6.795   -24%
+ * against a ~+-2% noise floor. helper_lookup_tb_ptr was 32-35% of on-CPU
+ * samples before; after, tb_htable_lookup drops out of the profile entirely.
  *
- * Cost is 16 bytes/entry = 1MB per vCPU (was 64KB); this machine is single-core.
+ * 14 is the knee, not a guess: 15/16/18 were measured and are statistically
+ * indistinguishable from 14, so the whole effect is the single step 12 -> 14
+ * (6 -> 7 page bits) and larger caches only cost footprint.
+ *
+ * Cost is 16 bytes/entry = 256KB per vCPU (was 64KB); this machine is single-core.
  */
-#define TB_JMP_CACHE_BITS 16
+#define TB_JMP_CACHE_BITS 14
 #define TB_JMP_CACHE_SIZE (1 << TB_JMP_CACHE_BITS)
 
 /*
