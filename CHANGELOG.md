@@ -1,3 +1,25 @@
+2026-07-30  rtc: make SSR a real sub-second counter instead of a constant.
+            RTC_SSR was a read-only shadow of its 0 reset value that
+            nothing ever wrote, and with PRER's reset PREDIV_S of 255
+            that pins the HAL's (PREDIV_S - SSR)/(PREDIV_S + 1) fraction
+            at a constant 255/256 -- so GW_GetCurrentMillis() and
+            _gettimeofday() reported tv_usec == 996000 forever and every
+            sub-second delta computed from them came out zero. Reported
+            from a retro-go session where gettimeofday()-based timing
+            worked on real hardware and silently measured nothing here.
+            SSR now down-counts from the programmed PREDIV_S across each
+            calendar second off the same virtual-clock-anchored calendar
+            TR/DR already used, and SSR/TR/DR reads take the hardware's
+            shadow-register lock (latched on the first SSR-or-TR read,
+            released on the closing DR read) so the triple the HAL reads
+            in that order is always one coherent instant rather than
+            three independent samples that can straddle a second
+            boundary. The calendar anchor is also in vmstate now (v2); it
+            was missing entirely, so a restored snapshot kept the
+            destination's own reset-seeded base. Verified live against
+            stock mario over gdb: SSR down-counts ~104/256 per 0.4s and
+            rolls over exactly on the TR seconds increment.
+
 2026-07-29  docker-headless: gate timeline recording out of the headless
             entrypoint. --record-timeline (GNW_TIMELINE_RECORD) landed in
             the entrypoint alongside the feature, but it records LIVE

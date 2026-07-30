@@ -38,7 +38,16 @@
  * (in case firmware ever sets the clock), but no tested firmware image
  * actually does that -- they only read it.
  *
- * Every other register (SSR, PRER, WUTR, WPR, CALR, SHIFTR,
+ * SSR (the synchronous prescaler's sub-second down-counter) is derived
+ * from the same calendar, using the programmed PRER.PREDIV_S, and
+ * SSR/TR/DR reads take the hardware's shadow-register lock so the three
+ * are always a coherent snapshot -- both in gnw_h7b0_rtc_read()/
+ * _sync_calendar(). It has to be real, not a shadow: a constant SSR
+ * makes the HAL's (PREDIV_S - SSR)/(PREDIV_S + 1) fraction constant
+ * too, which silently freezes tv_usec for every
+ * GW_GetCurrentMillis()/_gettimeofday() caller.
+ *
+ * Every other register (PRER, WUTR, WPR, CALR, SHIFTR,
  * timestamp/alarm value registers, CFGR) is a plain read/write shadow
  * with no side effects.
  *
@@ -126,8 +135,17 @@ struct GnwH7B0RtcState {
      * images tested so far, so there's nothing to seed it from except
      * the host clock.
      */
-    time_t rtc_base_epoch;
+    int64_t rtc_base_epoch;
     int64_t rtc_base_vclock_ns;
+
+    /*
+     * Calendar shadow-register lock: virtual-clock instant that a
+     * pending SSR/TR/DR read sequence is being served from, held from
+     * the first SSR-or-TR read until the closing DR read (see the
+     * comment in gnw_h7b0_rtc_read()).
+     */
+    bool shadow_locked;
+    int64_t shadow_vclock_ns;
 
     bool sync_host;
 };

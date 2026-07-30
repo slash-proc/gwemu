@@ -42,20 +42,59 @@ static inline unsigned int rtc_unbcd(uint32_t v)
     return ((v >> 4) & 0xf) * 10 + (v & 0xf);
 }
 
-/* Recompute TR/DR from the running calendar (host wall-clock time plus
- * elapsed virtual-clock time since the last read/write) and store the
- * encoded BCD fields back into regs, so gnw_h7b0_rtc_read() just
- * returns whatever's already there. */
-static void gnw_h7b0_rtc_sync_calendar(GnwH7B0RtcState *s)
+/* Recompute SSR/TR/DR from the running calendar (host wall-clock time
+ * plus elapsed virtual-clock time since the last read/write) as of
+ * virtual-clock time at_ns, and store the encoded fields back into
+ * regs, so gnw_h7b0_rtc_read() just returns whatever's already there.
+ *
+ * at_ns is passed in rather than sampled here so the shadow-register
+ * lock (see gnw_h7b0_rtc_read()) can re-derive all three registers
+ * from one single instant. */
+static void gnw_h7b0_rtc_sync_calendar(GnwH7B0RtcState *s, int64_t at_ns)
 {
-    int64_t elapsed_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
-                          s->rtc_base_vclock_ns;
-    time_t now = s->rtc_base_epoch + elapsed_ns / NANOSECONDS_PER_SECOND;
+    int64_t elapsed_ns = at_ns - s->rtc_base_vclock_ns;
+    int64_t now = s->rtc_base_epoch + elapsed_ns / NANOSECONDS_PER_SECOND;
+    int64_t frac_ns = elapsed_ns % NANOSECONDS_PER_SECOND;
+    time_t now_t = now;
     struct tm tm;
     uint32_t tr, dr;
     unsigned int rtc_wday;
+    uint32_t prediv_s;
 
-    localtime_r(&now, &tm);
+    if (frac_ns < 0) {
+        /* Only reachable if the calendar was re-anchored into the
+         * future; keep the sub-second field in range regardless. */
+        frac_ns += NANOSECONDS_PER_SECOND;
+        now--;
+        now_t = now;
+    }
+
+    /*
+     * SSR is the synchronous prescaler's *down*-counter: it reloads to
+     * PREDIV_S at each calendar-second boundary and counts down to 0
+     * over the following second, which is why the HAL computes the
+     * fraction as (PREDIV_S - SSR) / (PREDIV_S + 1) rather than
+     * SSR / PREDIV_S.
+     *
+     * This was a permanently-zero read-only shadow until 2026-07-30
+     * (SSR's generated reset value is 0 and nothing ever wrote it), and
+     * that is *not* an inert stub: with the reset PREDIV_S of 255 it
+     * makes the HAL's fraction a constant 255/256, so every
+     * GW_GetCurrentMillis()/_gettimeofday() caller sees tv_usec pinned
+     * at 996000 and any sub-second delta comes out zero. Reported from
+     * a retro-go session where gettimeofday()-based timing worked on
+     * real hardware and silently measured nothing here.
+     *
+     * Resolution is 1/(PREDIV_S+1) s -- 3.9ms at the reset prescaler,
+     * same ceiling as real silicon. This is not a sub-frame timer on
+     * either; that's what TIM2 is for.
+     */
+    prediv_s = s->regs[GNW_H7B0_RTC_PRER_OFFSET >> 2] & 0x7fff;
+    s->regs[GNW_H7B0_RTC_SSR_OFFSET >> 2] =
+        prediv_s - (uint32_t)((frac_ns * (prediv_s + 1))
+                              / NANOSECONDS_PER_SECOND);
+
+    localtime_r(&now_t, &tm);
 
     tr = (rtc_bcd(tm.tm_sec) & 0x7f)
        | ((rtc_bcd(tm.tm_min) & 0x7f) << 8)
@@ -91,6 +130,8 @@ static void gnw_h7b0_rtc_reanchor_calendar(GnwH7B0RtcState *s)
 
     s->rtc_base_epoch = mktime(&tm);
     s->rtc_base_vclock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /* A clock-set invalidates any in-progress shadow snapshot. */
+    s->shadow_locked = false;
 }
 
 static void gnw_h7b0_rtc_reset(DeviceState *dev)
@@ -120,7 +161,8 @@ static void gnw_h7b0_rtc_reset(DeviceState *dev)
 
     s->rtc_base_epoch = time(NULL);
     s->rtc_base_vclock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    gnw_h7b0_rtc_sync_calendar(s);
+    s->shadow_locked = false;
+    gnw_h7b0_rtc_sync_calendar(s, s->rtc_base_vclock_ns);
     qemu_irq_lower(s->irq);
 }
 
@@ -153,8 +195,36 @@ static uint64_t gnw_h7b0_rtc_read(void *opaque, hwaddr addr, unsigned int size)
                       __func__, addr);
         return 0;
     }
-    if (addr == GNW_H7B0_RTC_TR_OFFSET || addr == GNW_H7B0_RTC_DR_OFFSET) {
-        gnw_h7b0_rtc_sync_calendar(s);
+    /*
+     * Shadow-register lock. On real hardware the calendar registers are
+     * a coherent snapshot: reading SSR or TR freezes SSR/TR/DR until DR
+     * is read, which is exactly why HAL_RTC_GetTime() reads SSR -> TR ->
+     * DR in that order. Without the lock, each read here re-derives
+     * independently from the virtual clock, so a second boundary falling
+     * between the SSR and TR reads yields an inconsistent triple (a
+     * sub-second field from one second paired with a seconds field from
+     * the next -- i.e. an occasional one-second jump backwards or
+     * forwards in whatever the caller computes). Latch the instant on
+     * the first of SSR/TR and release on DR, mirroring the hardware
+     * guarantee the HAL is written against.
+     */
+    switch (addr) {
+    case GNW_H7B0_RTC_SSR_OFFSET:
+    case GNW_H7B0_RTC_TR_OFFSET:
+        if (!s->shadow_locked) {
+            s->shadow_locked = true;
+            s->shadow_vclock_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        }
+        gnw_h7b0_rtc_sync_calendar(s, s->shadow_vclock_ns);
+        break;
+    case GNW_H7B0_RTC_DR_OFFSET:
+        gnw_h7b0_rtc_sync_calendar(s, s->shadow_locked
+                                       ? s->shadow_vclock_ns
+                                       : qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        s->shadow_locked = false;
+        break;
+    default:
+        break;
     }
     return s->regs[addr >> 2];
 }
@@ -310,10 +380,19 @@ static void gnw_h7b0_rtc_init(Object *obj)
 
 static const VMStateDescription vmstate_gnw_h7b0_rtc = {
     .name = TYPE_GNW_H7B0_RTC,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, GnwH7B0RtcState, GNW_H7B0_RTC_SIZE / 4),
+        /* The calendar anchor was missing from v1 entirely, so a v1
+         * snapshot restored the encoded TR/DR but kept whatever base the
+         * destination's own reset() had seeded -- the calendar jumped on
+         * the next read. Migrating it (v2) is what makes the restored
+         * clock continue from where it was saved. */
+        VMSTATE_INT64_V(rtc_base_epoch, GnwH7B0RtcState, 2),
+        VMSTATE_INT64_V(rtc_base_vclock_ns, GnwH7B0RtcState, 2),
+        VMSTATE_BOOL_V(shadow_locked, GnwH7B0RtcState, 2),
+        VMSTATE_INT64_V(shadow_vclock_ns, GnwH7B0RtcState, 2),
         VMSTATE_END_OF_LIST()
     }
 };

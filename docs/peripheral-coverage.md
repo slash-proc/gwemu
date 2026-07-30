@@ -33,7 +33,7 @@ need scripted upkeep.
 | RNG | Partial | Real `RNG_SR.DRDY` completion (was a full unimplemented-device stub). |
 | CRC | Partial | Real CRC-32 unit, correct reset value. |
 | DWT | Partial | Real `CYCCNT` only. |
-| RTC | Partial | Real IRQ wiring on `MISR & (ALRAF|ALRBF)`, backup-domain registers correctly survive CPU-only reset. |
+| RTC | Partial | Real IRQ wiring on `MISR & (ALRAF|ALRBF)`, backup-domain registers correctly survive CPU-only reset. TR/DR/SSR are a real virtual-clock calendar with the hardware shadow-register lock; alarms/wakeup-timer are instant-fire approximations. |
 | FLASH_R | Partial | Real sector-erase side effect against actual flash memory; `OPTSR_CUR.RDP` seeded to real factory default. |
 | OSPI (x2) | Partial | Real command decoding, auto-polling, IRQ lines. |
 | SPI | Partial | Real `TXP`/`RXP` status-flag behavior. |
