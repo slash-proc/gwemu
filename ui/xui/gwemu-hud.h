@@ -47,6 +47,7 @@ void gwemu_hud_init(SDL_Window *window, SDL_Renderer *renderer);
 void gwemu_hud_cleanup(void);
 void gwemu_hud_update(void);
 void gwemu_hud_render(void);
+void gwemu_hud_reset_font_texture(void);
 void gwemu_hud_process_sdl_events(SDL_Event *event);
 void gwemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
 void gwemu_hud_set_framebuffer_texture(SDL_Texture *tex, bool flip);
