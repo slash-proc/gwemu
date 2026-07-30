@@ -28,6 +28,7 @@
 #include "exec/target_page.h"
 #include "accel/tcg/cpu-ops.h"
 #include "tb-internal.h"
+#include "hw/misc/gnw_env.h"
 #include "system/tcg.h"
 #include "tcg/tcg.h"
 #include "tb-hash.h"
@@ -64,11 +65,71 @@ static bool tb_cmp(const void *ap, const void *bp)
             tb_page_addr1(a) == tb_page_addr1(b));
 }
 
+/*
+ * GNW_GOTO_TB_CROSSPAGE registry.
+ *
+ * translator_use_goto_tb() normally refuses a chainable goto_tb whose
+ * destination is on a different target page than the TB start. That rule is
+ * what makes a direct jump safe to leave patched forever: reaching the source
+ * TB implies a tb_lookup() already validated the vaddr->paddr mapping and the
+ * execute permission of *that* page, and the destination lives in the same
+ * page. Nothing else ever revalidates a patched jump -- tlb_flush() clears the
+ * TLB and the jump *cache*, but never calls tb_reset_jump().
+ *
+ * With the knob on we allow cross-page jumps and restore the invariant the
+ * other way round: every link established is recorded here, and every TLB
+ * flush (the event that signals a mapping or permission change) tears all of
+ * them down again. Code *modification* is already handled independently by
+ * tb_phys_invalidate() -> tb_jmp_unlink(), which unlinks incoming jumps
+ * regardless of which page they came from.
+ *
+ * Pointers stay valid until tb_flush(), which resets the whole code buffer;
+ * the list is cleared there.
+ */
+bool gnw_goto_tb_crosspage;
+static GPtrArray *gnw_linked_tbs;
+static QemuMutex gnw_link_lock;
+
+void gnw_note_tb_link(TranslationBlock *tb, int n)
+{
+    qemu_mutex_lock(&gnw_link_lock);
+    g_ptr_array_add(gnw_linked_tbs, (void *)((uintptr_t)tb | n));
+    qemu_mutex_unlock(&gnw_link_lock);
+}
+
+void gnw_unlink_all_jumps(void)
+{
+    if (!gnw_goto_tb_crosspage) {
+        return;
+    }
+    qemu_mutex_lock(&gnw_link_lock);
+    for (guint i = 0; i < gnw_linked_tbs->len; i++) {
+        uintptr_t v = (uintptr_t)g_ptr_array_index(gnw_linked_tbs, i);
+        tb_reset_jump((TranslationBlock *)(v & ~1), v & 1);
+    }
+    g_ptr_array_set_size(gnw_linked_tbs, 0);
+    qemu_mutex_unlock(&gnw_link_lock);
+}
+
+static void gnw_forget_all_jumps(void)
+{
+    if (!gnw_goto_tb_crosspage) {
+        return;
+    }
+    qemu_mutex_lock(&gnw_link_lock);
+    g_ptr_array_set_size(gnw_linked_tbs, 0);
+    qemu_mutex_unlock(&gnw_link_lock);
+}
+
 void tb_htable_init(void)
 {
     unsigned int mode = QHT_MODE_AUTO_RESIZE;
 
     qht_init(&tb_ctx.htable, tb_cmp, CODE_GEN_HTABLE_SIZE, mode);
+
+    gnw_goto_tb_crosspage = gnw_env_enabled("GNW_GOTO_TB_CROSSPAGE");
+    gnw_linked_tbs = g_ptr_array_new();
+    qemu_mutex_init(&gnw_link_lock);
 }
 
 typedef struct PageDesc PageDesc;
@@ -785,6 +846,7 @@ void tb_flush__exclusive_or_serial(void)
     tb_remove_all();
 
     tcg_region_reset_all();
+    gnw_forget_all_jumps();
     /* XXX: flush processor icache at this point if cache flush is expensive */
     qatomic_inc(&tb_ctx.tb_flush_count);
     qemu_plugin_flush_cb();

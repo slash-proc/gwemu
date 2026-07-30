@@ -176,7 +176,18 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
         return false;
     }
 
-    /* Check for the dest on the same page as the start of the TB.  */
+    /*
+     * Check for the dest on the same page as the start of the TB.
+     * GNW_GOTO_TB_CROSSPAGE lifts this; see tb-maint.c for why that is
+     * only safe together with the tlb-flush teardown there. Never in
+     * user mode: there is no tlb_flush() to hang the teardown off, and
+     * mprotect() can change page permissions.
+     */
+#ifndef CONFIG_USER_ONLY
+    if (gnw_goto_tb_crosspage) {
+        return true;
+    }
+#endif
     return translator_is_same_page(db, dest);
 }
 

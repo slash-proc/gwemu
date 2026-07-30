@@ -660,6 +660,20 @@ static inline void tb_add_jump(TranslationBlock *tb, int n,
 
     qemu_spin_unlock(&tb_next->jmp_lock);
 
+    /*
+     * Only cross-page links need the flush-time teardown (see tb-maint.c);
+     * a same-page link is safe by construction and must NOT be recorded, or
+     * a TLB-flush-heavy guest would permanently lose all chaining.
+     * Compared on *physical* pages: on this fork's M-profile target there is
+     * no virtual mapping (VA == PA), so equal phys page implies equal virt
+     * page. On an MMU target where two virtual pages alias one physical page
+     * this would under-record -- hence the knob stays off by default.
+     */
+    if (gnw_goto_tb_crosspage &&
+        ((tb_page_addr0(tb) ^ tb_page_addr0(tb_next)) & TARGET_PAGE_MASK)) {
+        gnw_note_tb_link(tb, n);
+    }
+
     qemu_log_mask(CPU_LOG_EXEC, "Linking TBs %p index %d -> %p\n",
                   tb->tc.ptr, n, tb_next->tc.ptr);
     return;

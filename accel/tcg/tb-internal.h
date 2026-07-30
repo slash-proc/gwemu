@@ -52,4 +52,10 @@ void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t ram_addr,
 bool tb_invalidate_phys_page_unwind(CPUState *cpu, tb_page_addr_t addr,
                                     uintptr_t pc);
 
+
+/* GNW_GOTO_TB_CROSSPAGE: see the comment in tb-maint.c */
+extern bool gnw_goto_tb_crosspage;
+void gnw_note_tb_link(TranslationBlock *tb, int n);
+void gnw_unlink_all_jumps(void);
+
 #endif
