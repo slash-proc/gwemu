@@ -4,23 +4,33 @@ set -eu
 
 dir="$1"
 GWEMU_DATE=$(date -u)
+# Try git first, then the stamped files -- NOT "git if .git exists, else files".
+# In a git worktree .git is a FILE (a gitdir: pointer), so `test -e .git`
+# succeeds while git itself fails whenever the real git dir is not reachable --
+# exactly what happens inside the aarch64 cross-build container, which bind
+# mounts only the worktree. That produced a silent 0.0.0 build with an empty
+# commit: a binary that cannot say which build it is, which is worse than a
+# build failure during a cross-platform test round.
 GWEMU_COMMIT=$( \
   cd "$dir"; \
-  if test -e .git; then \
-    git rev-parse HEAD 2>/dev/null | tr -d '\n'; \
-  elif test -e GWEMU_COMMIT; then \
-    cat GWEMU_COMMIT; \
-  fi)
+  git rev-parse HEAD 2>/dev/null | tr -d '\n' || true)
+if [ "${GWEMU_COMMIT}" = "" ] && test -e "$dir/GWEMU_COMMIT"; then
+  GWEMU_COMMIT=$(cat "$dir/GWEMU_COMMIT")
+fi
+
 GWEMU_VERSION=$( \
   cd "$dir"; \
-  if test -e .git; then \
-    git describe --tags --match 'v*' 2>/dev/null | cut -c 2- | tr -d '\n' || true; \
-  elif test -e GWEMU_VERSION; then \
-    cat GWEMU_VERSION; \
-  fi)
+  git describe --tags --match 'v*' 2>/dev/null | cut -c 2- | tr -d '\n' || true)
+if [ "${GWEMU_VERSION}" = "" ] && test -e "$dir/GWEMU_VERSION"; then
+  GWEMU_VERSION=$(cat "$dir/GWEMU_VERSION")
+fi
 
 if [ "${GWEMU_VERSION}" = "" ]; then
   GWEMU_VERSION="0.0.0"
+  echo "gwemu-version.sh: WARNING: no git metadata and no GWEMU_VERSION file" \
+       "in $dir -- this binary will report version 0.0.0 and cannot be" \
+       "identified. Stamp a GWEMU_VERSION/GWEMU_COMMIT file for out-of-git" \
+       "builds." >&2
 fi
 
 get_version_field() {
