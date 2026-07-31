@@ -29,6 +29,7 @@
 #include "accel/tcg/cpu-ops.h"
 #include "tb-internal.h"
 #include "hw/misc/gnw_env.h"
+#include "qemu/timer.h"
 #include "system/tcg.h"
 #include "tcg/tcg.h"
 #include "tb-hash.h"
@@ -97,18 +98,65 @@ void gnw_note_tb_link(TranslationBlock *tb, int n)
     qemu_mutex_unlock(&gnw_link_lock);
 }
 
+/*
+ * GNW_CROSSPAGE_STATS=1 reports how much wall time this teardown actually
+ * costs. It exists because a bug report attributed a pause_all_vcpus()
+ * stall to this function monopolising the BQL; the registry is cleared on
+ * every flush, so it should only ever hold a few dozen entries, and this
+ * says so with a number instead of an argument. Printed every 1000 flushes
+ * and once at exit -- if "worst" is not in the milliseconds, this function
+ * is not what is holding the BQL.
+ */
+static bool gnw_crosspage_stats;
+static uint64_t gnw_unlink_calls, gnw_unlink_entries;
+static uint64_t gnw_unlink_ns_total, gnw_unlink_ns_worst;
+static guint gnw_unlink_len_worst;
+
+static void gnw_crosspage_report(void)
+{
+    if (!gnw_unlink_calls) {
+        return;
+    }
+    fprintf(stderr, "gnw-crosspage: %" PRIu64 " flushes, %" PRIu64 " links "
+            "torn down (%.1f avg, %u worst), time %.3fms total / %.1fus avg "
+            "/ %.1fus worst\n",
+            gnw_unlink_calls, gnw_unlink_entries,
+            (double)gnw_unlink_entries / gnw_unlink_calls,
+            gnw_unlink_len_worst,
+            gnw_unlink_ns_total / 1e6,
+            (double)gnw_unlink_ns_total / gnw_unlink_calls / 1e3,
+            gnw_unlink_ns_worst / 1e3);
+}
+
 void gnw_unlink_all_jumps(void)
 {
+    int64_t t0;
+
     if (!gnw_goto_tb_crosspage) {
         return;
     }
+    t0 = gnw_crosspage_stats ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : 0;
+
     qemu_mutex_lock(&gnw_link_lock);
     for (guint i = 0; i < gnw_linked_tbs->len; i++) {
         uintptr_t v = (uintptr_t)g_ptr_array_index(gnw_linked_tbs, i);
         tb_reset_jump((TranslationBlock *)(v & ~1), v & 1);
     }
+    if (gnw_crosspage_stats) {
+        gnw_unlink_entries += gnw_linked_tbs->len;
+        gnw_unlink_len_worst = MAX(gnw_unlink_len_worst, gnw_linked_tbs->len);
+    }
     g_ptr_array_set_size(gnw_linked_tbs, 0);
     qemu_mutex_unlock(&gnw_link_lock);
+
+    if (gnw_crosspage_stats) {
+        uint64_t dt = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0;
+        gnw_unlink_ns_total += dt;
+        gnw_unlink_ns_worst = MAX(gnw_unlink_ns_worst, dt);
+        if (++gnw_unlink_calls % 1000 == 0) {
+            gnw_crosspage_report();
+        }
+    }
 }
 
 static void gnw_forget_all_jumps(void)
@@ -129,6 +177,10 @@ void tb_htable_init(void)
 
     /* ON by default; GNW_GOTO_TB_CROSSPAGE=0 is the escape hatch. */
     gnw_goto_tb_crosspage = gnw_env_enabled_default_on("GNW_GOTO_TB_CROSSPAGE");
+    gnw_crosspage_stats = gnw_env_enabled("GNW_CROSSPAGE_STATS");
+    if (gnw_crosspage_stats) {
+        atexit(gnw_crosspage_report);
+    }
     gnw_linked_tbs = g_ptr_array_new();
     qemu_mutex_init(&gnw_link_lock);
 }
