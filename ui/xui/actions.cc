@@ -14,10 +14,26 @@
 
 void ActionTogglePause(void)
 {
+    /*
+     * Do NOT call vm_stop()/vm_start() directly from the UI/HUD thread.
+     * gl_render_frame() holds the BQL around the ImGui update (where menu
+     * clicks and keyboard shortcuts land), and vm_stop() then runs
+     * pause_all_vcpus() + bdrv_drain_all() + bdrv_flush_all() on that same
+     * thread. With a block-backed SD image attached that drain/flush can
+     * block the UI thread indefinitely (macOS beachball) -- the main
+     * AioContext progress the drain waits on cannot run while the UI holds
+     * the BQL. Same class of bug as the watchdog's -watchdog-action pause
+     * fix: defer via vmstop_request / a oneshot BH so the QEMU main loop
+     * owns the state transition.
+     *
+     * Helpers live in ui/gwemu.c (C) so we don't pull qemu/aio.h into this
+     * C++ TU -- qom/object.h uses `typename` as a parameter name, which is
+     * a C++ keyword.
+     */
     if (runstate_is_running()) {
-        vm_stop(RUN_STATE_PAUSED);
+        gwemu_request_vm_stop();
     } else {
-        vm_start();
+        gwemu_request_vm_start();
     }
 }
 

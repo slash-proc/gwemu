@@ -125,6 +125,11 @@ static QemuSemaphore display_shutdown_sem;
 static QEMUTimer *vblank_timer;
 static QemuThread vblank_thread;
 static bool qemu_exiting;
+/* Set by qemu_main after qemu_cleanup returns -- the UI thread polls this
+ * (while pumping SDL events) instead of blocking in qemu_thread_join, so
+ * macOS AppKit/SDL stay responsive during block-layer flush on quit and so
+ * SDL audio teardown that needs the main thread cannot deadlock. */
+static bool qemu_cleanup_done;
 static int exit_status;
 
 
@@ -147,6 +152,23 @@ void gwemu_main_loop_unlock(void)
     lock_held_acc += qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - lock_start;
 #endif
     bql_unlock();
+}
+
+void gwemu_request_vm_stop(void)
+{
+    qemu_system_vmstop_request_prepare();
+    qemu_system_vmstop_request(RUN_STATE_PAUSED);
+}
+
+static void gwemu_vm_start_bh(void *opaque)
+{
+    (void)opaque;
+    vm_start();
+}
+
+void gwemu_request_vm_start(void)
+{
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), gwemu_vm_start_bh, NULL);
 }
 
 SDL_Window *gwemu_get_window(void)
@@ -2181,10 +2203,15 @@ static void *qemu_main(void *opaque)
     qatomic_set(&qemu_exiting, true);
     bql_unlock();
 
+    /* Wait until the UI thread has left its render loop (so it will not
+     * touch DisplaySurface / textures during teardown), then run cleanup
+     * while that thread is still alive and pumping SDL events -- see the
+     * matching loop after display_shutdown_sem is posted in main(). */
     qemu_sem_wait(&display_shutdown_sem);
     bql_lock();
     qemu_cleanup(exit_status);
     bql_unlock();
+    qatomic_set(&qemu_cleanup_done, true);
 
     return NULL;
 }
@@ -2571,6 +2598,24 @@ int main(int argc, char **argv)
         gl_render_frame(scon);
     }
     qemu_sem_post(&display_shutdown_sem);
+    /*
+     * Do not qemu_thread_join() yet: qemu_cleanup() (block drain/flush,
+     * audio teardown) still runs on the qemu_main thread and can take a
+     * while -- or, on macOS, deadlock if the SDL/CoreAudio main thread is
+     * frozen inside join. Pump events until cleanup signals done, then
+     * join (should return immediately) and tear down SDL. Bounded so a
+     * genuinely wedged cleanup ends up as a diagnosable hang in join
+     * rather than an infinite, responsive spin here.
+     */
+    for (int waited_ms = 0;
+         !qatomic_read(&qemu_cleanup_done) && waited_ms < 15000;
+         waited_ms += 10) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            /* Discard -- the guest is gone; keep AppKit/SDL alive only. */
+        }
+        SDL_Delay(10);
+    }
     qemu_thread_join(&thread);
     display_finalize();
     return exit_status;

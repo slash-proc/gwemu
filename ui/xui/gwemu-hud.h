@@ -42,6 +42,11 @@ bool gwemu_get_fb_pixels(uint8_t **pixels, int *w, int *h);
 void gwemu_main_loop_lock(void);
 void gwemu_main_loop_unlock(void);
 
+/* Defer vm_stop/vm_start onto the QEMU main loop (safe from the UI/HUD
+ * thread while it holds the BQL). See ActionTogglePause. */
+void gwemu_request_vm_stop(void);
+void gwemu_request_vm_start(void);
+
 // Implemented in gwemu_hud.cc
 void gwemu_hud_init(SDL_Window *window, SDL_Renderer *renderer);
 void gwemu_hud_cleanup(void);
