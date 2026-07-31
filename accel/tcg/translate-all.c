@@ -611,14 +611,21 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
     /*
      * Remember this PC so the block is regenerated ending here and the
      * loop stops taking this path every iteration -- see gnw_note_io_pc.
-     * The currently-cached block still has the access mid-stream, so it
-     * must be dropped, otherwise it keeps being executed and keeps
-     * faulting. Only on the first sighting: after that the regenerated
-     * block already ends at the access and no longer comes through here.
+     *
+     * We deliberately do NOT call tb_phys_invalidate() here, and neither
+     * does upstream cpu_io_recompile(). A fork-local invalidate of the
+     * currently-executing TB was added for the MMIO-PC cache, but
+     * do_tb_phys_invalidate() takes tb->jmp_lock, and taking it on the TB
+     * this vCPU is executing deadlocks against any thread waiting for the
+     * vCPU to stop: qemu_main sits in qemu_cond_wait() inside
+     * pause_all_vcpus() while the vCPU spins on jmp_lock. Confirmed on
+     * macOS via `sample` on both the Pause/Resume menu item and QMP
+     * "stop". Marking the PC known is enough for the NEXT translation to
+     * end at the access; the old TB takes at most one more iorecompile
+     * trip (cflags_next_tb below forces a one-insn stand-in) and then
+     * ages out of the hash.
      */
-    if (gnw_note_io_pc(cpu->cc->get_pc(cpu))) {
-        tb_phys_invalidate(tb, -1);
-    }
+    gnw_note_io_pc(cpu->cc->get_pc(cpu));
 
     cpu->cflags_next_tb = curr_cflags(cpu) | CF_MEMI_ONLY | CF_NOIRQ | n;
 
