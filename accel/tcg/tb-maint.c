@@ -175,8 +175,29 @@ void tb_htable_init(void)
 
     qht_init(&tb_ctx.htable, tb_cmp, CODE_GEN_HTABLE_SIZE, mode);
 
-    /* ON by default; GNW_GOTO_TB_CROSSPAGE=0 is the escape hatch. */
-    gnw_goto_tb_crosspage = gnw_env_enabled_default_on("GNW_GOTO_TB_CROSSPAGE");
+    /*
+     * OFF by default. Worth -27% host CPU on the DOS core when on, and
+     * GNW_GOTO_TB_CROSSPAGE=1 opts back in, but it cannot ship on while
+     * cpu_io_recompile() declines to invalidate the executing TB (see the
+     * comment there). That TB keeps the MMIO access mid-stream and keeps
+     * re-faulting; with chaining on it is re-entered through a patched
+     * cross-page direct jump instead of a lookup that would honour
+     * cflags_next_tb, so the guest never makes progress and gwemu hangs
+     * during startup before the first frame. Confirmed on arm64 macOS:
+     * removed-invalidate + knob on hangs, removed-invalidate + knob off
+     * boots and Pause/Resume/quit all work.
+     *
+     * Not reproducible on x86_64 -- five other variables (SD card
+     * attached, profile execv relaunch, renderer, images, config path)
+     * were matched exactly on an Intel Mac and it boots fine either way,
+     * which points at arm64's weaker memory ordering exposing a race that
+     * TSO hides.
+     *
+     * To get the win back, cpu_io_recompile() needs to invalidate safely
+     * (async_safe_run_on_cpu, after the vCPU has left the TB) rather than
+     * not at all -- then this can go back to on by default.
+     */
+    gnw_goto_tb_crosspage = gnw_env_enabled("GNW_GOTO_TB_CROSSPAGE");
     gnw_crosspage_stats = gnw_env_enabled("GNW_CROSSPAGE_STATS");
     if (gnw_crosspage_stats) {
         atexit(gnw_crosspage_report);

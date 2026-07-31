@@ -40,11 +40,14 @@ offset — so a 12-bit cache indexes on only 6 page bits, and a working set over
 so the whole effect is the single step 12 → 14 and larger caches only cost
 footprint. Costs 256KB/vCPU.
 
-### `perf/goto-tb-crosspage` — cross-page `goto_tb` chaining (ON by default)
+### `perf/goto-tb-crosspage` — cross-page `goto_tb` chaining (OFF by default since 2026-07-31)
 
-**−27% host CPU** on the DOS core (7.24s → 5.28s). `GNW_GOTO_TB_CROSSPAGE=0`
-is the escape hatch;
-guest DWT agrees (cpu 22→14%/frame, idle 75→85%, cpi 52→33, blit 342→87µs).
+**−27% host CPU** on the DOS core (7.24s → 5.28s) when enabled;
+`GNW_GOTO_TB_CROSSPAGE=1` opts in.
+Guest DWT agrees (cpu 22→14%/frame, idle 75→85%, cpi 52→33, blit 342→87µs).
+See "Why it was demoted to opt-in" below — the win is real and still
+recoverable, but it currently depends on a `cpu_io_recompile()` change that
+cannot ship alongside it.
 
 Cause, measured by histogramming the guest PC of all 412M TB lookups in a 30s
 run: **~85% are plain direct branches whose target is in a different 1KB page** —
@@ -65,10 +68,50 @@ every TLB flush tears them all down. Same-page links are deliberately *not*
 recorded, so a flush-heavy guest keeps normal chaining. Code modification was
 already covered independently by `tb_phys_invalidate()` → `tb_jmp_unlink()`.
 
-**Why it shipped on despite an untested hazard.** Project decision: keep measured
-improvements unless obviously buggy, and validate them together in a broad
-cross-platform test round rather than holding each behind a knob indefinitely.
-What follows is therefore the watch-list for that round, not a blocker.
+**Why it was demoted to opt-in (2026-07-31).** Not because the teardown is
+expensive — it is not, see below — but because it is incompatible with the fix
+for a separate deadlock.
+
+The macOS beachball on Pause/Resume and quit was three independent bugs, two in
+UI threading and one in `cpu_io_recompile()`, which invalidated the TB the vCPU
+was *currently executing*. `do_tb_phys_invalidate()` takes `tb->jmp_lock`, so
+any thread waiting for that vCPU to stop deadlocks against it. The fix is to
+stop invalidating there, as upstream does.
+
+That fix and this knob cannot both be on. Without the invalidate the faulting TB
+stays live with the MMIO access mid-stream; with cross-page chaining on it is
+re-entered through a patched direct jump instead of a lookup that would honour
+`cflags_next_tb`, so the guest never progresses and gwemu hangs at startup
+before the first frame. Confirmed by exhausting the matrix on arm64 macOS —
+only invalidate-removed + knob-off works, and Pause/Resume/quit are clean there:
+
+| `cpu_io_recompile` invalidate | knob | result |
+|---|---|---|
+| present | on | beachballs on Pause (the original report) |
+| present | off | beachballs on Pause |
+| removed | on | hangs during startup |
+| removed | **off** | **works** |
+
+**The teardown-cost theory was wrong.** The first diagnosis blamed
+`gnw_unlink_all_jumps()` for monopolising the BQL. It does not: the registry is
+cleared on every flush (`g_ptr_array_set_size(.., 0)`), so it carries ~18–25
+entries per call, and `GNW_CROSSPAGE_STATS=1` measured **2.0µs worst case** over
+47 flushes. Recorded because the wrong cause was nearly written down here as
+fact, which would have sent the next person looking in the wrong place.
+
+**Not reproducible on x86_64.** An Intel Mac matched binary, knob, SD card,
+profile `execv` relaunch, renderer and config path exactly and booted fine in
+every combination, including 50 scripted QMP stop/cont cycles. That points at
+arm64's weaker memory ordering exposing a race TSO hides — so this needs an
+arm64 host to test, and a clean x86_64 run proves nothing.
+
+**How to get the win back.** Make `cpu_io_recompile()` invalidate *safely*
+rather than not at all — `async_safe_run_on_cpu()`, after the vCPU has left the
+TB — which avoids the lock inversion without creating the livelock. Then this
+can go back to on by default. Untried as of 2026-07-31.
+
+What follows is the original watch-list from when this shipped on by default.
+It is still the right list for any future re-enable.
 
 The teardown is confirmed live (1970 links noted, 79
 flush events, 1444 torn down per run), and every M-profile MPU write that
