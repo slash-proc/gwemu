@@ -1,3 +1,18 @@
+2026-08-07  ospi: model the OCTOSPI's shared-pin constraint -- the
+            memory-mapped XIP window at 0x9xxxxxxx now raises a bus
+            fault whenever the controller is not in memory-mapped mode
+            (CR.EN clear or CR.FMODE != 11), per RM0455 24.4.17's AXI
+            slave error conditions. Previously extflash was a plain
+            always-readable RAM region, so firmware reading or
+            executing from external flash between HAL_OSPI_Abort() and
+            the restore of FMODE=11 -- which faults on silicon -- ran
+            fine here, making that whole defect class invisible to
+            gwemu testing. The gate sits above OTFDEC's decrypt
+            overlays and is up from reset; host-side accesses
+            (-device loader, pmemsave, gdbstub) bypass it. CR.ABORT is
+            now self-clearing per 24.4.18. Stock Zelda and retro-go
+            both verified unaffected.
+
 2026-07-30  ui: fix the Settings window never opening when Vulkan is
             unavailable. SDL3's SDL_HINT_RENDER_DRIVER is a whitelist,
             not a preference -- with it set, SDL_CreateRenderer() tries
