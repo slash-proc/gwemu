@@ -31,6 +31,160 @@
 #include "hw/misc/gnw_h7b0_regs_ospi.h"
 #include "hw/misc/gnw_h7b0_stub_log.h"
 
+/*
+ * XIP window availability
+ * -----------------------
+ * The OCTOSPI has one set of pins. RM0455 24.4.17 ("OCTOSPI error
+ * management") lists, among the conditions under which the controller
+ * generates an *AXI slave error* for an access to the memory-mapped
+ * window: "The memory-mapped mode is disabled and an AXI read or
+ * write request occurs", "A read or write address (including the
+ * address offset if ADOFFEN bit is set) exceeds the size of the
+ * external memory", and "The OCTOSPI is disabled while a read or
+ * write burst is requested". So on silicon the window is not a
+ * passive always-readable aperture: it exists only while
+ * CR.FMODE == 11 with the controller enabled, and vanishes the moment
+ * firmware leaves memory-mapped mode.
+ *
+ * That is exactly what the documented page-program sequence does
+ * (RM0455 24.4.11): abort out of memory-mapped mode, program via
+ * indirect mode, auto-poll for completion, then re-enter memory-mapped
+ * mode. HAL_OSPI_Abort() *is* that exit. Between it and the restore of
+ * FMODE, any instruction fetch or data load from the window faults on
+ * real hardware -- so firmware that runs a callback, ISR or const
+ * lookup out of external flash across that gap is broken on silicon
+ * even though it works fine against a model that keeps the bytes
+ * readable throughout. Modeling the window as a plain RAM region made
+ * that entire defect class structurally invisible; this gate makes it
+ * fault here too.
+ *
+ * The H7B0's OCTOSPI_SR has no BERRF bit (confirmed against
+ * sdk/cmsis-device-h7/Include/stm32h7b0xx.h: SR is TEF/TCF/FTF/SMF/
+ * TOF/BUSY/FLEVEL only), which is RM0455's "otherwise the Slave bus
+ * error response is generated at system level as transaction response
+ * with no dedicated bit into the controller status register" case --
+ * so a violation is a pure bus fault with no status flag to set.
+ */
+static bool ospi_memmap_active(GnwH7B0OspiState *s)
+{
+    uint32_t cr = s->regs[GNW_H7B0_OSPI_CR >> 2];
+
+    return (cr & OSPI_CR_EN) &&
+           ((cr & OSPI_CR_FMODE_MASK) >> OSPI_CR_FMODE_SHIFT)
+               == OSPI_FMODE_MEMMAP;
+}
+
+static void ospi_xip_fault_log(GnwH7B0OspiState *s, hwaddr addr, bool is_write)
+{
+    uint32_t cr = s->regs[GNW_H7B0_OSPI_CR >> 2];
+
+    /*
+     * One-shot: a faulting fetch typically re-executes from the
+     * BusFault handler, and per-access logging would drown the log.
+     */
+    if (s->xip_fault_logged) {
+        return;
+    }
+    s->xip_fault_logged = true;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "%s: %s at XIP window offset 0x%" HWADDR_PRIx " while "
+                  "memory-mapped mode is not active (CR=0x%08x, EN=%u, "
+                  "FMODE=%u) -- real hardware answers this with an AXI "
+                  "slave error (RM0455 24.4.17); raising a bus fault. "
+                  "Firmware must not read or execute from the XIP window "
+                  "between leaving memory-mapped mode (e.g. "
+                  "HAL_OSPI_Abort()) and restoring FMODE=11.\n",
+                  __func__, is_write ? "write" : "read/fetch", addr,
+                  cr, !!(cr & OSPI_CR_EN),
+                  (cr & OSPI_CR_FMODE_MASK) >> OSPI_CR_FMODE_SHIFT);
+}
+
+/*
+ * Accesses carrying MEMTXATTRS_UNSPECIFIED are not guest AXI traffic:
+ * they are host-side pokes at the address space -- `-device loader`
+ * painting a flash image in at reset, the monitor's pmemsave/xp, the
+ * gdbstub reading memory. Those model an external programmer or a
+ * debugger touching the chip, not the CPU going through the OCTOSPI's
+ * AXI port, so the window's availability doesn't apply to them; they
+ * are serviced straight out of the backing store. (This also means
+ * device DMA, which mostly uses unspecified attrs in QEMU, is not
+ * gated -- the CPU fetch/load path is what this models, and it is the
+ * one that matters for the defect class this exists to catch.)
+ */
+static bool ospi_xip_gate_bypass(GnwH7B0OspiState *s, MemTxAttrs attrs)
+{
+    return attrs.unspecified && s->backing;
+}
+
+static MemTxResult ospi_xip_gate_read(void *opaque, hwaddr addr,
+                                       uint64_t *data, unsigned size,
+                                       MemTxAttrs attrs)
+{
+    GnwH7B0OspiState *s = opaque;
+
+    if (ospi_xip_gate_bypass(s, attrs)) {
+        *data = (addr + size <= s->flash_size)
+                 ? ldn_le_p(s->backing + addr, size) : 0;
+        return MEMTX_OK;
+    }
+    ospi_xip_fault_log(s, addr, false);
+    *data = 0;
+    return MEMTX_ERROR;
+}
+
+static MemTxResult ospi_xip_gate_write(void *opaque, hwaddr addr,
+                                        uint64_t value, unsigned size,
+                                        MemTxAttrs attrs)
+{
+    GnwH7B0OspiState *s = opaque;
+
+    if (ospi_xip_gate_bypass(s, attrs)) {
+        if (addr + size <= s->flash_size) {
+            stn_le_p(s->backing + addr, size, value);
+        }
+        return MEMTX_OK;
+    }
+    ospi_xip_fault_log(s, addr, true);
+    return MEMTX_ERROR;
+}
+
+static const MemoryRegionOps ospi_xip_gate_ops = {
+    .read_with_attrs = ospi_xip_gate_read,
+    .write_with_attrs = ospi_xip_gate_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
+/*
+ * Map or unmap the faulting gate to match the controller's current
+ * mode. Priority 2 puts it above both the plain extflash RAM region
+ * (priority 0) and OTFDEC's decrypt overlays (priority 1) -- on real
+ * hardware the OTFDEC sits downstream of the OCTOSPI, so a dead window
+ * is dead through the decrypt path too.
+ */
+static void ospi_xip_gate_update(GnwH7B0OspiState *s)
+{
+    bool want_gate;
+
+    if (!s->xip_as) {
+        return;
+    }
+    want_gate = !ospi_memmap_active(s);
+    if (want_gate == s->xip_gate_mapped) {
+        return;
+    }
+    if (want_gate) {
+        memory_region_add_subregion_overlap(s->xip_as, s->xip_base,
+                                             &s->xip_gate, 2);
+    } else {
+        memory_region_del_subregion(s->xip_as, &s->xip_gate);
+    }
+    s->xip_gate_mapped = want_gate;
+}
+
 static void gnw_h7b0_ospi_reset(DeviceState *dev)
 {
     GnwH7B0OspiState *s = GNW_H7B0_OSPI(dev);
@@ -43,6 +197,13 @@ static void gnw_h7b0_ospi_reset(DeviceState *dev)
     s->pending_addr = 0;
     s->dr_pos = 0;
     s->wel = false;
+    s->xip_fault_logged = false;
+    /*
+     * CR resets with EN=0/FMODE=00, so the window comes up dead -- as
+     * on real silicon, where nothing can be fetched from external
+     * flash until firmware has configured memory-mapped mode.
+     */
+    ospi_xip_gate_update(s);
     qemu_irq_lower(s->irq);
 }
 
@@ -434,7 +595,17 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
         ospi_update_irq(s);
         return;
     case GNW_H7B0_OSPI_CR:
-        s->regs[addr >> 2] = value;
+        /*
+         * ABORT is self-clearing: RM0455 24.4.18 says BUSY and ABORT
+         * are both reset once the abort completes, and our transfers
+         * are instantaneous, so it never reads back as set.
+         */
+        s->regs[addr >> 2] = value & ~OSPI_CR_ABORT;
+        if (value & OSPI_CR_ABORT) {
+            s->regs[GNW_H7B0_OSPI_SR >> 2] &= ~OSPI_SR_BUSY;
+        }
+        /* EN/FMODE decide whether the XIP window exists at all. */
+        ospi_xip_gate_update(s);
         ospi_update_irq(s);
         return;
     case GNW_H7B0_OSPI_SR:
@@ -467,6 +638,24 @@ void gnw_h7b0_ospi_set_backing(GnwH7B0OspiState *s, void *backing)
     s->backing = backing;
 }
 
+void gnw_h7b0_ospi_set_xip_window(GnwH7B0OspiState *s,
+                                   MemoryRegion *system_memory,
+                                   hwaddr base, uint64_t size)
+{
+    char name[64];
+
+    snprintf(name, sizeof(name), "%s-xip-gate",
+             object_get_canonical_path_component(OBJECT(s)));
+    memory_region_init_io(&s->xip_gate, OBJECT(s), &ospi_xip_gate_ops, s,
+                           name, size);
+    s->xip_as = system_memory;
+    s->xip_base = base;
+    s->xip_size = size;
+    s->xip_gate_mapped = false;
+    /* Reset already ran at realize; apply the gate for the current CR. */
+    ospi_xip_gate_update(s);
+}
+
 static void gnw_h7b0_ospi_init(Object *obj)
 {
     GnwH7B0OspiState *s = GNW_H7B0_OSPI(obj);
@@ -477,10 +666,22 @@ static void gnw_h7b0_ospi_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
+/*
+ * The gate's mapped/unmapped state is a pure function of CR (EN and
+ * FMODE), which is migrated, so re-derive it rather than migrating the
+ * MemoryRegion mapping itself.
+ */
+static int gnw_h7b0_ospi_post_load(void *opaque, int version_id)
+{
+    ospi_xip_gate_update(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_gnw_h7b0_ospi = {
     .name = TYPE_GNW_H7B0_OSPI,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = gnw_h7b0_ospi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, GnwH7B0OspiState, GNW_H7B0_OSPI_SIZE / 4),
         VMSTATE_UINT8(pending_instr, GnwH7B0OspiState),

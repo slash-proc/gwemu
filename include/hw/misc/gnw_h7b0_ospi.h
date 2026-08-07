@@ -104,6 +104,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
 /* FCR bit positions mirror SR's TEF/TCF/FTF/SMF/TOF exactly. */
 
 #define GNW_H7B0_OSPI_CR    0x00
+#define OSPI_CR_EN          (1U << 0)
+#define OSPI_CR_ABORT       (1U << 1)
 #define OSPI_CR_TEIE        (1U << 16)
 #define OSPI_CR_TCIE        (1U << 17)
 #define OSPI_CR_FTIE        (1U << 18)
@@ -113,6 +115,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
 #define OSPI_CR_FMODE_SHIFT 28
 #define OSPI_CR_FMODE_MASK  (0x3U << OSPI_CR_FMODE_SHIFT)
 #define OSPI_FMODE_AUTOPOLL 2U
+#define OSPI_FMODE_MEMMAP   3U
 
 /* Automatic status-polling registers (RM0455 OCTOSPI_PSMKR/PSMAR). */
 #define GNW_H7B0_OSPI_PSMKR 0x80
@@ -216,7 +219,35 @@ struct GnwH7B0OspiState {
      * return 0xFF) until wired.
      */
     uint8_t *backing;
+
+    /*
+     * Memory-mapped (XIP) window gate -- see the "XIP window
+     * availability" comment block in gnw_h7b0_ospi.c. `xip_gate` is an
+     * always-faulting IO region covering the whole XIP span, mapped
+     * over the plain extflash RAM region (and over any OTFDEC decrypt
+     * overlay, hence a priority above OTFDEC's 1) exactly while the
+     * controller is NOT in memory-mapped mode, so a guest fetch or
+     * load from the window during an indirect program/erase raises a
+     * BusFault the way real silicon's AXI slave error does. Unwired
+     * (`xip_as` NULL) leaves the gate permanently disabled, which is
+     * what OCTOSPI2 gets -- no XIP region is modeled for it.
+     */
+    MemoryRegion *xip_as;
+    MemoryRegion xip_gate;
+    hwaddr   xip_base;
+    uint64_t xip_size;
+    bool     xip_gate_mapped;
+    bool     xip_fault_logged;
 };
+
+/*
+ * Wire this controller's memory-mapped window to the system address
+ * space so the XIP availability gate can be mapped over it. Call
+ * post-realize, alongside gnw_h7b0_ospi_set_backing().
+ */
+void gnw_h7b0_ospi_set_xip_window(GnwH7B0OspiState *s,
+                                   MemoryRegion *system_memory,
+                                   hwaddr base, uint64_t size);
 
 void gnw_h7b0_ospi_set_backing(GnwH7B0OspiState *s, void *backing);
 

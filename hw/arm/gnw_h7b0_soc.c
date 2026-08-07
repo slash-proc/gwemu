@@ -490,6 +490,14 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      */
     gnw_h7b0_ospi_set_backing(&s->octospi1,
                                memory_region_get_ram_ptr(&s->extflash));
+    /*
+     * ...and tell it which span that XIP window occupies, so it can
+     * kill the window whenever the controller leaves memory-mapped
+     * mode, the way real silicon's shared pins do -- see the "XIP
+     * window availability" comment in gnw_h7b0_ospi.c.
+     */
+    gnw_h7b0_ospi_set_xip_window(&s->octospi1, system_memory,
+                                  EXTFLASH_BASE_ADDRESS, EXTFLASH_SIZE);
 
     qdev_prop_set_uint64(DEVICE(&s->octospi2), "flash-size", EXTFLASH_SIZE);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->octospi2), errp)) {
