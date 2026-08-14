@@ -1,3 +1,25 @@
+2026-08-14  spi: model SPI1's DMA request path, so retro-go-sd's
+            DMA-based SD block reads actually complete. Firmware commit
+            5e19e392e made SPI_RxBuffer() use
+            HAL_SPI_TransmitReceive_DMA() for every 512-byte SD data
+            block; with no DMA modelling at all each block instead ate
+            the firmware's full 100ms HAL_SPI_GetState() timeout plus a
+            HAL_SPI_Abort() before falling back to the polled path
+            (~0.5 sector reads/sec, nothing booted inside a timeline).
+            SPI1 now registers DMAMUX requests 37/38 with the DMA
+            controller, does the real SSI byte exchange out of the RX
+            stream's notifier (sourcing outgoing bytes from the TX
+            stream's buffer), and raises EOT on NVIC 35 so
+            HAL_SPI_IRQHandler retires the transfer. Two register-level
+            bugs found live along the way and fixed here: the
+            SVD-derived CR1 write mask (0xfd01) dropped CSTART (bit 9)
+            entirely, so every transfer start was silently discarded;
+            and the polled TXDR path never cleared CSTART, which left it
+            stuck at 1 and made the next DMA transfer's streams look
+            already-started before the guest armed them. Measured after:
+            sustained 100-500 SD blocks/sec, guest at a full 59.6fps.
+            GNW_SPI_DMA_TRACE=1 prints per-second block throughput.
+
 2026-08-07  ospi: model the OCTOSPI's shared-pin constraint -- the
             memory-mapped XIP window at 0x9xxxxxxx now raises a bus
             fault whenever the controller is not in memory-mapped mode

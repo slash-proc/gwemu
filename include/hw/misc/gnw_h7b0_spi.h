@@ -72,6 +72,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/ssi/ssi.h"
+#include "hw/misc/gnw_h7b0_dma.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_SPI "gnw-h7b0-spi"
@@ -88,16 +89,41 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0SpiState, GNW_H7B0_SPI)
 #define SPI_CR1_SPE         (1U << 0)
 #define SPI_CR1_CSTART      (1U << 9)
 
+#define GNW_H7B0_SPI_CR2    0x04
+#define SPI_CR2_TSIZE_MASK  0x0000ffffU
+
+#define GNW_H7B0_SPI_CFG1   0x08
+#define SPI_CFG1_RXDMAEN    (1U << 14)
+#define SPI_CFG1_TXDMAEN    (1U << 15)
+
+#define GNW_H7B0_SPI_IER    0x10
+/* IER bit positions mirror SR's exactly (EOTIE is bit 3, etc). */
+
 #define GNW_H7B0_SPI_SR     0x14
 #define SPI_SR_RXP          (1U << 0)
 #define SPI_SR_TXP          (1U << 1)
 #define SPI_SR_EOT          (1U << 3)
+#define SPI_SR_TXTF         (1U << 4)
 
 #define GNW_H7B0_SPI_IFCR   0x18
 /* IFCR bit positions mirror SR's TXP/EOT/etc exactly. */
 
 #define GNW_H7B0_SPI_TXDR   0x20
 #define GNW_H7B0_SPI_RXDR   0x30
+
+/*
+ * SR bits this model can actually raise, masked against IER when driving
+ * the interrupt line. Deliberately excludes the error flags HAL enables
+ * ITs for (OVR/UDR/FRE/MODF) -- nothing here ever sets them, and SUSP
+ * must stay clear too or HAL_SPI_IRQHandler() takes its suspend branch.
+ */
+#define GNW_H7B0_SPI_IRQ_MASK \
+    (SPI_SR_RXP | SPI_SR_TXP | SPI_SR_EOT | SPI_SR_TXTF)
+
+/* DMAMUX1 DMAREQ_IDs for SPI1 (sdk/stm32h7xx-hal-driver/Inc/
+ * stm32h7xx_hal_dma.h: DMA_REQUEST_SPI1_RX/TX). */
+#define GNW_H7B0_SPI1_DMA_REQUEST_RX 37
+#define GNW_H7B0_SPI1_DMA_REQUEST_TX 38
 
 struct GnwH7B0SpiState {
     SysBusDevice parent_obj;
@@ -109,6 +135,30 @@ struct GnwH7B0SpiState {
 
     bool sd_card;
     SSIBus *ssi;
+
+    qemu_irq irq;
+
+    /*
+     * Which of the two DMA streams a CSTART-ed DMA transfer is still
+     * waiting on (bit 0 = RX, bit 1 = TX, per the DMAEN bits set when
+     * CSTART was written). EOT is raised only once this reaches 0, so a
+     * TX stream that hasn't finished yet doesn't get stranded by an
+     * early CSTART clear -- HAL_DMA_IRQHandler needs the TX stream's
+     * TCIF to return hdmatx to HAL_DMA_STATE_READY for the next block.
+     */
+    uint8_t dma_pending;
+
+    /* Set by gnw_h7b0_spi_set_dma() for SPI1 only (the SD-card SPI);
+     * NULL on SPI2, which drives the LCD panel with no DMA at all. */
+    GnwH7B0DmaState *dma;
 };
+
+/*
+ * Wire this SPI to the DMA controller so CFG1.TXDMAEN/RXDMAEN transfers
+ * really move bytes. Plain setter rather than a QOM link so realize
+ * order between the two devices doesn't matter -- same pattern as
+ * gnw_h7b0_sai1_set_dma().
+ */
+void gnw_h7b0_spi_set_dma(GnwH7B0SpiState *s, GnwH7B0DmaState *dma);
 
 #endif

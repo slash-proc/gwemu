@@ -380,6 +380,39 @@ void gnw_h7b0_dma_set_request_notifier(GnwH7B0DmaState *s, int request,
     gnw_h7b0_dma_rebind_request(s);
 }
 
+bool gnw_h7b0_dma_get_request_stream_regs(GnwH7B0DmaState *s, int request,
+                                           uint32_t *m0ar, uint32_t *ndtr)
+{
+    for (int slot = 0; slot < GNW_H7B0_DMA_REQ_REG_COUNT; slot++) {
+        const GnwH7B0DmaReqReg *reg = &s->req_reg[slot];
+        int stream = reg->bound_stream;
+        int ctrl, local;
+        hwaddr stream_base;
+        uint32_t cr;
+        hwaddr mar_off;
+
+        if (reg->req_id != request || stream < 0) {
+            continue;
+        }
+
+        ctrl = stream / GNW_H7B0_DMA_STREAMS_PER_CTRL;
+        local = stream % GNW_H7B0_DMA_STREAMS_PER_CTRL;
+        stream_base = (hwaddr)ctrl * GNW_H7B0_DMA_CTRL_SIZE +
+                       GNW_H7B0_DMA_S0CR_OFFSET +
+                       (hwaddr)local * GNW_H7B0_DMA_STREAM_STRIDE;
+        cr = s->regs[stream_base >> 2];
+        if (!(cr & DMA_SxCR_EN)) {
+            return false;
+        }
+        /* Same M0AR/M1AR selection as gnw_h7b0_dma_set_isr_bit(). */
+        mar_off = ((cr & DMA_SxCR_DBM) && (cr & DMA_SxCR_CT)) ? 0x10 : 0xc;
+        *m0ar = s->regs[(stream_base + mar_off) >> 2];
+        *ndtr = s->regs[(stream_base + 0x4) >> 2];
+        return true;
+    }
+    return false;
+}
+
 void gnw_h7b0_dma_set_request_active_fn(GnwH7B0DmaState *s, int request,
                                          GnwH7B0DmaStreamActiveFn fn,
                                          void *opaque)
@@ -714,7 +747,21 @@ static void gnw_h7b0_dma_start_stream(GnwH7B0DmaState *s, int stream)
 {
     gnw_h7b0_dma_do_m2m_copy(s, stream);
 
-    if (s->stream_low_latency[stream]) {
+    /*
+     * A low_latency stream whose peripheral is not asserting its request
+     * yet must NOT complete inline here: SPI1's DMA streams are enabled
+     * (HAL_DMA_Start_IT) several register writes *before* CR1.CSTART
+     * actually starts the transfer, so completing at EN time would move
+     * bytes before the SPI is running and retire the transfer out of
+     * order with HAL_SPI_TransmitReceive_DMA()'s own setup sequence.
+     * Fall through to the timer path, which polls the predicate every
+     * GNW_H7B0_DMA_REQ_POLL_NS and -- once active -- still uses this
+     * stream's 1ns low_latency half delay, so it finishes promptly.
+     */
+    bool req_active = !s->stream_active_fn[stream] ||
+        s->stream_active_fn[stream](s->stream_active_fn_opaque[stream]);
+
+    if (s->stream_low_latency[stream] && req_active) {
         /*
          * Complete synchronously in this same call, no QEMUTimer round
          * trip at all -- see gnw_h7b0_dma_set_request_notifier()'s
@@ -770,6 +817,40 @@ static void gnw_h7b0_dma_start_stream(GnwH7B0DmaState *s, int stream)
     s->stream_last_tick_ns[stream] = s->stream_deadline_ns[stream];
     gnw_h7b0_dma_schedule_next(s, stream,
                                 gnw_h7b0_dma_half_delay_ns(s, stream));
+}
+
+void gnw_h7b0_dma_kick_request(GnwH7B0DmaState *s, int request)
+{
+    for (int slot = 0; slot < GNW_H7B0_DMA_REQ_REG_COUNT; slot++) {
+        const GnwH7B0DmaReqReg *reg = &s->req_reg[slot];
+        int stream = reg->bound_stream;
+        int ctrl, local;
+        hwaddr cr_off;
+
+        if (reg->req_id != request || stream < 0 || !s->stream_low_latency[stream]) {
+            continue;
+        }
+
+        ctrl = stream / GNW_H7B0_DMA_STREAMS_PER_CTRL;
+        local = stream % GNW_H7B0_DMA_STREAMS_PER_CTRL;
+        cr_off = (hwaddr)ctrl * GNW_H7B0_DMA_CTRL_SIZE +
+                  GNW_H7B0_DMA_S0CR_OFFSET +
+                  (hwaddr)local * GNW_H7B0_DMA_STREAM_STRIDE;
+        if (!(s->regs[cr_off >> 2] & DMA_SxCR_EN)) {
+            return;
+        }
+        if (s->stream_active_fn[stream] &&
+            !s->stream_active_fn[stream](s->stream_active_fn_opaque[stream])) {
+            return;
+        }
+
+        /* Drop the pending stall-poll first: start_stream() completes a
+         * low_latency stream inline and clears EN, and a stale timer
+         * would then just re-enter the tick for a disabled stream. */
+        timer_del(s->stream_timer[stream]);
+        gnw_h7b0_dma_start_stream(s, stream);
+        return;
+    }
 }
 
 static void gnw_h7b0_dma_reset(DeviceState *dev)

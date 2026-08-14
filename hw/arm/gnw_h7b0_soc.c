@@ -545,6 +545,8 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->spi1), 0, SPI1_BASE_ADDRESS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi1), 0,
+                        qdev_get_gpio_in(armv7m, SPI1_IRQn));
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->rtc), errp)) {
         return;
@@ -713,6 +715,8 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
                                    DEVICE(&s->sai1));
     gnw_h7b0_hash_set_dma(&s->hash, &s->dma);
     gnw_h7b0_adc_set_dma(&s->adc, &s->dma);
+    /* SPI1 only -- SPI2 drives the LCD panel with no DMA at all. */
+    gnw_h7b0_spi_set_dma(&s->spi1, &s->dma);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dac1), errp)) {
         return;

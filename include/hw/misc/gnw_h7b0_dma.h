@@ -90,9 +90,11 @@ typedef struct GnwH7B0DmaReqReg {
 } GnwH7B0DmaReqReg;
 
 /* Max simultaneous request-ID registrations. Currently used by SAI1
- * (audio, request 87) and HASH (DMA-in, request 78); generously
- * headroomed for future DMA-capable peripherals. */
-#define GNW_H7B0_DMA_REQ_REG_COUNT 4
+ * (audio, request 87), HASH (DMA-in, request 78), ADC2 (request 10) and
+ * SPI1 (RX 37 / TX 38); generously headroomed for future DMA-capable
+ * peripherals. Overflowing this is only a LOG_GUEST_ERROR and a silently
+ * dropped registration, so keep the headroom. */
+#define GNW_H7B0_DMA_REQ_REG_COUNT 8
 
 struct GnwH7B0DmaState {
     SysBusDevice parent_obj;
@@ -217,5 +219,31 @@ void gnw_h7b0_dma_set_request_notifier(GnwH7B0DmaState *s, int request,
 void gnw_h7b0_dma_set_request_active_fn(GnwH7B0DmaState *s, int request,
                                          GnwH7B0DmaStreamActiveFn fn,
                                          void *opaque);
+
+/*
+ * Current M0AR/NDTR of whichever stream `request` is bound to, for a
+ * peripheral that needs to see a *different* request's buffer than the
+ * one whose notifier is firing -- SPI1's RX notifier does the real byte
+ * exchange and needs the TX stream's outgoing bytes (gnw_h7b0_spi.c).
+ * Returns false if the request isn't registered, isn't bound to a
+ * stream, or that stream isn't enabled.
+ */
+bool gnw_h7b0_dma_get_request_stream_regs(GnwH7B0DmaState *s, int request,
+                                           uint32_t *m0ar, uint32_t *ndtr);
+
+/*
+ * "This request just became active -- run it now."
+ *
+ * A low_latency stream whose active predicate was false at SxCR.EN time
+ * falls back to the timer path, which only notices the predicate going
+ * true on its next GNW_H7B0_DMA_REQ_POLL_NS stall poll. For SPI1 that
+ * poll interval, not the byte count, was the entire cost of an SD block
+ * read (~250us each, i.e. seconds of extra latency across a FatFs
+ * directory scan). The peripheral knows exactly when it starts the
+ * transfer (CR1.CSTART), so it calls this to complete the stream inline
+ * right there instead of waiting to be polled. No-op unless the request
+ * is bound to an enabled, low_latency, currently-active stream.
+ */
+void gnw_h7b0_dma_kick_request(GnwH7B0DmaState *s, int request);
 
 #endif

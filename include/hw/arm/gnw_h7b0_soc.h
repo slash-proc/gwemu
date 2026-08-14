@@ -395,6 +395,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
  * did, which a plain-RAM stub never sets.
  */
 #define SPI1_BASE_ADDRESS 0x40013000
+/*
+ * Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type. Needed for
+ * the DMA-driven SD block reads: HAL retires those from SPI1's EOT
+ * interrupt (see gnw_h7b0_spi.c's DMA section). SPI2 has no IRQ wired --
+ * its LCD path is polled.
+ */
+#define SPI1_IRQn 35
 
 /*
  * EXTI + SYSCFG, per STM32H7B0.svd (contiguous 0x400-per-block,
