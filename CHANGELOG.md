@@ -1,3 +1,17 @@
+2026-08-19  gpio: TIME is PA2, not PA2+PC5 -- pressing it no longer
+            asserts the charger's PGOOD line. Stock Zelda supports two
+            board variants, choosing the pin pair at runtime from a .bss
+            byte at 0x2000ab92: the button matrix (0x08016808) reads TIME
+            from PC5 when it is 1 and PA2 otherwise, and the active-low
+            PGOOD sense (0x0800f004) takes the opposite pin of the pair.
+            Nothing writes that byte, so this board is permanently the
+            "TIME on PA2, PGOOD on PC5" variant. The old table drove both
+            pins, which worked for TIME by accident while telling firmware
+            external power had just been connected on every press. PC5 is
+            now instead held low from reset, so the emulated unit always
+            reads as plugged in (deliberate policy -- no battery or
+            charger UI is modelled).
+
 2026-08-14  spi: model SPI1's DMA request path, so retro-go-sd's
             DMA-based SD block reads actually complete. Firmware commit
             5e19e392e made SPI_RxBuffer() use

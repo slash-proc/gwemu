@@ -63,12 +63,22 @@ enum {
 };
 
 /*
- * A button can be wired to up to two pins: TIME is physically on both
- * PC5 and PA2 (WKUP2) -- stock Zelda's read_buttons (FUN_08016808)
- * reads TIME from PA2 in its default/clock mode and only from PC5 when
- * a mode byte is set, so pressing TIME must drive both low or stock
- * firmware never sees it. (PWR on PA0/WKUP1 is the same wakeup-capable
- * pattern, single-wired.) pin2 == 0 means "no second wiring".
+ * pin2 == 0 means "no second wiring". PWR on PA0/WKUP1 is wakeup-capable
+ * and single-wired.
+ *
+ * TIME is PA2 (WKUP2) on this board, NOT PC5, and must not also drive
+ * PC5. Stock Zelda supports two board variants and picks the pin pair at
+ * runtime off a byte at 0x2000ab92: the button matrix at 0x08016808 reads
+ * TIME from PC5 when that byte == 1 and from PA2 otherwise, while the
+ * charger's active-low PGOOD sense takes the opposite pin of the pair
+ * (read at 0x0800f004, same flag byte via 0x2000ab90+2). Nothing in bank1
+ * ever writes the byte -- it is .bss, reads 0 live -- so this board is
+ * permanently the "TIME on PA2, PGOOD on PC5" variant.
+ *
+ * Driving both pins (as this table used to) worked for TIME by accident
+ * and simultaneously pulled PGOOD low, so every TIME press told firmware
+ * external power had just been connected. Verified by A/B: PC5-only makes
+ * TIME stop responding entirely.
  */
 typedef struct GnwButtonPin {
     int port;
@@ -80,7 +90,7 @@ typedef struct GnwButtonPin {
 static const GnwButtonPin gnw_h7b0_button_pins[GNW_BTN__COUNT] = {
     [GNW_BTN_PAUSE]  = { 2, 1U << 13 },
     [GNW_BTN_GAME]   = { 2, 1U << 1  },
-    [GNW_BTN_TIME]   = { 2, 1U << 5, 0, 1U << 2 },
+    [GNW_BTN_TIME]   = { 0, 1U << 2 },
     [GNW_BTN_A]      = { 3, 1U << 9  },
     [GNW_BTN_B]      = { 3, 1U << 5  },
     [GNW_BTN_LEFT]   = { 3, 1U << 11 },
@@ -343,6 +353,17 @@ static void gnw_h7b0_gpio_reset(DeviceState *dev)
      * and fix on its own terms, not a reason to reintroduce readings that
      * contradict measured real hardware.
      */
+
+    /*
+     * PC5 is the BQ24072 charger's PGOOD sense on this board variant (see
+     * the gnw_h7b0_button_pins comment for how firmware picks the pin),
+     * active low: low means external power is present. Hold it low so the
+     * emulated unit always looks plugged in -- gwemu models no battery and
+     * exposes no charger UI, and a unit that believes it is on battery can
+     * take low-power/charge-retry paths unrelated to what we emulate. A
+     * deliberate emulator policy choice, not a real-hardware measurement.
+     */
+    s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) >> 2] &= ~(1u << 5);
 }
 
 static uint64_t gnw_h7b0_gpio_read(void *opaque, hwaddr addr,
