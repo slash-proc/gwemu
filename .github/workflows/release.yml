@@ -351,7 +351,10 @@ jobs:
           # meson/ninja/cmake/pkg-config/dylibbundler stay arm64 (host
           # tools, never linked into the target binary).
           brew install ninja meson cmake dylibbundler pkg-config
-          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
+          # The Homebrew installer dropped its Intel /usr/local path in
+          # September 2026. Pin the last revision with Intel bootstrap
+          # support; the x86_64 formula installs below still run under Rosetta.
+          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/7a133dc74051ee4efc79467ed215dfedf45aea2/install.sh)" </dev/null
           # zlib: libpng.pc has `Requires: zlib`, so pkg-config resolves
           # libpng only if a zlib.pc is visible. PKG_CONFIG_LIBDIR below
           # REPLACES the default search path, which hides the SDK's own
