@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "hw/core/cpu.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
@@ -71,19 +72,7 @@ enum {
  * power-good input, and doing so makes a TIME press look like a power
  * connection. pin2 == 0 means "no second wiring".
  *
- * TIME is PA2 (WKUP2) on this board, NOT PC5, and must not also drive
- * PC5. Stock Zelda supports two board variants and picks the pin pair at
- * runtime off a byte at 0x2000ab92: the button matrix at 0x08016808 reads
- * TIME from PC5 when that byte == 1 and from PA2 otherwise, while the
- * charger's active-low PGOOD sense takes the opposite pin of the pair
- * (read at 0x0800f004, same flag byte via 0x2000ab90+2). Nothing in bank1
- * ever writes the byte -- it is .bss, reads 0 live -- so this board is
- * permanently the "TIME on PA2, PGOOD on PC5" variant.
- *
- * Driving both pins (as this table used to) worked for TIME by accident
- * and simultaneously pulled PGOOD low, so every TIME press told firmware
- * external power had just been connected. Verified by A/B: PC5-only makes
- * TIME stop responding entirely.
+ * PWR on PA0/WKUP1 is wakeup-capable and single-wired.
  */
 typedef struct GnwButtonPin {
     int port;
@@ -106,6 +95,27 @@ static const GnwButtonPin gnw_h7b0_button_pins[GNW_BTN__COUNT] = {
     [GNW_BTN_START]  = { 2, 1U << 11 },
     [GNW_BTN_SELECT] = { 2, 1U << 12 },
 };
+
+#define GNW_UNLOCK_PAYLOAD_SIZE 1288
+#define GNW_UNLOCK_ENTRY_OFFSET 0x4a0
+
+typedef struct GnwUnlockHandoff {
+    uint8_t *itcm;
+    size_t itcm_offset;
+    uint8_t payload[GNW_UNLOCK_PAYLOAD_SIZE];
+} GnwUnlockHandoff;
+
+static void gnw_h7b0_gpio_run_unlock_payload(CPUState *cpu,
+                                             run_on_cpu_data data)
+{
+    GnwUnlockHandoff *handoff = data.host_ptr;
+
+    memcpy(handoff->itcm + handoff->itcm_offset, handoff->payload,
+           sizeof(handoff->payload));
+    cpu_set_pc(cpu, (handoff->itcm_offset + GNW_UNLOCK_ENTRY_OFFSET) | 1);
+    cpu_exit(cpu);
+    g_free(handoff);
+}
 
 /*
  * Keyboard mapping. Arrow keys for the d-pad are the obvious choice;
@@ -178,6 +188,88 @@ static void gnw_h7b0_gpio_set_pin(GnwH7B0GpioState *s, int port,
     }
 }
 
+static bool gnw_h7b0_gpio_try_unlock_handoff(GnwH7B0GpioState *s,
+                                             bool power_edge,
+                                             bool *stock_itcm_ready)
+{
+    static const uint8_t unlock_start[] = {
+        0x72, 0xb6, 0x12, 0x48, 0x00, 0x21, 0x01, 0x60,
+        0x11, 0x49, 0x81, 0x61, 0x11, 0x48, 0x00, 0x21,
+    };
+    static const struct {
+        size_t itcm_offset;
+        size_t extflash_offset;
+        const char *stock_itcm_sha1;
+    } models[] = {
+        { 0, 0, "ca71a54c0a22cca5c6ee129faee9f99f3a346ca0" },
+        { 0x20, 0x30c3a8, "2f70156235ffd871599facf64457040d549353b4" },
+    };
+    uint8_t decoded[GNW_UNLOCK_PAYLOAD_SIZE];
+
+    *stock_itcm_ready = false;
+    if (!s->cpu || !s->itcm || !s->rdp_value || *s->rdp_value != 0x55) {
+        *stock_itcm_ready = true;
+        return false;
+    }
+
+    for (size_t model = 0; model < ARRAY_SIZE(models); model++) {
+        size_t itcm_offset = models[model].itcm_offset;
+        size_t extflash_offset = models[model].extflash_offset;
+        const uint8_t *payload = s->itcm + itcm_offset;
+        bool payload_in_itcm;
+
+        if (itcm_offset + GNW_UNLOCK_PAYLOAD_SIZE > s->itcm_size) {
+            continue;
+        }
+        payload_in_itcm = memcmp(payload + GNW_UNLOCK_ENTRY_OFFSET,
+                                 unlock_start, sizeof(unlock_start)) == 0;
+        if (!payload_in_itcm) {
+            char *sha1 = g_compute_checksum_for_data(
+                G_CHECKSUM_SHA1, payload, 1300);
+            bool matches = g_str_equal(sha1, models[model].stock_itcm_sha1);
+            g_free(sha1);
+            if (!matches) {
+                continue;
+            }
+            *stock_itcm_ready = true;
+            if (!s->extflash || !s->extflash_baseline ||
+                extflash_offset + sizeof(decoded) > s->extflash_size ||
+                extflash_offset + sizeof(decoded) >
+                    s->extflash_baseline_size) {
+                return false;
+            }
+            for (size_t i = 0; i < sizeof(decoded); i++) {
+                decoded[i] = s->extflash[extflash_offset + i] ^
+                             s->itcm[itcm_offset + i] ^
+                             s->extflash_baseline[extflash_offset + i];
+            }
+            payload = decoded;
+        } else {
+            *stock_itcm_ready = true;
+        }
+
+        if (memcmp(payload + GNW_UNLOCK_ENTRY_OFFSET, unlock_start,
+                   sizeof(unlock_start)) == 0) {
+            GnwUnlockHandoff *handoff = g_new(GnwUnlockHandoff, 1);
+
+            handoff->itcm = s->itcm;
+            handoff->itcm_offset = itcm_offset;
+            memcpy(handoff->payload, payload, sizeof(handoff->payload));
+            s->unlock_handoff_active = power_edge;
+            async_run_on_cpu(s->cpu, gnw_h7b0_gpio_run_unlock_payload,
+                             RUN_ON_CPU_HOST_PTR(handoff));
+            return true;
+        }
+    }
+    return false;
+}
+
+bool gnw_h7b0_gpio_try_boot_handoff(GnwH7B0GpioState *s,
+                                    bool *stock_itcm_ready)
+{
+    return gnw_h7b0_gpio_try_unlock_handoff(s, false, stock_itcm_ready);
+}
+
 static const char *const gnw_h7b0_button_names[GNW_BTN__COUNT] = {
     [GNW_BTN_PAUSE]  = "pause",
     [GNW_BTN_GAME]   = "game",
@@ -208,6 +300,26 @@ static void gnw_h7b0_gpio_set_button(GnwH7B0GpioState *s, int button,
 {
     const GnwButtonPin *bp = &gnw_h7b0_button_pins[button];
 
+    if (button == GNW_BTN_PWR && s->unlock_handoff_active) {
+        /* The release edge belongs to the cold-start control and must not
+         * interrupt the payload after the handoff has begun. */
+        if (!pressed) {
+            s->unlock_handoff_active = false;
+        }
+        return;
+    }
+
+    /* The physical POWER edge enters the same verified boot-ROM handoff
+     * model used during initial VM startup. */
+    if (button == GNW_BTN_PWR && pressed) {
+        bool stock_itcm_ready;
+
+        if (gnw_h7b0_gpio_try_unlock_handoff(s, true,
+                                              &stock_itcm_ready)) {
+            return;
+        }
+    }
+
     gnw_h7b0_gpio_set_pin(s, bp->port, bp->pin, pressed);
     if (bp->pin2) {
         gnw_h7b0_gpio_set_pin(s, bp->port2, bp->pin2, pressed);
@@ -221,6 +333,23 @@ void gnw_h7b0_gpio_inject_button(GnwH7B0GpioState *s, int button,
     if (button >= 0 && button < GNW_BTN__COUNT) {
         gnw_h7b0_gpio_set_button(s, button, pressed);
     }
+}
+
+void gnw_h7b0_gpio_set_unlock_handoff(GnwH7B0GpioState *s, CPUState *cpu,
+                                      uint8_t *itcm, size_t itcm_size,
+                                      uint8_t *extflash, size_t extflash_size,
+                                      uint8_t *extflash_baseline,
+                                      size_t extflash_baseline_size,
+                                      uint8_t *rdp_value)
+{
+    s->cpu = cpu;
+    s->itcm = itcm;
+    s->itcm_size = itcm_size;
+    s->extflash = extflash;
+    s->extflash_size = extflash_size;
+    s->extflash_baseline = extflash_baseline;
+    s->extflash_baseline_size = extflash_baseline_size;
+    s->rdp_value = rdp_value;
 }
 
 static FILE *rec_file = NULL;

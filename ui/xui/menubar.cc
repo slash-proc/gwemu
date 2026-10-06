@@ -142,7 +142,9 @@ void ShowMainMenu()
         // PA0/EXTI0 standby-wake logic handles it exactly as a real
         // physical press, not a GUI-level shortcut.
         float btn_w = ImGui::CalcTextSize("Power").x + 2 * ImGui::GetStyle().FramePadding.x;
-        ImGui::SameLine(ImGui::GetWindowWidth() - 2 * btn_w - 24);
+        float cold_w = ImGui::CalcTextSize("Cold cycle").x +
+                       2 * ImGui::GetStyle().FramePadding.x;
+        ImGui::SameLine(ImGui::GetWindowWidth() - 2 * btn_w - cold_w - 36);
         if (ImGui::Button("Reset")) {
             ActionReset();
         }
@@ -151,6 +153,15 @@ void ShowMainMenu()
         }
         if (ImGui::Button("Power")) {
             gnw_input_synth_press(GNW_INPUT_BTN_PWR);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Press the device POWER button");
+        }
+        if (ImGui::Button("Cold cycle")) {
+            ActionColdPowerCycle();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Clear volatile RAM and registers, reset, then power on");
         }
 
         g_main_menu_height = ImGui::GetWindowHeight();

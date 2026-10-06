@@ -11,6 +11,13 @@
 #include "exec/hwaddr.h"
 #include "system/ramlist.h"
 
+typedef bool (*PhysicalMemoryDebugAccessFn)(void *opaque, hwaddr addr,
+                                             hwaddr len, bool is_write);
+void physical_memory_register_debug_access_filter(hwaddr start, hwaddr size,
+                                                   PhysicalMemoryDebugAccessFn fn,
+                                                   void *opaque);
+void physical_memory_unregister_debug_access_filters(void *opaque);
+
 #define DIRTY_CLIENTS_ALL     ((1 << DIRTY_MEMORY_NUM) - 1)
 #define DIRTY_CLIENTS_NOCODE  (DIRTY_CLIENTS_ALL & ~(1 << DIRTY_MEMORY_CODE))
 

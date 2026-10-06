@@ -27,6 +27,10 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "system/address-spaces.h"
+#include "system/runstate.h"
+#include "system/reset.h"
+#include "hw/core/resettable.h"
+#include "monitor/monitor.h"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -37,6 +41,168 @@
 #include "system/system.h"
 #include "hw/misc/unimp.h"
 #include "hw/misc/gnw_h7b0_regs_rcc.h"
+#include "target/arm/cpu.h"
+
+/* GnWManager's Zelda payload is placed at 0x30c3a8. Save that span plus the
+ * 1,300-byte ITCM validation window; Mario's payload is at offset zero. */
+#define GNW_UNLOCK_BASELINE_SIZE (0x30c3a8 + 1300)
+#define GNW_STARTUP_HANDOFF_POLL_NS (10 * 1000000LL)
+#define GNW_STARTUP_HANDOFF_MAX_ATTEMPTS 500
+
+static void gnw_h7b0_cold_power_release(void *opaque)
+{
+    GnwH7B0State *s = opaque;
+
+    gnw_h7b0_gpio_inject_button(&s->gpio,
+                                gnw_h7b0_gpio_button_from_name("pwr"), false);
+}
+
+static void gnw_h7b0_cold_power_on(void *opaque)
+{
+    GnwH7B0State *s = opaque;
+
+    gnw_h7b0_gpio_inject_button(&s->gpio,
+                                gnw_h7b0_gpio_button_from_name("pwr"), true);
+    timer_mod(s->cold_power_release_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200 * 1000000LL);
+}
+
+static void gnw_h7b0_startup_handoff(void *opaque)
+{
+    GnwH7B0State *s = opaque;
+    bool stock_itcm_ready;
+
+    if (gnw_h7b0_gpio_try_boot_handoff(&s->gpio, &stock_itcm_ready) ||
+        stock_itcm_ready) {
+        return;
+    }
+    if (s->startup_handoff_attempts++ < GNW_STARTUP_HANDOFF_MAX_ATTEMPTS) {
+        timer_mod(s->startup_handoff_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  GNW_STARTUP_HANDOFF_POLL_NS);
+    }
+}
+
+static void hmp_gnw_cold_cycle(Monitor *mon, const QDict *qdict)
+{
+    gnw_h7b0_soc_cold_power_cycle();
+    monitor_printf(mon, "GNW cold power cycle requested\n");
+}
+
+static void hmp_gnw_ui_reset(Monitor *mon, const QDict *qdict)
+{
+    gnw_h7b0_soc_ui_reset();
+    monitor_printf(mon, "GNW UI reset requested\n");
+}
+
+void gnw_h7b0_soc_cold_power_cycle(void)
+{
+    Object *obj = object_resolve_path_type("/machine/soc", TYPE_GNW_H7B0_SOC,
+                                           NULL);
+    GnwH7B0State *s;
+    uint8_t *itcm;
+
+    if (!obj) {
+        warn_report("gnw-h7b0: cold power cycle requested without a live SoC");
+        return;
+    }
+    s = GNW_H7B0_SOC(obj);
+    itcm = memory_region_get_ram_ptr(&s->itcm);
+
+    /* The immutable boot path supplies this original ITCM image after power
+     * is restored. Preserve the real loader-provided bytes once so later
+     * cold cycles do not reuse the decoded unlock payload. */
+    if (!s->cold_itcm_seed) {
+        s->cold_itcm_seed = g_memdup2(itcm, memory_region_size(&s->itcm));
+    }
+
+    /* Full power removal clears volatile SRAM banks. Internal/external flash,
+     * option bytes, and the factory UID are nonvolatile and retained. */
+#define CLEAR_VOLATILE_RAM(field) \
+    memset(memory_region_get_ram_ptr(&s->field), 0, \
+           memory_region_size(&s->field))
+    CLEAR_VOLATILE_RAM(itcm);
+    CLEAR_VOLATILE_RAM(dtcm);
+    CLEAR_VOLATILE_RAM(axisram1);
+    CLEAR_VOLATILE_RAM(ahbsram1);
+    CLEAR_VOLATILE_RAM(ahbsram2);
+    CLEAR_VOLATILE_RAM(srdsram);
+    CLEAR_VOLATILE_RAM(bkpsram);
+#undef CLEAR_VOLATILE_RAM
+    memcpy(itcm, s->cold_itcm_seed, memory_region_size(&s->itcm));
+
+    /* Reset the CPU and all peripheral registers, then reapply power and
+     * synthesize the user's POWER press after 750 ms of guest time. */
+    qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_UI);
+    timer_mod(s->cold_power_on_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 750 * 1000000LL);
+}
+
+static void gnw_h7b0_soc_reset_exit(Object *obj, ResetType type)
+{
+    GnwH7B0State *s = GNW_H7B0_SOC(obj);
+    ARMCPU *cpu = s->armv7m.cpu;
+    CPUARMState *env;
+
+    (void)type;
+
+    if (s->initial_boot_handoff_pending) {
+        s->initial_boot_handoff_pending = false;
+        s->startup_handoff_attempts = 0;
+        timer_mod(s->startup_handoff_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
+    }
+
+    if (!s->ui_reset_to_fault_pending) {
+        return;
+    }
+    s->ui_reset_to_fault_pending = false;
+
+    /* The physical RDP1 device's reset-halt/one-step sequence was captured
+     * through GnWManager/OpenOCD: reset leaves the core at the inaccessible
+     * vector-table sentinel (PC=FFFFFFFE, MSP=FFFFFFFC), and the first step
+     * raises IACCVIOL and escalates it to a vector-table HardFault. Preserve
+     * that architectural state on the UI's warm Reset. Cold Power Cycle has
+     * a separate path and must still boot the staged external-flash payload.
+     */
+    if (!cpu || s->flash_r.rdp_value != 0x55) {
+        return;
+    }
+
+    env = &cpu->env;
+    memset(env->regs, 0, sizeof(env->regs));
+    env->regs[13] = 0xfffffffc;
+    env->regs[14] = 0xffffffff;
+    env->regs[15] = 0xfffffffe;
+    env->NF = 0;
+    env->ZF = 1; /* QEMU stores ZF inverted; this leaves xPSR.Z clear. */
+    env->CF = 0;
+    env->VF = 0;
+    env->QF = 0;
+    env->GE = 0;
+    env->thumb = true;
+    env->v7m.vecbase[M_REG_NS] = FLASH_BANK1_BASE_ADDRESS;
+    env->v7m.other_sp = 0;
+    env->v7m.exception = 3; /* HardFault active */
+    env->v7m.cfsr[M_REG_NS] = 1; /* IACCVIOL */
+    env->v7m.hfsr = (1U << 30) | (1U << 1); /* FORCED | VECTTBL */
+    env->v7m.dfsr = 9; /* HALTED | VCATCH, as reported by OpenOCD */
+    s->rcc.regs[GNW_H7B0_RCC_RSR >> 2] = 0x01e80000;
+    cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_EXITTB);
+    cpu->parent_obj.halted = true;
+}
+
+void gnw_h7b0_soc_ui_reset(void)
+{
+    Object *obj = object_resolve_path_type("/machine/soc", TYPE_GNW_H7B0_SOC,
+                                           NULL);
+
+    if (obj) {
+        GnwH7B0State *s = GNW_H7B0_SOC(obj);
+        s->ui_reset_to_fault_pending = true;
+    }
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
 
 static void gnw_h7b0_soc_initfn(Object *obj)
 {
@@ -216,6 +382,55 @@ static bool gnw_h7b0_init_ram_or_file(MemoryRegion *mr, Object *owner,
     }
     memory_region_init_ram(mr, owner, name, size, errp);
     return *errp == NULL;
+}
+
+static uint8_t *gnw_h7b0_load_unlock_baseline(const char *image_path,
+                                              const uint8_t *extflash,
+                                              bool refresh, Error **errp)
+{
+    uint8_t *baseline = g_malloc(GNW_UNLOCK_BASELINE_SIZE);
+
+    if (!refresh && image_path && image_path[0]) {
+        char *path = g_strdup_printf("%s.gnw-unlock-baseline", image_path);
+        gchar *contents = NULL;
+        gsize length = 0;
+        GError *local_err = NULL;
+
+        if (g_file_get_contents(path, &contents, &length, &local_err)) {
+            if (length == GNW_UNLOCK_BASELINE_SIZE) {
+                memcpy(baseline, contents, length);
+                g_free(contents);
+                g_free(path);
+                return baseline;
+            }
+            g_free(contents);
+        } else if (!g_error_matches(local_err, G_FILE_ERROR,
+                                   G_FILE_ERROR_NOENT)) {
+            error_setg(errp, "cannot read unlock baseline '%s': %s", path,
+                       local_err->message);
+            g_clear_error(&local_err);
+            g_free(path);
+            g_free(baseline);
+            return NULL;
+        }
+        g_clear_error(&local_err);
+
+        memcpy(baseline, extflash, GNW_UNLOCK_BASELINE_SIZE);
+        if (!g_file_set_contents(path, (const gchar *)baseline,
+                                 GNW_UNLOCK_BASELINE_SIZE, &local_err)) {
+            error_setg(errp, "cannot save unlock baseline '%s': %s", path,
+                       local_err->message);
+            g_clear_error(&local_err);
+            g_free(path);
+            g_free(baseline);
+            return NULL;
+        }
+        g_free(path);
+        return baseline;
+    }
+
+    memcpy(baseline, extflash, GNW_UNLOCK_BASELINE_SIZE);
+    return baseline;
 }
 
 static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
@@ -601,6 +816,14 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
 
+    gnw_h7b0_flash_r_set_initial_locked(&s->flash_r, s->rdp_locked);
+    if (s->rdp_image && s->rdp_image[0]) {
+        gnw_h7b0_flash_r_set_rdp_image(&s->flash_r, s->rdp_image);
+    } else if (s->bank1_image && s->bank1_image[0]) {
+        char *rdp_image = g_strdup_printf("%s.rdp", s->bank1_image);
+    gnw_h7b0_flash_r_set_rdp_image(&s->flash_r, rdp_image);
+        g_free(rdp_image);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->flash_r), errp)) {
         return;
     }
@@ -667,6 +890,20 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      * more formally for one internal notification. */
     s->gpio.exti = &s->exti;
     s->gpio.syscfg = &s->syscfg;
+    s->extflash_unlock_baseline = gnw_h7b0_load_unlock_baseline(
+        s->extflash_image, memory_region_get_ram_ptr(&s->extflash),
+        s->flash_r.rdp_value != 0x55, errp);
+    if (!s->extflash_unlock_baseline) {
+        return;
+    }
+    gnw_h7b0_gpio_set_unlock_handoff(&s->gpio, CPU(s->armv7m.cpu),
+                                     memory_region_get_ram_ptr(&s->itcm),
+                                     memory_region_size(&s->itcm),
+                                     memory_region_get_ram_ptr(&s->extflash),
+                                     memory_region_size(&s->extflash),
+                                     s->extflash_unlock_baseline,
+                                     GNW_UNLOCK_BASELINE_SIZE,
+                                     &s->flash_r.rdp_value);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->syscfg), errp)) {
         return;
@@ -773,6 +1010,16 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->usart1), 0, USART1_BASE_ADDRESS);
 
+    s->startup_handoff_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                            gnw_h7b0_startup_handoff, s);
+    s->cold_power_on_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                          gnw_h7b0_cold_power_on, s);
+    s->cold_power_release_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                               gnw_h7b0_cold_power_release, s);
+    s->initial_boot_handoff_pending = s->rdp_locked;
+    monitor_register_hmp("gnw-cold-cycle", false, hmp_gnw_cold_cycle);
+    monitor_register_hmp("gnw-ui-reset", false, hmp_gnw_ui_reset);
+
     /*
      * Remaining peripherals (DMA2D, GPIO, USART, real flash/QSPI boot)
      * are added in later phases; see ../../docs/roadmap.md.
@@ -791,11 +1038,40 @@ static const Property gnw_h7b0_soc_properties[] = {
     DEFINE_PROP_STRING("bank1-image", GnwH7B0State, bank1_image),
     DEFINE_PROP_STRING("bank2-image", GnwH7B0State, bank2_image),
     DEFINE_PROP_STRING("extflash-image", GnwH7B0State, extflash_image),
+    DEFINE_PROP_STRING("rdp-image", GnwH7B0State, rdp_image),
+    DEFINE_PROP_BOOL("rdp-locked", GnwH7B0State, rdp_locked, false),
+};
+
+static void gnw_h7b0_soc_finalize(Object *obj)
+{
+    GnwH7B0State *s = GNW_H7B0_SOC(obj);
+
+    g_free(s->extflash_unlock_baseline);
+    g_free(s->cold_itcm_seed);
+    if (s->cold_power_on_timer) {
+        timer_free(s->cold_power_on_timer);
+    }
+    if (s->cold_power_release_timer) {
+        timer_free(s->cold_power_release_timer);
+    }
+    if (s->startup_handoff_timer) {
+        timer_free(s->startup_handoff_timer);
+    }
+}
+
+struct GnwH7B0StateClass {
+    SysBusDeviceClass parent_class;
+    ResettablePhases parent_phases;
 };
 
 static void gnw_h7b0_soc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    GnwH7B0StateClass *sc = GNW_H7B0_SOC_CLASS(klass);
+
+    resettable_class_set_parent_phases(RESETTABLE_CLASS(klass), NULL, NULL,
+                                       gnw_h7b0_soc_reset_exit,
+                                       &sc->parent_phases);
 
     dc->realize = gnw_h7b0_soc_realize;
     device_class_set_props(dc, gnw_h7b0_soc_properties);
@@ -805,7 +1081,9 @@ static const TypeInfo gnw_h7b0_soc_info = {
     .name          = TYPE_GNW_H7B0_SOC,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(GnwH7B0State),
+    .class_size    = sizeof(GnwH7B0StateClass),
     .instance_init = gnw_h7b0_soc_initfn,
+    .instance_finalize = gnw_h7b0_soc_finalize,
     .class_init    = gnw_h7b0_soc_class_init,
 };
 

@@ -12,6 +12,9 @@
 #include "../gwemu-notifications.h"
 #include "snapshot-manager.hh"
 
+extern "C" void gnw_h7b0_soc_cold_power_cycle(void);
+extern "C" void gnw_h7b0_soc_ui_reset(void);
+
 void ActionTogglePause(void)
 {
     /*
@@ -39,7 +42,12 @@ void ActionTogglePause(void)
 
 void ActionReset(void)
 {
-    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    gnw_h7b0_soc_ui_reset();
+}
+
+void ActionColdPowerCycle(void)
+{
+    gnw_h7b0_soc_cold_power_cycle();
 }
 
 void ActionShutdown(void)

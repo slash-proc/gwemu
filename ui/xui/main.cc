@@ -518,7 +518,8 @@ extern "C" void gwemu_auto_launch_active_profile(void)
     gwemu_relaunch_with_flash_images(p->Bank1Path().c_str(),
                                      p->Bank2Path().c_str(),
                                      p->ExtflashPath().c_str(),
-                                     sdp.empty() ? NULL : sdp.c_str());
+                                     sdp.empty() ? NULL : sdp.c_str(),
+                                     p->rdp_locked);
 }
 
 void gwemu_settings_hud_process_sdl_events(SDL_Event *event)

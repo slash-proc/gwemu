@@ -653,6 +653,33 @@ SRST
 ERST
 
     {
+        .name       = "gnw-cold-cycle",
+        .args_type  = "",
+        .params     = "",
+        .help       = "cold-power-cycle a gnw-h7b0 guest in place",
+        .cmd        = NULL,
+    },
+
+SRST
+``gnw-cold-cycle``
+  Clear volatile RAM, reset the Game & Watch SoC, and press POWER without
+  restarting the QEMU process.
+ERST
+
+    {
+        .name       = "gnw-ui-reset",
+        .args_type  = "",
+        .params     = "",
+        .help       = "reset a Game & Watch guest as the UI Reset action does",
+        .cmd        = NULL,
+    },
+
+SRST
+``gnw-ui-reset``
+  Reset the Game & Watch SoC, reproducing the locked-device reset fault.
+ERST
+
+    {
         .name       = "system_powerdown",
         .args_type  = "",
         .params     = "",

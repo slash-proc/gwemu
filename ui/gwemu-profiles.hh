@@ -6,6 +6,7 @@
  * Layout under the app-data base path (gwemu_settings_get_base_path()):
  *   profiles/<id>/profile.toml            metadata (see GwProfile)
  *   profiles/<id>/bank1.bin               owned copy, 0xFF-padded
+ *   profiles/<id>/bank1.bin.rdp           persistent RDP option byte
  *   profiles/<id>/bank2.bin
  *   profiles/<id>/extflash.bin
  *   profiles/<id>/sdcard.qcow2            only when sd.mode == Bundled
@@ -66,6 +67,8 @@ struct GwProfile {
     std::string bank1 = "bank1.bin";
     std::string bank2 = "bank2.bin";
     std::string extflash = "extflash.bin";
+    /* Seed the device's persistent RDP option byte on profile launch. */
+    bool rdp_locked = false;
 
     /* Informational provenance labels for UI display only --
      * "ofw-mario" | "patched-zelda" | "user-file" | "blank" | "". */

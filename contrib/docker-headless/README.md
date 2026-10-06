@@ -47,6 +47,7 @@ flash). Artifacts land in `/out`.
 | `--fps N` | recording frame rate (default 60) |
 | `--deterministic` | `-icount shift=auto,sleep=off` (experimental — see docs; **not** a speed-up button) |
 | `--qmp-port N` | expose QMP on `tcp:0.0.0.0:N` for debugging |
+| `--rdp-locked` | boot with STM32 read protection level 1; debugger access to internal flash is denied, and unlocking erases both internal flash banks |
 | `--keep-raw` | keep the raw `.frames`/`.wav` intermediates |
 | `-- ...` | pass everything after `--` to qemu verbatim |
 

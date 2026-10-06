@@ -1963,6 +1963,50 @@ static void gnw_h7b0_ltdc_update_display(void *opaque)
     int width, height;
     bool dirty;
 
+    /* The boot ROM's locked-device payload deliberately disables both
+     * pixel layers and leaves the LTDC enabled with Layer 1's default
+     * color set. On the H7B0 this is the visible blue recovery screen.
+     * There is no framebuffer to capture in this state, so publish the
+     * default-color scanout directly instead of leaving QEMU's initial
+     * "Guest has not initialized the display" placeholder visible.
+     */
+    if ((s->active_gcr & LTDC_GCR_LTDCEN) &&
+        !(s->active_l1cr & LTDC_LxCR_LEN) &&
+        !(s->active_l2cr & LTDC_LxCR_LEN) &&
+        s->active_l1dccr == 0xff0000ff) {
+        uint32_t hstart = s->active_l1whpcr & 0x0fff;
+        uint32_t hend = (s->active_l1whpcr >> 16) & 0x0fff;
+        uint32_t vstart = s->active_l1wvpcr & 0x07ff;
+        uint32_t vend = (s->active_l1wvpcr >> 16) & 0x07ff;
+        int scan_width = hend > hstart ? hend - hstart : 320;
+        int scan_height = vend > vstart ? vend - vstart : 240;
+        uint32_t color = s->active_l1dccr;
+
+        if (surface_bits_per_pixel(surface) == 32) {
+            if (scan_width * GNW_H7B0_LTDC_SCALE != surface_width(surface) ||
+                scan_height * GNW_H7B0_LTDC_SCALE != surface_height(surface)) {
+                qemu_console_resize(s->con, scan_width * GNW_H7B0_LTDC_SCALE,
+                                    scan_height * GNW_H7B0_LTDC_SCALE);
+                surface = qemu_console_surface(s->con);
+            }
+            for (int y = 0; y < scan_height; y++) {
+                uint8_t *row = surface_data(surface) +
+                    (hwaddr)y * GNW_H7B0_LTDC_SCALE * surface_stride(surface);
+                for (int sy = 0; sy < GNW_H7B0_LTDC_SCALE; sy++) {
+                    uint32_t *dst = (uint32_t *)(row +
+                        (hwaddr)sy * surface_stride(surface));
+                    for (int x = 0; x < scan_width * GNW_H7B0_LTDC_SCALE; x++) {
+                        dst[x] = color;
+                    }
+                }
+            }
+            dpy_gfx_update(s->con, 0, 0, scan_width * GNW_H7B0_LTDC_SCALE,
+                           scan_height * GNW_H7B0_LTDC_SCALE);
+            s->invalidate = 0;
+            return;
+        }
+    }
+
     /*
      * Snapshot the currently-published buffer pointer/dims/dirty flag
      * under compositor_publish_lock -- the ONLY thing that can change

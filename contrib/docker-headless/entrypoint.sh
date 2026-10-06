@@ -13,6 +13,7 @@ IMAGES="${GWEMU_IMAGES:-/images}"
 OUT="${GWEMU_OUT:-/out}"
 BANK1= BANK2= EXTFLASH= SD=
 TIMELINE= RECORD= FPS=60 DETERMINISTIC=0 KEEP_RAW=0 QMP_PORT=
+RDP_LOCKED=0
 EXTRA_ARGS=()
 
 usage() {
@@ -28,6 +29,7 @@ usage: entrypoint [options]
   --fps N                            recording frame rate (default 60)
   --deterministic                    -icount shift=auto,sleep=off (experimental)
   --qmp-port N                       expose QMP on tcp:0.0.0.0:N (debug only)
+  --rdp-locked                       boot with STM32 read protection level 1
   --keep-raw                         keep .frames/.wav intermediates
   -- ...                             pass remaining args to qemu verbatim
 EOF
@@ -58,6 +60,7 @@ while [ $# -gt 0 ]; do
     --fps) FPS=$2; shift 2;;
     --deterministic) DETERMINISTIC=1; shift;;
     --qmp-port) QMP_PORT=$2; shift 2;;
+    --rdp-locked) RDP_LOCKED=1; shift;;
     --keep-raw) KEEP_RAW=1; shift;;
     --) shift; EXTRA_ARGS=("$@"); break;;
     *) usage;;
@@ -100,6 +103,7 @@ ARGS=(-M gnw-h7b0 -display none
       -global gnw-h7b0-soc.bank1-image="$BANK1"
       -global gnw-h7b0-soc.bank2-image="$BANK2"
       -global gnw-h7b0-soc.extflash-image="$EXTFLASH")
+[ "$RDP_LOCKED" = 1 ] && ARGS+=(-global gnw-h7b0-soc.rdp-locked=on)
 [ -n "$SD" ] && ARGS+=(-drive if=sd,file="$SD")
 [ -n "$QMP_PORT" ] && ARGS+=(-qmp tcp:0.0.0.0:"$QMP_PORT",server,nowait)
 [ "$DETERMINISTIC" = 1 ] && ARGS+=(-icount shift=auto,sleep=off)

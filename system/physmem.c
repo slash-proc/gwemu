@@ -69,6 +69,47 @@
 #include "qemu/main-loop.h"
 #include "system/replay.h"
 
+typedef struct PhysicalMemoryDebugFilter {
+    hwaddr start;
+    hwaddr size;
+    PhysicalMemoryDebugAccessFn fn;
+    void *opaque;
+} PhysicalMemoryDebugFilter;
+
+static GList *physical_memory_debug_filters;
+
+void physical_memory_register_debug_access_filter(hwaddr start, hwaddr size,
+                                                   PhysicalMemoryDebugAccessFn fn,
+                                                   void *opaque)
+{
+    PhysicalMemoryDebugFilter *filter = g_new(PhysicalMemoryDebugFilter, 1);
+    *filter = (PhysicalMemoryDebugFilter) {
+        .start = start,
+        .size = size,
+        .fn = fn,
+        .opaque = opaque,
+    };
+    physical_memory_debug_filters =
+        g_list_prepend(physical_memory_debug_filters, filter);
+}
+
+void physical_memory_unregister_debug_access_filters(void *opaque)
+{
+    GList *it = physical_memory_debug_filters;
+
+    while (it) {
+        GList *next = it->next;
+        PhysicalMemoryDebugFilter *filter = it->data;
+
+        if (filter->opaque == opaque) {
+            physical_memory_debug_filters =
+                g_list_delete_link(physical_memory_debug_filters, it);
+            g_free(filter);
+        }
+        it = next;
+    }
+}
+
 #include "system/ramblock.h"
 
 #include "qemu/pmem.h"
@@ -4048,6 +4089,10 @@ int cpu_memory_rw_debug(CPUState *cpu, vaddr addr,
 
         page = addr & TARGET_PAGE_MASK;
         phys_addr = cpu_get_phys_page_attrs_debug(cpu, page, &attrs);
+        /* This path is used by HMP and the GDB stub. Preserve the fact that
+         * this is a debugger-originated transaction so devices can model
+         * protections that distinguish debugger access from guest access. */
+        attrs.debug = true;
         asidx = cpu_asidx_from_attrs(cpu, attrs);
         /* if no physical page mapped, return an error */
         if (phys_addr == -1)
@@ -4056,6 +4101,14 @@ int cpu_memory_rw_debug(CPUState *cpu, vaddr addr,
         if (l > len)
             l = len;
         phys_addr += (addr & ~TARGET_PAGE_MASK);
+        for (GList *it = physical_memory_debug_filters; it; it = it->next) {
+            PhysicalMemoryDebugFilter *filter = it->data;
+            if (phys_addr < filter->start + filter->size &&
+                filter->start < phys_addr + l &&
+                !filter->fn(filter->opaque, phys_addr, l, is_write)) {
+                return -1;
+            }
+        }
         res = address_space_rw(cpu->cpu_ases[asidx].as, phys_addr, attrs, buf,
                                l, is_write);
         if (res != MEMTX_OK) {

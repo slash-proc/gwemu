@@ -20,6 +20,7 @@
 
 void ActionTogglePause();
 void ActionReset();
+void ActionColdPowerCycle();
 void ActionShutdown();
 void ActionScreenshot();
 void ActionLoadSnapshotChecked(const char *name);

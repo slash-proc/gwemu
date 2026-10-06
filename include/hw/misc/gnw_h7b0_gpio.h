@@ -77,6 +77,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0GpioState, GNW_H7B0_GPIO)
 
 typedef struct GnwH7B0ExtiState GnwH7B0ExtiState;
 typedef struct GnwH7B0SyscfgState GnwH7B0SyscfgState;
+typedef struct CPUState CPUState;
 
 struct GnwH7B0GpioState {
     SysBusDevice parent_obj;
@@ -93,6 +94,17 @@ struct GnwH7B0GpioState {
      * port -- several buttons share a line number across ports
      * (PA0/PD0 both line 0, PC5/PD5 line 5, PC11/PD11 line 11). */
     GnwH7B0SyscfgState *syscfg;
+    /* Optional cold-boot unlock-payload handoff. The SoC connects the
+     * CPU, ITCM bytes, and current RDP option byte after realization. */
+    CPUState *cpu;
+    uint8_t *itcm;
+    uint8_t *extflash;
+    uint8_t *extflash_baseline;
+    uint8_t *rdp_value;
+    size_t itcm_size;
+    size_t extflash_size;
+    size_t extflash_baseline_size;
+    bool unlock_handoff_active;
     QEMUTimer *pa0_release_timer;
     /*
      * Optional keyboard-remap property ("keymap"): comma-separated
@@ -113,6 +125,14 @@ struct GnwH7B0GpioState {
 int gnw_h7b0_gpio_button_from_name(const char *name);
 void gnw_h7b0_gpio_inject_button(GnwH7B0GpioState *s, int button,
                                  bool pressed);
+void gnw_h7b0_gpio_set_unlock_handoff(GnwH7B0GpioState *s, CPUState *cpu,
+                                      uint8_t *itcm, size_t itcm_size,
+                                      uint8_t *extflash, size_t extflash_size,
+                                      uint8_t *extflash_baseline,
+                                      size_t extflash_baseline_size,
+                                      uint8_t *rdp_value);
+bool gnw_h7b0_gpio_try_boot_handoff(GnwH7B0GpioState *s,
+                                    bool *stock_itcm_ready);
 void gnw_timeline_record_quit(void);
 
 #endif

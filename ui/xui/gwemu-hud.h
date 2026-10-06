@@ -23,6 +23,7 @@
 #ifndef GWEMU_HUD_H
 #define GWEMU_HUD_H
 
+#include <stdbool.h>
 #include <SDL3/SDL.h>
 
 #ifdef __cplusplus
@@ -80,11 +81,13 @@ void gwemu_settings_hud_show(void);
  * sdcard_qcow2: absolute path to a qcow2 SD image appended as
  * "-drive if=sd,format=qcow2,file=..." (any pre-existing if=sd -drive
  * pair is stripped first); NULL = no SD card.
+ * rdp_locked: initial read-protection level selected by the profile.
  */
 void gwemu_relaunch_with_flash_images(const char *bank1_image,
                                       const char *bank2_image,
                                       const char *extflash_image,
-                                      const char *sdcard_qcow2);
+                                      const char *sdcard_qcow2,
+                                      bool rdp_locked);
 
 void gwemu_auto_launch_active_profile(void);
 

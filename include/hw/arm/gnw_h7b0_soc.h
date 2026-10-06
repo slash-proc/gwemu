@@ -32,6 +32,7 @@
 #include "hw/arm/armv7m.h"
 #include "hw/misc/gnw_h7b0_rcc.h"
 #include "hw/misc/gnw_h7b0_pwr.h"
+#include "qemu/timer.h"
 #include "hw/misc/gnw_h7b0_ospi.h"
 #include "hw/misc/gnw_h7b0_adc.h"
 #include "hw/misc/gnw_h7b0_lptim1.h"
@@ -68,7 +69,7 @@
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_SOC "gnw-h7b0-soc"
-OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0State, GNW_H7B0_SOC)
+OBJECT_DECLARE_TYPE(GnwH7B0State, GnwH7B0StateClass, GNW_H7B0_SOC)
 
 /*
  * Real STM32H7B0 memory map, per RM0455 Table 6 (rm0455.pdf, repo root),
@@ -580,6 +581,17 @@ struct GnwH7B0State {
     MemoryRegion extflash;
     MemoryRegion uid;
 
+    /* A cold power cycle clears volatile silicon state without destroying
+     * the emulator process. The captured ITCM boot seed models the bytes
+     * supplied by the device's immutable boot path after power returns. */
+    uint8_t *cold_itcm_seed;
+    QEMUTimer *startup_handoff_timer;
+    QEMUTimer *cold_power_on_timer;
+    QEMUTimer *cold_power_release_timer;
+    unsigned startup_handoff_attempts;
+    bool initial_boot_handoff_pending;
+    bool ui_reset_to_fault_pending;
+
     Clock *sysclk;
 
     /*
@@ -595,11 +607,26 @@ struct GnwH7B0State {
      * behavior: anonymous RAM seeded once at boot via `-device loader`,
      * with writes never touching the source file -- e.g. for repeatable
      * testing against a known-good image without needing to re-copy it
-     * after every run.
+     * after every run. For a persistent extflash image, the RDP cold-boot
+     * handoff also keeps IMAGE.gnw-unlock-baseline beside it: the small
+     * original span needed to decode GnWManager's staged payload after the
+     * emulator process is fully stopped and relaunched.
      */
     char *bank1_image;
     char *bank2_image;
     char *extflash_image;
+    /* Small pre-payload extflash snapshot used to model GnWManager's
+     * XOR-decoded cold-boot transfer into ITCM. */
+    uint8_t *extflash_unlock_baseline;
+    char *rdp_image;
+    /* Start with STM32 readout protection level 1 instead of level 0. */
+    bool rdp_locked;
 };
+
+/* UI action: clear volatile device state, reset the SoC, then press POWER. */
+void gnw_h7b0_soc_cold_power_cycle(void);
+
+/* UI Reset on an RDP-locked device reproduces the captured reset fault. */
+void gnw_h7b0_soc_ui_reset(void);
 
 #endif

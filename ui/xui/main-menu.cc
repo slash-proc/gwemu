@@ -80,7 +80,7 @@ void MainMenuInputView::Draw()
 
 void MainMenuSystemView::Draw()
 {
-    ImGui::TextWrapped("System settings placeholder.");
+    ImGui::TextWrapped("Configure device behavior.");
 
     ImGui::Spacing();
     SectionTitle("Time & Clock");
@@ -183,6 +183,8 @@ void MainMenuProfilesView::Draw()
             // Read-only info
             ImGui::Text("Created: %s", p->created.c_str());
             ImGui::Text("Storage: %.1f MiB", p->disk_bytes / 1048576.0f);
+            ImGui::Text("Read protection: %s", p->rdp_locked ?
+                        "Level 1 (locked)" : "Level 0 (unlocked)");
             if (p->sd.mode != GwSdMode::None) {
                 ImGui::Text("SD Card: %s", p->sd.mode == GwSdMode::Bundled ? "Bundled" : "Shared");
             }
@@ -198,7 +200,8 @@ void MainMenuProfilesView::Draw()
                 gwemu_relaunch_with_flash_images(p->Bank1Path().c_str(),
                                                  p->Bank2Path().c_str(),
                                                  p->ExtflashPath().c_str(),
-                                                 sdp.empty() ? NULL : sdp.c_str());
+                                                 sdp.empty() ? NULL : sdp.c_str(),
+                                                 p->rdp_locked);
             }
             ImGui::SameLine();
             if (ImGui::Button("Modify", ImVec2(0, 40 * g_viewport_mgr.m_scale))) {

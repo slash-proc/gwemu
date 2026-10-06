@@ -127,6 +127,7 @@ static bool load_profile_toml(GwProfile &p, std::string &err)
         toml::table t = toml::parse_file(path);
         p.display_name = t["display_name"].value_or(std::string(p.id));
         p.created = t["created"].value_or(std::string(""));
+        p.rdp_locked = t["rdp_locked"].value_or(false);
         if (auto *flash = t["flash"].as_table()) {
             p.bank1 = (*flash)["bank1"].value_or(std::string("bank1.bin"));
             p.bank2 = (*flash)["bank2"].value_or(std::string("bank2.bin"));
@@ -168,6 +169,7 @@ bool GwProfileStore::Save(const GwProfile &p, std::string &err)
         {"version", 1},
         {"display_name", p.display_name},
         {"created", p.created},
+        {"rdp_locked", p.rdp_locked},
         {"flash", flash},
     };
     if (p.sd.mode != GwSdMode::None) {
@@ -389,6 +391,7 @@ std::string GwProfileStore::Duplicate(const std::string &source_id_ref, std::str
     dst->bank1 = src->bank1;
     dst->bank2 = src->bank2;
     dst->extflash = src->extflash;
+    dst->rdp_locked = src->rdp_locked;
     dst->prov_bank1 = src->prov_bank1;
     dst->prov_bank2 = src->prov_bank2;
     dst->prov_extflash = src->prov_extflash;

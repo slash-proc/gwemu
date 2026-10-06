@@ -37,6 +37,12 @@ struct GnwH7B0FlashRState {
      * created before flash_r in the SoC's realize()). */
     MemoryRegion *bank1_mr;
     MemoryRegion *bank2_mr;
+
+    bool initial_locked;
+    char *rdp_image;
+    bool rdp_initialized;
+    uint8_t rdp_value;
+    uint8_t optkey_stage;
 };
 
 /* Wire the FLASH_R device to the actual bank memory it controls. Must be
@@ -45,5 +51,8 @@ struct GnwH7B0FlashRState {
  * an erase-triggering CR write (i.e. any time before CPU reset/resume). */
 void gnw_h7b0_flash_r_set_banks(GnwH7B0FlashRState *s, MemoryRegion *bank1,
                                  MemoryRegion *bank2);
+void gnw_h7b0_flash_r_set_initial_locked(GnwH7B0FlashRState *s, bool locked);
+void gnw_h7b0_flash_r_set_rdp_image(GnwH7B0FlashRState *s,
+                                    const char *image);
 
 #endif

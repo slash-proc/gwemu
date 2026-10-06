@@ -663,16 +663,18 @@ void GnwFlashStorageView::Draw()
                 // Preserve the active profile's SD card (if any) across
                 // the flash-only Apply -- this view doesn't manage SD.
                 std::string sdp;
+                bool rdp_locked = false;
                 GwProfile *ap = g_profile_store.Find(
                     g_config.general.active_profile);
                 if (ap) {
                     sdp = ap->SdPath();
+                    rdp_locked = ap->rdp_locked;
                 }
                 gwemu_relaunch_with_flash_images(
                     bank1.empty() ? nullptr : bank1.c_str(),
                     bank2.empty() ? nullptr : bank2.c_str(),
                     extflash.empty() ? nullptr : extflash.c_str(),
-                    sdp.empty() ? nullptr : sdp.c_str());
+                    sdp.empty() ? nullptr : sdp.c_str(), rdp_locked);
                 // Only reached if the relaunch itself failed (logged by
                 // gwemu_relaunch_with_flash_images) -- old config keeps running.
                 m_status_msg = "Relaunch failed, see log; previous config still running.";

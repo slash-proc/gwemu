@@ -182,6 +182,8 @@ void ProfileWizard::Open()
         SyncStockReflection();
     }
     m_build_state.store(BuildIdle);
+    m_edit_profile_id.clear();
+    m_rdp_locked = false;
     m_created_id.clear();
     m_completed = false;
     m_name_hint = GwProfileStore::GenerateName();
@@ -218,6 +220,7 @@ void ProfileWizard::OpenForEdit(const std::string &profile_id)
     m_completed = false;
     m_content_changed = true;
     m_edit_profile_id = profile_id;
+    m_rdp_locked = p->rdp_locked;
     m_s2_visited = true; // prevent EnterProfileStage defaults from overriding
     
     g_strlcpy(m_name, p->display_name.c_str(), sizeof(m_name));
@@ -395,6 +398,7 @@ bool ProfileWizard::BuildWorker(std::string &err)
         GwProfile *p = g_profile_store.Find(id);
         if (p) {
             p->display_name = name;
+            p->rdp_locked = m_rdp_locked;
             g_profile_store.Save(*p, err);
         } else {
             err = "editing profile not found";
@@ -402,6 +406,9 @@ bool ProfileWizard::BuildWorker(std::string &err)
         }
     }
     GwProfile *p = g_profile_store.Find(id);
+    if (p) {
+        p->rdp_locked = m_rdp_locked;
+    }
 
     bool ok = true;
     bool patched_pair = m_patched && Bank1Game() >= 0;
@@ -1618,6 +1625,12 @@ void ProfileWizard::DrawForm()
     ImGui::InputTextWithHint("##name", m_name_hint.c_str(), m_name, sizeof(m_name));
 
     ImGui::Spacing();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Locked:");
+    ImGui::SameLine();
+    ImGui::Checkbox("##profile_locked", &m_rdp_locked);
+
+    ImGui::Spacing();
     DrawFirmwareStrip();
     ImGui::Spacing();
     ImGui::Separator();
@@ -1685,7 +1698,8 @@ void ProfileWizard::DrawBuildView()
                 gwemu_relaunch_with_flash_images(p->Bank1Path().c_str(),
                                                  p->Bank2Path().c_str(),
                                                  p->ExtflashPath().c_str(),
-                                                 sdp.empty() ? NULL : sdp.c_str());
+                                                 sdp.empty() ? NULL : sdp.c_str(),
+                                                 p->rdp_locked);
             }
         }
         ImGui::SameLine();
