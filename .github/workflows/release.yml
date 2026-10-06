@@ -63,6 +63,8 @@ env:
 
 jobs:
   build-linux:
+    permissions:
+      contents: read
     strategy:
       # Independent legs -- don't let one arch's failure cancel the
       # other's real pass/fail signal (same rationale as build-macos).
@@ -296,6 +298,8 @@ jobs:
           # bit (upload-artifact@v4 strips permissions).
 
   build-macos:
+    permissions:
+      contents: read
     strategy:
       # Default fail-fast cancels the arm64 leg the instant x86_64 fails
       # (or vice versa) even though they're fully independent builds --
@@ -585,6 +589,8 @@ jobs:
   # pull in, so a set mismatch FAILS the job instead of silently
   # shipping a half-universal app that dies on one arch.
   merge-macos-universal:
+    permissions:
+      contents: read
     needs: [build-macos]
     runs-on: macos-14
     steps:
@@ -653,6 +659,8 @@ jobs:
           # out un-zipped (a DMG needs no exec bit, unlike the AppImage).
 
   build-windows:
+    permissions:
+      contents: read
     # Cross-compiled from Linux in the MXE-based static toolchain
     # (contrib/docker-win-static/, derived from xemu's public toolchain
     # image): every dependency including glib is a static .a, so the
@@ -755,6 +763,8 @@ jobs:
   # that major, ":X.Y" the highest patch of that minor. ":latest" is also
   # pushed (owner's call: convenient, if a bit shitty -- prefer pinning).
   build-docker:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

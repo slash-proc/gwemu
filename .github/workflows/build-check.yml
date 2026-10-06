@@ -7,9 +7,6 @@ on:
   push:
     branches:
       - gnw-h7b0
-  pull_request:
-    branches:
-      - gnw-h7b0
 
 # Shared with the tag-triggered Release workflow: never consume build
 # resources for both full matrices at the same time.
@@ -20,5 +17,10 @@ concurrency:
 jobs:
   all-release-targets:
     uses: ./.github/workflows/release.yml
+    # GitHub validates permissions across the entire called workflow,
+    # including the tag-only publish job, even when build_check skips it.
+    # This workflow runs only on trusted default-branch pushes.
+    permissions:
+      contents: write
     with:
       build_check: true
