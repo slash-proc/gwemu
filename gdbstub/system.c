@@ -40,6 +40,29 @@ typedef struct {
 
 GDBSystemState gdbserver_system_state;
 
+static bool gdb_stop_on_connect = true;
+
+void gdb_set_stop_on_connect(bool stop)
+{
+    gdb_stop_on_connect = stop;
+}
+
+bool gdb_command_requires_halt(const char *command)
+{
+    if (command[0] == 'm' || command[0] == 'M') {
+        return false;
+    }
+
+    if (gdb_stop_on_connect) {
+        return true;
+    }
+
+    /* Capability and status queries are passive debug-port operations. Keep
+     * them live in hardware-like mode; monitor commands can reset or mutate
+     * the machine, so they still require the traditional halted state. */
+    return command[0] != 'q' || g_str_has_prefix(command, "qRcmd,");
+}
+
 static void reset_gdbserver_state(void)
 {
     g_free(gdbserver_state.processes);
@@ -97,7 +120,9 @@ static void gdb_chr_event(void *opaque, QEMUChrEvent event)
         s->c_cpu = gdb_first_attached_cpu();
         s->g_cpu = s->c_cpu;
 
-        vm_stop(RUN_STATE_PAUSED);
+        if (gdb_stop_on_connect) {
+            vm_stop(RUN_STATE_PAUSED);
+        }
         replay_gdb_attached();
         break;
     default:

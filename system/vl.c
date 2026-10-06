@@ -3147,6 +3147,12 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_gdb:
                 add_device_config(DEV_GDB, optarg);
                 break;
+            case QEMU_OPTION_gdb_no_stop_on_connect:
+                gdb_set_stop_on_connect(false);
+                break;
+            case QEMU_OPTION_gdb_stop_on_connect:
+                gdb_set_stop_on_connect(true);
+                break;
             case QEMU_OPTION_L:
                 if (is_help_option(optarg)) {
                     list_data_dirs = true;

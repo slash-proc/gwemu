@@ -2362,6 +2362,7 @@ static bool g_is_headless_invocation = false;
 static char **inject_default_args(int argc, char **argv, int *out_argc)
 {
     bool have_machine = false, have_display = false, have_flash_image = false;
+    bool have_gdb_connect_mode = false;
     bool is_query = false;
     for (int i = 1; i < argc; i++) {
         if (!argv[i]) continue;
@@ -2385,6 +2386,9 @@ static char **inject_default_args(int argc, char **argv, int *out_argc)
                    strcmp(argv[i], "-help") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             is_query = true;
+        } else if (strcmp(argv[i], "-gdb-no-stop-on-connect") == 0 ||
+                   strcmp(argv[i], "-gdb-stop-on-connect") == 0) {
+            have_gdb_connect_mode = true;
         } else if (strcmp(argv[i], "-global") == 0 && i + 1 < argc &&
                    argv[i + 1] && is_flash_image_global(argv[i + 1])) {
             have_flash_image = true;
@@ -2428,6 +2432,13 @@ static char **inject_default_args(int argc, char **argv, int *out_argc)
     if (!have_display) {
         g_ptr_array_add(new_argv, (char *)"-display");
         g_ptr_array_add(new_argv, (char *)"gwemu");
+    }
+    if (!have_gdb_connect_mode) {
+        /* GDB is used as a live debug transport for hardware parity. A
+         * physical SWD attach does not stop the MCU; keep a running guest
+         * running when a debugger connects. Explicit halt/reset commands
+         * retain their normal GDB behavior. */
+        g_ptr_array_add(new_argv, (char *)"-gdb-no-stop-on-connect");
     }
     for (int i = 1; i < argc; i++) {
         g_ptr_array_add(new_argv, argv[i]);

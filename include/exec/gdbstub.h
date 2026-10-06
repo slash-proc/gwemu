@@ -60,6 +60,16 @@ void gdb_unregister_coprocessor_all(CPUState *cpu);
 bool gdbserver_start(const char *port_or_device, Error **errp);
 
 /**
+ * gdb_set_stop_on_connect() - Set whether a system GDB connection pauses VM
+ * @stop: whether to pause the VM when a GDB client connects
+ *
+ * System emulation defaults to stopping on attach, as traditional debuggers
+ * expect. Some targets use GDB as a live debug transport and need hardware
+ * probe semantics instead; those may disable the attach pause explicitly.
+ */
+void gdb_set_stop_on_connect(bool stop);
+
+/**
  * gdb_feature_builder_init() - Initialize GDBFeatureBuilder.
  * @builder: The builder to be initialized.
  * @feature: The feature to be filled.

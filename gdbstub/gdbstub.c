@@ -2492,17 +2492,15 @@ void gdb_read_byte(uint8_t ch)
                 gdb_put_buffer(&reply, 1);
                 /*
                  * Defer the halt-while-running gate to here (was
-                 * previously per-byte in gdb_read_byte, above) and skip
-                 * it for plain memory read/write ('m'/'M'): those don't
-                 * need the CPU stopped to be serviced correctly (see the
-                 * comment above gdb_read_byte's runstate_is_running()
-                 * check). Every other command -- register access,
-                 * continue/step, breakpoints, qXfer, etc. -- still halts
-                 * first, unchanged from before.
+                 * previously per-byte in gdb_read_byte, above). Memory
+                 * reads/writes and passive GDB queries can be serviced
+                 * while running in live-attach mode; operations that need
+                 * a stable CPU state or can mutate the machine still stop
+                 * first. The default debugger mode preserves the prior
+                 * all-stop behavior for every non-memory command.
                  */
                 if (runstate_is_running() &&
-                    gdbserver_state.line_buf[0] != 'm' &&
-                    gdbserver_state.line_buf[0] != 'M') {
+                    gdb_command_requires_halt(gdbserver_state.line_buf)) {
                     vm_stop(RUN_STATE_PAUSED);
                 }
                 gdbserver_state.state = gdb_handle_packet(gdbserver_state.line_buf);
@@ -2544,4 +2542,3 @@ void gdb_create_default_process(GDBState *s)
     process->attached = false;
     process->target_xml = NULL;
 }
-

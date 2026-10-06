@@ -4997,16 +4997,22 @@ ERST
 
 DEF("gdb", HAS_ARG, QEMU_OPTION_gdb, \
     "-gdb dev        accept gdb connection on 'dev'. (QEMU defaults to starting\n"
-    "                the guest without waiting for gdb to connect; use -S too\n"
-    "                if you want it to not start execution.)\n",
+    "                the guest without waiting for gdb to connect; a client\n"
+    "                connection pauses it unless -gdb-no-stop-on-connect is used.)\n",
+    QEMU_ARCH_ALL)
+DEF("gdb-no-stop-on-connect", 0, QEMU_OPTION_gdb_no_stop_on_connect, \
+    "-gdb-no-stop-on-connect  do not pause a running guest when GDB connects\n",
+    QEMU_ARCH_ALL)
+DEF("gdb-stop-on-connect", 0, QEMU_OPTION_gdb_stop_on_connect, \
+    "-gdb-stop-on-connect     pause a running guest when GDB connects (default)\n",
     QEMU_ARCH_ALL)
 SRST
 ``-gdb dev``
     Accept a gdb connection on device dev (see the :ref:`GDB usage` chapter
-    in the System Emulation Users Guide). Note that this option does not pause QEMU
-    execution -- if you want QEMU to not start the guest until you
-    connect with gdb and issue a ``continue`` command, you will need to
-    also pass the ``-S`` option to QEMU.
+    in the System Emulation Users Guide). QEMU starts the guest without
+    waiting for a client by default, then pauses it when a client connects.
+    Use ``-S`` to pause from startup, or ``-gdb-no-stop-on-connect`` to
+    leave a running guest running when a client attaches.
 
     The most usual configuration is to listen on a local TCP socket::
 
@@ -5020,6 +5026,14 @@ SRST
     .. parsed-literal::
 
         (gdb) target remote | exec |qemu_system| -gdb stdio ...
+
+``-gdb-no-stop-on-connect``
+    Do not pause a running guest when a GDB client connects. The default
+    behavior remains to pause on attach. This option only changes attach
+    behavior; explicit GDB halt, interrupt, and continue commands still work.
+
+``-gdb-stop-on-connect``
+    Restore the default behavior and pause a running guest when GDB connects.
 ERST
 
 DEF("s", 0, QEMU_OPTION_s, \

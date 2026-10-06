@@ -95,6 +95,9 @@ typedef struct GDBState {
 /* lives in main gdbstub.c */
 extern GDBState gdbserver_state;
 
+/* System-mode attach policy used by the packet dispatcher. */
+bool gdb_command_requires_halt(const char *command);
+
 /*
  * Inline utility function, convert from int to hex and back
  */
