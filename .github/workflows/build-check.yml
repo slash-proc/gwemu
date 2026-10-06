@@ -1,65 +1,24 @@
 name: Build check
 
-# Fast, cheap sanity check: does gnw-h7b0 still build and register as a
-# machine. Runs on every push/PR. NOT the release pipeline (see
-# release.yml for the full Linux/Mac/Windows release build, which only
-# runs on tags/manual dispatch) -- this job intentionally only builds
-# Linux and only checks that the binary exists and the board is present.
-
+# Every default-branch update runs the full release build matrix as a
+# validation build. The reusable release workflow skips publication for
+# this caller.
 on:
   push:
+    branches:
+      - gnw-h7b0
   pull_request:
+    branches:
+      - gnw-h7b0
+
+# Shared with the tag-triggered Release workflow: never consume build
+# resources for both full matrices at the same time.
+concurrency:
+  group: gwemu-release-or-build-check
+  cancel-in-progress: false
 
 jobs:
-  build-check:
-    strategy:
-      fail-fast: false
-      matrix:
-        # ubuntu-24.04-arm is a native aarch64 GitHub-hosted runner (free
-        # for public repos) -- covers the Raspberry Pi 4/5 target.
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            ninja-build pkg-config libglib2.0-dev libpixman-1-dev libsdl2-dev liblzma-dev \
-            libpng-dev
-          # libpng-dev: PNG screendump support. configure now hard-errors
-          # without it (see the fork-local check in meson.build) precisely
-          # so a PNG-less build can never ship silently again.
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Install meson/ninja (pip, for a consistent recent version)
-        run: pip install meson ninja pyyaml
-
-      - name: Configure
-        run: |
-          mkdir build
-          cd build
-          # Deliberately NO --enable-lto, on either arch, even though the
-          # shipped aarch64 release asset does use it (release.yml). This
-          # job is the cheap per-push "does it still build" check: LTO
-          # makes the link substantially slower for no signal this job
-          # cares about, and it would not even configure the same way --
-          # LTO can't link while system SDL2 and the vendored SDL3 are
-          # both present, so this job would have to drop --disable-sdl's
-          # worth of coverage to use it. Keeping this build closest to a
-          # plain default-configure is the point.
-          ../configure --target-list=arm-softmmu
-
-      - name: Build
-        run: ninja -C build
-
-      - name: Smoke check -- gnw-h7b0 machine registered
-        run: |
-          ./build/qemu-system-arm -M help | grep -q gnw-h7b0 || {
-            echo "gnw-h7b0 machine not found in -M help output" >&2
-            exit 1
-          }
+  all-release-targets:
+    uses: ./.github/workflows/release.yml
+    with:
+      build_check: true

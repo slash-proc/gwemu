@@ -36,6 +36,20 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      build_check:
+        description: Run all release targets as validation without publishing
+        type: boolean
+        required: false
+        default: false
+
+# The build-check caller holds the shared group for the whole reusable
+# workflow run. Give its nested workflow a per-run group to avoid locking
+# against its caller; direct release runs share the global group with checks.
+concurrency:
+  group: ${{ inputs.build_check && format('gwemu-build-check-child-{0}', github.run_id) || 'gwemu-release-or-build-check' }}
+  cancel-in-progress: false
 
 env:
   # Keep this list in sync with what's actually in scripts/ -- see
@@ -769,6 +783,7 @@ jobs:
           done
 
   publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-linux, merge-macos-universal, build-windows]
     runs-on: ubuntu-latest
     permissions:
