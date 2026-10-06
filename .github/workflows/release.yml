@@ -65,6 +65,7 @@ jobs:
   build-linux:
     permissions:
       contents: read
+    timeout-minutes: 30
     strategy:
       # Independent legs -- don't let one arch's failure cancel the
       # other's real pass/fail signal (same rationale as build-macos).
@@ -300,6 +301,7 @@ jobs:
   build-macos:
     permissions:
       contents: read
+    timeout-minutes: 30
     strategy:
       # Default fail-fast cancels the arm64 leg the instant x86_64 fails
       # (or vice versa) even though they're fully independent builds --
@@ -591,6 +593,7 @@ jobs:
   merge-macos-universal:
     permissions:
       contents: read
+    timeout-minutes: 30
     needs: [build-macos]
     runs-on: macos-14
     steps:
@@ -661,6 +664,7 @@ jobs:
   build-windows:
     permissions:
       contents: read
+    timeout-minutes: 30
     # Cross-compiled from Linux in the MXE-based static toolchain
     # (contrib/docker-win-static/, derived from xemu's public toolchain
     # image): every dependency including glib is a static .a, so the
@@ -765,6 +769,7 @@ jobs:
   build-docker:
     permissions:
       contents: read
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -800,6 +805,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-linux, merge-macos-universal, build-windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
