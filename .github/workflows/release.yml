@@ -368,7 +368,11 @@ jobs:
           # The Homebrew installer dropped its Intel /usr/local path in
           # September 2026. Pin the last revision with Intel bootstrap
           # support; the x86_64 formula installs below still run under Rosetta.
-          arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/7a133dc74051ee4efc79467ed215dfedf45aea2/install.sh)" </dev/null
+          brew_install_script="$(mktemp)"
+          trap 'rm -f "$brew_install_script"' EXIT
+          curl -fsSL -o "$brew_install_script" \
+            https://raw.githubusercontent.com/Homebrew/install/7a133dcc74051ee4efc79467ed215dfedf45aea2/install.sh
+          arch -x86_64 /bin/bash "$brew_install_script" </dev/null
           # zlib: libpng.pc has `Requires: zlib`, so pkg-config resolves
           # libpng only if a zlib.pc is visible. PKG_CONFIG_LIBDIR below
           # REPLACES the default search path, which hides the SDK's own
