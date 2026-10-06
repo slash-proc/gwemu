@@ -345,11 +345,8 @@ jobs:
           sudo /opt/local/bin/port -N selfupdate
           # Binary-only mode fails promptly if an archive is unavailable;
           # it never falls back to building dependencies from source.
-          # Install lzo2 explicitly on both architectures: QEMU enables it
-          # when detected, and an architecture-dependent dependency closure
-          # previously left its dylib in only the x86_64 app bundle.
           sudo /opt/local/bin/port -b install cmake dylibbundler glib2 \
-            libepoxy lzo2 libpixman libpng meson ninja pkgconfig xz zlib
+            libepoxy libpixman libpng meson ninja pkgconfig xz zlib
           echo "/opt/local/bin" >> "$GITHUB_PATH"
           echo "/opt/local/sbin" >> "$GITHUB_PATH"
           echo "PKG_CONFIG_PATH=/opt/local/lib/pkgconfig:/opt/local/share/pkgconfig" >> "$GITHUB_ENV"
@@ -365,7 +362,11 @@ jobs:
           ../configure --target-list=arm-softmmu --disable-sdl \
             --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
             --disable-curl --disable-libssh --disable-curses --disable-libusb \
-            --disable-zstd --disable-dbus-display --disable-gio
+            --disable-zstd --disable-lzo --disable-dbus-display --disable-gio
+          # Disable optional LZO on both legs. Even with lzo2 installed,
+          # only the Intel build detected it and bundled its dylib, which
+          # made the universal Frameworks sets differ. GWemu profiles use
+          # raw flash images and do not need QEMU's LZO image decompressor.
           # NOTE: png is deliberately NOT disabled here. Both legs
           # install libpng from the same MacPorts port set, so dylib sets match
           # for the universal lipo merge, and PNG screendump is a
