@@ -302,6 +302,8 @@ jobs:
     permissions:
       contents: read
     timeout-minutes: 30
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
     strategy:
       # Default fail-fast cancels the arm64 leg the instant x86_64 fails
       # (or vice versa) even though they're fully independent builds --
@@ -311,16 +313,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
-          - runner: macos-14
+          - runner: macos-15-intel
             arch: x86_64
         # No --enable-lto on either macOS leg, deliberately. LTO is
         # measured and soaked on aarch64 *Linux* only (+8.0%); on macOS
         # it is entirely unmeasured, nobody on this project has a Mac to
-        # soak it on, and the x86_64 leg is already an unusual
-        # cross-compile (-arch x86_64 from an arm64 runner, two Homebrew
-        # prefixes) whose output then gets lipo-merged -- adding an
+        # soak it on, and the x86_64 leg is a native Intel build whose output
+        # then gets lipo-merged -- adding an
         # untested whole-program optimisation under that is how silent
         # breakage ships. Both legs already pass --disable-sdl, so the
         # SDL2/SDL3 link conflict that blocks LTO elsewhere would not
@@ -328,137 +329,49 @@ jobs:
         # by us", so this is a reasonable thing to revisit the moment
         # someone can benchmark an Apple Silicon build.
         #
-        # Both legs run on macos-14 (arm64 host). The x86_64 leg used to
-        # run on a native macos-13 (Intel) runner, but those have been
-        # observed stuck queued for 6+ hours with no runner ever picking
-        # them up -- a known GH Actions scarcity issue with Intel macOS
-        # runners specifically. Apple Clang on arm64 can natively
-        # cross-compile to x86_64 via -arch, so we do that instead of
-        # waiting on a scarce runner at all.
+        # Use native Apple Silicon and Intel runners so both architecture
+        # builds use native toolchains and libraries.
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies (arm64 leg)
-        if: matrix.arch == 'arm64'
+      - name: Install MacPorts binary dependencies
         run: |
-          # libpng: QEMU's screendump has no PNG encoder without it, so
-          # the headless timeline's `screenshot` action fails at runtime
-          # ("Enable PNG support with libpng for screendump"). Confirmed
-          # missing from the shipped 0.0.14 universal DMG.
-          # zlib: MUST be installed and used on BOTH legs. libpng.pc
-          # `Requires: zlib`, and the x86_64 leg has to use Homebrew's
-          # zlib (its PKG_CONFIG_LIBDIR hides the SDK's zlib.pc). If this
-          # leg instead resolved the SDK's zlib, the two arches would link
-          # different zlibs, only x86_64 would bundle libz.<ver>.dylib,
-          # and the universal merge job would (correctly) refuse to lipo
-          # apps with mismatched Frameworks sets -- which is exactly how
-          # the first v0.0.17 merge failed.
-          brew install ninja pkg-config glib pixman meson dylibbundler cmake libepoxy xz libpng zlib
+          set -euo pipefail
+          port_pkg="MacPorts-2.12.5-15-Sequoia.pkg"
+          curl -fsSL -o "$port_pkg" "https://distfiles.macports.org/MacPorts/${port_pkg}"
+          trap 'rm -f "$port_pkg"' EXIT
+          sudo installer -pkg "$port_pkg" -target /
+          sudo /opt/local/bin/port -N selfupdate
+          # Binary-only mode fails promptly if an archive is unavailable;
+          # it never falls back to building dependencies from source.
+          sudo /opt/local/bin/port -b install cmake dylibbundler glib2 \
+            libepoxy libpixman libpng meson ninja pkgconfig xz zlib
+          echo "/opt/local/bin" >> "$GITHUB_PATH"
+          echo "/opt/local/sbin" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG_PATH=/opt/local/lib/pkgconfig:/opt/local/share/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_LIBDIR=/opt/local/lib/pkgconfig:/opt/local/share/pkgconfig" >> "$GITHUB_ENV"
           # pyyaml: subprojects/genconfig/gen_config.py needs it; mkvenv's
           # venv is non-isolated so a system/user install is enough.
           pip3 install --user --break-system-packages pyyaml || pip3 install --user pyyaml
 
-      - name: Install build dependencies (x86_64 cross leg)
-        if: matrix.arch == 'x86_64'
-        run: |
-          set -euo pipefail
-          # arm64 Homebrew (/opt/homebrew) formulae are arm64-only --
-          # their .dylibs can't link into an x86_64 binary. macos-14
-          # runners have Rosetta 2, so install a SEPARATE x86_64 Homebrew
-          # under /usr/local (the classic Intel prefix) via `arch -x86_64`
-          # and get real x86_64 glib/pixman/libepoxy/liblzma from it.
-          # meson/ninja/cmake/pkg-config/dylibbundler stay arm64 (host
-          # tools, never linked into the target binary).
-          brew install ninja meson cmake dylibbundler pkg-config
-          # The Homebrew installer dropped its Intel /usr/local path in
-          # September 2026. Pin the last revision with Intel bootstrap
-          # support; the x86_64 formula installs below still run under Rosetta.
-          brew_install_script="$(mktemp)"
-          trap 'rm -f "$brew_install_script"' EXIT
-          curl -fsSL -o "$brew_install_script" \
-            https://raw.githubusercontent.com/Homebrew/install/7a133dcc74051ee4efc79467ed215dfedf45aea2/install.sh
-          arch -x86_64 /bin/bash "$brew_install_script" </dev/null
-          # zlib: libpng.pc has `Requires: zlib`, so pkg-config resolves
-          # libpng only if a zlib.pc is visible. PKG_CONFIG_LIBDIR below
-          # REPLACES the default search path, which hides the SDK's own
-          # zlib.pc -- so an x86_64 zlib must exist under /usr/local or
-          # libpng silently fails to resolve and configure now hard-errors
-          # (v0.0.17). Homebrew's zlib is keg-only, hence the explicit
-          # opt/zlib pkgconfig dir in PKG_CONFIG_PATH.
-          arch -x86_64 /usr/local/bin/brew install pkg-config glib pixman libepoxy xz libpng zlib
-          # pyyaml: subprojects/genconfig/gen_config.py needs it; mkvenv's
-          # venv is non-isolated so a system/user install is enough. This
-          # leg still runs meson/mkvenv under the arm64 (host) Python.
-          pip3 install --user --break-system-packages pyyaml || pip3 install --user pyyaml
-
       - name: Configure
-        env:
-          GNW_CMAKE_OSX_ARCHITECTURES: ${{ matrix.arch == 'x86_64' && 'x86_64' || '' }}
         run: |
           mkdir build
           cd build
-          if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            # Cross-compile from this arm64 runner: -arch x86_64 tells
-            # Apple Clang to emit x86_64 code/link an x86_64 binary
-            # directly, no separate cross-toolchain needed. Point
-            # pkg-config at the x86_64 Homebrew prefix (/usr/local) so it
-            # resolves glib/pixman/libepoxy/liblzma to real x86_64
-            # libs instead of the arm64 ones under /opt/homebrew.
-            # /usr/local/opt/zlib/lib/pkgconfig: Homebrew's zlib is
-            # keg-only, so it is never symlinked into /usr/local/lib/
-            # pkgconfig. libpng.pc `Requires: zlib`, and LIBDIR below
-            # replaces the default search path (hiding the SDK's zlib.pc),
-            # so without this entry libpng does not resolve and configure
-            # hard-errors. This exact failure broke the v0.0.17 run.
-            export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/local/opt/zlib/lib/pkgconfig"
-            export PKG_CONFIG_LIBDIR="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/usr/local/opt/zlib/lib/pkgconfig"
-            # --cross-prefix= (even empty) is what actually flips
-            # configure's own cross_compile flag to "yes" -- without it,
-            # --cpu=x86_64 alone never triggers writing a real
-            # [host_machine] section into config-meson.cross, so meson
-            # still believed the host was aarch64 despite the -arch
-            # flags, and QEMU's own host-arch-conditional code (e.g.
-            # crypto/aes-round.h's separate NEON vs x86_64 accel paths)
-            # picked the wrong (ARM NEON) implementation entirely --
-            # confirmed via real build failures, not a hypothetical.
-            # With this, configure also emits config-meson.native so
-            # build-time tools (code generators, meson's own machinery)
-            # correctly still run as native arm64, not under Rosetta.
-            ../configure --target-list=arm-softmmu --cpu=x86_64 \
-              --cross-prefix= \
-              --extra-cflags="-arch x86_64" \
-              --extra-cxxflags="-arch x86_64" \
-              --extra-ldflags="-arch x86_64" \
-              --disable-sdl \
-              --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
-              --disable-curl --disable-libssh --disable-curses --disable-libusb \
-              --disable-zstd --disable-dbus-display --disable-gio
-          else
-            # Point at Homebrew's keg-only zlib so this leg links the SAME
-            # zlib as the x86_64 leg. Without it, arm64 resolves the SDK's
-            # /usr/lib/pkgconfig/zlib.pc, links the system libz, bundles no
-            # libz dylib, and the universal merge fails on mismatched
-            # Frameworks sets. PKG_CONFIG_PATH (not LIBDIR) so the default
-            # search path is kept for everything else on this leg.
-            export PKG_CONFIG_PATH="/opt/homebrew/opt/zlib/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-            ../configure --target-list=arm-softmmu --disable-sdl \
-              --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
-              --disable-curl --disable-libssh --disable-curses --disable-libusb \
-              --disable-zstd --disable-dbus-display --disable-gio
-          fi
+          ../configure --target-list=arm-softmmu --disable-sdl \
+            --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
+            --disable-curl --disable-libssh --disable-curses --disable-libusb \
+            --disable-zstd --disable-dbus-display --disable-gio
           # NOTE: png is deliberately NOT disabled here. Both legs
-          # `brew install libpng` above, so the dylib sets still match
+          # install libpng from the same MacPorts port set, so dylib sets match
           # for the universal lipo merge, and PNG screendump is a
           # hard requirement of this fork (configure now errors without
           # it -- see the fork-local check in meson.build). The v0.0.14
           # universal DMG shipped with --disable-png and could not take
           # a screenshot at all; that is what this omission fixes.
           # The --disable-vnc..--disable-gio block pins the OPTIONAL
-          # feature set identically on both legs: the arm64 runner's
-          # preinstalled Homebrew otherwise auto-enables a pile of
-          # features (gnutls+its chain, vnc, libusb, zstd,
-          # gio) the minimal x86_64 prefix doesn't have, and the
+          # feature set identically on both legs, and the
           # universal merge job (correctly) refuses to lipo two apps
           # with different dylib sets -- exactly how v0.0.12's first
           # run failed. None of these features are part of what gwemu
@@ -586,16 +499,15 @@ jobs:
 
   # lipo both arch .apps into ONE universal gwemu.app / DMG -- the only
   # macOS release asset (xemu's macos-universal model). The main binary
-  # AND every bundled dylib get fat-merged pairwise; the two Homebrew
-  # prefixes (/opt/homebrew vs /usr/local) can drift in what dylibs they
-  # pull in, so a set mismatch FAILS the job instead of silently
+  # AND every bundled dylib get fat-merged pairwise; a set mismatch
+  # FAILS the job instead of silently
   # shipping a half-universal app that dies on one arch.
   merge-macos-universal:
     permissions:
       contents: read
     timeout-minutes: 30
     needs: [build-macos]
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -643,7 +555,7 @@ jobs:
       - name: Smoke test (native arch of this runner)
         run: |
           set -euo pipefail
-          # macos-14 = arm64: launching the universal app here exercises
+          # macos-15 = arm64: launching the universal app here exercises
           # the arm64 slice (the x86_64 slice was validated on real
           # Intel hardware when the recipe landed). Alive after 10s with
           # sane startup output = pass.
