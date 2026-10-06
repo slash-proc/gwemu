@@ -1,3 +1,12 @@
+2026-10-06  gpio: use one physical button/power-good pinout for all firmware
+            The working game-and-watch-retro-go-sd board definitions put
+            GAME on PC1, PAUSE on PC13, TIME on PC5, and charger PGOOD on
+            PA2. The previous August stock-firmware interpretation swapped
+            TIME/PGOOD. In Retro-Go it made TIME pull PA2 low and visibly
+            report a power connection. Use the board pinout globally: TIME
+            drives PC5; PA2 is held low as the emulator's powered PGOOD
+            state. No firmware/profile switch chooses GPIO wiring.
+
 2026-08-19  gpio: TIME is PA2, not PA2+PC5 -- pressing it no longer
             asserts the charger's PGOOD line. Stock Zelda supports two
             board variants, choosing the pin pair at runtime from a .bss
