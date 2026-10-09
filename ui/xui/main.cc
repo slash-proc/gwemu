@@ -253,9 +253,8 @@ void gwemu_hud_set_framebuffer_texture(SDL_Texture *tex, bool flip)
 
 bool gwemu_hud_get_framebuffer_size(int *w, int *h)
 {
-    // Same technique RenderFramebuffer() already uses -- query the actual
-    // texture dims rather than assuming a compile-time panel resolution
-    // constant (none exists; LTDC's output size is register-configurable).
+    // Window presets are based on the actual LTDC texture size. The 2x
+    // texture is intentional: it keeps the fixed 320x240 panel readable.
     if (!g_tex) {
         return false;
     }
@@ -266,8 +265,25 @@ bool gwemu_hud_get_framebuffer_size(int *w, int *h)
     return *w > 0 && *h > 0;
 }
 
+int gwemu_hud_get_menu_bar_height_pixels(SDL_Window *window)
+{
+    if (!window || !g_config.display.ui.show_menubar ||
+        g_config.display.ui.menubar_behavior !=
+            CONFIG_DISPLAY_UI_MENUBAR_BEHAVIOR_FIXED) {
+        return 0;
+    }
+    int window_w = 0, window_h = 0, pixel_w = 0, pixel_h = 0;
+    SDL_GetWindowSize(window, &window_w, &window_h);
+    SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
+    float density = window_h > 0 ? (float)pixel_h / window_h : 1.0f;
+    float points = g_main_menu_height > 0.0f ? g_main_menu_height :
+                   ImGui::GetFrameHeight();
+    return (int)ceilf(points * density);
+}
+
 void gwemu_hud_update(void)
 {
+    static bool initial_bezel_size_applied;
     ImGuiIO& io = ImGui::GetIO();
     uint32_t now = SDL_GetTicks();
 
@@ -285,6 +301,19 @@ void gwemu_hud_update(void)
 
     GdbSettingsTick();
     g_viewport_mgr.Update();
+    if (!initial_bezel_size_applied) {
+        if (g_config.display.ui.bezel == CONFIG_DISPLAY_UI_BEZEL_NONE) {
+            if (g_tex) {
+                gwemu_hud_resize_for_bezel(
+                    gwemu_hud_get_current_display_scale());
+                initial_bezel_size_applied = true;
+            }
+        } else if (g_tex) {
+            gwemu_hud_resize_for_bezel(
+                gwemu_hud_get_current_display_scale());
+            initial_bezel_size_applied = true;
+        }
+    }
     g_font_mgr.Update();
     if (g_last_scale != g_viewport_mgr.m_scale) {
         ImGuiStyle &style = ImGui::GetStyle();
@@ -296,7 +325,18 @@ void gwemu_hud_update(void)
     if (!first_boot_window.is_open) {
         int ww, wh;
         SDL_GetWindowSizeInPixels(gwemu_get_window(), &ww, &wh);
-        RenderFramebuffer(g_tex, ww, wh, g_flip_req);
+        bool fixed_menu = g_config.display.ui.show_menubar &&
+            g_config.display.ui.menubar_behavior ==
+                CONFIG_DISPLAY_UI_MENUBAR_BEHAVIOR_FIXED;
+        int menu_reserve = fixed_menu
+            ? gwemu_hud_get_menu_bar_height_pixels(gwemu_get_window()) : 0;
+        if (menu_reserve >= wh) menu_reserve = 0;
+        if (menu_reserve) {
+            RenderFramebuffer(g_tex, ww, wh - menu_reserve, g_flip_req,
+                              menu_reserve);
+        } else {
+            RenderFramebuffer(g_tex, ww, wh, g_flip_req);
+        }
     }
 
     ImGui_ImplSDLRenderer3_NewFrame();
@@ -317,7 +357,7 @@ void gwemu_hud_update(void)
 #endif
 
     if (g_config.display.ui.show_menubar && !first_boot_window.is_open) {
-        // Auto-hide main menu after 5s of inactivity
+        // Auto-hide main menu after 5s of inactivity when requested.
         static uint32_t last_check = 0;
         float alpha = 1.0;
         const uint32_t timeout = 5000;
@@ -326,7 +366,9 @@ void gwemu_hud_update(void)
         if (menu_wakeup) {
             last_check = now;
         }
-        if ((now-last_check) > timeout) {
+        bool auto_hide = g_config.display.ui.menubar_behavior ==
+            CONFIG_DISPLAY_UI_MENUBAR_BEHAVIOR_AUTO_HIDE;
+        if (auto_hide && (now-last_check) > timeout) {
             if (g_config.display.ui.use_animations) {
                 float t = fmin((float)((now-last_check)-timeout)/fade_duration, 1);
                 alpha = 1-t;

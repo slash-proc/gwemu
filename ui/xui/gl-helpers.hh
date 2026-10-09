@@ -32,7 +32,12 @@
 extern SDL_Texture *g_logo_tex;
 
 void InitCustomRendering(void);
-void RenderFramebuffer(SDL_Texture *tex, int width, int height, bool flip);
+void gwemu_hud_get_display_window_size(int scale, int *width, int *height);
+int gwemu_hud_get_current_display_scale(void);
+void gwemu_hud_resize_for_bezel(int display_scale);
+void gwemu_hud_set_window_aspect_ratio_for_size(int width, int height);
+void RenderFramebuffer(SDL_Texture *tex, int width, int height, bool flip,
+                       int top_offset = 0);
 bool RenderFramebufferToPng(SDL_Texture *tex, bool flip,
                             std::vector<uint8_t> &png, int max_width = 0,
                             int max_height = 0);

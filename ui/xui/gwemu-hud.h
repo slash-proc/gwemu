@@ -38,6 +38,8 @@ SDL_Window *gwemu_get_window(void);
  * Wayland presentation (see definition in ui/gwemu.c). */
 void gwemu_snap_window_points(SDL_Window *win, int px_w, int px_h,
                               int *pt_w, int *pt_h);
+void gwemu_set_window_size_pixels(SDL_Window *win, int px_w, int px_h);
+float gwemu_get_window_pixel_scale(SDL_Window *win);
 SDL_Renderer *gwemu_get_renderer(void);
 bool gwemu_get_fb_pixels(uint8_t **pixels, int *w, int *h);
 void gwemu_main_loop_lock(void);
@@ -58,6 +60,7 @@ void gwemu_hud_process_sdl_events(SDL_Event *event);
 void gwemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
 void gwemu_hud_set_framebuffer_texture(SDL_Texture *tex, bool flip);
 bool gwemu_hud_get_framebuffer_size(int *w, int *h);
+int gwemu_hud_get_menu_bar_height_pixels(SDL_Window *window);
 
 // Secondary context for Settings window
 void gwemu_settings_hud_init(SDL_Window *window, SDL_Renderer *renderer);
