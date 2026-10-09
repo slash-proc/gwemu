@@ -376,7 +376,13 @@ static void gnw_h7b0_gpio_input_event(DeviceState *dev, QemuConsole *src,
             rec_file = fopen(rec_path, "w");
             if (!rec_file) {
                 error_report("gnw-gpio: cannot open GNW_TIMELINE_RECORD=%s", rec_path);
+            } else if (setvbuf(rec_file, NULL, _IONBF, 0) != 0) {
+                error_report("gnw-gpio: cannot disable buffering for "
+                             "GNW_TIMELINE_RECORD=%s", rec_path);
+                fclose(rec_file);
+                rec_file = NULL;
             } else {
+                /* Keep every write visible even if QEMU crashes. */
                 fprintf(rec_file, "# Automatically recorded timeline\n");
             }
         }
@@ -403,7 +409,6 @@ static void gnw_h7b0_gpio_input_event(DeviceState *dev, QemuConsole *src,
                     fprintf(rec_file, "%.3f %s %s\n", t,
                             key->down ? "down" : "release",
                             gnw_h7b0_button_names[i]);
-                    fflush(rec_file);
                 }
                 break;
             }

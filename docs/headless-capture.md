@@ -87,6 +87,11 @@ GNW_TIMELINE_RECORD=demo.tl ./build/qemu-system-arm -M gnw-h7b0 ... -display gwe
 
 then replay it here with `GNW_TIMELINE`/`--timeline`.
 
+The file is opened on the first input event, replacing any existing file.
+The header and each button event are written immediately without stdio
+buffering, so a QEMU crash preserves events already written. A normal GUI
+exit appends the final `quit` action; a crashed recording has no final `quit`.
+
 **This is deliberately unavailable headless**, and the docker entrypoint
 rejects `--record-timeline` with an error rather than accepting it.
 Recording hangs off the GPIO device's QEMU input handler, so it only sees
