@@ -343,8 +343,15 @@ jobs:
           trap 'rm -f "$port_pkg"' EXIT
           sudo installer -pkg "$port_pkg" -target /
           sudo /opt/local/bin/port -N selfupdate
+          # MacPorts currently has no binary expat archive for the Intel
+          # macOS 15 runner's Darwin 24 platform. Install expat separately
+          # with normal archive-first behavior so MacPorts can build this
+          # small dependency from source when its archive is missing. Keep
+          # the rest of the dependency set binary-only for predictable CI.
+          sudo /opt/local/bin/port -N install expat
           # Binary-only mode fails promptly if an archive is unavailable;
-          # it never falls back to building dependencies from source.
+          # after expat is present, it never falls back to building the
+          # remaining dependencies from source.
           sudo /opt/local/bin/port -b install cmake dylibbundler glib2 \
             libepoxy libpixman libpng meson ninja pkgconfig xz zlib
           echo "/opt/local/bin" >> "$GITHUB_PATH"
