@@ -258,8 +258,8 @@ display:
     fullscreen_exclusive: bool
     startup_size:
       type: enum
-      values: [last_used, 640x480, 720x480, 1280x720, 1280x800, 1280x960, 1920x1080, 2560x1440, 2560x1600, 2560x1920, 3840x2160]
-      default: 1280x960
+      values: [last_used, 320x240, 640x480, 720x480, 1280x720, 1280x800, 1280x960, 1920x1080, 2560x1440, 2560x1600, 2560x1920, 3840x2160]
+      default: 320x240
     last_width:
       type: integer
       default: 640
@@ -273,6 +273,14 @@ display:
     show_menubar:
       type: bool
       default: true
+    menubar_behavior:
+      type: enum
+      values: [auto_hide, fixed]
+      default: fixed
+    bezel:
+      type: enum
+      values: [none, mario, zelda]
+      default: none
     show_notifications:
       type: bool
       default: true
