@@ -335,7 +335,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install MacPorts binary dependencies
+      - name: Install MacPorts dependencies
         run: |
           set -euo pipefail
           port_pkg="MacPorts-2.12.5-15-Sequoia.pkg"
@@ -343,9 +343,11 @@ jobs:
           trap 'rm -f "$port_pkg"' EXIT
           sudo installer -pkg "$port_pkg" -target /
           sudo /opt/local/bin/port -N selfupdate
-          # Binary-only mode fails promptly if an archive is unavailable;
-          # it never falls back to building dependencies from source.
-          sudo /opt/local/bin/port -b install cmake dylibbundler glib2 \
+          # MacPorts mirrors can lag the current port tree, leaving an
+          # archive unavailable even though the port itself is valid.
+          # Allow MacPorts to build missing archives from source so these
+          # transient mirror gaps do not fail the release job.
+          sudo /opt/local/bin/port -N install cmake dylibbundler glib2 \
             libepoxy libpixman libpng meson ninja pkgconfig xz zlib
           echo "/opt/local/bin" >> "$GITHUB_PATH"
           echo "/opt/local/sbin" >> "$GITHUB_PATH"
@@ -353,7 +355,7 @@ jobs:
           echo "PKG_CONFIG_LIBDIR=/opt/local/lib/pkgconfig:/opt/local/share/pkgconfig" >> "$GITHUB_ENV"
           # pyyaml: subprojects/genconfig/gen_config.py needs it; mkvenv's
           # venv is non-isolated so a system/user install is enough.
-          pip3 install --user --break-system-packages pyyaml || pip3 install --user pyyaml
+          pip3 install --user --break-system-packages pyyaml tomli || pip3 install --user pyyaml tomli
 
       - name: Configure
         run: |
@@ -362,7 +364,8 @@ jobs:
           ../configure --target-list=arm-softmmu --disable-sdl \
             --disable-vnc --disable-gnutls --disable-nettle --disable-gcrypt \
             --disable-curl --disable-libssh --disable-curses --disable-libusb \
-            --disable-zstd --disable-lzo --disable-dbus-display --disable-gio
+            --disable-zstd --disable-lzo --disable-dbus-display --disable-gio \
+            --disable-vde --disable-snappy -Dfdt=internal
           # Disable optional LZO on both legs. Even with lzo2 installed,
           # only the Intel build detected it and bundled its dylib, which
           # made the universal Frameworks sets differ. GWemu profiles use
@@ -380,6 +383,9 @@ jobs:
           # with different dylib sets -- exactly how v0.0.12's first
           # run failed. None of these features are part of what gwemu
           # ships (same trimming rationale as the static Windows exe).
+          # --disable-vde/--disable-snappy and -Dfdt=internal keep
+          # optional dependencies from a runner's preinstalled Homebrew
+          # tree out of the bundles; GWemu does not use those features.
           # --disable-sdl: QEMU's own legacy `-display sdl` backend (SDL2,
           # separate from our GUI's SDL3) -- our GUI (`-display gwemu`)
           # supersedes it entirely, and a real user's crash report on a
