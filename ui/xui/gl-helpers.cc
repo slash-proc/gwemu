@@ -86,7 +86,7 @@ void gwemu_hud_get_display_window_size(int display_scale, int *width,
     SDL_Window *win = gwemu_get_window();
     int tw = 0, th = 0;
     if (!win || !width || !height || display_scale < 1 ||
-        !gwemu_hud_get_framebuffer_size(&tw, &th)) {
+        !gwemu_hud_get_native_display_size(&tw, &th)) {
         return;
     }
     *width = tw * display_scale;

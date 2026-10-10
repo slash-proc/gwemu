@@ -54,7 +54,7 @@ void MainMenuDisplayView::Draw()
     ImGui::TextWrapped("Resize the window to an exact multiple of the "
                         "emulated screen's native resolution:");
     int tw = 0, th = 0;
-    bool have_size = gwemu_hud_get_framebuffer_size(&tw, &th);
+    bool have_size = gwemu_hud_get_native_display_size(&tw, &th);
     for (int mult = 1; mult <= 4; mult++) {
         if (mult > 1) ImGui::SameLine();
         char label[8];

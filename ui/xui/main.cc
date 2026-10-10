@@ -251,17 +251,16 @@ void gwemu_hud_set_framebuffer_texture(SDL_Texture *tex, bool flip)
     g_flip_req = flip;
 }
 
-bool gwemu_hud_get_framebuffer_size(int *w, int *h)
+bool gwemu_hud_get_native_display_size(int *w, int *h)
 {
-    // Window presets are based on the actual LTDC texture size. The 2x
-    // texture is intentional: it keeps the fixed 320x240 panel readable.
+    // The LTDC model publishes a 2x nearest-neighbor surface (640x480) so
+    // it stays crisp on high-density hosts. Window presets are in physical
+    // panel pixels: the Game & Watch display itself is 320x240.
     if (!g_tex) {
         return false;
     }
-    float fw = 0, fh = 0;
-    SDL_GetTextureSize(g_tex, &fw, &fh);
-    *w = (int)fw;
-    *h = (int)fh;
+    *w = 320;
+    *h = 240;
     return *w > 0 && *h > 0;
 }
 

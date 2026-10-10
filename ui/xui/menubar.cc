@@ -74,7 +74,7 @@ void ShowMainMenu()
             // multiple) is the primary control and comes first; the
             // framebuffer remains integer-scaled while the window is resized.
             int tw = 0, th = 0;
-            bool have_size = gwemu_hud_get_framebuffer_size(&tw, &th);
+            bool have_size = gwemu_hud_get_native_display_size(&tw, &th);
             for (int mult = 1; mult <= 4; mult++) {
                 char label[8];
                 snprintf(label, sizeof(label), "%dx", mult);

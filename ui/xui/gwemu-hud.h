@@ -59,7 +59,7 @@ void gwemu_hud_reset_font_texture(void);
 void gwemu_hud_process_sdl_events(SDL_Event *event);
 void gwemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
 void gwemu_hud_set_framebuffer_texture(SDL_Texture *tex, bool flip);
-bool gwemu_hud_get_framebuffer_size(int *w, int *h);
+bool gwemu_hud_get_native_display_size(int *w, int *h);
 int gwemu_hud_get_menu_bar_height_pixels(SDL_Window *window);
 
 // Secondary context for Settings window
