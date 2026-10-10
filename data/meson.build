@@ -8,6 +8,8 @@ pfiles = [
   'controller_mask_s.png',
   'xmu_mask.png',
   'logo_sdf.png',
+  'mario_bezel.png',
+  'zelda_bezel.png',
   'xemu_64x64.png',
   'abxy.ttf',
   'Roboto-Medium.ttf',
