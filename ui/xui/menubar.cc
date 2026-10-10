@@ -8,6 +8,7 @@
 #include "scene-manager.hh"
 #include "misc.hh"
 #include "monitor.hh"
+#include "gl-helpers.hh"
 #include "gwemu-hud.h"
 #include "../gwemu-settings.h"
 #include "../gwemu-gnw-input.h"
@@ -70,11 +71,10 @@ void ShowMainMenu()
             // Quick-access mirror of Settings > Display -- same
             // g_config.display.ui.* state, just reachable without opening
             // the full Settings window. Window Scale (resolution x integer
-            // multiple) is the primary control and comes first; Display
-            // mode is the non-integer-window-size fallback, demoted below
-            // a separator -- same ordering rationale as display-view.cc.
+            // multiple) is the primary control and comes first; the
+            // framebuffer remains integer-scaled while the window is resized.
             int tw = 0, th = 0;
-            bool have_size = gwemu_hud_get_framebuffer_size(&tw, &th);
+            bool have_size = gwemu_hud_get_native_display_size(&tw, &th);
             for (int mult = 1; mult <= 4; mult++) {
                 char label[8];
                 snprintf(label, sizeof(label), "%dx", mult);
@@ -84,10 +84,13 @@ void ShowMainMenu()
                      * POINTS -- snap so points*scale is integral, keeping
                      * fractional-scale Wayland presentation 1:1 (sharp) at
                      * the nearest size to N x native pixels. */
-                    int pw, ph;
-                    gwemu_snap_window_points(gwemu_get_window(), tw * mult,
-                                             th * mult, &pw, &ph);
-                    SDL_SetWindowSize(gwemu_get_window(), pw, ph);
+                    int target_w, target_h;
+                    gwemu_hud_get_display_window_size(mult, &target_w,
+                                                       &target_h);
+                    gwemu_hud_set_window_aspect_ratio_for_size(target_w,
+                                                                target_h);
+                    gwemu_set_window_size_pixels(gwemu_get_window(),
+                                                 target_w, target_h);
                 }
                 if (!have_size) ImGui::EndDisabled();
             }
@@ -96,22 +99,27 @@ void ShowMainMenu()
                 gwemu_toggle_fullscreen();
             }
             ImGui::Separator();
-            int fit_idx = (int)g_config.display.ui.fit;
-            bool center = fit_idx == CONFIG_DISPLAY_UI_FIT_CENTER;
-            bool scale_ar = fit_idx == CONFIG_DISPLAY_UI_FIT_SCALE;
-            bool stretch = fit_idx == CONFIG_DISPLAY_UI_FIT_STRETCH;
-            if (ImGui::BeginMenu("Content Fit (non-integer sizes)")) {
-                if (ImGui::MenuItem("Center", NULL, center)) {
-                    g_config.display.ui.fit = CONFIG_DISPLAY_UI_FIT_CENTER;
+            if (ImGui::BeginMenu("Device bezel")) {
+                if (ImGui::MenuItem("None", NULL,
+                                    g_config.display.ui.bezel == CONFIG_DISPLAY_UI_BEZEL_NONE)) {
+                    int display_scale = gwemu_hud_get_current_display_scale();
+                    g_config.display.ui.bezel = CONFIG_DISPLAY_UI_BEZEL_NONE;
                     gwemu_settings_save();
+                    gwemu_hud_resize_for_bezel(display_scale);
                 }
-                if (ImGui::MenuItem("Scale", NULL, scale_ar)) {
-                    g_config.display.ui.fit = CONFIG_DISPLAY_UI_FIT_SCALE;
+                if (ImGui::MenuItem("Mario", NULL,
+                                    g_config.display.ui.bezel == CONFIG_DISPLAY_UI_BEZEL_MARIO)) {
+                    int display_scale = gwemu_hud_get_current_display_scale();
+                    g_config.display.ui.bezel = CONFIG_DISPLAY_UI_BEZEL_MARIO;
                     gwemu_settings_save();
+                    gwemu_hud_resize_for_bezel(display_scale);
                 }
-                if (ImGui::MenuItem("Stretch", NULL, stretch)) {
-                    g_config.display.ui.fit = CONFIG_DISPLAY_UI_FIT_STRETCH;
+                if (ImGui::MenuItem("Zelda", NULL,
+                                    g_config.display.ui.bezel == CONFIG_DISPLAY_UI_BEZEL_ZELDA)) {
+                    int display_scale = gwemu_hud_get_current_display_scale();
+                    g_config.display.ui.bezel = CONFIG_DISPLAY_UI_BEZEL_ZELDA;
                     gwemu_settings_save();
+                    gwemu_hud_resize_for_bezel(display_scale);
                 }
                 ImGui::EndMenu();
             }

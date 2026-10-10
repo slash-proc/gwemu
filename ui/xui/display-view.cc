@@ -6,6 +6,7 @@
 #include "widgets.hh"
 #include "../gwemu-settings.h"
 #include "gwemu-hud.h"
+#include "gl-helpers.hh"
 
 void MainMenuDisplayView::Draw()
 {
@@ -24,6 +25,24 @@ void MainMenuDisplayView::Draw()
                 "this at any time)")) {
         gwemu_settings_save();
     }
+    int menu_behavior = (int)g_config.display.ui.menubar_behavior;
+    if (ChevronCombo("Menu bar behavior", &menu_behavior,
+                     "Auto-hide after inactivity\0"
+                     "Keep fixed above the display\0",
+                     "Choose whether the menu overlays the display or reserves space above it")) {
+        g_config.display.ui.menubar_behavior =
+            (CONFIG_DISPLAY_UI_MENUBAR_BEHAVIOR)menu_behavior;
+        gwemu_settings_save();
+    }
+    int bezel = (int)g_config.display.ui.bezel;
+    if (ChevronCombo("Device bezel", &bezel,
+                     "None\0Mario\0Zelda\0",
+                     "Show the virtual screen inside device artwork when it fits")) {
+        int display_scale = gwemu_hud_get_current_display_scale();
+        g_config.display.ui.bezel = (CONFIG_DISPLAY_UI_BEZEL)bezel;
+        gwemu_settings_save();
+        gwemu_hud_resize_for_bezel(display_scale);
+    }
 
     // Primary control: the window follows the emulated screen's real
     // resolution x an integer scale -- this is the main, expected way to
@@ -35,7 +54,7 @@ void MainMenuDisplayView::Draw()
     ImGui::TextWrapped("Resize the window to an exact multiple of the "
                         "emulated screen's native resolution:");
     int tw = 0, th = 0;
-    bool have_size = gwemu_hud_get_framebuffer_size(&tw, &th);
+    bool have_size = gwemu_hud_get_native_display_size(&tw, &th);
     for (int mult = 1; mult <= 4; mult++) {
         if (mult > 1) ImGui::SameLine();
         char label[8];
@@ -46,10 +65,11 @@ void MainMenuDisplayView::Draw()
              * snap so points*scale is integral, keeping fractional-scale
              * Wayland presentation 1:1 (sharp) at the nearest size to
              * N x native pixels. */
-            int pw, ph;
-            gwemu_snap_window_points(gwemu_get_window(), tw * mult,
-                                     th * mult, &pw, &ph);
-            SDL_SetWindowSize(gwemu_get_window(), pw, ph);
+            int target_w, target_h;
+            gwemu_hud_get_display_window_size(mult, &target_w, &target_h);
+            gwemu_hud_set_window_aspect_ratio_for_size(target_w, target_h);
+            gwemu_set_window_size_pixels(gwemu_get_window(), target_w,
+                                         target_h);
         }
         ImGui::EndDisabled();
     }
@@ -57,38 +77,6 @@ void MainMenuDisplayView::Draw()
         ImGui::Text("Native size: %dx%d", tw, th);
     } else {
         ImGui::TextDisabled("(native size not available yet)");
-    }
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    /*
-     * Edge case, not the primary control: only matters if the window ends
-     * up at a size that ISN'T an exact multiple of the native resolution
-     * (e.g. manually dragged to an arbitrary size) -- governs how content
-     * fits into that mismatched space. g_config.display.ui.fit and the
-     * actual scaling math were already ported into gl-helpers.cc's
-     * RenderFramebuffer() in Phase 1; this just exposes it, demoted below
-     * Window Scale since it's the fallback case, not the main path.
-     * Deliberately NOT exposing the ported aspect_ratio enum's 4:3/16:9
-     * options as a picker: this board has one fixed real panel aspect
-     * ratio, and those two options would just visibly distort it --
-     * Native/Auto already produce identical (correct) output here since
-     * GetDisplayAspectRatio() falls back to the real texture's own aspect
-     * either way.
-     */
-    SectionTitle("Content Fit (non-integer window sizes)");
-    ImGui::TextWrapped("Only matters if the window isn't sized to an exact "
-                        "multiple above (e.g. manually resized).");
-    int fit_idx = (int)g_config.display.ui.fit;
-    if (ChevronCombo("Display mode", &fit_idx,
-                     "Center\0"
-                     "Scale (preserve aspect)\0"
-                     "Stretch\0",
-                     "How the emulated screen fits into a mismatched-size window")) {
-        g_config.display.ui.fit = (CONFIG_DISPLAY_UI_FIT)fit_idx;
-        gwemu_settings_save();
     }
 
     ImGui::Spacing();

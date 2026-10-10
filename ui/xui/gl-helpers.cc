@@ -25,14 +25,20 @@
 #include "gwemu-hud.h"
 #include <glib/gstdio.h>
 #include "data/logo_sdf.png.h"
+#include "data/mario_bezel.png.h"
+#include "data/zelda_bezel.png.h"
 #include "notifications.hh"
 #include "stb_image.h"
 #include <fpng.h>
+#include <climits>
+#include <cstdlib>
 #include <math.h>
 #include <stdio.h>
 #include <vector>
 
 SDL_Texture *g_logo_tex;
+static SDL_Texture *g_mario_bezel_tex;
+static SDL_Texture *g_zelda_bezel_tex;
 
 SDL_Texture *LoadTextureFromMemory(const unsigned char *buf,
                                    unsigned int size)
@@ -58,6 +64,112 @@ SDL_Texture *LoadTextureFromMemory(const unsigned char *buf,
 void InitCustomRendering(void)
 {
     g_logo_tex = LoadTextureFromMemory(logo_sdf_data, logo_sdf_size);
+    g_mario_bezel_tex = LoadTextureFromMemory(mario_bezel_data, mario_bezel_size);
+    g_zelda_bezel_tex = LoadTextureFromMemory(zelda_bezel_data, zelda_bezel_size);
+}
+
+void gwemu_hud_set_window_aspect_ratio_for_size(int width, int height)
+{
+    SDL_Window *win = gwemu_get_window();
+    if (!win || width <= 0 || height <= 0) {
+        return;
+    }
+    /* Let the window manager constrain interactive drags. Resizing the
+     * window from a resize event makes SDL and the WM fight over geometry. */
+    float aspect = (float)width / height;
+    SDL_SetWindowAspectRatio(win, aspect, aspect);
+}
+
+void gwemu_hud_get_display_window_size(int display_scale, int *width,
+                                       int *height)
+{
+    SDL_Window *win = gwemu_get_window();
+    int tw = 0, th = 0;
+    if (!win || !width || !height || display_scale < 1 ||
+        !gwemu_hud_get_native_display_size(&tw, &th)) {
+        return;
+    }
+    *width = tw * display_scale;
+    *height = th * display_scale;
+    if (g_config.display.ui.bezel == CONFIG_DISPLAY_UI_BEZEL_MARIO) {
+        float screen_scale = fmaxf(tw * display_scale / 406.0f,
+                                   th * display_scale / 307.0f);
+        *width = (int)ceilf(919 * screen_scale);
+        *height = (int)ceilf(550 * screen_scale);
+    } else if (g_config.display.ui.bezel == CONFIG_DISPLAY_UI_BEZEL_ZELDA) {
+        float screen_scale = fmaxf(tw * display_scale / 415.0f,
+                                   th * display_scale / 318.0f);
+        *width = (int)ceilf(950 * screen_scale);
+        *height = (int)ceilf(567 * screen_scale);
+    }
+    if (g_config.display.ui.show_menubar &&
+        g_config.display.ui.menubar_behavior ==
+            CONFIG_DISPLAY_UI_MENUBAR_BEHAVIOR_FIXED) {
+        /* The menu height is measured in renderer pixels, while the window
+         * target above is converted through SDL's display scale before
+         * resizing. Scale the menu contribution into the same target units
+         * or the bezel loses that height and is letterboxed horizontally. */
+        float pixel_density = fmaxf(SDL_GetWindowPixelDensity(win), 1.0f);
+        float target_units_per_renderer_pixel =
+            gwemu_get_window_pixel_scale(win) / pixel_density;
+        *height += (int)ceilf(
+            gwemu_hud_get_menu_bar_height_pixels(win) *
+            target_units_per_renderer_pixel);
+    }
+}
+
+int gwemu_hud_get_current_display_scale(void)
+{
+    SDL_Window *win = gwemu_get_window();
+    if (!win) {
+        return 1;
+    }
+
+    int current_w, current_h;
+    SDL_GetWindowSize(win, &current_w, &current_h);
+    int best_scale = 1;
+    int best_distance = INT_MAX;
+    for (int scale = 1; scale <= 4; scale++) {
+        int target_w, target_h, target_w_points, target_h_points;
+        gwemu_hud_get_display_window_size(scale, &target_w, &target_h);
+        if (target_w <= 0 || target_h <= 0) {
+            break;
+        }
+        gwemu_snap_window_points(win, target_w, target_h, &target_w_points,
+                                 &target_h_points);
+        int distance = abs(current_w - target_w_points) +
+                       abs(current_h - target_h_points);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_scale = scale;
+        }
+    }
+    return best_scale;
+}
+
+void gwemu_hud_resize_for_bezel(int display_scale)
+{
+    SDL_Window *win = gwemu_get_window();
+    int width = 0, height = 0;
+    if (!win || display_scale < 1 || display_scale > 4) {
+        return;
+    }
+    gwemu_hud_get_display_window_size(display_scale, &width, &height);
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    gwemu_hud_set_window_aspect_ratio_for_size(width, height);
+
+    if (g_config.display.ui.bezel == CONFIG_DISPLAY_UI_BEZEL_NONE) {
+        /* With no artwork, return to the guest display's native 1x size
+         * instead of retaining the larger bezel window geometry. */
+        gwemu_set_window_size_pixels(win, width, height);
+        return;
+    }
+    const SDL_DisplayMode *mode =
+        SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win));
+    if (mode && (width > mode->w || height > mode->h)) return;
+    gwemu_set_window_size_pixels(win, width, height);
 }
 
 static float GetDisplayAspectRatio(int width, int height)
@@ -77,12 +189,13 @@ static float GetDisplayAspectRatio(int width, int height)
 }
 
 /*
- * Draw the guest framebuffer into the window, honoring the configured
- * fit mode (scale/stretch/center), aspect-ratio override and filtering.
+ * Fit the guest framebuffer to the window. With a bezel selected, fit the
+ * artwork to the available area and place the framebuffer in its opening.
  * `flip` is vestigial from the GL days (texture data is top-down now)
  * but kept in the signature to minimize call-site churn.
  */
-void RenderFramebuffer(SDL_Texture *tex, int width, int height, bool flip)
+void RenderFramebuffer(SDL_Texture *tex, int width, int height, bool flip,
+                       int top_offset)
 {
     if (!tex) {
         return;
@@ -95,57 +208,55 @@ void RenderFramebuffer(SDL_Texture *tex, int width, int height, bool flip)
         return;
     }
 
+    SDL_Texture *bezel = NULL;
+    float bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+    if (g_config.display.ui.bezel == CONFIG_DISPLAY_UI_BEZEL_MARIO) {
+        bezel = g_mario_bezel_tex;
+        bx0 = 257.0f; by0 = 124.0f; bx1 = 663.0f; by1 = 431.0f;
+    } else if (g_config.display.ui.bezel == CONFIG_DISPLAY_UI_BEZEL_ZELDA) {
+        bezel = g_zelda_bezel_tex;
+        bx0 = 269.0f; by0 = 128.0f; bx1 = 684.0f; by1 = 446.0f;
+    }
+
+    SDL_FRect dst;
+    if (bezel) {
+        float bwf = 0, bhf = 0;
+        SDL_GetTextureSize(bezel, &bwf, &bhf);
+        /* The window is constrained to the selected bezel ratio. Fill the
+         * available device area directly so rounding and menu-height
+         * differences cannot expose black strips at either side. */
+        SDL_FRect outer = { 0.0f, (float)top_offset, (float)width,
+                            (float)height };
+        SDL_RenderTexture(gwemu_get_renderer(), bezel, NULL, &outer);
+        float sx = outer.w / bwf, sy = outer.h / bhf;
+        dst = (SDL_FRect){ outer.x + bx0 * sx, outer.y + by0 * sy,
+                           (bx1 - bx0) * sx, (by1 - by0) * sy };
+    } else {
+        float t_ratio = GetDisplayAspectRatio(tw, th);
+        if (g_config.display.ui.fit == CONFIG_DISPLAY_UI_FIT_STRETCH) {
+            dst = (SDL_FRect){ 0, (float)top_offset, (float)width,
+                               (float)height };
+        } else if (g_config.display.ui.fit == CONFIG_DISPLAY_UI_FIT_CENTER) {
+            float dw = t_ratio * th;
+            dst = (SDL_FRect){ (width - dw) / 2.0f, (float)top_offset,
+                               dw, (float)th };
+        } else {
+            float w_ratio = (float)width / (float)height;
+            float dw, dh;
+            if (w_ratio >= t_ratio) {
+                dh = height;
+                dw = height * t_ratio;
+            } else {
+                dw = width;
+                dh = width / t_ratio;
+            }
+            dst = (SDL_FRect){ (width - dw) / 2.0f,
+                               top_offset + (height - dh) / 2.0f, dw, dh };
+        }
+    }
     SDL_SetTextureScaleMode(tex,
         g_config.display.filtering == CONFIG_DISPLAY_FILTERING_NEAREST ?
         SDL_SCALEMODE_NEAREST : SDL_SCALEMODE_LINEAR);
-
-    SDL_FRect dst;
-    if (g_config.display.ui.fit == CONFIG_DISPLAY_UI_FIT_STRETCH) {
-        dst = (SDL_FRect){ 0, 0, (float)width, (float)height };
-    } else if (g_config.display.ui.fit == CONFIG_DISPLAY_UI_FIT_CENTER) {
-        float t_ratio = GetDisplayAspectRatio(tw, th);
-        float dw = t_ratio * th;
-        dst = (SDL_FRect){ (width - dw) / 2.0f, (height - th) / 2.0f,
-                           dw, (float)th };
-    } else { /* scale to fit */
-        float t_ratio = GetDisplayAspectRatio(tw, th);
-        float w_ratio = (float)width / (float)height;
-        float dw, dh;
-        if (w_ratio >= t_ratio) {
-            dh = height;
-            dw = height * t_ratio;
-        } else {
-            dw = width;
-            dh = width / t_ratio;
-        }
-        dst = (SDL_FRect){ (width - dw) / 2.0f, (height - dh) / 2.0f,
-                           dw, dh };
-    }
-
-    /*
-     * Integer-multiple snap: window sizes are snapped UP a few pixels
-     * past N x native (fractional-scale Wayland can't hit N x native
-     * exactly in whole points -- see gwemu_snap_window_points()), so
-     * when the fit lands within a few pixels of an exact integer
-     * multiple of the guest resolution, draw at EXACTLY that multiple,
-     * centered, nearest-neighbor: pixel-sharp at the intended size with
-     * an imperceptible letterbox. Free-form window sizes far from a
-     * multiple keep the plain fit (and configured filtering) above.
-     */
-    if (g_config.display.ui.fit != CONFIG_DISPLAY_UI_FIT_STRETCH) {
-        const float snap_thresh = 6.0f;
-        int mult = (int)lroundf(dst.w / tw);
-        if (mult >= 1 &&
-            fabsf(dst.w - (float)(mult * tw)) <= snap_thresh &&
-            fabsf(dst.h - (float)(mult * th)) <= snap_thresh &&
-            mult * tw <= width && mult * th <= height) {
-            dst.w = mult * tw;
-            dst.h = mult * th;
-            dst.x = floorf((width - dst.w) / 2.0f);
-            dst.y = floorf((height - dst.h) / 2.0f);
-            SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
-        }
-    }
 
     SDL_Renderer *r = gwemu_get_renderer();
 
@@ -167,12 +278,12 @@ void RenderFramebuffer(SDL_Texture *tex, int width, int height, bool flip)
             last_ow = ow;
             last_oh = oh;
             fprintf(stderr,
-                    "SCALE_DEBUG blit driver=%s in=%dx%d win=%dx%dpt "
-                    "%dx%dpx out=%dx%d curout=%dx%d rscale=%.3fx%.3f "
-                    "dst=(%.1f,%.1f %.1fx%.1f)\n",
-                    SDL_GetCurrentVideoDriver(), width, height, wpt, hpt,
-                    wpx, hpx, ow, oh, cow, coh, sx, sy, dst.x, dst.y, dst.w,
-                    dst.h);
+                    "SCALE_DEBUG blit driver=%s render_area=%dx%d guest="
+                    "%dx%d win=%dx%dpt %dx%dpx out=%dx%d curout=%dx%d "
+                    "rscale=%.3fx%.3f dst=(%.1f,%.1f %.1fx%.1f)\n",
+                    SDL_GetCurrentVideoDriver(), width, height, tw, th, wpt,
+                    hpt, wpx, hpx, ow, oh, cow, coh, sx, sy, dst.x, dst.y,
+                    dst.w, dst.h);
         }
     }
 
