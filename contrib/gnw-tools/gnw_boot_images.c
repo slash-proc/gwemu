@@ -56,7 +56,7 @@ static char *xstrdup_printf(const char *fmt, ...)
 /*
  * Evaluates a small "N * N * N ..." integer expression, e.g. "256 * 1024"
  * or "64 * 1024 * 1024" -- exactly the shape gnw_h7b0_soc.h's own
- * FLASH_BANK_SIZE/EXTFLASH_SIZE #defines use. A single enclosing pair of
+ * FLASH_BANK_SIZE/EXTFLASH_DEFAULT_SIZE #defines use. A single enclosing pair of
  * parens is stripped first if present. Supports decimal and 0x-hex terms.
  */
 static bool eval_mul_expr(const char *expr, unsigned long long *out)
@@ -265,8 +265,9 @@ static bool ensure_dir(const char *path, char **error_msg)
     return true;
 }
 
-bool gnw_make_boot_images(const char *game, const char *repo_root,
-                           char **error_msg)
+bool gnw_make_boot_images_for_size(const char *game, const char *repo_root,
+                                    uint64_t extflash_size,
+                                    char **error_msg)
 {
     if (error_msg) {
         *error_msg = NULL;
@@ -275,12 +276,15 @@ bool gnw_make_boot_images(const char *game, const char *repo_root,
     char *header_path = xstrdup_printf("%s/include/hw/arm/gnw_h7b0_soc.h",
                                         repo_root);
 
-    unsigned long long bank_size = 0, extflash_size = 0;
+    unsigned long long bank_size = 0, configured_size = 0;
     bool ok = read_define(header_path, "FLASH_BANK_SIZE", &bank_size,
                            error_msg);
     if (ok) {
-        ok = read_define(header_path, "EXTFLASH_SIZE", &extflash_size,
-                          error_msg);
+        if (!extflash_size) {
+            ok = read_define(header_path, "EXTFLASH_DEFAULT_SIZE",
+                             &configured_size, error_msg);
+            extflash_size = configured_size;
+        }
     }
     free(header_path);
     if (!ok) {
@@ -336,4 +340,10 @@ bool gnw_make_boot_images(const char *game, const char *repo_root,
     free(internal_data);
     free(extflash_data);
     return ok;
+}
+
+bool gnw_make_boot_images(const char *game, const char *repo_root,
+                           char **error_msg)
+{
+    return gnw_make_boot_images_for_size(game, repo_root, 0, error_msg);
 }

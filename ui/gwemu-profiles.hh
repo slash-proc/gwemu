@@ -67,6 +67,7 @@ struct GwProfile {
     std::string bank1 = "bank1.bin";
     std::string bank2 = "bank2.bin";
     std::string extflash = "extflash.bin";
+    std::string nor_chip = "c2-25-3a";
     /* Seed the device's persistent RDP option byte on profile launch. */
     bool rdp_locked = false;
 

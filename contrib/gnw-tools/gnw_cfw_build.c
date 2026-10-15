@@ -39,7 +39,6 @@
 #include <string.h>
 
 #define FLASH_BANK_SIZE 0x40000u
-#define EXTFLASH_SIZE   0x4000000u
 #define BOOTLOADER_RESERVE 0x32000u /* 200KiB, matches gnwmanager's bootloader=True internal length */
 
 struct game_config {
@@ -101,6 +100,14 @@ static uint8_t *read_file(const char *path, size_t *out_len, char **error_msg)
 static bool write_file_padded(const char *path, const uint8_t *data, size_t len,
                               size_t pad_to, char **error_msg)
 {
+    if (len > pad_to) {
+        char detail[512];
+        snprintf(detail, sizeof(detail),
+                 "%s requires %zu bytes, larger than selected NOR capacity %zu",
+                 path, len, pad_to);
+        set_err(error_msg, "%s", detail);
+        return false;
+    }
     FILE *f = fopen(path, "wb");
     if (!f) {
         set_err(error_msg, "cannot write %s", path);
@@ -132,6 +139,7 @@ bool gnw_cfw_build_images(const char *game,
                           const char *patch_path,
                           const char *out_bank1,
                           const char *out_extflash,
+                          uint64_t extflash_size,
                           GnwCfwBuildResult *result,
                           char **error_msg)
 {
@@ -253,7 +261,8 @@ bool gnw_cfw_build_images(const char *game,
     if (!write_file_padded(out_bank1, d.internal.data, d.internal.len, FLASH_BANK_SIZE, error_msg)) {
         goto out;
     }
-    if (!write_file_padded(out_extflash, d.external.data, d.external.len, EXTFLASH_SIZE, error_msg)) {
+    if (!write_file_padded(out_extflash, d.external.data, d.external.len,
+                           extflash_size, error_msg)) {
         goto out;
     }
 

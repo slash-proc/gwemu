@@ -35,7 +35,7 @@ need scripted upkeep.
 | DWT | Partial | Real `CYCCNT` only. |
 | RTC | Partial | Real IRQ wiring on `MISR & (ALRAF|ALRBF)`, backup-domain registers correctly survive CPU-only reset. TR/DR/SSR are a real virtual-clock calendar with the hardware shadow-register lock; alarms/wakeup-timer are instant-fire approximations. |
 | FLASH_R | Partial | Real sector-erase side effect against actual flash memory; `OPTSR_CUR.RDP` seeded to real factory default. |
-| OSPI (x2) | Partial | Real command decoding, auto-polling, IRQ lines. |
+| OSPI (x2) | Partial | Real command decoding, auto-polling, IRQ lines, and a selectable JEDEC NOR catalog with capacity-dependent SFDP density, read/program/erase opcodes, and Winbond/Spansion status handling. The SoC maps both controllers to the selected chip capacity (up to 256 MiB). |
 | SPI | Partial | Real `TXP`/`RXP`/`EOT` status-flag behavior and a real SSI byte exchange with the virtual SD card. SPI1 additionally models the DMA request path (DMAMUX requests 37/38 into DMA1, `CFG1.TXDMAEN`/`RXDMAEN`, `CR1.CSTART` gating, EOT interrupt on NVIC 35) so retro-go-sd's `HAL_SPI_TransmitReceive_DMA()` SD block reads complete instead of timing out. SPI2 (LCD) is polled only, no IRQ, no DMA. |
 | LPUART1 | Stub | Register-array shadow, correct reset values, no real UART behavior. |
 | USART1 | Partial | Transmit only: ISR reports the transmitter always ready, TDR writes go to serial port 0. No RX. Homebrew printf console. |

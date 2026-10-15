@@ -18,8 +18,30 @@
 //
 #pragma once
 #include <functional>
+#include <stdint.h>
 #include <SDL3/SDL_dialog.h>
 #include "common.hh"
+
+// Tracks a window's natural content height and emits a resize request only
+// after the measured height has settled. This keeps dynamic ImGui forms from
+// needing a hand-maintained list of every state that can add a row, and avoids
+// fighting the user while they resize a window.
+class ContentFitHeight {
+public:
+    explicit ContentFitHeight(uint64_t settle_ms = 32)
+        : m_settle_ms(settle_ms) {}
+
+    void Reset();
+    void Observe(float height, uint64_t now_ms);
+    bool TakeRequest(float *height);
+
+private:
+    uint64_t m_settle_ms;
+    uint64_t m_changed_ms = 0;
+    float m_candidate = -1.0f;
+    float m_reported = -1.0f;
+    bool m_pending = false;
+};
 
 void Separator();
 void SectionTitle(const char *title);

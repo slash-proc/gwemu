@@ -65,10 +65,8 @@ protected:
     GnwBankSlot m_bank[2]; // 0=bank1 (allow_patch=true), 1=bank2 (allow_patch=false)
     bool m_ofw_at_zero = false; // explicit toggle, see class comment
 
-    // Extflash size: preset index into kExtSizeMiB (see .cc), or -1 for the
-    // "Custom" numeric override in m_ext_size_custom_mib.
-    int m_ext_size_choice = 6; // default 64 MiB, see kExtSizeMiB
-    int m_ext_size_custom_mib = 64;
+    // Stable JEDEC-keyed NOR selection; capacity comes from the chip table.
+    std::string m_nor_chip_key = "c2-25-3a";
 
     std::vector<GnwExtflashBlobRow> m_extflash_rows;
 
@@ -102,6 +100,7 @@ protected:
     void ResolveExtflashRowSizes();
     uint32_t GetOrComputePatchedExtflashSize(const char *game);
     uint32_t ExtflashSizeBytes() const;
+    uint64_t RequiredExtflashBytes() const;
     bool ApplyBank1(std::string *err);
 
     // Shared by both banks -- see class comment. allow_patch gates whether

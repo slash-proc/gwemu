@@ -1,3 +1,11 @@
+2026-10-15  ospi: select supported NOR chips up to 256 MiB
+            The Flash tab and profile wizard now select a chip from the
+            JEDEC catalog used by retro-go-sd. The selected capacity sets
+            the extflash mapping and OSPI density; smaller source blobs
+            are extended with erased-state 0xFF bytes and blobs that do
+            not fit are rejected. Internal flash images also receive
+            explicit 0xFF padding through the selected 256 KiB bank size.
+
 2026-10-06  gpio: use one physical button/power-good pinout for all firmware
             The working game-and-watch-retro-go-sd board definitions put
             GAME on PC1, PAUSE on PC13, TIME on PC5, and charger PGOOD on

@@ -31,6 +31,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,7 +55,8 @@ typedef struct GnwCfwBuildResult {
  *   patch_path     gnwmanager's pre-built novel-code binary for this
  *                  game (the 0x08032000.bin from cli/gnw_patch/binaries)
  *   out_bank1      output, 0xFF-padded to the 256K flash bank size
- *   out_extflash   output, 0xFF-padded to the 64M extflash size
+ *   extflash_size  selected NOR capacity in bytes
+ *   out_extflash   output, 0xFF-padded to extflash_size
  *   result         optional (may be NULL): used-byte counts
  *   error_msg      on failure: malloc'd message, caller frees
  *
@@ -68,6 +70,7 @@ bool gnw_cfw_build_images(const char *game,
                           const char *patch_path,
                           const char *out_bank1,
                           const char *out_extflash,
+                          uint64_t extflash_size,
                           GnwCfwBuildResult *result,
                           char **error_msg);
 

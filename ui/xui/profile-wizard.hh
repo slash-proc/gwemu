@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include "flash-backups.hh"
+#include "widgets.hh"
 
 class ProfileWizard {
 public:
@@ -33,16 +34,9 @@ public:
     // settings-window host to decide whether closing the wizard should
     // also close the window vs fall back to the settings menu).
     bool WasCompleted() const { return m_completed; }
-    // Natural content height (ImGui points) measured during the last
-    // Draw() -- the host resizes the SDL settings window to this so the
-    // wizard never scrolls or clips (see gwemu_settings_hud_update).
-    float DesiredHeight() const { return m_desired_h; }
-    // True exactly on frames where the layout genuinely changed
-    // (accordion toggled, template/validation rows changed) -- the host
-    // issues ONE resize request then and otherwise never touches the
-    // window (accepting whatever size the WM granted; fighting the
-    // compositor per-frame degraded the whole window over time).
-    bool TakeContentChanged() { bool c = m_content_changed; m_content_changed = false; return c; }
+    // Emits a settled natural-height request measured from the widgets drawn
+    // this frame. The host applies it to the native window.
+    bool TakeHeightRequest(float *height) { return m_height_fit.TakeRequest(height); }
 
 private:
     enum Template { TplStockMario, TplStockZelda, TplCustom };
@@ -66,17 +60,11 @@ private:
     void EnterProfileStage();
     void DrawBankAssignments();
     void DrawSdSection();
-    bool DrawExtSizeStepper(); // returns true when the user changed it
+    void DrawNorChipSelector(float width);
+    uint64_t RequiredExtflashBytes() const;
+    void SetNorChip(const std::string &key);
     void DrawBuildView();
     void StartBuild();
-    // Single shared predicate: is Zelda content involved in ANY current
-    // selection (stock zelda template, zelda assets extflash, zelda OFW
-    // bank1 -- in any template state)? Future zelda-touching contexts
-    // must extend THIS, so the 4 MiB floor can't miss one.
-    bool ZeldaInvolved() const;
-    // Lowest legal extflash size for the current selection (Zelda content
-    // needs at least 4 MiB -- owner-specified floor).
-    int MinExtSizeMiB() const;
     void SyncStockReflection();
     bool BuildWorker(std::string &err);   // runs on m_thread
     bool ValidSources(std::string *why) const;
@@ -110,6 +98,7 @@ private:
     int m_ext_choice = ExtBlank;
     std::string m_ext_path;
     int m_ext_size_mib = 64;
+    std::string m_nor_chip_key = "c2-25-3a";
 
     // SD Card section (see DrawSdSection). SD state deliberately never
     // resets on template selection and never flips the template to
@@ -138,9 +127,7 @@ private:
     std::string m_build_error;    // written before state flip
     std::string m_created_id;     // set by worker on success
     bool m_completed = false;
-    float m_desired_h = 0.0f;
-    bool m_content_changed = false;
-    unsigned m_last_sig = ~0u;
+    ContentFitHeight m_height_fit;
     bool m_assignments_open = false;
     std::string m_edit_profile_id;
     // Cached existence of the gnwmanager patch binary (per game),
@@ -148,6 +135,9 @@ private:
     // from ValidSources()/DrawForm() before.
     mutable std::string m_patchbin_path[2];
     mutable uint64_t m_patchbin_check_ms[2] = { 0, 0 };
+    mutable std::string m_required_extflash_path;
+    mutable uint64_t m_required_extflash_bytes = 0;
+    mutable uint64_t m_required_extflash_check_ms = 0;
     // Resolution order: ../gnwmanager checkout, then <appdata>/cache.
     // Empty string = not available locally (a download may provide it).
     const std::string &ResolvePatchBinary(int gi) const;

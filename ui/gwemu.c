@@ -2334,14 +2334,16 @@ static bool is_flash_image_global(const char *arg)
 {
     return strncmp(arg, "gnw-h7b0-soc.bank1-image=", 25) == 0 ||
            strncmp(arg, "gnw-h7b0-soc.bank2-image=", 25) == 0 ||
-           strncmp(arg, "gnw-h7b0-soc.extflash-image=", 28) == 0;
+           strncmp(arg, "gnw-h7b0-soc.extflash-image=", 28) == 0 ||
+           strncmp(arg, "gnw-h7b0-soc.extflash-chip=", 27) == 0;
 }
 
 void gwemu_relaunch_with_flash_images(const char *bank1_image,
                                       const char *bank2_image,
                                       const char *extflash_image,
                                       const char *sdcard_qcow2,
-                                      bool rdp_locked)
+                                      bool rdp_locked,
+                                      const char *extflash_chip)
 {
     GPtrArray *new_argv = g_ptr_array_new();
     g_ptr_array_add(new_argv, g_orig_argv[0]);
@@ -2384,6 +2386,12 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
         g_ptr_array_add(new_argv, (char *)"-global");
         g_ptr_array_add(new_argv, ef);
     }
+    if (extflash_chip && extflash_chip[0]) {
+        char *chip = g_strdup_printf("gnw-h7b0-soc.extflash-chip=%s",
+                                     extflash_chip);
+        g_ptr_array_add(new_argv, (char *)"-global");
+        g_ptr_array_add(new_argv, chip);
+    }
     char *rdp = g_strdup_printf("gnw-h7b0-soc.rdp-locked=%s",
                                 rdp_locked ? "on" : "off");
     g_ptr_array_add(new_argv, (char *)"-global");
@@ -2407,6 +2415,10 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
     }
     g_ptr_array_add(new_argv, NULL);
 
+    if (extflash_chip && extflash_chip[0]) {
+        gwemu_settings_set_string(&g_config.general.extflash_chip,
+                                  extflash_chip);
+    }
     // execv() replaces this process image and does NOT run atexit handlers
     // -- gwemu_settings_save() is normally also registered via atexit() as
     // a safety net, but that never fires here. Flush explicitly so any

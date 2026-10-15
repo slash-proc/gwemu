@@ -5,15 +5,11 @@
  * Not cycle-accurate -- command/status completion is instant (TCF set
  * the moment CCR/IR/AR is written, no dummy-cycle or clock-rate
  * timing modeled) -- but the indirect-mode command *protocol* is now
- * real: RDID/RDSR/RDCR/SFDP/WREN/RSTEN/RST are decoded and answered
- * as a synthetic Macronix MX25U51245G (64Mbit... no, 64MB/512Mbit,
- * JEDEC C2 25 3A) NOR flash chip -- see retro-go's
+ * real: RDID/status/SFDP/WREN/reset and data commands are decoded for
+ * the selected part in gnw_h7b0_nor.h, sourced from retro-go's
  * ../gnw-chainloader/retro-go-sd/Core/Src/gw_flash.c for the real
- * driver's command set and jedec_map[] this was cross-checked
- * against. Picked to match EXTFLASH_SIZE's existing 64M placeholder
- * (gnw_h7b0_soc.h) exactly, so SFDP-reported density and the actual
- * backing region size agree. PP/SE/BE32K/BE64K/CE (0x3E/0x21/0x5C/
- * 0xDC/0x60) and indirect READ (0xEC) now read/modify the same
+ * driver's command set and jedec_map[]. Program/erase/read commands
+ * read and modify the same
  * memory-mapped XIP RAM region at EXTFLASH_BASE_ADDRESS the CPU sees
  * (wired up by gnw_h7b0_ospi_set_backing(), called from
  * gnw_h7b0_soc.c) -- so littlefs's block device ops in retro-go's
@@ -21,10 +17,8 @@
  * OSPI_EraseSync(), read via direct memcpy from the mapped region)
  * now actually persist across each other instead of writes being
  * silently dropped while reads always saw the `-device loader`-
- * populated initial content. Only the specific opcodes
- * cmds_quad_32b_mx[] uses (this device's synthetic identity) are
- * handled this way; any other program/erase/read opcode still
- * no-ops/returns zero, since no other identity is emulated.
+ * populated initial content. Supported opcodes and capacity are
+ * selected together, so guest detection and the backing region agree.
  *
  * ST HAL's HAL_OSPI_Command() (used by both the no-data and
  * indirect-write paths in
@@ -128,14 +122,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
 #define GNW_H7B0_OSPI_IR    0x110
 
 /*
- * NOR flash command opcodes this device decodes -- see
- * ../gnw-chainloader/retro-go-sd/Core/Src/gw_flash.c's cmds_quad_32b_mx[]
- * (the config matched by the synthetic JEDEC ID below).
+ * Common NOR flash opcodes; data-command opcodes vary by selected
+ * command profile in gnw_h7b0_ospi.c.
  */
 #define OSPI_CMD_WRSR   0x01
 #define OSPI_CMD_RDSR   0x05
 #define OSPI_CMD_WREN   0x06
 #define OSPI_CMD_RDCR   0x15
+#define OSPI_CMD_RDAR   0x65
+#define OSPI_CMD_RDSR2  0x35
+#define OSPI_CMD_WRSR2  0x31
+#define OSPI_CMD_WRSR3  0x11
 #define OSPI_CMD_RSTEN  0x66
 #define OSPI_CMD_RST    0x99
 #define OSPI_CMD_RDID   0x9F
@@ -143,18 +140,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
 #define OSPI_CMD_SFDP   0x5A
 
 /*
- * PP/erase/READ opcodes for cmds_quad_32b_mx[] specifically (the
- * config table gw_flash.c's jedec_map[] selects for this device's
- * synthetic Macronix identity, which is >16MB and thus 32-bit-address
- * quad commands) -- see gnw_h7b0_ospi_set_backing() in gnw_h7b0_ospi.c
- * for how these now actually read/modify the memory-mapped XIP region
- * instead of being dropped.
+ * Default Macronix 32-bit profile opcodes. Other profiles use their
+ * own opcodes from retro-go's command table.
  */
-#define OSPI_CMD_PP     0x3E /* 4PP4B */
-#define OSPI_CMD_SE     0x21 /* Sector Erase, 4KB */
-#define OSPI_CMD_BE32K  0x5C /* Block Erase, 32KB */
-#define OSPI_CMD_BE64K  0xDC /* Block Erase, 64KB */
-#define OSPI_CMD_READ   0xEC /* 4READ4B */
+#define OSPI_CMD_PP     0x3E /* Macronix 4PP4B */
+#define OSPI_CMD_SE     0x21 /* Macronix Sector Erase, 4KB */
+#define OSPI_CMD_BE32K  0x5C /* Macronix Block Erase, 32KB */
+#define OSPI_CMD_BE64K  0xDC /* Macronix Block Erase, 64KB */
+#define OSPI_CMD_READ   0xEC /* Macronix 4READ4B */
 
 /*
  * CCR's ADSIZE[1:0] field (bits 13:12, per STM32H7B0.svd / CMSIS
@@ -163,9 +156,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
  * ADSIZE (ADSIZE only controls how many bytes real hardware clocks out
  * over the wire), so nothing here changes how pending_addr is
  * interpreted -- this is purely so gnw_h7b0_ospi_write() can flag a
- * command whose firmware-configured ADSIZE doesn't match what this
- * device's synthetic identity is documented (in the header comment
- * above) to use, instead of silently trusting that assumption forever.
+ * command whose firmware-configured ADSIZE doesn't match what the
+ * selected part's command profile expects.
  */
 #define OSPI_CCR_ADSIZE_SHIFT  12
 #define OSPI_CCR_ADSIZE_MASK   (0x3U << OSPI_CCR_ADSIZE_SHIFT)
@@ -179,16 +171,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
 #define OSPI_FLASH_SR_WEL  (1U << 1)
 #define OSPI_FLASH_SR_QE   (1U << 6)
 
-/*
- * Synthetic chip identity: Macronix MX25U51245G, 64MB/512Mbit, quad
- * mode always-on (QE hardwired set in RDSR so the MX/ISSI init path
- * in gw_flash.c's init_mx_issi() skips its WRSR round-trip). Matches
- * EXTFLASH_SIZE's existing 64M placeholder (gnw_h7b0_soc.h) so the
- * SFDP-reported density and the real backing region size agree.
- */
-#define OSPI_FLASH_JEDEC_MANUF  0xC2
-#define OSPI_FLASH_JEDEC_TYPE   0x25
-#define OSPI_FLASH_JEDEC_DENS   0x3A
+/* Default part when no chip is selected through the SoC property. */
 #define OSPI_FLASH_DEFAULT_SIZE (64 * 1024 * 1024)
 
 #define OSPI_SFDP_TABLE_PTR  0x20
@@ -209,6 +192,7 @@ struct GnwH7B0OspiState {
     bool     wel;
 
     uint64_t flash_size;
+    uint32_t chip_index;
 
     /*
      * Host pointer into the memory-mapped XIP RAM region (extflash in

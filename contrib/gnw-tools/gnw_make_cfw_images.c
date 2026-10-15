@@ -27,15 +27,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 int main(int argc, char **argv)
 {
     if (argc < 2 || (strcmp(argv[1], "mario") != 0 && strcmp(argv[1], "zelda") != 0)) {
-        fprintf(stderr, "usage: %s <mario|zelda> [repo_root]\n", argv[0]);
+        fprintf(stderr, "usage: %s <mario|zelda> [repo_root] [extflash_mib]\n", argv[0]);
         return 1;
     }
     const char *game = argv[1];
     const char *repo_root = argc >= 3 ? argv[2] : ".";
+    uint64_t extflash_size = (uint64_t)64 * 1024 * 1024;
+    if (argc >= 4) {
+        char *end;
+        unsigned long long mib = strtoull(argv[3], &end, 10);
+        if (!argv[3][0] || *end || mib == 0 || mib > 256) {
+            fprintf(stderr, "extflash_mib must be between 1 and 256\n");
+            return 1;
+        }
+        extflash_size = (uint64_t)mib * 1024 * 1024;
+    }
 
     char internal_path[1024], external_path[1024], patch_path[1024];
     char out_bank1[1024], out_extflash[1024];
@@ -54,7 +65,8 @@ int main(int argc, char **argv)
     GnwCfwBuildResult res;
     char *err = NULL;
     if (!gnw_cfw_build_images(game, internal_path, external_path, patch_path,
-                              out_bank1, out_extflash, &res, &err)) {
+                              out_bank1, out_extflash, extflash_size,
+                              &res, &err)) {
         fprintf(stderr, "%s\n", err ? err : "cfw build failed");
         if (err && strstr(err, patch_path)) {
             fprintf(stderr, "note: expects a gnwmanager checkout at ../gnwmanager relative to repo_root\n");

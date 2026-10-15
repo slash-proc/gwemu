@@ -11,24 +11,35 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <inttypes.h>
 
 extern "C" {
 #include "../../contrib/gnw-tools/gnw_boot_images.h"
+#include "../../contrib/gnw-tools/gnw_cfw_build.h"
 }
 #include "gwemu-hud.h"
 #include "common.hh"
 #include "../gwemu-profiles.hh"
+#include "hw/misc/gnw_h7b0_nor.h"
 
 static const char *kGameNames[2] = { "mario", "zelda" };
 
-// Extflash size presets, MiB, powers of two 1..256. Index 9 (past the end)
-// means "Custom", using m_ext_size_custom_mib instead.
-static const int kExtSizeMiB[9] = { 1, 2, 4, 8, 16, 32, 64, 128, 256 };
-static const int kExtSizeCustomIdx = 9;
+static const GnwNorChip *SelectedNorChip(const std::string &key)
+{
+    const GnwNorChip *chip = gnw_nor_chip_by_key(key.c_str());
+    return chip ? chip : gnw_nor_chip_by_key(GNW_NOR_DEFAULT_CHIP_KEY);
+}
 
 GnwFlashStorageView::GnwFlashStorageView()
 {
     m_backup_dir = "backup";
+    if (g_config.general.extflash_chip && g_config.general.extflash_chip[0]) {
+        m_nor_chip_key = g_config.general.extflash_chip;
+    }
+    if (g_config.general.active_profile && g_config.general.active_profile[0]) {
+        GwProfile *profile = g_profile_store.Find(g_config.general.active_profile);
+        if (profile) m_nor_chip_key = profile->nor_chip;
+    }
     RescanBackupDir();
 }
 
@@ -75,13 +86,11 @@ void GnwFlashStorageView::ApplyPreset(int preset)
         m_bank[0] = GnwBankSlot{}; m_bank[0].choice = 1; m_bank[0].patch = true; m_bank[0].bootloader = true;
         m_bank[1] = GnwBankSlot{}; m_bank[1].choice = 3; // Browse -- user must still pick a file
         m_ofw_at_zero = true;
-        m_ext_size_choice = 6; // 64 MiB
         break;
     case kPresetZeldaRetroGo:
         m_bank[0] = GnwBankSlot{}; m_bank[0].choice = 2; m_bank[0].patch = true; m_bank[0].bootloader = true;
         m_bank[1] = GnwBankSlot{}; m_bank[1].choice = 3;
         m_ofw_at_zero = true;
-        m_ext_size_choice = 6;
         break;
     case kPresetCustom:
     default:
@@ -93,10 +102,28 @@ void GnwFlashStorageView::ApplyPreset(int preset)
 
 uint32_t GnwFlashStorageView::ExtflashSizeBytes() const
 {
-    int mib = (m_ext_size_choice < kExtSizeCustomIdx)
-                  ? kExtSizeMiB[m_ext_size_choice]
-                  : std::clamp(m_ext_size_custom_mib, 1, 256);
-    return (uint32_t)mib * 1024u * 1024u;
+    return SelectedNorChip(m_nor_chip_key)->size_bytes;
+}
+
+uint64_t GnwFlashStorageView::RequiredExtflashBytes() const
+{
+    uint64_t required = 0;
+    if (m_bank[0].choice >= 1 && m_bank[0].choice <= 2) {
+        int idx = m_bank[0].choice - 1;
+        std::string path = m_backup_dir + "/flash_backup_" + kGameNames[idx] + ".bin";
+        GStatBuf st;
+        if (g_stat(path.c_str(), &st) == 0 && st.st_size > 0) {
+            required = st.st_size;
+        }
+        if (m_bank[0].patch) {
+            uint32_t patched = m_patched_size_cache[idx].load();
+            required = std::max<uint64_t>(required, patched);
+        }
+    }
+    for (const auto &row : m_extflash_rows) {
+        required = std::max(required, (uint64_t)row.offset + row.size);
+    }
+    return required;
 }
 
 void GnwFlashStorageView::ResolveExtflashRowSizes()
@@ -148,9 +175,14 @@ uint32_t GnwFlashStorageView::GetOrComputePatchedExtflashSize(const char *game)
 
     m_size_compute_running[idx] = true;
     std::string game_str = game;
-    m_size_threads[idx] = std::thread([this, idx, game_str]() {
+    /* Probe the complete supported range so the cached used length can
+     * constrain every chip choice without rerunning the patch per choice. */
+    uint64_t capacity_mib = 256;
+    m_size_threads[idx] = std::thread([this, idx, game_str, capacity_mib]() {
         std::string cmd = "./build/contrib/gnw-tools/gnw-make-cfw-images ";
         cmd += game_str;
+        cmd += " . ";
+        cmd += std::to_string(capacity_mib);
         cmd += " 2>&1";
         FILE *p = popen(cmd.c_str(), "r");
         if (!p) {
@@ -224,6 +256,43 @@ static bool SpliceBlobIntoFile(const char *path, uint32_t offset,
     return true;
 }
 
+static bool PadFileWithFF(const char *path, uint64_t capacity,
+                          std::string *err)
+{
+    GStatBuf st;
+    if (g_stat(path, &st) != 0 || st.st_size < 0) {
+        if (err) *err = std::string("cannot stat extflash image ") + path;
+        return false;
+    }
+    if ((uint64_t)st.st_size > capacity) {
+        if (err) *err = std::string("extflash image requires ") +
+            std::to_string(st.st_size) + " bytes; selected chip holds " +
+            std::to_string(capacity) + " bytes";
+        return false;
+    }
+    if ((uint64_t)st.st_size == capacity) return true;
+
+    FILE *f = g_fopen(path, "ab");
+    if (!f) {
+        if (err) *err = std::string("cannot extend extflash image ") + path;
+        return false;
+    }
+    std::vector<uint8_t> fill(1 << 20, 0xFF);
+    uint64_t left = capacity - (uint64_t)st.st_size;
+    bool ok = true;
+    while (left) {
+        size_t n = (size_t)std::min<uint64_t>(left, fill.size());
+        if (fwrite(fill.data(), 1, n, f) != n) {
+            ok = false;
+            break;
+        }
+        left -= n;
+    }
+    if (fclose(f) != 0) ok = false;
+    if (!ok && err) *err = std::string("failed to pad extflash image with 0xFF: ") + path;
+    return ok;
+}
+
 bool GnwFlashStorageView::ApplyBank1(std::string *err)
 {
     if (m_bank[0].choice == 0) return true; // nothing to do
@@ -233,51 +302,56 @@ bool GnwFlashStorageView::ApplyBank1(std::string *err)
         return true;
     }
     const char *game = kGameNames[m_bank[0].choice - 1];
-
     char *cerr = nullptr;
-    if (!gnw_make_boot_images(game, ".", &cerr)) {
+    if (m_bank[0].patch) {
+        std::string internal = m_backup_dir + "/internal_flash_backup_" + game + ".bin";
+        std::string external = m_backup_dir + "/flash_backup_" + game + ".bin";
+        std::string patch = std::string("../gnwmanager/gnwmanager/cli/gnw_patch/binaries/") +
+                            game + "/0x08032000.bin";
+        std::string out_dir = m_backup_dir + "/qemu-images";
+        g_mkdir_with_parents(out_dir.c_str(), 0755);
+        std::string bank1 = out_dir + "/" + game + "-bank1-patched.bin";
+        std::string extflash = out_dir + "/" + game + "-extflash-patched.bin";
+        GnwCfwBuildResult result = {};
+        if (!gnw_cfw_build_images(game, internal.c_str(), external.c_str(),
+                                  patch.c_str(), bank1.c_str(), extflash.c_str(),
+                                  ExtflashSizeBytes(), &result, &cerr)) {
+            if (err) *err = cerr ? cerr : "CFW image build failed";
+            free(cerr);
+            return false;
+        }
+        free(cerr);
+        if (!m_extflash_rows.empty() && m_extflash_rows[0].implicit) {
+            m_extflash_rows[0].size = result.extflash_used;
+        }
+    } else if (!gnw_make_boot_images_for_size(game, ".", ExtflashSizeBytes(),
+                                              &cerr)) {
         if (err) *err = cerr ? cerr : "gnw_make_boot_images failed";
         free(cerr);
         return false;
+    } else {
+        free(cerr);
     }
 
-    if (m_bank[0].patch) {
-        // gnw-make-cfw-images is a standalone CLI tool (its patch logic
-        // isn't yet refactored into a directly-linkable library function).
-        // Shelling out here is a deliberate, flagged shortcut, not an
-        // oversight -- refactoring into a real library entry point is
-        // separate follow-up work.
-        std::string cmd = "./build/contrib/gnw-tools/gnw-make-cfw-images ";
-        cmd += game;
-        cmd += " 2>&1";
-        FILE *p = popen(cmd.c_str(), "r");
-        if (!p) {
-            if (err) *err = "failed to launch gnw-make-cfw-images";
-            return false;
-        }
-        char buf[256];
-        std::string output;
-        while (fgets(buf, sizeof(buf), p)) output += buf;
-        int rc = pclose(p);
-        if (rc != 0) {
-            if (err) *err = "gnw-make-cfw-images failed: " + output;
-            return false;
-        }
-        // Note: --bootloader is not currently an optional flag in
-        // gnw-make-cfw-images -- it always patches with bootloader=true.
-        // The Bootloader checkbox therefore has no effect yet.
-
-        if (!m_extflash_rows.empty() && m_extflash_rows[0].implicit) {
-            size_t marker = output.find("extflash-patched.bin (");
-            if (marker != std::string::npos) {
-                unsigned long used = strtoul(output.c_str() + marker + 22, nullptr, 10);
-                if (used > 0) m_extflash_rows[0].size = (uint32_t)used;
-            }
-        }
-    }
+    ResolveExtflashRowSizes();
 
     const char *ext_suffix = m_bank[0].patch ? "-extflash-patched.bin" : "-extflash.bin";
     std::string ext_path = m_backup_dir + "/qemu-images/" + game + ext_suffix;
+    GStatBuf ext_st;
+    uint64_t required = 0;
+    if (g_stat(ext_path.c_str(), &ext_st) == 0 && ext_st.st_size > 0) {
+        required = ext_st.st_size;
+    }
+    for (const auto &row : m_extflash_rows) {
+        required = std::max(required, (uint64_t)row.offset + row.size);
+    }
+    if (required > ExtflashSizeBytes()) {
+        if (err) *err = "extflash contents require " +
+            std::to_string(required) + " bytes, but " +
+            SelectedNorChip(m_nor_chip_key)->name + " holds " +
+            std::to_string(ExtflashSizeBytes()) + " bytes";
+        return false;
+    }
     for (auto &row : m_extflash_rows) {
         if (row.implicit) continue;
         gchar *contents = nullptr;
@@ -294,7 +368,11 @@ bool GnwFlashStorageView::ApplyBank1(std::string *err)
         if (!ok) return false;
     }
 
-    ResolveExtflashRowSizes();
+    if (g_stat(ext_path.c_str(), &ext_st) == 0 && ext_st.st_size > 0 &&
+        !PadFileWithFF(ext_path.c_str(), ExtflashSizeBytes(), err)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -536,24 +614,6 @@ void GnwFlashStorageView::DrawExtflashEditor()
     // GetOrComputePatchedExtflashSize() returns immediately (0 if still
     // running), so calling this every frame is cheap/safe now, not a
     // popen() per frame.
-    SyncImplicitExtflashRow();
-
-    SectionTitle("External Flash");
-
-    const char *size_items[10] = {
-        "1 MiB", "2 MiB", "4 MiB", "8 MiB", "16 MiB",
-        "32 MiB", "64 MiB", "128 MiB", "256 MiB", "Custom",
-    };
-    if (ImGui::Combo("Size", &m_ext_size_choice, size_items, 10)) {
-        SyncImplicitExtflashRow();
-    }
-    if (m_ext_size_choice == kExtSizeCustomIdx) {
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(100);
-        ImGui::InputInt("MiB##customsize", &m_ext_size_custom_mib);
-        m_ext_size_custom_mib = std::clamp(m_ext_size_custom_mib, 1, 256);
-    }
-
     bool ofw_available = (m_bank[0].choice != 0 && m_bank[0].choice <= 2) && m_bank[0].patch;
     ImGui::BeginDisabled(!ofw_available);
     if (ImGui::Checkbox("OFW @ 0", &m_ofw_at_zero)) {
@@ -638,16 +698,54 @@ void GnwFlashStorageView::Draw()
                         [this](const char *p) { m_bank[1].custom_path = p; });
     }
 
+    SyncImplicitExtflashRow();
+    ResolveExtflashRowSizes();
+    ImGui::Separator();
+    SectionTitle("External Flash");
+    uint64_t required = RequiredExtflashBytes();
+    const GnwNorChip *selected_chip = SelectedNorChip(m_nor_chip_key);
+    char selected_label[160];
+    snprintf(selected_label, sizeof(selected_label), "%s — %" PRIu64
+             " MiB (JEDEC %02X %02X %02X)", selected_chip->name,
+             selected_chip->size_bytes >> 20, selected_chip->jedec[0],
+             selected_chip->jedec[1], selected_chip->jedec[2]);
+    if (ImGui::BeginCombo("NOR chip", selected_label)) {
+        for (unsigned i = 0; i < GNW_NOR_CHIP_COUNT; i++) {
+            const GnwNorChip &chip = gnw_nor_chips[i];
+            char label[160];
+            snprintf(label, sizeof(label), "%s — %" PRIu64
+                     " MiB (JEDEC %02X %02X %02X)", chip.name,
+                     chip.size_bytes >> 20, chip.jedec[0], chip.jedec[1],
+                     chip.jedec[2]);
+            ImGui::BeginDisabled(chip.size_bytes < required);
+            if (ImGui::Selectable(label, m_nor_chip_key == chip.key)) {
+                m_nor_chip_key = chip.key;
+                SyncImplicitExtflashRow();
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::Text("Capacity: %" PRIu64 " MiB", selected_chip->size_bytes >> 20);
+    if (required) {
+        ImGui::SameLine();
+        ImGui::TextColored(selected_chip->size_bytes < required
+                               ? ImVec4(1, 0.3f, 0.3f, 1)
+                               : ImVec4(0.3f, 1, 0.3f, 1),
+                           "Required by blobs: %" PRIu64 " bytes", required);
+    }
+
     if (m_preset != kPresetStockMario && m_preset != kPresetStockZelda) {
-        ImGui::Separator();
         DrawExtflashEditor();
     }
 
     ImGui::Separator();
+    ImGui::BeginDisabled(RequiredExtflashBytes() > ExtflashSizeBytes());
     if (ImGui::Button("Apply")) {
         m_show_apply_confirm = true;
         ImGui::OpenPopup("Apply Flash Config");
     }
+    ImGui::EndDisabled();
 
     ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_Appearing);
     if (ImGui::BeginPopupModal("Apply Flash Config", &m_show_apply_confirm,
@@ -669,12 +767,25 @@ void GnwFlashStorageView::Draw()
                 if (ap) {
                     sdp = ap->SdPath();
                     rdp_locked = ap->rdp_locked;
+                    ap->nor_chip = m_nor_chip_key;
+                    std::string save_err;
+                    if (!g_profile_store.Save(*ap, save_err)) {
+                        m_status_msg = "Could not save NOR chip selection: " + save_err;
+                        m_status_is_error = true;
+                        ImGui::CloseCurrentPopup();
+                        ImGui::EndPopup();
+                        return;
+                    }
                 }
+                gwemu_settings_set_string(&g_config.general.extflash_chip,
+                                          m_nor_chip_key.c_str());
+                gwemu_settings_save();
                 gwemu_relaunch_with_flash_images(
                     bank1.empty() ? nullptr : bank1.c_str(),
                     bank2.empty() ? nullptr : bank2.c_str(),
                     extflash.empty() ? nullptr : extflash.c_str(),
-                    sdp.empty() ? nullptr : sdp.c_str(), rdp_locked);
+                    sdp.empty() ? nullptr : sdp.c_str(), rdp_locked,
+                    m_nor_chip_key.c_str());
                 // Only reached if the relaunch itself failed (logged by
                 // gwemu_relaunch_with_flash_images) -- old config keeps running.
                 m_status_msg = "Relaunch failed, see log; previous config still running.";

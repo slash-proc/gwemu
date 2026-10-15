@@ -14,12 +14,13 @@
 #include "../gwemu-profiles.hh"
 #include "../gwemu-sdcreate.h"
 #include "../gwemu-http.h"
+#include "hw/misc/gnw_h7b0_nor.h"
 
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <algorithm>
-#include <cfloat>
 #include <cstring>
+#include <inttypes.h>
 
 extern "C" {
 #include "../../contrib/gnw-tools/gnw_cfw_build.h"
@@ -28,7 +29,86 @@ extern "C" {
 ProfileWizard g_profile_wizard;
 
 static const uint32_t kBankSize = 0x40000u;      // 256K flash bank
-static const uint64_t kExtPadOfw = 0x4000000u;   // 64MiB, matches the CFW tool
+
+static const GnwNorChip *NorChip(const std::string &key)
+{
+    const GnwNorChip *chip = gnw_nor_chip_by_key(key.c_str());
+    return chip ? chip : gnw_nor_chip_by_key(GNW_NOR_DEFAULT_CHIP_KEY);
+}
+
+static const std::vector<const GnwNorChip *> &NorChipChoices()
+{
+    static const std::vector<const GnwNorChip *> choices = [] {
+        std::vector<const GnwNorChip *> result;
+        for (unsigned i = 0; i < GNW_NOR_CHIP_COUNT; i++) {
+            const GnwNorChip *chip = &gnw_nor_chips[i];
+            bool duplicate_model = false;
+            for (const GnwNorChip *prior : result) {
+                if (prior->size_bytes == chip->size_bytes &&
+                    prior->profile == chip->profile &&
+                    strcmp(prior->name, chip->name) == 0) {
+                    duplicate_model = true;
+                    break;
+                }
+            }
+            if (!duplicate_model) {
+                result.push_back(chip);
+            }
+        }
+        std::sort(result.begin(), result.end(), [](const GnwNorChip *a,
+                                                   const GnwNorChip *b) {
+            if (a->size_bytes != b->size_bytes) {
+                return a->size_bytes < b->size_bytes;
+            }
+            int by_name = strcmp(a->name, b->name);
+            if (by_name != 0) {
+                return by_name < 0;
+            }
+            return a->jedec[0] != b->jedec[0] ? a->jedec[0] < b->jedec[0] :
+                   a->jedec[1] != b->jedec[1] ? a->jedec[1] < b->jedec[1] :
+                                                 a->jedec[2] < b->jedec[2];
+        });
+        return result;
+    }();
+    return choices;
+}
+
+static bool PadFileToFF(const std::string &path, uint64_t capacity,
+                        std::string &err)
+{
+    GStatBuf st;
+    if (g_stat(path.c_str(), &st) != 0 || st.st_size < 0) {
+        err = "cannot stat " + path;
+        return false;
+    }
+    if ((uint64_t)st.st_size > capacity) {
+        err = path + " is larger than the selected NOR chip";
+        return false;
+    }
+    if ((uint64_t)st.st_size == capacity) return true;
+    FILE *f = g_fopen(path.c_str(), "ab");
+    if (!f) {
+        err = "cannot extend " + path;
+        return false;
+    }
+    std::vector<uint8_t> fill(1 << 20, 0xFF);
+    uint64_t left = capacity - (uint64_t)st.st_size;
+    bool ok = true;
+    while (left) {
+        size_t n = (size_t)std::min<uint64_t>(left, fill.size());
+        if (fwrite(fill.data(), 1, n, f) != n) {
+            err = "short 0xFF padding write to " + path;
+            ok = false;
+            break;
+        }
+        left -= n;
+    }
+    if (fclose(f) != 0 && ok) {
+        err = "close failed on " + path;
+        ok = false;
+    }
+    return ok;
+}
 
 static const SDL_DialogFileFilter kBinFilter[] = {
     { "Firmware images (*.bin)", "bin" },
@@ -160,6 +240,7 @@ void ProfileWizard::JoinWorker()
 
 void ProfileWizard::Open()
 {
+    m_height_fit.Reset();
     m_library.Rescan();
     g_profile_store.Scan();   // shared-SD registry may have changed
     if (m_sd_mode == SdShared) {
@@ -182,6 +263,9 @@ void ProfileWizard::Open()
         SyncStockReflection();
     }
     m_build_state.store(BuildIdle);
+    SetNorChip(g_config.general.extflash_chip && g_config.general.extflash_chip[0]
+                   ? g_config.general.extflash_chip
+                   : GNW_NOR_DEFAULT_CHIP_KEY);
     m_edit_profile_id.clear();
     m_rdp_locked = false;
     m_created_id.clear();
@@ -216,9 +300,9 @@ void ProfileWizard::OpenForEdit(const std::string &profile_id)
     m_library.Rescan();
     g_profile_store.Scan();
     m_stage = StageProfile;
+    m_height_fit.Reset();
     m_folder_chosen = false;
     m_completed = false;
-    m_content_changed = true;
     m_edit_profile_id = profile_id;
     m_rdp_locked = p->rdp_locked;
     m_s2_visited = true; // prevent EnterProfileStage defaults from overriding
@@ -243,8 +327,7 @@ void ProfileWizard::OpenForEdit(const std::string &profile_id)
     else if (p->prov_extflash == "ofw-zelda") m_ext_choice = ExtOfwZelda;
     else { m_ext_choice = ExtFile; m_ext_path = p->ExtflashPath(); }
     
-    m_ext_size_mib = (int)(p->disk_bytes >> 20); // rough estimate
-    if (m_ext_size_mib < 1) m_ext_size_mib = 64; // default
+    SetNorChip(p->nor_chip);
     
     m_sd_mode = SdNone;
     if (p->sd.mode == GwSdMode::Bundled) {
@@ -281,8 +364,10 @@ static bool copy_padded(const std::string &src, const std::string &dst,
                         uint64_t pad_to, std::string &err)
 {
     if (src == dst) {
-        // Edit-in-place: no-op to prevent truncating the file to 0.
-        return true;
+        // Editing a profile may point back at its current image. Keep it
+        // intact, while still enforcing the selected flash capacity and
+        // explicit erased-state padding.
+        return pad_to ? PadFileToFF(dst, pad_to, err) : true;
     }
 
     FILE *in = g_fopen(src.c_str(), "rb");
@@ -318,6 +403,10 @@ static bool copy_padded(const std::string &src, const std::string &dst,
     if (ok && written == 0) {
         /* An empty source would leave a pad-only image that cannot boot. */
         err = "source is empty: " + src;
+        ok = false;
+    }
+    if (ok && pad_to && written > pad_to) {
+        err = "source is larger than the selected flash region: " + src;
         ok = false;
     }
     if (ok && written < pad_to) {
@@ -408,6 +497,7 @@ bool ProfileWizard::BuildWorker(std::string &err)
     GwProfile *p = g_profile_store.Find(id);
     if (p) {
         p->rdp_locked = m_rdp_locked;
+        p->nor_chip = m_nor_chip_key;
     }
 
     bool ok = true;
@@ -427,6 +517,7 @@ bool ProfileWizard::BuildWorker(std::string &err)
                                   ResolvePatchBinary(gi).c_str(),
                                   p->Bank1Path().c_str(),
                                   p->ExtflashPath().c_str(),
+                                  NorChip(m_nor_chip_key)->size_bytes,
                                   NULL, &cerr);
         if (!ok) {
             err = cerr ? cerr : "CFW patch failed";
@@ -452,7 +543,8 @@ bool ProfileWizard::BuildWorker(std::string &err)
             ok = copy_padded(m_library.InternalPath(gi), p->Bank1Path(), kBankSize, err);
             if (ok) {
                 m_build_step.store(2);
-                ok = copy_padded(m_library.ExternalPath(gi), p->ExtflashPath(), kExtPadOfw, err);
+                ok = copy_padded(m_library.ExternalPath(gi), p->ExtflashPath(),
+                                 NorChip(m_nor_chip_key)->size_bytes, err);
             }
             p->prov_bank1 = std::string("ofw-") + game;
             p->prov_extflash = std::string("ofw-") + game;
@@ -512,11 +604,17 @@ bool ProfileWizard::BuildWorker(std::string &err)
                 break;
             }
             case ExtFile:
-                ok = copy_padded(m_ext_path, p->ExtflashPath(), 0, err);
+                ok = copy_padded(m_ext_path, p->ExtflashPath(), blank_size, err);
                 p->prov_extflash = "user-file";
                 break;
             }
         }
+    }
+
+    if (ok) {
+        m_build_step.store(3);
+        ok = PadFileToFF(p->ExtflashPath(), NorChip(m_nor_chip_key)->size_bytes,
+                         err);
     }
 
     // SD card (step 4).
@@ -781,8 +879,8 @@ bool ProfileWizard::ValidSources(std::string *why) const
         if (why) *why = "extflash: no file selected";
         return false;
     }
-    if (m_ext_choice != ExtFile && m_ext_size_mib < MinExtSizeMiB()) {
-        if (why) *why = "extflash: Zelda content needs at least 4 MiB";
+    if (NorChip(m_nor_chip_key)->size_bytes < RequiredExtflashBytes()) {
+        if (why) *why = "extflash: selected NOR chip is smaller than the image requirement";
         return false;
     }
     
@@ -805,16 +903,36 @@ bool ProfileWizard::ValidSources(std::string *why) const
     return true;
 }
 
-bool ProfileWizard::ZeldaInvolved() const
+void ProfileWizard::SetNorChip(const std::string &key)
 {
-    return m_template == TplStockZelda ||
-           m_ext_choice == ExtOfwZelda ||
-           m_bank1_choice == B1OfwZelda;
+    const GnwNorChip *chip = NorChip(key);
+    m_nor_chip_key = chip->key;
+    m_ext_size_mib = (int)(chip->size_bytes >> 20);
 }
 
-int ProfileWizard::MinExtSizeMiB() const
+uint64_t ProfileWizard::RequiredExtflashBytes() const
 {
-    return ZeldaInvolved() ? 4 : 1;
+    std::string path;
+    if (m_ext_choice == ExtOfwMario) path = m_library.ExternalPath(0);
+    else if (m_ext_choice == ExtOfwZelda) path = m_library.ExternalPath(1);
+    else if (m_ext_choice == ExtFile) path = m_ext_path;
+
+    uint64_t now = SDL_GetTicks();
+    if (path == m_required_extflash_path &&
+        now - m_required_extflash_check_ms < 1000) {
+        return m_required_extflash_bytes;
+    }
+
+    m_required_extflash_path = path;
+    m_required_extflash_check_ms = now;
+    m_required_extflash_bytes = 0;
+    if (!path.empty()) {
+        GStatBuf st;
+        if (g_stat(path.c_str(), &st) == 0 && st.st_size > 0) {
+            m_required_extflash_bytes = (uint64_t)st.st_size;
+        }
+    }
+    return m_required_extflash_bytes;
 }
 
 // While a stock template is active the Bank Assignments accordion is a
@@ -826,17 +944,12 @@ void ProfileWizard::SyncStockReflection()
         m_bank1_choice = B1OfwMario;
         m_bank2_choice = B2Blank;
         m_ext_choice = ExtOfwMario;
-        m_ext_size_mib = 64;
         m_patched = true;   // assumed case, incl. Stock Mario (owner call)
     } else if (m_template == TplStockZelda) {
         m_bank1_choice = B1OfwZelda;
         m_bank2_choice = B2Blank;
         m_ext_choice = ExtOfwZelda;
-        m_ext_size_mib = 64;
         m_patched = true;   // assumed case (owner call)
-    }
-    if (m_ext_size_mib < MinExtSizeMiB()) {
-        m_ext_size_mib = MinExtSizeMiB();
     }
 }
 
@@ -981,13 +1094,14 @@ void ProfileWizard::DrawGameCard(int gi, float w)
     }
 
     ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImVec2 size(w, GNW_CARD_H * sc);
+    ImVec2 size(w, 76 * sc);
     ImVec2 end(pos.x + size.x, pos.y + size.y);
     ImDrawList *dl = ImGui::GetWindowDrawList();
-    float r = GNW_RADIUS_CARD * sc;
-    float pad = GNW_PAD_CARD * sc;
+    float r = 10 * sc;
+    float pad = 14 * sc;
 
-    ImVec4 border = GNW_COL_CARD_BORDER;
+    ImVec4 card_bg(0.125f, 0.14f, 0.135f, 1.0f);
+    ImVec4 border(0.25f, 0.29f, 0.27f, 0.9f);
     border.w = 0.5f;
     if (st == kCardComplete) {
         border = GNW_COL_ACCENT_DIM;
@@ -996,7 +1110,7 @@ void ProfileWizard::DrawGameCard(int gi, float w)
         border = GNW_COL_WARN;
         border.w = 0.4f;
     }
-    dl->AddRectFilled(pos, end, ImGui::GetColorU32(GNW_COL_CARD_BG), r);
+    dl->AddRectFilled(pos, end, ImGui::GetColorU32(card_bg), r);
     if (st == kCardComplete) {
         ImVec4 wash = GNW_COL_ACCENT_WASH;
         wash.w *= lit;
@@ -1071,9 +1185,10 @@ void ProfileWizard::DrawFirmwareStage()
 
     ImGui::PushFont(g_font_mgr.m_menu_font_medium);
     const char *title = "Add official firmware";
-    ImGui::SetCursorPosX((win_w - ImGui::CalcTextSize(title).x) * 0.5f);
     ImGui::TextUnformatted(title);
     ImGui::PopFont();
+    ImGui::Dummy(ImVec2(0, 6 * sc));
+    ImGui::Separator();
     ImGui::Dummy(ImVec2(0, GNW_GAP_SECTION * sc));
 
     if (m_stage == StageFwPrompt) {
@@ -1183,38 +1298,68 @@ void ProfileWizard::DrawFirmwareStrip()
 }
 
 
-// Width of the shared right-hand column in Bank Assignments -- Patched
-// checkbox (row 1) and the size stepper (row 3) both live in it, and all
-// three combos end where it begins (owner call: uniform widths, vertical
-// alignment).
-static float kRightColW()
+// Width reserved at the right of Bank Assignments for the Patched
+// checkbox; the bank selectors share the same left edge and width.
+// Source rows use a fixed-width selector and let the path consume the
+// remaining space. This keeps the action button beside a readable path
+// without allowing the source combo to dominate the row.
+static void DrawWizardFileField(const char *str_id, const char *current_path,
+                                const SDL_DialogFileFilter *filters,
+                                int nfilters, float width,
+                                std::function<void(const char *)> on_select)
 {
-    return 150.0f * g_viewport_mgr.m_scale;
+    float sc = g_viewport_mgr.m_scale;
+    ImGui::PushID(str_id);
+    ImGui::BeginGroup();
+    ImGui::TextDisabled(ICON_FA_FILE);
+    ImGui::SameLine(0, 4 * sc);
+
+    bool has_path = current_path && *current_path;
+    const char *path = has_path ? current_path : "(no file)";
+    float button_w = ImGui::CalcTextSize("Change...").x +
+                     ImGui::GetStyle().FramePadding.x * 2 + 2 * sc;
+    float text_w = width - ImGui::CalcTextSize(ICON_FA_FILE).x -
+                   4 * sc - button_w - ImGui::GetStyle().ItemSpacing.x;
+    std::string display = EllipsizeMiddle(path, std::max(24 * sc, text_w));
+    ImGui::TextDisabled("%s", display.c_str());
+    if (ImGui::IsItemHovered() && has_path) {
+        ImGui::SetTooltip("%s", path);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Change...")) {
+        ShowOpenFileDialog(filters, nfilters, current_path, on_select);
+    }
+    ImGui::EndGroup();
+    ImGui::PopID();
 }
 
-bool ProfileWizard::DrawExtSizeStepper()
+void ProfileWizard::DrawNorChipSelector(float width)
 {
-    bool changed = false;
-    int min_mib = MinExtSizeMiB();
-    if (m_ext_size_mib < min_mib) {
-        m_ext_size_mib = min_mib;
+    const GnwNorChip *selected = NorChip(m_nor_chip_key);
+    char preview[128];
+    snprintf(preview, sizeof(preview), "%" PRIu64 " MiB (%s)",
+             selected->size_bytes >> 20, selected->name);
+
+    const auto &choices = NorChipChoices();
+    ImGui::SetNextItemWidth(width);
+    if (ImGui::BeginCombo("##nor_chip", preview,
+                          ImGuiComboFlags_HeightLargest)) {
+        uint64_t required = RequiredExtflashBytes();
+        for (const GnwNorChip *chip : choices) {
+            char label[128];
+            snprintf(label, sizeof(label), "%" PRIu64 " MiB (%s)",
+                     chip->size_bytes >> 20, chip->name);
+            ImGui::BeginDisabled(chip->size_bytes < required);
+            bool same_part = selected->size_bytes == chip->size_bytes &&
+                             selected->profile == chip->profile &&
+                             strcmp(selected->name, chip->name) == 0;
+            if (ImGui::Selectable(label, same_part)) {
+                SetNorChip(chip->key);
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
     }
-    ImGui::BeginDisabled(m_ext_size_mib <= min_mib);
-    if (ImGui::Button("-##extsize")) {
-        m_ext_size_mib = std::max(min_mib, m_ext_size_mib / 2);
-        changed = true;
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::Text("%d MiB", m_ext_size_mib);
-    ImGui::SameLine();
-    ImGui::BeginDisabled(m_ext_size_mib >= 256);
-    if (ImGui::Button("+##extsize")) {
-        m_ext_size_mib = std::min(256, m_ext_size_mib * 2);
-        changed = true;
-    }
-    ImGui::EndDisabled();
-    return changed;
 }
 
 void ProfileWizard::DrawBankAssignments()
@@ -1227,7 +1372,9 @@ void ProfileWizard::DrawBankAssignments()
         ImGui::SetNextItemOpen(false);
         m_close_assignments_next = false;
     }
+    ImGui::PushFont(g_font_mgr.m_menu_font_medium);
     m_assignments_open = ImGui::CollapsingHeader("Flash");
+    ImGui::PopFont();
     if (!m_assignments_open) {
         return;
     }
@@ -1241,9 +1388,13 @@ void ProfileWizard::DrawBankAssignments()
 
     ImGui::Indent();
 
+    const float scale = g_viewport_mgr.m_scale;
+    const float label_width = 120 * scale;
+    const float source_width = 180 * scale;
+
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Bank 1");
-    ImGui::SameLine(120 * g_viewport_mgr.m_scale);
+    ImGui::SameLine(label_width);
     // OFW entries appear only when found+verified in the backup library
     // -- mirror of the hidden-until-available stock templates.
     struct B1Item { const char *label; int choice; };
@@ -1258,7 +1409,7 @@ void ProfileWizard::DrawBankAssignments()
         if (b1_items[i].choice == m_bank1_choice) b1_sel = i;
     }
     bool b1_show_patch = Bank1Game() >= 0;
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
+    ImGui::SetNextItemWidth(source_width);
     if (ImGui::BeginCombo("##b1", b1_items[b1_sel].label)) {
         for (int i = 0; i < b1_n; i++) {
             if (ImGui::Selectable(b1_items[i].label, i == b1_sel)) {
@@ -1294,7 +1445,7 @@ void ProfileWizard::DrawBankAssignments()
         ImGui::EndCombo();
     }
     if (b1_show_patch) {
-        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
+        ImGui::SameLine(0, 12 * scale);
         // Deliberately NOT part of `changed`: toggling Patched on a
         // stock template is still that stock template (patched stock is
         // a first-class stock flavor), it must not flip to Custom.
@@ -1320,16 +1471,17 @@ void ProfileWizard::DrawBankAssignments()
         }
     }
     if (m_bank1_choice == B1File) {
-        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
-        InlineFileField("##b1file", m_bank1_path.c_str(), kBinFilter, 2, false,
-                        [this](const char *p) { m_bank1_path = p; });
+        ImGui::SameLine(0, 10 * scale);
+        DrawWizardFileField("##b1file", m_bank1_path.c_str(), kBinFilter, 2,
+                            ImGui::GetContentRegionAvail().x,
+                            [this](const char *p) { m_bank1_path = p; });
     }
 
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Bank 2");
-    ImGui::SameLine(120 * g_viewport_mgr.m_scale);
+    ImGui::SameLine(label_width);
     const char *b2_items[] = { "Empty", "File..." };
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
+    ImGui::SetNextItemWidth(source_width);
     if (ImGui::BeginCombo("##b2", b2_items[m_bank2_choice])) {
         for (int i = 0; i < 2; i++) {
             if (ImGui::Selectable(b2_items[i], i == m_bank2_choice)) {
@@ -1346,14 +1498,15 @@ void ProfileWizard::DrawBankAssignments()
         ImGui::EndCombo();
     }
     if (m_bank2_choice == B2File) {
-        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
-        InlineFileField("##b2file", m_bank2_path.c_str(), kBinFilter, 2, false,
-                        [this](const char *p) { m_bank2_path = p; });
+        ImGui::SameLine(0, 10 * scale);
+        DrawWizardFileField("##b2file", m_bank2_path.c_str(), kBinFilter, 2,
+                            ImGui::GetContentRegionAvail().x,
+                            [this](const char *p) { m_bank2_path = p; });
     }
 
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Extflash");
-    ImGui::SameLine(120 * g_viewport_mgr.m_scale);
+    ImGui::SameLine(label_width);
     // Enum-keyed filtered list, same pattern as Bank 1 -- game-assets
     // entries appear only when that game's extflash dump exists.
     struct ExtItem { const char *label; int choice; };
@@ -1367,8 +1520,13 @@ void ProfileWizard::DrawBankAssignments()
     for (int i = 0; i < ext_n; i++) {
         if (ext_items[i].choice == m_ext_choice) ext_sel = i;
     }
-    // Leave room for the inline size stepper on the same row (owner call).
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
+    float combo_gap = 10 * scale;
+    float row_start = ImGui::GetCursorPosX() - label_width;
+    float row_width = ImGui::GetWindowContentRegionMax().x - row_start;
+    float nor_width = std::min(270 * scale, row_width * 0.34f);
+    float nor_x = row_start + row_width - nor_width;
+    float ext_width = 175 * scale;
+    ImGui::SetNextItemWidth(ext_width);
     if (ImGui::BeginCombo("##ext", ext_items[ext_sel].label)) {
         for (int i = 0; i < ext_n; i++) {
             if (ImGui::Selectable(ext_items[i].label, i == ext_sel)) {
@@ -1385,21 +1543,19 @@ void ProfileWizard::DrawBankAssignments()
         ImGui::EndCombo();
     }
     if (m_ext_choice == ExtFile) {
-        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
-        InlineFileField("##extfile", m_ext_path.c_str(), kBinFilter, 2, false,
-                        [this](const char *p) { m_ext_path = p; });
-    } else {
-        ImGui::SameLine(0, 10 * g_viewport_mgr.m_scale);
-        changed |= DrawExtSizeStepper();
+        ImGui::SameLine(0, combo_gap);
+        float path_width = std::max(80 * scale,
+            nor_x - ImGui::GetCursorPosX() - combo_gap);
+        DrawWizardFileField("##extfile", m_ext_path.c_str(), kBinFilter, 2,
+                            path_width,
+                            [this](const char *p) { m_ext_path = p; });
     }
-
+    ImGui::SameLine(nor_x);
+    DrawNorChipSelector(nor_width);
     ImGui::Unindent();
 
     if (changed && m_template != TplCustom) {
         m_template = TplCustom;
-    }
-    if (changed && m_ext_size_mib < MinExtSizeMiB()) {
-        m_ext_size_mib = MinExtSizeMiB();
     }
 }
 
@@ -1445,7 +1601,9 @@ void ProfileWizard::DrawSdSection()
         break;
     }
 
+    ImGui::PushFont(g_font_mgr.m_menu_font_medium);
     m_sd_open = ImGui::CollapsingHeader("SD Card");
+    ImGui::PopFont();
 
     // Right-aligned summary on the header line itself.
     {
@@ -1485,7 +1643,7 @@ void ProfileWizard::DrawSdSection()
         m_sd_mode == SdNone   ? "None" :
         m_sd_mode == SdNew    ? "New card" :
         m_sd_mode == SdImport ? "File..." : "Shared card...";
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
+    ImGui::SetNextItemWidth(190 * sc);
     if (ImGui::BeginCombo("##sdmode", mode_label)) {
         if (ImGui::Selectable("None", m_sd_mode == SdNone)) {
             m_sd_mode = SdNone;
@@ -1547,8 +1705,10 @@ void ProfileWizard::DrawSdSection()
         ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight()));
     } else if (m_sd_mode == SdImport) {
         ImGui::SameLine(0, 10 * sc);
-        InlineFileField("##sdimport", m_sd_import_path.c_str(), kQcow2Filter, 2, false,
-                        [this](const char *p) { m_sd_import_path = p; });
+        DrawWizardFileField("##sdimport", m_sd_import_path.c_str(),
+                            kQcow2Filter, 2,
+                            ImGui::GetContentRegionAvail().x,
+                            [this](const char *p) { m_sd_import_path = p; });
 
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Transfer");
@@ -1574,7 +1734,7 @@ void ProfileWizard::DrawSdSection()
             // Mode armed but registry emptied mid-session: disabled combo
             // + hint; Open() falls back to None next time.
             ImGui::BeginDisabled();
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
+            ImGui::SetNextItemWidth(360 * sc);
             if (ImGui::BeginCombo("##sdshared", "(no shared cards)")) {
                 ImGui::EndCombo();
             }
@@ -1597,7 +1757,7 @@ void ProfileWizard::DrawSdSection()
                     cur = entry(s);
                 }
             }
-            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - kRightColW());
+            ImGui::SetNextItemWidth(360 * sc);
             if (ImGui::BeginCombo("##sdshared", cur.c_str())) {
                 for (const GwSharedSd *s : shareable) {
                     if (ImGui::Selectable(entry(s).c_str(),
@@ -1617,18 +1777,17 @@ void ProfileWizard::DrawSdSection()
 
 void ProfileWizard::DrawForm()
 {
-    // Name -- single line, label + field.
+    // Keep identity controls together: the profile name gets the flexible
+    // space, while the lock toggle stays visible at the right.
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Name");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(-FLT_MIN);
+    float lock_width = 100 * g_viewport_mgr.m_scale;
+    ImGui::SetNextItemWidth(std::max(120 * g_viewport_mgr.m_scale,
+        ImGui::GetContentRegionAvail().x - lock_width));
     ImGui::InputTextWithHint("##name", m_name_hint.c_str(), m_name, sizeof(m_name));
-
-    ImGui::Spacing();
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted("Locked:");
     ImGui::SameLine();
-    ImGui::Checkbox("##profile_locked", &m_rdp_locked);
+    ImGui::Checkbox("Locked", &m_rdp_locked);
 
     ImGui::Spacing();
     DrawFirmwareStrip();
@@ -1636,8 +1795,11 @@ void ProfileWizard::DrawForm()
     ImGui::Separator();
     ImGui::Spacing();
 
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushFont(g_font_mgr.m_menu_font_medium);
     ImGui::TextUnformatted("Template");
-    ImGui::Spacing();
+    ImGui::PopFont();
+    ImGui::SameLine(120 * g_viewport_mgr.m_scale);
     // Order (owner call): Mario, Zelda, Custom last. Stock entries are
     // hidden entirely (not disabled) until that game's dumps are
     // found+verified -- the backup-folder row above is how users make
@@ -1648,7 +1810,17 @@ void ProfileWizard::DrawForm()
         if (!avail) {
             continue;
         }
-        if (ImGui::RadioButton(stock_names[i], m_template == i)) {
+        bool selected = m_template == i;
+        if (selected) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.34f, 0.17f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.42f, 0.21f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, GNW_COL_ACCENT_ACTIVE);
+        }
+        bool clicked = ImGui::Button(stock_names[i]);
+        if (selected) {
+            ImGui::PopStyleColor(3);
+        }
+        if (clicked) {
             if (m_template != i) {
                 m_close_assignments_next = true;
                 // Also collapse the SD section (but NEVER reset SD state
@@ -1658,15 +1830,25 @@ void ProfileWizard::DrawForm()
             m_template = i;
             SyncStockReflection();
         }
+        ImGui::SameLine(0, 8 * g_viewport_mgr.m_scale);
     }
-    if (ImGui::RadioButton("Custom", m_template == TplCustom)) {
+    bool custom_selected = m_template == TplCustom;
+    if (custom_selected) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.34f, 0.17f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.42f, 0.21f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, GNW_COL_ACCENT_ACTIVE);
+    }
+    bool custom_clicked = ImGui::Button("Custom");
+    if (custom_selected) {
+        ImGui::PopStyleColor(3);
+    }
+    if (custom_clicked) {
         if (m_template != TplCustom) {
             m_open_assignments_next = true;
         }
         m_template = TplCustom;
     }
 
-    ImGui::Spacing();
     DrawBankAssignments();
     DrawSdSection();
 }
@@ -1699,7 +1881,8 @@ void ProfileWizard::DrawBuildView()
                                                  p->Bank2Path().c_str(),
                                                  p->ExtflashPath().c_str(),
                                                  sdp.empty() ? NULL : sdp.c_str(),
-                                                 p->rdp_locked);
+                                                 p->rdp_locked,
+                                                 p->nor_chip.c_str());
             }
         }
         ImGui::SameLine();
@@ -1731,7 +1914,8 @@ void ProfileWizard::Draw()
     // gwemu_settings_hud_update) -- fill that window edge to edge, with a
     // healthy uniform content margin (owner call: left-aligned content,
     // never hugging the edges).
-    float pad = 28 * g_viewport_mgr.m_scale;
+    float sc = g_viewport_mgr.m_scale;
+    float pad = 30 * sc;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
     ImGuiIO &io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
@@ -1748,6 +1932,30 @@ void ProfileWizard::Draw()
         return;
     }
 
+    // A wizard-local theme: softer surfaces, outlined controls, roomier
+    // hit targets and a restrained green accent. The rest of the settings
+    // UI keeps its existing palette.
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(9 * sc, 6 * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10 * sc, 6 * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2(7 * sc, 5 * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 7 * sc);
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabRounding, 7 * sc);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.75f * sc);
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, ImVec4(0.72f, 0.76f, 0.73f, 0.72f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.28f, 0.32f, 0.29f, 0.72f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.145f, 0.155f, 0.15f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.19f, 0.22f, 0.20f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.18f, 0.29f, 0.18f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.17f, 0.16f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.31f, 0.20f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, GNW_COL_ACCENT_ACTIVE);
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.145f, 0.19f, 0.15f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.18f, 0.27f, 0.18f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.20f, 0.34f, 0.20f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.36f, 0.40f, 0.37f, 0.42f));
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, GNW_COL_ACCENT);
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogramHovered, GNW_COL_ACCENT_HOVER);
+
     bool building = m_build_state.load() != BuildIdle;
     bool fw_stage = !building && m_stage != StageProfile;
     if (fw_stage) {
@@ -1756,7 +1964,9 @@ void ProfileWizard::Draw()
         ImGui::PushFont(g_font_mgr.m_menu_font_medium);
         ImGui::TextUnformatted("New Device Profile");
         ImGui::PopFont();
-        ImGui::Dummy(ImVec2(0, 10 * g_viewport_mgr.m_scale));
+        ImGui::Dummy(ImVec2(0, 8 * sc));
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, 4 * sc));
         if (building) {
             DrawBuildView();
         } else {
@@ -1764,45 +1974,16 @@ void ProfileWizard::Draw()
         }
     }
 
-    // Natural height of everything above the bottom row, BEFORE any
-    // pinning -- the host resizes the OS window toward
-    // DesiredHeight(), which is what makes "never scrolls, never
-    // clips" hold.
+    // Natural height of everything above the bottom row, before the footer
+    // is pinned. Measuring the rendered cursor catches every conditional row
+    // (including SD Card modes) without duplicating their state in a layout
+    // signature.
     float content_bottom = ImGui::GetCursorPosY();
     float reason_h = ImGui::GetTextLineHeightWithSpacing();
     float btn_h = ImGui::GetFrameHeightWithSpacing();
-    m_desired_h = content_bottom + reason_h + btn_h +
-                  (28 * g_viewport_mgr.m_scale);
-
-    // Layout signature: the discrete states that legitimately change the
-    // natural height. The host resizes only when this changes -- never
-    // from per-frame height deltas (which fought user drag-resizes and
-    // compositor size grants, degrading the window over time).
-    unsigned sig = (unsigned)m_template |
-                   ((unsigned)m_assignments_open << 3) |
-                   ((unsigned)(m_build_state.load() != BuildIdle) << 4) |
-                   ((unsigned)m_patched << 5) |
-                   ((unsigned)m_bank1_choice << 6) |
-                   ((unsigned)m_bank2_choice << 9) |
-                   ((unsigned)m_ext_choice << 11) |
-                   ((unsigned)((int)(m_desired_h / 24)) << 16);
-    // Stage + card states also change the natural layout (hash-combined
-    // rather than shifted -- the height field above uses the high bits).
-    sig ^= (unsigned)m_stage * 0x9E3779B9u;
-    // SD section states that change the natural height.
-    unsigned sd_sig = (unsigned)m_sd_open |
-                      ((unsigned)m_sd_mode << 1) |
-                      ((unsigned)m_sd_storage << 3) |
-                      ((unsigned)m_sd_transfer << 4) |
-                      ((unsigned)!m_sd_import_path.empty() << 5) |
-                      ((unsigned)ShareableSds().size() << 6);
-    sig ^= sd_sig * 0x27D4EB2Fu;
-    sig ^= (unsigned)GnwCardStateOf(m_library.status[0]) * 0x85EBCA6Bu;
-    sig ^= (unsigned)GnwCardStateOf(m_library.status[1]) * 0xC2B2AE35u;
-    if (sig != m_last_sig) {
-        m_last_sig = sig;
-        m_content_changed = true;
-    }
+    float footer_gap = 8 * sc + ImGui::GetStyle().ItemSpacing.y;
+    float required_height = content_bottom + footer_gap + reason_h + btn_h + pad;
+    m_height_fit.Observe(required_height, SDL_GetTicks());
 
     // Bottom row: Cancel (left) / Create (right), pinned to the window
     // bottom. Cancel = skip into the normal settings menu (the host
@@ -1811,18 +1992,17 @@ void ProfileWizard::Draw()
         // Firmware-stage bottom row: [Skip] left; right = the single
         // accent element (Select folder... on S1a, Continue on S1b once
         // at least one card is Complete).
-        float sc = g_viewport_mgr.m_scale;
-        float y = ImGui::GetWindowHeight() - btn_h -
-                  (28 * g_viewport_mgr.m_scale);
+        float y = ImGui::GetWindowHeight() - btn_h - pad;
         if (ImGui::GetCursorPosY() < y) {
+            ImGui::SetCursorPosY(y - 8 * sc);
+            ImGui::Separator();
             ImGui::SetCursorPosY(y);
         }
         if (ImGui::Button("Skip", ImVec2(110 * sc, 0))) {
             EnterProfileStage();
         }
         float bw = 160 * sc;
-        ImGui::SameLine(ImGui::GetWindowWidth() - bw -
-                        (28 * g_viewport_mgr.m_scale));
+        ImGui::SameLine(ImGui::GetWindowWidth() - bw - pad);
         if (m_stage == StageFwPrompt) {
             m_focus_continue = false;
             PushAccentButton();
@@ -1847,9 +2027,10 @@ void ProfileWizard::Draw()
             }
         }
     } else if (!building) {
-        float y = ImGui::GetWindowHeight() - btn_h -
-                  (28 * g_viewport_mgr.m_scale);
+        float y = ImGui::GetWindowHeight() - btn_h - pad;
         if (ImGui::GetCursorPosY() < y) {
+            ImGui::SetCursorPosY(y - 8 * sc);
+            ImGui::Separator();
             ImGui::SetCursorPosY(y);
         }
         if (ImGui::Button("Cancel", ImVec2(110 * g_viewport_mgr.m_scale, 0))) {
@@ -1857,23 +2038,29 @@ void ProfileWizard::Draw()
         }
         std::string why;
         bool can_create = ValidSources(&why);
-        float create_w = 110 * g_viewport_mgr.m_scale;
-        ImGui::SameLine(ImGui::GetWindowWidth() - create_w -
-                        (28 * g_viewport_mgr.m_scale));
+        float create_w = 120 * sc;
+        ImGui::SameLine(ImGui::GetWindowWidth() - create_w - pad);
         ImGui::BeginDisabled(!can_create);
+        if (can_create) {
+            PushAccentButton();
+        }
         if (ImGui::Button("Create", ImVec2(create_w, 0))) {
             StartBuild();
+        }
+        if (can_create) {
+            PopAccentButton();
         }
         ImGui::EndDisabled();
         if (!can_create) {
             // Reason, subtle, right-aligned above the button row.
             ImVec2 sz = ImGui::CalcTextSize(why.c_str());
-            ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - sz.x -
-                                           (28 * g_viewport_mgr.m_scale),
+            ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() - sz.x - pad,
                                        y - ImGui::GetTextLineHeightWithSpacing()));
             ImGui::TextDisabled("%s", why.c_str());
         }
     }
 
+    ImGui::PopStyleColor(14);
+    ImGui::PopStyleVar(6);
     ImGui::End();
 }

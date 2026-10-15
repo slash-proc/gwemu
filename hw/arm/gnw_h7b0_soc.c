@@ -42,6 +42,7 @@
 #include "hw/misc/unimp.h"
 #include "hw/misc/gnw_h7b0_regs_rcc.h"
 #include "target/arm/cpu.h"
+#include "hw/misc/gnw_h7b0_nor.h"
 
 /* GnWManager's Zelda payload is placed at 0x30c3a8. Save that span plus the
  * 1,300-byte ITCM validation window; Mario's payload is at offset zero. */
@@ -256,6 +257,59 @@ static void gnw_h7b0_soc_initfn(Object *obj)
     s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
 }
 
+/* Extend a flash image explicitly with the erased NOR value, never sparse
+ * zero-filled bytes. Images larger than the physical region are rejected
+ * instead of silently hiding their tail behind the guest mapping.
+ */
+static bool gnw_h7b0_prepare_flash_image(const char *path, uint64_t size,
+                                         Error **errp)
+{
+    FILE *f = g_fopen(path, "r+b");
+    uint8_t fill[64 * 1024];
+    long current;
+
+    if (!f) {
+        f = g_fopen(path, "w+b");
+    }
+    if (!f) {
+        error_setg_errno(errp, errno, "cannot open flash image '%s'", path);
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (current = ftell(f)) < 0) {
+        error_setg_errno(errp, errno, "cannot determine size of flash image '%s'",
+                         path);
+        fclose(f);
+        return false;
+    }
+    if ((uint64_t)current > size) {
+        error_setg(errp, "flash image '%s' is %ld bytes, larger than the "
+                   "selected region (%" PRIu64 " bytes)", path, current, size);
+        fclose(f);
+        return false;
+    }
+    if ((uint64_t)current < size) {
+        memset(fill, 0xFF, sizeof(fill));
+        while ((uint64_t)current < size) {
+            size_t n = MIN((uint64_t)sizeof(fill), size - (uint64_t)current);
+            if (fwrite(fill, 1, n, f) != n) {
+                error_setg_errno(errp, errno, "cannot pad flash image '%s' with 0xFF",
+                                 path);
+                fclose(f);
+                return false;
+            }
+            current += n;
+        }
+        if (fflush(f) != 0) {
+            error_setg_errno(errp, errno, "cannot flush padded flash image '%s'",
+                             path);
+            fclose(f);
+            return false;
+        }
+    }
+    fclose(f);
+    return true;
+}
+
 /*
  * Backs `field` directly by `image_path` (created/truncated to `size` if it
  * doesn't already exist yet) when non-NULL/non-empty, so guest writes land
@@ -350,22 +404,20 @@ static bool gnw_h7b0_init_ram_or_file(MemoryRegion *mr, Object *owner,
                                        const char *image_path, Error **errp)
 {
     if (image_path != NULL && image_path[0] != '\0') {
-        /*
-         * Both backends below silently create the file (and extend a short
-         * one) as a hole of zeros. Booting blank flash is legitimate -- the
-         * machine then just resets in a loop until a debugger flashes it,
-         * exactly like real hardware -- but silently manufacturing a
-         * profile's missing image is worth a word, since "my device went
-         * blank" is otherwise indistinguishable from a lost file.
-         */
-        struct stat st;
-        if (stat(image_path, &st) != 0) {
-            info_report("%s: flash image \"%s\" does not exist yet -- "
-                        "creating it blank", name, image_path);
-        } else if ((uint64_t)st.st_size < size) {
-            info_report("%s: flash image \"%s\" is %" PRIu64 " bytes, shorter "
-                        "than the %" PRIu64 "-byte region -- extending it",
-                        name, image_path, (uint64_t)st.st_size, size);
+        /* Prepare explicitly because both the POSIX mmap backend and
+         * Windows file extension otherwise expose new bytes as zeros. */
+        struct stat before;
+        bool existed = stat(image_path, &before) == 0;
+        if (!gnw_h7b0_prepare_flash_image(image_path, size, errp)) {
+            return false;
+        }
+        if (!existed) {
+            info_report("%s: created blank flash image '%s' with 0xFF contents",
+                        name, image_path);
+        } else if ((uint64_t)before.st_size < size) {
+            info_report("%s: padded flash image '%s' from %" PRIu64
+                        " to %" PRIu64 " bytes with 0xFF",
+                        name, image_path, (uint64_t)before.st_size, size);
         }
 #ifdef CONFIG_POSIX
         return memory_region_init_ram_from_file(mr, owner, name, size, 0,
@@ -381,7 +433,10 @@ static bool gnw_h7b0_init_ram_or_file(MemoryRegion *mr, Object *owner,
 #endif
     }
     memory_region_init_ram(mr, owner, name, size, errp);
-    return *errp == NULL;
+    if (!errp || *errp == NULL) {
+        memset(memory_region_get_ram_ptr(mr), 0xFF, size);
+    }
+    return !errp || *errp == NULL;
 }
 
 static uint8_t *gnw_h7b0_load_unlock_baseline(const char *image_path,
@@ -439,6 +494,15 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     MemoryRegion *system_memory = get_system_memory();
     DeviceState *armv7m;
     Error *err = NULL;
+    const GnwNorChip *nor_chip = gnw_nor_chip_by_key(
+        s->extflash_chip ? s->extflash_chip : GNW_NOR_DEFAULT_CHIP_KEY);
+
+    if (!nor_chip) {
+        error_setg(errp, "unknown extflash chip '%s'",
+                   s->extflash_chip ? s->extflash_chip : "(null)");
+        return;
+    }
+    s->extflash_size = nor_chip->size_bytes;
 
     if (!clock_has_source(s->sysclk)) {
         error_setg(errp, "sysclk clock must be wired up by the board code");
@@ -500,7 +564,7 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
                              FLASH_BANK2_BASE_ADDRESS, FLASH_BANK_SIZE,
                              s->bank2_image);
     INIT_RAM_OR_FILE_REGION(extflash, "GNW_H7B0.extflash", EXTFLASH_BASE_ADDRESS,
-                             EXTFLASH_SIZE, s->extflash_image);
+                             s->extflash_size, s->extflash_image);
     INIT_RAM_REGION(uid, "GNW_H7B0.uid", UID_BASE_ADDRESS, UID_SIZE);
 
     /*
@@ -683,13 +747,11 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->pwr), 0, PWR_BASE_ADDRESS);
 
-    /*
-     * flash-size ties the OSPI device's synthetic JEDEC/SFDP identity
-     * to the same 64M placeholder EXTFLASH_SIZE uses for the
-     * memory-mapped XIP window below, so density reported over the
-     * command protocol and the actual backing region size agree.
-     */
-    qdev_prop_set_uint64(DEVICE(&s->octospi1), "flash-size", EXTFLASH_SIZE);
+    /* Keep the JEDEC/SFDP identity, command profile and XIP backing size
+     * tied to the single chip selected by gwemu. */
+    qdev_prop_set_uint64(DEVICE(&s->octospi1), "flash-size", s->extflash_size);
+    qdev_prop_set_uint32(DEVICE(&s->octospi1), "chip-index",
+                         (uint32_t)(nor_chip - gnw_nor_chips));
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->octospi1), errp)) {
         return;
     }
@@ -712,9 +774,11 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      * window availability" comment in gnw_h7b0_ospi.c.
      */
     gnw_h7b0_ospi_set_xip_window(&s->octospi1, system_memory,
-                                  EXTFLASH_BASE_ADDRESS, EXTFLASH_SIZE);
+                                  EXTFLASH_BASE_ADDRESS, s->extflash_size);
 
-    qdev_prop_set_uint64(DEVICE(&s->octospi2), "flash-size", EXTFLASH_SIZE);
+    qdev_prop_set_uint64(DEVICE(&s->octospi2), "flash-size", s->extflash_size);
+    qdev_prop_set_uint32(DEVICE(&s->octospi2), "chip-index",
+                         (uint32_t)(nor_chip - gnw_nor_chips));
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->octospi2), errp)) {
         return;
     }
@@ -850,14 +914,14 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->otfdec1), 0, OTFDEC1_BASE_ADDRESS);
     gnw_h7b0_otfdec_set_extflash(&s->otfdec1, system_memory, &s->extflash,
-                                  EXTFLASH_BASE_ADDRESS, EXTFLASH_SIZE);
+                                  EXTFLASH_BASE_ADDRESS, s->extflash_size);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->otfdec2), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->otfdec2), 0, OTFDEC2_BASE_ADDRESS);
     gnw_h7b0_otfdec_set_extflash(&s->otfdec2, system_memory, &s->extflash,
-                                  EXTFLASH_BASE_ADDRESS, EXTFLASH_SIZE);
+                                  EXTFLASH_BASE_ADDRESS, s->extflash_size);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->cryp), errp)) {
         return;
@@ -1038,6 +1102,7 @@ static const Property gnw_h7b0_soc_properties[] = {
     DEFINE_PROP_STRING("bank1-image", GnwH7B0State, bank1_image),
     DEFINE_PROP_STRING("bank2-image", GnwH7B0State, bank2_image),
     DEFINE_PROP_STRING("extflash-image", GnwH7B0State, extflash_image),
+    DEFINE_PROP_STRING("extflash-chip", GnwH7B0State, extflash_chip),
     DEFINE_PROP_STRING("rdp-image", GnwH7B0State, rdp_image),
     DEFINE_PROP_BOOL("rdp-locked", GnwH7B0State, rdp_locked, false),
 };

@@ -26,17 +26,22 @@
 #define GNW_BOOT_IMAGES_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /*
  * Builds backup/qemu-images/<game>-{bank1,bank2,extflash}.bin from
  * backup/internal_flash_backup_<game>.bin and backup/flash_backup_<game>.bin,
- * 0xFF-padded to FLASH_BANK_SIZE/EXTFLASH_SIZE (read from
- * include/hw/arm/gnw_h7b0_soc.h at repo_root).
+ * 0xFF-padded to FLASH_BANK_SIZE and the default extflash capacity.
  *
  * On failure, returns false and (if error_msg is non-NULL) sets *error_msg
  * to a malloc'd, caller-owned human-readable message (free() it).
  */
 bool gnw_make_boot_images(const char *game, const char *repo_root,
                            char **error_msg);
+
+/* Same operation with an explicit selected NOR capacity. */
+bool gnw_make_boot_images_for_size(const char *game, const char *repo_root,
+                                    uint64_t extflash_size,
+                                    char **error_msg);
 
 #endif

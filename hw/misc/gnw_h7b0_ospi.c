@@ -28,6 +28,7 @@
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "hw/misc/gnw_h7b0_ospi.h"
+#include "hw/misc/gnw_h7b0_nor.h"
 #include "hw/misc/gnw_h7b0_regs_ospi.h"
 #include "hw/misc/gnw_h7b0_stub_log.h"
 
@@ -259,24 +260,100 @@ static uint8_t ospi_sfdp_byte(GnwH7B0OspiState *s, uint32_t off)
     return 0;
 }
 
+static const GnwNorChip *ospi_chip(GnwH7B0OspiState *s)
+{
+    if (s->chip_index >= GNW_NOR_CHIP_COUNT) {
+        return gnw_nor_chip_by_key(GNW_NOR_DEFAULT_CHIP_KEY);
+    }
+    return &gnw_nor_chips[s->chip_index];
+}
+
+static uint8_t ospi_chip_read_opcode(GnwH7B0OspiState *s)
+{
+    switch (ospi_chip(s)->profile) {
+    case GNW_NOR_PROFILE_MX_24:
+    case GNW_NOR_PROFILE_MX_32_54:
+    case GNW_NOR_PROFILE_ISSI_24:
+    case GNW_NOR_PROFILE_WINBOND_24:
+        return 0xEB;
+    case GNW_NOR_PROFILE_SPANSION_32:
+    case GNW_NOR_PROFILE_MX_32:
+    case GNW_NOR_PROFILE_WINBOND_32:
+    default:
+        return 0xEC;
+    }
+}
+
+static uint8_t ospi_chip_program_opcode(GnwH7B0OspiState *s)
+{
+    switch (ospi_chip(s)->profile) {
+    case GNW_NOR_PROFILE_MX_24: return 0x38;
+    case GNW_NOR_PROFILE_MX_32: return 0x3E;
+    case GNW_NOR_PROFILE_MX_32_54: return 0x38;
+    case GNW_NOR_PROFILE_SPANSION_32: return 0x12;
+    case GNW_NOR_PROFILE_ISSI_24: return 0x38;
+    case GNW_NOR_PROFILE_WINBOND_24: return 0x32;
+    case GNW_NOR_PROFILE_WINBOND_32: return 0x34;
+    default: return 0;
+    }
+}
+
+static uint64_t ospi_chip_erase_size(GnwH7B0OspiState *s, uint8_t instr)
+{
+    switch (ospi_chip(s)->profile) {
+    case GNW_NOR_PROFILE_MX_24:
+    case GNW_NOR_PROFILE_MX_32_54:
+    case GNW_NOR_PROFILE_ISSI_24:
+    case GNW_NOR_PROFILE_WINBOND_24:
+        switch (instr) {
+        case 0x20: return 4 * 1024;
+        case 0x52: return 32 * 1024;
+        case 0xD8: return 64 * 1024;
+        }
+        break;
+    case GNW_NOR_PROFILE_MX_32:
+        switch (instr) {
+        case 0x21: return 4 * 1024;
+        case 0x5C: return 32 * 1024;
+        case 0xDC: return 64 * 1024;
+        }
+        break;
+    case GNW_NOR_PROFILE_SPANSION_32:
+        if (instr == 0xDC) return 256 * 1024;
+        break;
+    case GNW_NOR_PROFILE_WINBOND_32:
+        if (instr == 0x21) return 4 * 1024;
+        if (instr == 0xDC) return 64 * 1024;
+        break;
+    }
+    return 0;
+}
+
 /* Byte generator for the current indirect-read command's data phase. */
 static uint8_t ospi_gen_read_byte(GnwH7B0OspiState *s, uint32_t pos)
 {
     switch (s->pending_instr) {
     case OSPI_CMD_RDID:
-        switch (pos) {
-        case 0: return OSPI_FLASH_JEDEC_MANUF;
-        case 1: return OSPI_FLASH_JEDEC_TYPE;
-        case 2: return OSPI_FLASH_JEDEC_DENS;
-        default: return 0;
-        }
+        return pos < 3 ? ospi_chip(s)->jedec[pos] : 0;
     case OSPI_CMD_RDSR:
-        return OSPI_FLASH_SR_QE | (s->wel ? OSPI_FLASH_SR_WEL : 0);
+        return (s->wel ? OSPI_FLASH_SR_WEL : 0) |
+               ((ospi_chip(s)->profile == GNW_NOR_PROFILE_WINBOND_24 ||
+                 ospi_chip(s)->profile == GNW_NOR_PROFILE_WINBOND_32 ||
+                 ospi_chip(s)->profile == GNW_NOR_PROFILE_SPANSION_32)
+                    ? 0 : OSPI_FLASH_SR_QE);
     case OSPI_CMD_RDCR:
+        return ospi_chip(s)->profile == GNW_NOR_PROFILE_SPANSION_32 ? 0x02 : 0;
+    case OSPI_CMD_RDAR:
+        /* Spansion's init probes several volatile/nonvolatile registers. */
         return 0;
+    case OSPI_CMD_RDSR2:
+        return (ospi_chip(s)->profile == GNW_NOR_PROFILE_WINBOND_24 ||
+                ospi_chip(s)->profile == GNW_NOR_PROFILE_WINBOND_32 ||
+                ospi_chip(s)->profile == GNW_NOR_PROFILE_SPANSION_32) ? 0x02 : 0;
     case OSPI_CMD_SFDP:
         return ospi_sfdp_byte(s, s->pending_addr + pos);
-    case OSPI_CMD_READ: {
+    case 0xEB:
+    case 0xEC: {
         uint64_t off = s->pending_addr + pos;
 
         if (s->backing && off < s->flash_size) {
@@ -293,30 +370,36 @@ static uint8_t ospi_gen_read_byte(GnwH7B0OspiState *s, uint32_t pos)
 }
 
 /*
- * Expected CCR ADSIZE per address-phase command, per gw_flash.c's
- * cmds_quad_32b_mx[] (this device's synthetic identity -- see
- * gnw_h7b0_ospi.h). Erase/PP/READ are the "32b" 4-byte-address quad
- * commands the table name implies, but SFDP is *not*: cmds_quad_32b_mx's
- * CMD_SFDP entry is still ADDR_SIZE_24B (SFDP addressing is small and
- * conventionally 24-bit even on 32-bit-address flash). Commands not
- * listed here (RDID/RDSR/RDCR/WREN/RSTEN/RST/CE) have no address phase
- * at all (addr_lines == LINES_0 in gw_flash.c), so ADSIZE is meaningless
- * for them and they're intentionally absent.
+ * Expected CCR ADSIZE per address-phase command, following the selected
+ * command profile from retro-go's gw_flash.c. SFDP and register reads use
+ * 24-bit addresses; data and erase commands use the address width implied
+ * by that profile. Commands without an address phase are omitted.
  */
-static bool ospi_expected_adsize(uint8_t instr, uint32_t *adsize)
+static bool ospi_expected_adsize(GnwH7B0OspiState *s, uint8_t instr,
+                                  uint32_t *adsize)
 {
     switch (instr) {
     case OSPI_CMD_SFDP:
+    case OSPI_CMD_RDAR:
         *adsize = OSPI_ADSIZE_24B;
         return true;
-    case OSPI_CMD_SE:
-    case OSPI_CMD_BE32K:
-    case OSPI_CMD_BE64K:
-    case OSPI_CMD_PP:
-    case OSPI_CMD_READ:
-        *adsize = OSPI_ADSIZE_32B;
-        return true;
     default:
+        if (instr == ospi_chip_read_opcode(s) ||
+            instr == ospi_chip_program_opcode(s) ||
+            ospi_chip_erase_size(s, instr)) {
+            switch (ospi_chip(s)->profile) {
+            case GNW_NOR_PROFILE_MX_24:
+            case GNW_NOR_PROFILE_MX_32_54:
+            case GNW_NOR_PROFILE_ISSI_24:
+            case GNW_NOR_PROFILE_WINBOND_24:
+                *adsize = OSPI_ADSIZE_24B;
+                break;
+            default:
+                *adsize = OSPI_ADSIZE_32B;
+                break;
+            }
+            return true;
+        }
         return false;
     }
 }
@@ -352,6 +435,8 @@ static void ospi_cmd_triggered(GnwH7B0OspiState *s)
     case OSPI_CMD_RDID:
     case OSPI_CMD_RDSR:
     case OSPI_CMD_RDCR:
+    case OSPI_CMD_RDAR:
+    case OSPI_CMD_RDSR2:
     case OSPI_CMD_SFDP:
     case OSPI_CMD_RSTEN:
     case OSPI_CMD_RST:
@@ -523,7 +608,7 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
              */
             uint32_t expected_adsize, actual_adsize;
 
-            if (ospi_expected_adsize(s->pending_instr, &expected_adsize)) {
+            if (ospi_expected_adsize(s, s->pending_instr, &expected_adsize)) {
                 actual_adsize = (s->regs[GNW_H7B0_OSPI_CCR >> 2]
                                   & OSPI_CCR_ADSIZE_MASK)
                                  >> OSPI_CCR_ADSIZE_SHIFT;
@@ -544,18 +629,9 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
              * phase at all; that's handled in ospi_cmd_triggered()
              * on the IR-only trigger instead).
              */
-            switch (s->pending_instr) {
-            case OSPI_CMD_SE:
-                ospi_backing_erase(s, s->pending_addr, 4 * 1024);
-                break;
-            case OSPI_CMD_BE32K:
-                ospi_backing_erase(s, s->pending_addr, 32 * 1024);
-                break;
-            case OSPI_CMD_BE64K:
-                ospi_backing_erase(s, s->pending_addr, 64 * 1024);
-                break;
-            default:
-                break;
+            uint64_t erase_size = ospi_chip_erase_size(s, s->pending_instr);
+            if (erase_size) {
+                ospi_backing_erase(s, s->pending_addr, erase_size);
             }
         }
         s->dr_pos = 0;
@@ -577,7 +653,7 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
          * command (e.g. WRSR) still has its byte dropped, since only
          * PP is modeled with a real data-phase effect.
          */
-        if (s->pending_instr == OSPI_CMD_PP && s->backing) {
+        if (s->pending_instr == ospi_chip_program_opcode(s) && s->backing) {
             uint64_t off = s->pending_addr + s->dr_pos;
 
             if (off < s->flash_size) {
@@ -695,6 +771,7 @@ static const VMStateDescription vmstate_gnw_h7b0_ospi = {
 static const Property gnw_h7b0_ospi_properties[] = {
     DEFINE_PROP_UINT64("flash-size", GnwH7B0OspiState, flash_size,
                         OSPI_FLASH_DEFAULT_SIZE),
+    DEFINE_PROP_UINT32("chip-index", GnwH7B0OspiState, chip_index, 6),
 };
 
 static void gnw_h7b0_ospi_class_init(ObjectClass *klass, const void *data)

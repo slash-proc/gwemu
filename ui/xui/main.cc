@@ -560,7 +560,7 @@ extern "C" void gwemu_auto_launch_active_profile(void)
                                      p->Bank2Path().c_str(),
                                      p->ExtflashPath().c_str(),
                                      sdp.empty() ? NULL : sdp.c_str(),
-                                     p->rdp_locked);
+                                     p->rdp_locked, p->nor_chip.c_str());
 }
 
 void gwemu_settings_hud_process_sdl_events(SDL_Event *event)
@@ -604,20 +604,22 @@ void gwemu_settings_hud_update(void)
             // Cancel button closes it to fall through here.
             g_profile_wizard.Draw();
 
-            // Event-driven height tracking: exactly ONE resize request
-            // per genuine layout change (accordion toggle, template/
-            // validation rows) -- whatever size the WM then grants is
-            // accepted as-is. Per-frame height-delta resizing fought
-            // user drag-resizes and compositor size grants and
-            // degraded the window over time. Height only -- the user's
-            // chosen width is always respected.
-            if (g_profile_wizard.TakeContentChanged()) {
+            // Fit the wizard to the measured extent of its rendered
+            // content. ContentFitHeight waits for the measurement to settle
+            // before asking SDL to resize, so width drags do not trigger a
+            // stream of competing native resize requests.
+            float desired_h;
+            if (g_profile_wizard.TakeHeightRequest(&desired_h)) {
                 int cur_w, cur_h;
                 SDL_GetWindowSize(g_settings_window, &cur_w, &cur_h);
-                int want = (int)(g_profile_wizard.DesiredHeight() + 0.5f);
+                int want = (int)(desired_h + 0.5f);
                 if (want < 260) want = 260;
-                if (want > 1000) want = 1000;
-                if (SDL_abs(want - cur_h) > 8) {
+                SDL_Rect usable;
+                if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) &&
+                    usable.h > 80 && want > usable.h - 48) {
+                    want = usable.h - 48;
+                }
+                if (SDL_abs(want - cur_h) > 2) {
                     SDL_SetWindowSize(g_settings_window, cur_w, want);
                 }
             }

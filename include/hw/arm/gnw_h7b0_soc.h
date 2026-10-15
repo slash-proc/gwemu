@@ -152,7 +152,9 @@ OBJECT_DECLARE_TYPE(GnwH7B0State, GnwH7B0StateClass, GNW_H7B0_SOC)
  * real hardware; default to minicraft-gnw's linker.ld default (64M).
  */
 #define EXTFLASH_BASE_ADDRESS 0x90000000
-#define EXTFLASH_SIZE         (64 * 1024 * 1024)
+#define EXTFLASH_DEFAULT_SIZE (64 * 1024 * 1024)
+/* Compatibility for build-time image tools using the default board size. */
+#define EXTFLASH_SIZE EXTFLASH_DEFAULT_SIZE
 
 /*
  * RCC base address: computed as PERIPH_BASE + SRD_AHB4PERIPH_BASE offset
@@ -615,6 +617,8 @@ struct GnwH7B0State {
     char *bank1_image;
     char *bank2_image;
     char *extflash_image;
+    char *extflash_chip;
+    uint64_t extflash_size;
     /* Small pre-payload extflash snapshot used to model GnWManager's
      * XOR-decoded cold-boot transfer into ITCM. */
     uint8_t *extflash_unlock_baseline;

@@ -22,6 +22,48 @@
 #include "viewport-manager.hh"
 #include "ui/gwemu-os-utils.h"
 #include "gl-helpers.hh"
+#include <cmath>
+
+void ContentFitHeight::Reset()
+{
+    m_changed_ms = 0;
+    m_candidate = -1.0f;
+    m_reported = -1.0f;
+    m_pending = false;
+}
+
+void ContentFitHeight::Observe(float height, uint64_t now_ms)
+{
+    if (!std::isfinite(height) || height <= 0.0f) {
+        return;
+    }
+
+    if (m_candidate < 0.0f || std::fabs(height - m_candidate) > 1.0f) {
+        m_candidate = height;
+        m_changed_ms = now_ms;
+        return;
+    }
+
+    if (now_ms - m_changed_ms < m_settle_ms ||
+        (m_reported >= 0.0f && std::fabs(m_candidate - m_reported) <= 2.0f)) {
+        return;
+    }
+
+    m_reported = m_candidate;
+    m_pending = true;
+}
+
+bool ContentFitHeight::TakeRequest(float *height)
+{
+    if (!m_pending) {
+        return false;
+    }
+    m_pending = false;
+    if (height) {
+        *height = m_reported;
+    }
+    return true;
+}
 
 void Separator()
 {

@@ -6,6 +6,10 @@ general:
   # ui/gwemu-profiles.hh) -- empty means none. Generated field:
   # g_config.general.active_profile.
   active_profile: string
+  # Stable JEDEC key of the default NOR chip selected in the Flash tab.
+  extflash_chip:
+    type: string
+    default: c2-25-3a
   updates:
     check:
       type: bool

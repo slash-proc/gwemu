@@ -28,6 +28,7 @@
 
 #include "gwemu-profiles.hh"
 #include "gwemu-settings.h"
+#include "hw/misc/gnw_h7b0_nor.h"
 
 GwProfileStore g_profile_store;
 
@@ -132,6 +133,8 @@ static bool load_profile_toml(GwProfile &p, std::string &err)
             p.bank1 = (*flash)["bank1"].value_or(std::string("bank1.bin"));
             p.bank2 = (*flash)["bank2"].value_or(std::string("bank2.bin"));
             p.extflash = (*flash)["extflash"].value_or(std::string("extflash.bin"));
+            p.nor_chip = (*flash)["nor_chip"].value_or(
+                std::string(GNW_NOR_DEFAULT_CHIP_KEY));
             if (auto *prov = (*flash)["provenance"].as_table()) {
                 p.prov_bank1 = (*prov)["bank1"].value_or(std::string(""));
                 p.prov_bank2 = (*prov)["bank2"].value_or(std::string(""));
@@ -163,6 +166,7 @@ bool GwProfileStore::Save(const GwProfile &p, std::string &err)
         {"bank1", p.bank1},
         {"bank2", p.bank2},
         {"extflash", p.extflash},
+        {"nor_chip", p.nor_chip},
         {"provenance", prov},
     };
     toml::table t{
@@ -391,6 +395,7 @@ std::string GwProfileStore::Duplicate(const std::string &source_id_ref, std::str
     dst->bank1 = src->bank1;
     dst->bank2 = src->bank2;
     dst->extflash = src->extflash;
+    dst->nor_chip = src->nor_chip;
     dst->rdp_locked = src->rdp_locked;
     dst->prov_bank1 = src->prov_bank1;
     dst->prov_bank2 = src->prov_bank2;

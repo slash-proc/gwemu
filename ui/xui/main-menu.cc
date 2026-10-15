@@ -201,7 +201,8 @@ void MainMenuProfilesView::Draw()
                                                  p->Bank2Path().c_str(),
                                                  p->ExtflashPath().c_str(),
                                                  sdp.empty() ? NULL : sdp.c_str(),
-                                                 p->rdp_locked);
+                                                 p->rdp_locked,
+                                                 p->nor_chip.c_str());
             }
             ImGui::SameLine();
             if (ImGui::Button("Modify", ImVec2(0, 40 * g_viewport_mgr.m_scale))) {
