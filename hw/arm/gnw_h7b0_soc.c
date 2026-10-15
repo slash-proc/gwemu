@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "system/address-spaces.h"
