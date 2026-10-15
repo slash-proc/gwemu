@@ -2450,8 +2450,9 @@ void gwemu_relaunch_with_flash_images(const char *bank1_image,
 // multi-machine upstream QEMU -- there's no reason to force explicit
 // "-M gnw-h7b0 -display gwemu" on every invocation. If the user's own
 // argv doesn't already specify a machine/display, inject sensible
-// defaults; if it also doesn't configure any flash image, additionally
-// start halted (-S) for the same reason scripts/boot_qemu.sh --gui
+// defaults; if gwemu injects its default machine and no flash image is
+// configured, additionally start halted (-S) for the same reason
+// scripts/boot_qemu.sh --gui
 // already does: a fully blank vector table (SP=0, PC=0) is a genuine
 // ARMv7-M lockup the instant the CPU runs, not a safe idle state, and
 // QEMU treats that as fatal for the whole process. Returns a new,
@@ -2553,7 +2554,7 @@ static char **inject_default_args(int argc, char **argv, int *out_argc)
     for (int i = 1; i < argc; i++) {
         g_ptr_array_add(new_argv, argv[i]);
     }
-    if (!have_flash_image) {
+    if (!have_flash_image && !have_machine) {
         g_ptr_array_add(new_argv, (char *)"-S");
     }
     g_ptr_array_add(new_argv, NULL);
