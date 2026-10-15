@@ -2593,7 +2593,12 @@ int main(int argc, char **argv)
         int status;
 
         setlocale(LC_NUMERIC, "C");
-        fprintf(stderr, "gwemu_version: %s (headless)\n", gwemu_version);
+        /* Headless invocations are used by qtests and iotests, many of
+         * which compare stderr against golden output. Keep the build banner
+         * opt-in here so those tests only observe QEMU diagnostics. */
+        if (getenv("GNW_LOG_VERSION")) {
+            fprintf(stderr, "gwemu_version: %s (headless)\n", gwemu_version);
+        }
         qemu_init(argc, argv);
         status = qemu_main_loop();
         qemu_cleanup(status);
