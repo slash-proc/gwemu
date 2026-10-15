@@ -10,6 +10,9 @@ general:
   extflash_chip:
     type: string
     default: c2-25-3a
+  # Last folder selected for gnwmanager firmware backups. Empty means the
+  # default relative "backup" folder has not been explicitly selected.
+  firmware_backup_dir: string
   updates:
     check:
       type: bool

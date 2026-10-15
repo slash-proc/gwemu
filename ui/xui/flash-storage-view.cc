@@ -20,6 +20,7 @@ extern "C" {
 #include "gwemu-hud.h"
 #include "common.hh"
 #include "../gwemu-profiles.hh"
+#include "../gwemu-settings.h"
 #include "hw/misc/gnw_h7b0_nor.h"
 
 static const char *kGameNames[2] = { "mario", "zelda" };
@@ -32,7 +33,10 @@ static const GnwNorChip *SelectedNorChip(const std::string &key)
 
 GnwFlashStorageView::GnwFlashStorageView()
 {
-    m_backup_dir = "backup";
+    m_backup_dir = g_config.general.firmware_backup_dir &&
+                   g_config.general.firmware_backup_dir[0]
+                       ? g_config.general.firmware_backup_dir
+                       : "backup";
     if (g_config.general.extflash_chip && g_config.general.extflash_chip[0]) {
         m_nor_chip_key = g_config.general.extflash_chip;
     }
@@ -656,9 +660,20 @@ void GnwFlashStorageView::Draw()
     }
     ImGui::SameLine();
     InlineFileField("##backupdirpicker", m_backup_dir.c_str(), nullptr, 0, true,
-                    [this](const char *p) { m_backup_dir = p; RescanBackupDir(); });
+                    [this](const char *p) {
+                        m_backup_dir = p;
+                        gwemu_settings_set_string(
+                            &g_config.general.firmware_backup_dir, p);
+                        gwemu_settings_save();
+                        RescanBackupDir();
+                    });
     ImGui::SameLine();
-    if (ImGui::Button("Rescan")) RescanBackupDir();
+    if (ImGui::Button("Rescan")) {
+        gwemu_settings_set_string(&g_config.general.firmware_backup_dir,
+                                  m_backup_dir.c_str());
+        gwemu_settings_save();
+        RescanBackupDir();
+    }
     DrawGameStatusRow("Mario", m_status[0]);
     DrawGameStatusRow("Zelda", m_status[1]);
 

@@ -12,6 +12,7 @@
 #include "gnw-style-tokens.hh"
 #include "gwemu-hud.h"
 #include "../gwemu-profiles.hh"
+#include "../gwemu-settings.h"
 #include "../gwemu-sdcreate.h"
 #include "../gwemu-http.h"
 #include "hw/misc/gnw_h7b0_nor.h"
@@ -241,6 +242,14 @@ void ProfileWizard::JoinWorker()
 void ProfileWizard::Open()
 {
     m_height_fit.Reset();
+    if (g_config.general.firmware_backup_dir &&
+        g_config.general.firmware_backup_dir[0]) {
+        m_library.dir = g_config.general.firmware_backup_dir;
+        m_folder_chosen = true;
+    } else {
+        m_library.dir = "backup";
+        m_folder_chosen = false;
+    }
     m_library.Rescan();
     g_profile_store.Scan();   // shared-SD registry may have changed
     if (m_sd_mode == SdShared) {
@@ -255,6 +264,9 @@ void ProfileWizard::Open()
             m_sd_shared_image.clear();
         }
     }
+    SetNorChip(g_config.general.extflash_chip && g_config.general.extflash_chip[0]
+                   ? g_config.general.extflash_chip
+                   : GNW_NOR_DEFAULT_CHIP_KEY);
     if ((m_template == TplStockMario && !m_library.status[0].Available()) ||
         (m_template == TplStockZelda && !m_library.status[1].Available())) {
         m_template = TplCustom;
@@ -263,9 +275,6 @@ void ProfileWizard::Open()
         SyncStockReflection();
     }
     m_build_state.store(BuildIdle);
-    SetNorChip(g_config.general.extflash_chip && g_config.general.extflash_chip[0]
-                   ? g_config.general.extflash_chip
-                   : GNW_NOR_DEFAULT_CHIP_KEY);
     m_edit_profile_id.clear();
     m_rdp_locked = false;
     m_created_id.clear();
@@ -296,7 +305,13 @@ void ProfileWizard::OpenForEdit(const std::string &profile_id)
 {
     GwProfile *p = g_profile_store.Find(profile_id);
     if (!p) return;
-    
+
+    if (g_config.general.firmware_backup_dir &&
+        g_config.general.firmware_backup_dir[0]) {
+        m_library.dir = g_config.general.firmware_backup_dir;
+    } else {
+        m_library.dir = "backup";
+    }
     m_library.Rescan();
     g_profile_store.Scan();
     m_stage = StageProfile;
@@ -849,6 +864,10 @@ bool ProfileWizard::ValidSources(std::string *why) const
             return false;
         }
     }
+    if (NorChip(m_nor_chip_key)->size_bytes < RequiredExtflashBytes()) {
+        if (why) *why = "extflash: selected NOR chip is smaller than the image requirement";
+        return false;
+    }
     if (m_template == TplStockMario || m_template == TplStockZelda) {
         int gi = m_template == TplStockMario ? 0 : 1;
         if (!m_library.status[gi].Available() || !m_library.status[gi].external_found) {
@@ -879,11 +898,6 @@ bool ProfileWizard::ValidSources(std::string *why) const
         if (why) *why = "extflash: no file selected";
         return false;
     }
-    if (NorChip(m_nor_chip_key)->size_bytes < RequiredExtflashBytes()) {
-        if (why) *why = "extflash: selected NOR chip is smaller than the image requirement";
-        return false;
-    }
-    
     // Check uniqueness among file selections
     const std::string *paths[3] = {nullptr, nullptr, nullptr};
     if (m_bank1_choice == B1File) paths[0] = &m_bank1_path;
@@ -908,6 +922,23 @@ void ProfileWizard::SetNorChip(const std::string &key)
     const GnwNorChip *chip = NorChip(key);
     m_nor_chip_key = chip->key;
     m_ext_size_mib = (int)(chip->size_bytes >> 20);
+}
+
+void ProfileWizard::EnsureNorChipFitsExtflash()
+{
+    uint64_t required = RequiredExtflashBytes();
+    if (NorChip(m_nor_chip_key)->size_bytes >= required) {
+        return;
+    }
+
+    // The choices are sorted by capacity, so this picks the smallest
+    // supported chip that can preserve the selected source blob.
+    for (const GnwNorChip *chip : NorChipChoices()) {
+        if (chip->size_bytes >= required) {
+            SetNorChip(chip->key);
+            return;
+        }
+    }
 }
 
 uint64_t ProfileWizard::RequiredExtflashBytes() const
@@ -941,15 +972,19 @@ uint64_t ProfileWizard::RequiredExtflashBytes() const
 void ProfileWizard::SyncStockReflection()
 {
     if (m_template == TplStockMario) {
+        SetNorChip("c2-25-34"); // MX25U8035F, 1 MiB
         m_bank1_choice = B1OfwMario;
         m_bank2_choice = B2Blank;
         m_ext_choice = ExtOfwMario;
         m_patched = true;   // assumed case, incl. Stock Mario (owner call)
+        EnsureNorChipFitsExtflash();
     } else if (m_template == TplStockZelda) {
+        SetNorChip("c2-25-36"); // MX25U3232F, 4 MiB
         m_bank1_choice = B1OfwZelda;
         m_bank2_choice = B2Blank;
         m_ext_choice = ExtOfwZelda;
         m_patched = true;   // assumed case (owner call)
+        EnsureNorChipFitsExtflash();
     }
 }
 
@@ -994,6 +1029,9 @@ void ProfileWizard::PickFolder()
     }
     ShowOpenFolderDialog(def, [this](const char *path) {
         m_library.dir = path;
+        gwemu_settings_set_string(&g_config.general.firmware_backup_dir,
+                                  path);
+        gwemu_settings_save();
         m_library.Rescan();
         m_folder_chosen = true;
         if (m_stage == StageFwPrompt) {
@@ -1437,6 +1475,7 @@ void ProfileWizard::DrawBankAssignments()
                                           m_ext_choice == ExtOfwZelda;
                         if (have && (was_assets || m_patched)) {
                             m_ext_choice = want;
+                            EnsureNorChipFitsExtflash();
                         }
                     }
                 }
@@ -1456,6 +1495,7 @@ void ProfileWizard::DrawBankAssignments()
             int g = Bank1Game();
             if (g >= 0 && m_library.status[g].external_found) {
                 m_ext_choice = g == 0 ? ExtOfwMario : ExtOfwZelda;
+                EnsureNorChipFitsExtflash();
             }
         }
         int gi = Bank1Game();
@@ -1533,9 +1573,13 @@ void ProfileWizard::DrawBankAssignments()
                 if (m_ext_choice != ext_items[i].choice) {
                     m_ext_choice = ext_items[i].choice;
                     changed = true;
+                    EnsureNorChipFitsExtflash();
                     if (m_ext_choice == ExtFile) {
                         ShowOpenFileDialog(kBinFilter, 2, m_ext_path.c_str(),
-                                           [this](const char *p) { m_ext_path = p; });
+                                           [this](const char *p) {
+                                               m_ext_path = p;
+                                               EnsureNorChipFitsExtflash();
+                                           });
                     }
                 }
             }
@@ -1805,6 +1849,7 @@ void ProfileWizard::DrawForm()
     // found+verified -- the backup-folder row above is how users make
     // them appear.
     const char *stock_names[2] = { "Stock Mario", "Stock Zelda" };
+    int stock_template_selected = -1;
     for (int i = 0; i < 2; i++) {
         bool avail = m_library.status[i].Available() && m_library.status[i].external_found;
         if (!avail) {
@@ -1821,14 +1866,18 @@ void ProfileWizard::DrawForm()
             ImGui::PopStyleColor(3);
         }
         if (clicked) {
-            if (m_template != i) {
+            bool template_changed = m_template != i;
+            if (template_changed) {
                 m_close_assignments_next = true;
                 // Also collapse the SD section (but NEVER reset SD state
                 // -- it survives template switches by design).
                 m_close_sd_next = true;
             }
             m_template = i;
-            SyncStockReflection();
+            if (template_changed) {
+                stock_template_selected = i;
+                SyncStockReflection();
+            }
         }
         ImGui::SameLine(0, 8 * g_viewport_mgr.m_scale);
     }
@@ -1851,6 +1900,15 @@ void ProfileWizard::DrawForm()
 
     DrawBankAssignments();
     DrawSdSection();
+
+    // Apply the preset capacity after drawing the dependent flash controls,
+    // so any same-frame widget state cannot leave the previous preset's
+    // chip selected.
+    if (m_template == stock_template_selected) {
+        SetNorChip(stock_template_selected == TplStockMario
+                       ? "c2-25-34" : "c2-25-36");
+        EnsureNorChipFitsExtflash();
+    }
 }
 
 void ProfileWizard::DrawBuildView()

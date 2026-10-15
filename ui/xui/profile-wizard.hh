@@ -63,6 +63,7 @@ private:
     void DrawNorChipSelector(float width);
     uint64_t RequiredExtflashBytes() const;
     void SetNorChip(const std::string &key);
+    void EnsureNorChipFitsExtflash();
     void DrawBuildView();
     void StartBuild();
     void SyncStockReflection();
