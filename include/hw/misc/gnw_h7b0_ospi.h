@@ -2,11 +2,16 @@
  * STM32H7B0 OCTOSPI device with real indirect-mode command decoding
  * (Nintendo Game & Watch)
  *
- * Not cycle-accurate -- command/status completion is instant (TCF set
- * the moment CCR/IR/AR is written, no dummy-cycle or clock-rate
- * timing modeled) -- but the indirect-mode command *protocol* is now
- * real: RDID/status/SFDP/WREN/reset and data commands are decoded for
- * the selected part in gnw_h7b0_nor.h, sourced from retro-go's
+ * The default model completes commands instantly. An explicit experimental
+ * timing-mode property instead clocks supported indirect SDR/DTR frame phases
+ * from the OCTOSPI kernel rate and prescaler, including bounded FIFO stalls,
+ * BUSY/FTF/TCF deadlines, abort, reset and migration. It models architectural
+ * frame duration only: it does not claim measured NOR operation, HyperBus,
+ * memory-mapped/XIP, automatic-polling or MDMA timing accuracy. Unsupported
+ * frames retain functional instant-completion behavior and are diagnosed.
+ *
+ * The indirect-mode command protocol is decoded for the selected part in
+ * gnw_h7b0_nor.h, sourced from retro-go's command table and jedec_map[].
  * ../gnw-chainloader/retro-go-sd/Core/Src/gw_flash.c for the real
  * driver's command set and jedec_map[]. Program/erase/read commands
  * read and modify the same
@@ -74,6 +79,7 @@
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "qemu/timer.h"
 
 #define TYPE_GNW_H7B0_OSPI "gnw-h7b0-ospi"
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
@@ -110,6 +116,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
 #define OSPI_CR_FMODE_MASK  (0x3U << OSPI_CR_FMODE_SHIFT)
 #define OSPI_FMODE_AUTOPOLL 2U
 #define OSPI_FMODE_MEMMAP   3U
+#define OSPI_FMODE_INDIRECT_WRITE 0U
+#define OSPI_FMODE_INDIRECT_READ  1U
 
 /* Automatic status-polling registers (RM0455 OCTOSPI_PSMKR/PSMAR). */
 #define GNW_H7B0_OSPI_PSMKR 0x80
@@ -119,7 +127,32 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
 #define GNW_H7B0_OSPI_AR    0x48
 #define GNW_H7B0_OSPI_DR    0x50
 #define GNW_H7B0_OSPI_CCR   0x100
+#define GNW_H7B0_OSPI_TCR   0x108
 #define GNW_H7B0_OSPI_IR    0x110
+
+#define GNW_H7B0_OSPI_DCR1  0x08
+#define GNW_H7B0_OSPI_DCR2  0x0c
+
+#define OSPI_CR_DQM          (1U << 6)
+#define OSPI_CR_FTHRES_SHIFT 8
+#define OSPI_CR_FTHRES_MASK  (0x1fU << OSPI_CR_FTHRES_SHIFT)
+
+#define OSPI_DCR1_CSHT_SHIFT 8
+#define OSPI_DCR1_CSHT_MASK  (0x7U << OSPI_DCR1_CSHT_SHIFT)
+#define OSPI_DCR1_MTYP_SHIFT 24
+#define OSPI_DCR1_MTYP_MASK  (0x7U << OSPI_DCR1_MTYP_SHIFT)
+#define OSPI_DCR1_MTYP_HYPERBUS 4U
+
+#define OSPI_DCR2_PRESCALER_MASK 0xffU
+
+#define OSPI_CCR_IMODE_SHIFT 0
+#define OSPI_CCR_IMODE_MASK  (0x7U << OSPI_CCR_IMODE_SHIFT)
+#define OSPI_CCR_IDTR        (1U << 3)
+#define OSPI_CCR_ISIZE_SHIFT 4
+#define OSPI_CCR_ISIZE_MASK  (0x3U << OSPI_CCR_ISIZE_SHIFT)
+#define OSPI_CCR_ADMODE_SHIFT 8
+#define OSPI_CCR_ADMODE_MASK  (0x7U << OSPI_CCR_ADMODE_SHIFT)
+#define OSPI_CCR_ADDTR       (1U << 11)
 
 /*
  * Common NOR flash opcodes; data-command opcodes vary by selected
@@ -161,6 +194,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
  */
 #define OSPI_CCR_ADSIZE_SHIFT  12
 #define OSPI_CCR_ADSIZE_MASK   (0x3U << OSPI_CCR_ADSIZE_SHIFT)
+#define OSPI_CCR_ABMODE_SHIFT 16
+#define OSPI_CCR_ABMODE_MASK  (0x7U << OSPI_CCR_ABMODE_SHIFT)
+#define OSPI_CCR_ABDTR        (1U << 19)
+#define OSPI_CCR_ABSIZE_SHIFT 20
+#define OSPI_CCR_ABSIZE_MASK  (0x3U << OSPI_CCR_ABSIZE_SHIFT)
+#define OSPI_CCR_DMODE_SHIFT 24
+#define OSPI_CCR_DMODE_MASK   (0x7U << OSPI_CCR_DMODE_SHIFT)
+#define OSPI_CCR_DDTR         (1U << 27)
+
+#define OSPI_TCR_DCYC_MASK    0x1fU
 #define OSPI_ADSIZE_8B   0
 #define OSPI_ADSIZE_16B  1
 #define OSPI_ADSIZE_24B  2
@@ -176,6 +219,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0OspiState, GNW_H7B0_OSPI)
 
 #define OSPI_SFDP_TABLE_PTR  0x20
 
+#define GNW_H7B0_OSPI_FIFO_SIZE 32
+#define GNW_H7B0_OSPI_PROGRAM_BUFFER_SIZE 256
+
+typedef enum GnwH7B0OspiPhase {
+    GNW_H7B0_OSPI_PHASE_IDLE,
+    GNW_H7B0_OSPI_PHASE_CS_HIGH,
+    GNW_H7B0_OSPI_PHASE_PREAMBLE,
+    GNW_H7B0_OSPI_PHASE_INSTRUCTION,
+    GNW_H7B0_OSPI_PHASE_ADDRESS,
+    GNW_H7B0_OSPI_PHASE_ALTERNATE,
+    GNW_H7B0_OSPI_PHASE_DUMMY,
+    GNW_H7B0_OSPI_PHASE_DATA,
+    GNW_H7B0_OSPI_PHASE_POSTAMBLE,
+} GnwH7B0OspiPhase;
+
 struct GnwH7B0OspiState {
     SysBusDevice parent_obj;
 
@@ -190,6 +248,38 @@ struct GnwH7B0OspiState {
     uint32_t pending_addr;
     uint32_t dr_pos;
     bool     wel;
+
+    /* Opt-in architectural indirect-command wire timing. */
+    bool timing_mode;
+    bool timing_active;
+    bool timing_wire_complete;
+    bool timing_ncs_released;
+    bool timing_instruction_delivered;
+    bool timing_fallback_logged;
+    uint8_t timing_phase;
+    uint8_t fifo_head;
+    uint8_t fifo_level;
+    uint8_t fifo[GNW_H7B0_OSPI_FIFO_SIZE];
+    uint8_t delivered_program[GNW_H7B0_OSPI_PROGRAM_BUFFER_SIZE];
+    uint16_t delivered_program_len;
+    uint32_t timing_config_identity;
+    uint32_t test_kernel_clock_hz;
+    uint32_t kernel_clock_hz;
+    uint32_t active_ccr;
+    uint32_t active_tcr;
+    uint32_t active_dcr1;
+    uint32_t active_dcr2;
+    uint32_t active_instr;
+    uint32_t active_addr;
+    uint64_t active_length;
+    uint64_t active_delivered;
+    uint64_t active_consumed;
+    uint64_t phase_remaining_quanta;
+    uint64_t phase_progress_num;
+    uint64_t migrated_ncs_release_elapsed_ns;
+    int64_t phase_last_update_ns;
+    int64_t ncs_release_ns;
+    QEMUTimer *timing_timer;
 
     uint64_t flash_size;
     uint32_t chip_index;
@@ -234,5 +324,11 @@ void gnw_h7b0_ospi_set_xip_window(GnwH7B0OspiState *s,
                                    hwaddr base, uint64_t size);
 
 void gnw_h7b0_ospi_set_backing(GnwH7B0OspiState *s, void *backing);
+
+/* RCC wiring: initialize once, then call on every effective rate change. */
+void gnw_h7b0_ospi_set_kernel_clock_hz(GnwH7B0OspiState *s, uint32_t hz);
+void gnw_h7b0_ospi_kernel_clock_changed(void *opaque,
+                                         uint32_t old_hz,
+                                         uint32_t new_hz);
 
 #endif

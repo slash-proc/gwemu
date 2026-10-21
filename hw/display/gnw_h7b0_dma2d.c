@@ -25,10 +25,43 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "migration/vmstate.h"
 #include "exec/cpu-common.h"
+#include "exec/gnw-cycle-model.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/display/gnw_h7b0_dma2d.h"
 #include "hw/misc/gnw_h7b0_jpeg.h"
+
+/* The default functional path below remains synchronous.  Timed execution
+ * requires an explicit, versioned service profile.  This file ships only a
+ * hidden deterministic qtest profile; it makes no hardware throughput claim.
+ */
+#define DMA2D_TEST_PROFILE_ID UINT32_C(0x44324401)
+#define DMA_ENGINE_R1_RECEIPT_SHA256 \
+    "a4cbac646ba40c21f0e345f5f83124cac638e5c42dcfbc782ec54559bddfeb8e"
+#define DMA2D_DMA_ENGINE_R1_PROFILE_ID UINT32_C(0x44325201)
+/* Explicit candidate bound to dma2d-poll-fit-holdout-r4's physical score.
+ * The score itself keeps runtime_authorized=false, so the SoC never enables
+ * this profile automatically.  A caller must opt in with both properties;
+ * even then, the descriptor guard below accepts only the exact measured
+ * clock, memory placement, formats and FIT/HOLDOUT geometries. */
+#define DMA2D_POLL_R4_PROFILE_ID UINT32_C(0x44325204)
+#define DMA2D_POLL_R4_RECEIPT_SHA256 \
+    "6570f12a249b72e512f859285c4dcd4c20b96ed48ed5ff4d55f4d240655ec481"
+#define DMA2D_POLL_R4_REFERENCE_HZ UINT32_C(280000000)
+#define DMA2D_POLL_R4_SETUP_NUM UINT64_C(7339840)
+#define DMA2D_POLL_R4_PIXEL_NUM UINT32_C(65285)
+#define DMA2D_POLL_R4_DEN UINT32_C(65216)
+#define DMA2D_POLL_R4_SOURCE UINT32_C(0x24020000)
+#define DMA2D_POLL_R4_DESTINATION UINT32_C(0x24040000)
+#define DMA2D_POLL_R6_PROFILE_ID UINT32_C(0x44325206)
+#define DMA2D_POLL_R6_SCOPE_SHA256 \
+    "1d7d4972b2ea367a0c08abe391fedb0468f28075ea18799d8855dcc255fd67d2"
+#define DMA2D_SETTLE_BUDGET 64
+#define DMA2D_LWR_LINE_MASK 0xffffU
+#define AXI_SRAM_BASE UINT64_C(0x24000000)
+#define AXI_SRAM_END  UINT64_C(0x24100000)
 
 /*
  * Pixel-format conversion helpers. Everything funnels through a common
@@ -619,11 +652,466 @@ static void gnw_h7b0_dma2d_do_transfer(GnwH7B0Dma2dState *s)
     }
 }
 
+static void gnw_h7b0_dma2d_arm(GnwH7B0Dma2dState *s);
+
+uint32_t gnw_h7b0_dma2d_contends_for_range(void *opaque, uint64_t address,
+                                           unsigned size)
+{
+    GnwH7B0Dma2dState *s = opaque;
+    bool source_axi, destination_axi;
+
+    if (!s->active || !size || address < AXI_SRAM_BASE ||
+        address >= AXI_SRAM_END || size > AXI_SRAM_END - address) {
+        return 0;
+    }
+    source_axi = s->active_mode == DMA2D_MODE_M2M &&
+                 s->source >= AXI_SRAM_BASE && s->source < AXI_SRAM_END;
+    destination_axi = s->destination >= AXI_SRAM_BASE &&
+                      s->destination < AXI_SRAM_END;
+    return source_axi || destination_axi ? GNW_M7_BUS_MASTER_DMA2D : 0;
+}
+
+static bool gnw_h7b0_dma2d_phase_need(
+    uint32_t setup_cycles, uint32_t pixels,
+    const GnwH7B0Dma2dTimingProfile *profile, uint64_t *need)
+{
+    unsigned __int128 value =
+        (unsigned __int128)setup_cycles * profile->cycles_per_pixel_den +
+        (unsigned __int128)pixels * profile->cycles_per_pixel_num +
+        profile->cycles_per_line_num;
+
+    if (!value || value > UINT64_MAX) {
+        return false;
+    }
+    *need = value;
+    return true;
+}
+
+static bool gnw_h7b0_dma2d_mode_phase_needs(
+    GnwH7B0Dma2dModeTiming timing, uint32_t pixels,
+    uint64_t *regular_need, uint64_t *first_need)
+{
+    unsigned __int128 regular =
+        (unsigned __int128)pixels * timing.cycles_per_pixel_num;
+    unsigned __int128 first = timing.setup_num + regular;
+
+    if (!timing.cycles_per_pixel_den || !regular ||
+        regular > UINT64_MAX || first > UINT64_MAX) {
+        return false;
+    }
+    *regular_need = regular;
+    *first_need = first;
+    return true;
+}
+
+static bool gnw_h7b0_dma2d_poll_r4_geometry(uint32_t lines,
+                                             uint32_t pixels)
+{
+    static const struct {
+        uint16_t lines;
+        uint16_t pixels;
+    } geometries[] = {
+        { 16, 48 }, { 3, 256 }, { 32, 64 }, { 2, 1024 },
+        { 64, 64 }, { 2, 2048 }, { 64, 96 }, { 2, 3072 },
+        { 16, 80 }, { 2, 640 }, { 40, 64 }, { 2, 1280 },
+        { 72, 64 }, { 2, 2304 },
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(geometries); i++) {
+        if (geometries[i].lines == lines && geometries[i].pixels == pixels) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool gnw_h7b0_dma2d_poll_r6_geometry(uint32_t lines,
+                                             uint32_t pixels)
+{
+    return (lines == 32 && pixels == 56) ||
+           (lines == 2 && pixels == 896) ||
+           (lines == 64 && pixels == 56) ||
+           (lines == 2 && pixels == 1792) ||
+           (lines == 64 && pixels == 88) ||
+           (lines == 2 && pixels == 2816);
+}
+
+static void gnw_h7b0_dma2d_phase_add(GnwH7B0Dma2dState *s,
+                                      uint64_t elapsed)
+{
+    uint32_t rate = s->evidence_reference_hz ?: s->clock_hz;
+    uint32_t den = s->active_timing.cycles_per_pixel_den ?:
+                   s->profile.cycles_per_pixel_den;
+    unsigned __int128 scaled = (unsigned __int128)elapsed * rate * den +
+                               s->phase_subcycle;
+    unsigned __int128 whole = scaled / NANOSECONDS_PER_SECOND;
+
+    s->phase_subcycle = scaled % NANOSECONDS_PER_SECOND;
+    s->phase_progress = whole > UINT64_MAX - s->phase_progress ?
+                        UINT64_MAX : s->phase_progress + whole;
+}
+
+/* Commit exactly one completed output line.  Timed mode intentionally starts
+ * with the two operation classes for which the current functional model has
+ * a direct line worker.  Conversion, blend and CLUT traffic remain visible as
+ * unsupported and use the unchanged synchronous fallback. */
+static void gnw_h7b0_dma2d_commit_line(GnwH7B0Dma2dState *s)
+{
+    hwaddr dst = s->destination +
+                 (hwaddr)s->current_line * s->destination_stride;
+    hwaddr row_bytes = (hwaddr)s->pixels_per_line * s->bytes_per_pixel;
+
+    if (s->active_mode == DMA2D_MODE_R2M) {
+        g_autofree uint8_t *row = g_malloc(row_bytes);
+
+        for (uint32_t x = 0; x < s->pixels_per_line; x++) {
+            uint8_t *pixel = row + (hwaddr)x * s->bytes_per_pixel;
+
+            if (s->bytes_per_pixel == 4) {
+                stl_le_p(pixel, s->fill_color);
+            } else {
+                stw_le_p(pixel, (uint16_t)s->fill_color);
+            }
+        }
+        cpu_physical_memory_write(dst, row, row_bytes);
+    } else {
+        hwaddr src = s->source +
+                     (hwaddr)s->current_line * s->source_stride;
+        g_autofree uint8_t *row = g_malloc(row_bytes);
+
+        cpu_physical_memory_read(src, row, row_bytes);
+        cpu_physical_memory_write(dst, row, row_bytes);
+    }
+
+    s->current_line++;
+    if ((s->regs[GNW_H7B0_DMA2D_LWR >> 2] & DMA2D_LWR_LINE_MASK) ==
+        s->current_line) {
+        s->regs[GNW_H7B0_DMA2D_ISR >> 2] |= DMA2D_ISR_TWIF;
+    }
+    if (s->current_line == s->total_lines) {
+        s->active = false;
+        s->regs[GNW_H7B0_DMA2D_CR >> 2] &= ~DMA2D_CR_START;
+        s->regs[GNW_H7B0_DMA2D_ISR >> 2] |= DMA2D_ISR_TCIF;
+        timer_del(s->timer);
+        gnw_h7b0_dma2d_update_irq(s);
+        return;
+    }
+    if (s->active_timing.cycles_per_pixel_den) {
+        s->phase_need = (uint64_t)s->pixels_per_line *
+                        s->active_timing.cycles_per_pixel_num;
+    } else {
+        g_assert(gnw_h7b0_dma2d_phase_need(0, s->pixels_per_line,
+                                           &s->profile, &s->phase_need));
+    }
+    gnw_h7b0_dma2d_update_irq(s);
+}
+
+static bool gnw_h7b0_dma2d_settle(GnwH7B0Dma2dState *s, int64_t now)
+{
+    unsigned events = 0;
+
+    if (!s->active || now < s->last_update_ns) {
+        return true;
+    }
+    if (!s->clock_known || !s->clock_hz) {
+        s->last_update_ns = now;
+        return true;
+    }
+    while (s->active) {
+        if (s->phase_progress >= s->phase_need) {
+            s->phase_progress -= s->phase_need;
+            gnw_h7b0_dma2d_commit_line(s);
+            if (++events == DMA2D_SETTLE_BUDGET) {
+                return false;
+            }
+            continue;
+        }
+        uint64_t elapsed = now - s->last_update_ns;
+        uint64_t need = s->phase_need - s->phase_progress;
+        unsigned __int128 numerator =
+            (unsigned __int128)need * NANOSECONDS_PER_SECOND -
+            s->phase_subcycle;
+        unsigned __int128 denominator =
+            (unsigned __int128)(s->evidence_reference_hz ?: s->clock_hz) *
+            (s->active_timing.cycles_per_pixel_den ?:
+             s->profile.cycles_per_pixel_den);
+        unsigned __int128 delta128 =
+            (numerator + denominator - 1) / denominator;
+        uint64_t delta = delta128 > INT64_MAX ? INT64_MAX : delta128;
+
+        if (elapsed < delta) {
+            gnw_h7b0_dma2d_phase_add(s, elapsed);
+            s->last_update_ns = now;
+            return true;
+        }
+        gnw_h7b0_dma2d_phase_add(s, delta);
+        s->last_update_ns += delta;
+    }
+    return true;
+}
+
+static void gnw_h7b0_dma2d_arm(GnwH7B0Dma2dState *s)
+{
+    if (!s->active || !s->clock_known || !s->clock_hz) {
+        timer_del(s->timer);
+        return;
+    }
+    if (s->phase_progress >= s->phase_need) {
+        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        return;
+    }
+    uint64_t need = s->phase_need - s->phase_progress;
+    unsigned __int128 numerator =
+        (unsigned __int128)need * NANOSECONDS_PER_SECOND -
+        s->phase_subcycle;
+    unsigned __int128 denominator =
+        (unsigned __int128)(s->evidence_reference_hz ?: s->clock_hz) *
+        (s->active_timing.cycles_per_pixel_den ?:
+         s->profile.cycles_per_pixel_den);
+    unsigned __int128 delay = (numerator + denominator - 1) / denominator;
+    int64_t deadline = delay > INT64_MAX - s->last_update_ns ?
+                       INT64_MAX : s->last_update_ns + (int64_t)delay;
+
+    timer_mod(s->timer, deadline);
+}
+
+static void gnw_h7b0_dma2d_tick(void *opaque)
+{
+    GnwH7B0Dma2dState *s = opaque;
+
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!gnw_h7b0_dma2d_settle(s, now)) {
+        timer_mod(s->timer, now);
+    } else {
+        gnw_h7b0_dma2d_arm(s);
+    }
+}
+
+void gnw_h7b0_dma2d_set_timing_profile(
+    GnwH7B0Dma2dState *s, const GnwH7B0Dma2dTimingProfile *profile)
+{
+    g_assert(!DEVICE(s)->realized);
+    s->profile = profile ? *profile : (GnwH7B0Dma2dTimingProfile) { 0 };
+    s->migration_profile_identity = s->profile.identity;
+}
+
+void gnw_h7b0_dma2d_set_clock_info(GnwH7B0Dma2dState *s, bool known,
+                                    uint32_t reference_hz,
+                                    bool gate_enabled)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    while (!gnw_h7b0_dma2d_settle(s, now)) {
+        /* At most NLR.NL (65535) line commits; preserve the old clock for
+         * every completed line before installing the new rate. */
+    }
+    if (s->active && s->evidence_required_clock_hz &&
+        (!known || !gate_enabled ||
+         reference_hz != s->evidence_required_clock_hz)) {
+        s->unsupported_count++;
+        s->active = false;
+        s->regs[GNW_H7B0_DMA2D_CR >> 2] &= ~DMA2D_CR_START;
+        s->regs[GNW_H7B0_DMA2D_ISR >> 2] |= DMA2D_ISR_TEIF;
+        timer_del(s->timer);
+        gnw_h7b0_dma2d_update_irq(s);
+    }
+    if (!known && s->active) {
+        s->unsupported_count++;
+        qemu_log_mask(LOG_UNIMP,
+                      "gnw-h7b0-dma2d: active timed transfer lost known "
+                      "engine clock; phase paused\n");
+    }
+    s->clock_known = known;
+    s->clock_gate_enabled = gate_enabled;
+    s->clock_hz = known && gate_enabled ? reference_hz : 0;
+    gnw_h7b0_dma2d_arm(s);
+}
+
+#define GNW_DMA2D_AXI_SRAM_BASE UINT32_C(0x24000000)
+#define GNW_DMA2D_AXI_SRAM_BYTES UINT32_C(0x00100000)
+
+static bool gnw_h7b0_dma2d_axi_range(uint32_t address, uint64_t bytes)
+{
+    uint64_t end = (uint64_t)address + bytes;
+
+    return bytes && address >= GNW_DMA2D_AXI_SRAM_BASE &&
+           end <= (uint64_t)GNW_DMA2D_AXI_SRAM_BASE +
+                  GNW_DMA2D_AXI_SRAM_BYTES;
+}
+
+typedef enum GnwDma2dTimedStart {
+    GNW_DMA2D_TIMED_DISABLED,
+    GNW_DMA2D_TIMED_STARTED,
+    GNW_DMA2D_TIMED_REJECTED,
+} GnwDma2dTimedStart;
+
+static GnwDma2dTimedStart gnw_h7b0_dma2d_reject_timed(
+    GnwH7B0Dma2dState *s, const char *reason)
+{
+    s->unsupported_count++;
+    s->active = false;
+    timer_del(s->timer);
+    s->regs[GNW_H7B0_DMA2D_CR >> 2] &= ~DMA2D_CR_START;
+    s->regs[GNW_H7B0_DMA2D_ISR >> 2] |= DMA2D_ISR_TEIF;
+    qemu_log_mask(LOG_UNIMP, "gnw-h7b0-dma2d: %s; transfer rejected "
+                  "before data became visible\n", reason);
+    gnw_h7b0_dma2d_update_irq(s);
+    return GNW_DMA2D_TIMED_REJECTED;
+}
+
+static GnwDma2dTimedStart gnw_h7b0_dma2d_start_timed(
+    GnwH7B0Dma2dState *s)
+{
+    uint32_t cr = s->regs[GNW_H7B0_DMA2D_CR >> 2];
+    uint32_t mode = (cr & DMA2D_CR_MODE_MASK) >> DMA2D_CR_MODE_SHIFT;
+    uint32_t nlr = s->regs[GNW_H7B0_DMA2D_NLR >> 2];
+    uint32_t lines = nlr & DMA2D_NLR_NL_MASK;
+    uint32_t pixels = (nlr & DMA2D_NLR_PL_MASK) >> DMA2D_NLR_PL_SHIFT;
+    uint32_t out_cm = s->regs[GNW_H7B0_DMA2D_OPFCCR >> 2] &
+                      DMA2D_OPFCCR_CM_MASK;
+    int bpp = gnw_h7b0_dma2d_output_bpp(out_cm);
+    uint64_t source_stride;
+    uint64_t destination_stride;
+    uint64_t first_need;
+    uint64_t regular_need;
+
+    if (!s->timing_mode) {
+        return GNW_DMA2D_TIMED_DISABLED;
+    }
+
+    if (!s->profile.identity) {
+        return GNW_DMA2D_TIMED_DISABLED;
+    }
+    if (!s->profile.eligible ||
+        !s->profile.cycles_per_pixel_num ||
+        !s->profile.cycles_per_pixel_den || !s->clock_known ||
+        !(s->profile.supported_modes & (1U << mode)) || !lines || !pixels ||
+        bpp == 0 || (mode != DMA2D_MODE_R2M && mode != DMA2D_MODE_M2M)) {
+        if (s->profile.identity == DMA2D_DMA_ENGINE_R1_PROFILE_ID) {
+            return GNW_DMA2D_TIMED_DISABLED;
+        }
+        return gnw_h7b0_dma2d_reject_timed(
+            s, "timed transfer class unsupported");
+    }
+    if (s->profile.identity == DMA2D_DMA_ENGINE_R1_PROFILE_ID) {
+        GnwH7B0Dma2dModeTiming timing = s->mode_timing[mode];
+        if (!timing.cycles_per_pixel_den ||
+            s->clock_hz != s->evidence_required_clock_hz ||
+            out_cm != DMA2D_OUTPUT_ARGB8888 || lines > 32 || pixels > 32 ||
+            (uint64_t)lines * pixels < 8 ||
+            (uint64_t)lines * pixels > 1024 ||
+            !gnw_h7b0_dma2d_axi_range(
+                s->regs[GNW_H7B0_DMA2D_OMAR >> 2],
+                (uint64_t)lines * pixels * 4) ||
+            s->regs[GNW_H7B0_DMA2D_OOR >> 2] != 0 ||
+            (mode == DMA2D_MODE_M2M &&
+             (!gnw_h7b0_dma2d_axi_range(
+                  s->regs[GNW_H7B0_DMA2D_FGMAR >> 2],
+                  (uint64_t)lines * pixels * 4) ||
+              s->regs[GNW_H7B0_DMA2D_FGOR >> 2] != 0 ||
+              ((uint64_t)s->regs[GNW_H7B0_DMA2D_FGMAR >> 2] <
+                   (uint64_t)s->regs[GNW_H7B0_DMA2D_OMAR >> 2] +
+                       (uint64_t)lines * pixels * 4 &&
+               (uint64_t)s->regs[GNW_H7B0_DMA2D_OMAR >> 2] <
+                   (uint64_t)s->regs[GNW_H7B0_DMA2D_FGMAR >> 2] +
+                       (uint64_t)lines * pixels * 4)))) {
+            return GNW_DMA2D_TIMED_DISABLED;
+        }
+        s->active_timing = timing;
+    } else if (s->profile.identity == DMA2D_POLL_R4_PROFILE_ID ||
+               s->profile.identity == DMA2D_POLL_R6_PROFILE_ID) {
+        if (s->clock_hz != DMA2D_POLL_R4_REFERENCE_HZ ||
+            mode != DMA2D_MODE_M2M ||
+            out_cm != DMA2D_OUTPUT_ARGB8888 ||
+            s->regs[GNW_H7B0_DMA2D_FGPFCCR >> 2] !=
+                DMA2D_INPUT_ARGB8888 ||
+            s->regs[GNW_H7B0_DMA2D_FGMAR >> 2] != DMA2D_POLL_R4_SOURCE ||
+            s->regs[GNW_H7B0_DMA2D_OMAR >> 2] !=
+                DMA2D_POLL_R4_DESTINATION ||
+            s->regs[GNW_H7B0_DMA2D_FGOR >> 2] != 0 ||
+            s->regs[GNW_H7B0_DMA2D_OOR >> 2] != 0 ||
+            !(s->profile.identity == DMA2D_POLL_R4_PROFILE_ID ?
+              gnw_h7b0_dma2d_poll_r4_geometry(lines, pixels) :
+              gnw_h7b0_dma2d_poll_r6_geometry(lines, pixels))) {
+            return GNW_DMA2D_TIMED_DISABLED;
+        }
+        s->active_timing = s->mode_timing[DMA2D_MODE_M2M];
+    } else {
+        s->active_timing = (GnwH7B0Dma2dModeTiming) { 0 };
+    }
+
+    source_stride = mode == DMA2D_MODE_M2M ?
+        ((uint64_t)pixels + s->regs[GNW_H7B0_DMA2D_FGOR >> 2]) * bpp : 0;
+    destination_stride = ((uint64_t)pixels +
+        s->regs[GNW_H7B0_DMA2D_OOR >> 2]) * bpp;
+    if (source_stride > UINT32_MAX || destination_stride > UINT32_MAX ||
+        (uint64_t)s->regs[GNW_H7B0_DMA2D_OMAR >> 2] +
+            (uint64_t)(lines - 1) * destination_stride +
+            (uint64_t)pixels * bpp > UINT32_MAX ||
+        (mode == DMA2D_MODE_M2M &&
+         (uint64_t)s->regs[GNW_H7B0_DMA2D_FGMAR >> 2] +
+             (uint64_t)(lines - 1) * source_stride +
+             (uint64_t)pixels * bpp > UINT32_MAX) ||
+        !gnw_h7b0_dma2d_phase_need(s->profile.setup_cycles, pixels,
+                                    &s->profile, &first_need)) {
+        return gnw_h7b0_dma2d_reject_timed(
+            s, "timed descriptor overflows");
+    }
+    if (s->active_timing.cycles_per_pixel_den) {
+        if (!gnw_h7b0_dma2d_mode_phase_needs(
+                s->active_timing, pixels, &regular_need, &first_need)) {
+            return gnw_h7b0_dma2d_reject_timed(
+                s, "timed descriptor overflows");
+        }
+    }
+
+    if (mode == DMA2D_MODE_M2M) {
+        uint32_t fg_cm = s->regs[GNW_H7B0_DMA2D_FGPFCCR >> 2] &
+                         DMA2D_PFCCR_CM_MASK;
+        int fg_bpp;
+
+        if (!gnw_h7b0_dma2d_format_bpp(fg_cm, &fg_bpp) || fg_bpp != bpp) {
+            if (s->profile.identity == DMA2D_DMA_ENGINE_R1_PROFILE_ID) {
+                return GNW_DMA2D_TIMED_DISABLED;
+            }
+            return gnw_h7b0_dma2d_reject_timed(
+                s, "timed raw M2M format unsupported");
+        }
+    }
+
+    s->active = true;
+    s->active_mode = mode;
+    s->current_line = 0;
+    s->total_lines = lines;
+    s->pixels_per_line = pixels;
+    s->source = s->regs[GNW_H7B0_DMA2D_FGMAR >> 2];
+    s->destination = s->regs[GNW_H7B0_DMA2D_OMAR >> 2];
+    s->bytes_per_pixel = bpp;
+    s->source_stride = source_stride;
+    s->destination_stride = destination_stride;
+    s->fill_color = s->regs[GNW_H7B0_DMA2D_OCOLR >> 2];
+    s->phase_need = first_need;
+    s->phase_progress = 0;
+    s->phase_subcycle = 0;
+    s->last_update_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->regs[GNW_H7B0_DMA2D_CR >> 2] |= DMA2D_CR_START;
+    gnw_h7b0_dma2d_arm(s);
+    return GNW_DMA2D_TIMED_STARTED;
+}
+
 static void gnw_h7b0_dma2d_reset(DeviceState *dev)
 {
     GnwH7B0Dma2dState *s = GNW_H7B0_DMA2D(dev);
 
+    timer_del(s->timer);
     memset(s->regs, 0, sizeof(s->regs));
+    s->active = false;
+    s->current_line = 0;
+    s->phase_progress = 0;
+    s->phase_subcycle = 0;
+    s->unsupported_count = 0;
+    qemu_set_irq(s->irq, 0);
 }
 
 static uint64_t gnw_h7b0_dma2d_read(void *opaque, hwaddr addr,
@@ -681,11 +1169,48 @@ static void gnw_h7b0_dma2d_write(void *opaque, hwaddr addr, uint64_t val64,
         }
         return;
     case GNW_H7B0_DMA2D_CR:
+        if (s->active) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+            while (!gnw_h7b0_dma2d_settle(s, now)) {
+                /* An MMIO control write observes every line due by now. */
+            }
+            if (!s->active) {
+                /* Settlement may have completed the transfer. A stale START
+                 * copied from CR must not resurrect the completed work. */
+                s->regs[addr >> 2] = value &
+                    ~(DMA2D_CR_START | DMA2D_CR_ABORT | DMA2D_CR_SUSP);
+                gnw_h7b0_dma2d_update_irq(s);
+                return;
+            }
+            if (value & DMA2D_CR_ABORT) {
+                s->active = false;
+                timer_del(s->timer);
+                s->regs[addr >> 2] = value &
+                    ~(DMA2D_CR_START | DMA2D_CR_ABORT);
+                gnw_h7b0_dma2d_update_irq(s);
+                return;
+            }
+            if (value & DMA2D_CR_SUSP) {
+                qemu_log_mask(LOG_UNIMP,
+                              "gnw-h7b0-dma2d: timed suspend unsupported; "
+                              "transfer remains active\n");
+            }
+            s->regs[addr >> 2] = value | DMA2D_CR_START;
+            gnw_h7b0_dma2d_update_irq(s);
+            return;
+        }
         s->regs[addr >> 2] = value & ~DMA2D_CR_START;
         if (value & DMA2D_CR_START) {
-            gnw_h7b0_dma2d_do_transfer(s);
-            s->regs[GNW_H7B0_DMA2D_ISR >> 2] |= DMA2D_ISR_TCIF;
-            gnw_h7b0_dma2d_update_irq(s);
+            s->regs[addr >> 2] = value;
+            GnwDma2dTimedStart timed = gnw_h7b0_dma2d_start_timed(s);
+
+            if (timed == GNW_DMA2D_TIMED_DISABLED) {
+                s->regs[addr >> 2] &= ~DMA2D_CR_START;
+                gnw_h7b0_dma2d_do_transfer(s);
+                s->regs[GNW_H7B0_DMA2D_ISR >> 2] |= DMA2D_ISR_TCIF;
+                gnw_h7b0_dma2d_update_irq(s);
+            }
         }
         return;
     default:
@@ -715,16 +1240,321 @@ static void gnw_h7b0_dma2d_init(Object *obj)
                            TYPE_GNW_H7B0_DMA2D, GNW_H7B0_DMA2D_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
+    s->test_clock_known = true;
+    s->test_clock_hz = 100000000;
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, gnw_h7b0_dma2d_tick, s);
+}
+
+static int gnw_h7b0_dma2d_pre_save(void *opaque)
+{
+    GnwH7B0Dma2dState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    while (!gnw_h7b0_dma2d_settle(s, now)) {
+        /* NLR bounds completion work. */
+    }
+    s->migration_timing_mode = s->timing_mode;
+    s->migration_profile_identity = s->profile.identity;
+    s->migration_clock_ns = now;
+    return 0;
+}
+
+static bool gnw_h7b0_dma2d_post_load(void *opaque, int version_id,
+                                      Error **errp)
+{
+    GnwH7B0Dma2dState *s = opaque;
+    uint64_t regular_need;
+    uint64_t first_need;
+
+    if (version_id < 2) {
+        if (s->timing_mode || s->profile.identity) {
+            error_setg(errp, "DMA2D v1 migration lacks timed engine state");
+            return false;
+        }
+        gnw_h7b0_dma2d_update_irq(s);
+        return true;
+    }
+    if (s->migration_timing_mode != s->timing_mode) {
+        error_setg(errp, "DMA2D timing mode differs between endpoints");
+        return false;
+    }
+    if (s->migration_clock_ns < 0) {
+        error_setg(errp, "DMA2D migration has invalid virtual clock epoch");
+        return false;
+    }
+    if ((!s->clock_known || !s->clock_gate_enabled) && s->clock_hz) {
+        error_setg(errp,
+                   "DMA2D migration has inconsistent engine clock state");
+        return false;
+    }
+    if (!s->active) {
+        gnw_h7b0_dma2d_update_irq(s);
+        return true;
+    }
+    if (s->profile.identity == DMA2D_DMA_ENGINE_R1_PROFILE_ID ||
+        s->profile.identity == DMA2D_POLL_R4_PROFILE_ID ||
+        s->profile.identity == DMA2D_POLL_R6_PROFILE_ID) {
+        if (s->active_mode >= ARRAY_SIZE(s->mode_timing) ||
+            ((s->profile.identity == DMA2D_POLL_R4_PROFILE_ID ||
+              s->profile.identity == DMA2D_POLL_R6_PROFILE_ID) &&
+             s->active_mode != DMA2D_MODE_M2M)) {
+            error_setg(errp, "DMA2D migration has invalid timed mode");
+            return false;
+        }
+        s->active_timing = s->mode_timing[s->active_mode];
+        if (!gnw_h7b0_dma2d_mode_phase_needs(
+                s->active_timing, s->pixels_per_line,
+                &regular_need, &first_need)) {
+            error_setg(errp, "DMA2D migration has overflowing timed profile");
+            return false;
+        }
+    } else if (!gnw_h7b0_dma2d_phase_need(0, s->pixels_per_line,
+                                    &s->profile, &regular_need) ||
+        !gnw_h7b0_dma2d_phase_need(s->profile.setup_cycles,
+                                    s->pixels_per_line,
+                                    &s->profile, &first_need)) {
+        error_setg(errp, "DMA2D migration has overflowing timed profile");
+        return false;
+    }
+    if (!s->profile.eligible || !s->profile.identity ||
+        !s->total_lines ||
+        s->total_lines > DMA2D_NLR_NL_MASK || !s->pixels_per_line ||
+        s->pixels_per_line > (DMA2D_NLR_PL_MASK >> DMA2D_NLR_PL_SHIFT) ||
+        s->current_line >= s->total_lines ||
+        (s->active_mode != DMA2D_MODE_R2M &&
+         s->active_mode != DMA2D_MODE_M2M) ||
+        (s->bytes_per_pixel != 2 && s->bytes_per_pixel != 4) ||
+        (s->phase_need != regular_need &&
+         !(s->current_line == 0 && s->phase_need == first_need)) ||
+        s->phase_progress >= s->phase_need ||
+        s->phase_subcycle >= NANOSECONDS_PER_SECOND ||
+        s->last_update_ns < 0 ||
+        s->last_update_ns > s->migration_clock_ns ||
+        (uint64_t)s->destination +
+            (uint64_t)(s->total_lines - 1) * s->destination_stride +
+            (uint64_t)s->pixels_per_line * s->bytes_per_pixel > UINT32_MAX ||
+        (s->active_mode == DMA2D_MODE_M2M &&
+         (uint64_t)s->source +
+             (uint64_t)(s->total_lines - 1) * s->source_stride +
+             (uint64_t)s->pixels_per_line * s->bytes_per_pixel > UINT32_MAX) ||
+        !(s->regs[GNW_H7B0_DMA2D_CR >> 2] & DMA2D_CR_START)) {
+        error_setg(errp, "DMA2D migration has corrupt timed state");
+        return false;
+    }
+    s->last_update_ns += qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                         s->migration_clock_ns;
+    gnw_h7b0_dma2d_arm(s);
+    gnw_h7b0_dma2d_update_irq(s);
+    return true;
 }
 
 static const VMStateDescription vmstate_gnw_h7b0_dma2d = {
     .name = TYPE_GNW_H7B0_DMA2D,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .pre_save = gnw_h7b0_dma2d_pre_save,
+    .post_load_errp = gnw_h7b0_dma2d_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, GnwH7B0Dma2dState, GNW_H7B0_DMA2D_SIZE / 4),
+        VMSTATE_BOOL_V(migration_timing_mode, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_EQUAL_V(migration_profile_identity,
+                               GnwH7B0Dma2dState, 2,
+                               "DMA2D timing profile differs"),
+        VMSTATE_BOOL_V(clock_known, GnwH7B0Dma2dState, 2),
+        VMSTATE_BOOL_V(clock_gate_enabled, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(clock_hz, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT64_V(unsupported_count, GnwH7B0Dma2dState, 2),
+        VMSTATE_BOOL_V(active, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(active_mode, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(current_line, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(total_lines, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(pixels_per_line, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(source, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(destination, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(source_stride, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(destination_stride, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(bytes_per_pixel, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(fill_color, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT64_V(phase_need, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT64_V(phase_progress, GnwH7B0Dma2dState, 2),
+        VMSTATE_UINT32_V(phase_subcycle, GnwH7B0Dma2dState, 2),
+        VMSTATE_INT64_V(last_update_ns, GnwH7B0Dma2dState, 2),
+        VMSTATE_INT64_V(migration_clock_ns, GnwH7B0Dma2dState, 2),
         VMSTATE_END_OF_LIST()
     }
+};
+
+static void gnw_h7b0_dma2d_test_clock_set(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+{
+    const Property *prop = opaque;
+    uint32_t *value = object_field_prop_ptr(obj, prop);
+
+    if (!visit_type_uint32(v, name, value, errp)) {
+        return;
+    }
+    GnwH7B0Dma2dState *s = GNW_H7B0_DMA2D(obj);
+    gnw_h7b0_dma2d_set_clock_info(s, s->test_clock_known,
+                                  s->test_clock_hz, true);
+}
+
+static const PropertyInfo gnw_h7b0_dma2d_test_clock_prop = {
+    .type = "uint32",
+    .set = gnw_h7b0_dma2d_test_clock_set,
+    .realized_set_allowed = true,
+};
+
+static void gnw_h7b0_dma2d_test_known_set(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+{
+    const Property *prop = opaque;
+    bool *value = object_field_prop_ptr(obj, prop);
+
+    if (!visit_type_bool(v, name, value, errp)) {
+        return;
+    }
+    GnwH7B0Dma2dState *s = GNW_H7B0_DMA2D(obj);
+    gnw_h7b0_dma2d_set_clock_info(s, s->test_clock_known,
+                                  s->test_clock_hz, true);
+}
+
+static const PropertyInfo gnw_h7b0_dma2d_test_known_prop = {
+    .type = "bool",
+    .set = gnw_h7b0_dma2d_test_known_set,
+    .realized_set_allowed = true,
+};
+
+static void gnw_h7b0_dma2d_realize(DeviceState *dev, Error **errp)
+{
+    GnwH7B0Dma2dState *s = GNW_H7B0_DMA2D(dev);
+
+    if ((s->test_profile ? 1 : 0) +
+        (s->dma_engine_successor_profile ? 1 : 0) +
+        (s->dma2d_poll_r4_profile ? 1 : 0) +
+        (s->dma2d_poll_r6_profile ? 1 : 0) > 1) {
+        error_setg(errp, "DMA2D timing profiles are mutually exclusive");
+        return;
+    }
+    if ((s->dma_engine_successor_profile || s->dma2d_poll_r4_profile ||
+         s->dma2d_poll_r6_profile) &&
+        !s->timing_mode) {
+        error_setg(errp, "DMA2D evidence timing profile requires timing-mode=on");
+        return;
+    }
+    if (s->dma_engine_successor_profile &&
+        (!DMA_ENGINE_R1_RECEIPT_SHA256[0] ||
+         !s->dma_engine_successor_receipt_sha256 ||
+         strcmp(s->dma_engine_successor_receipt_sha256,
+                DMA_ENGINE_R1_RECEIPT_SHA256))) {
+        error_setg(errp, "DMA engine successor profile requires the exact reviewed replay receipt");
+        return;
+    }
+    if (!s->dma_engine_successor_profile &&
+        s->dma_engine_successor_receipt_sha256) {
+        error_setg(errp, "DMA2D DMA engine replay receipt requires its profile");
+        return;
+    }
+    if (s->dma2d_poll_r4_profile &&
+        (!s->dma2d_poll_r4_receipt_sha256 ||
+         strcmp(s->dma2d_poll_r4_receipt_sha256,
+                DMA2D_POLL_R4_RECEIPT_SHA256))) {
+        error_setg(errp, "DMA2D poll r4 candidate requires its exact "
+                   "physical HOLDOUT score receipt");
+        return;
+    }
+    if (!s->dma2d_poll_r4_profile && s->dma2d_poll_r4_receipt_sha256) {
+        error_setg(errp, "DMA2D poll r4 receipt requires its profile");
+        return;
+    }
+    if (s->dma2d_poll_r6_profile &&
+        (!s->dma2d_poll_r6_scope_sha256 ||
+         strcmp(s->dma2d_poll_r6_scope_sha256,
+                DMA2D_POLL_R6_SCOPE_SHA256))) {
+        error_setg(errp, "DMA2D poll r6 comparison profile requires its exact scope freeze");
+        return;
+    }
+    if (!s->dma2d_poll_r6_profile && s->dma2d_poll_r6_scope_sha256) {
+        error_setg(errp, "DMA2D poll r6 scope digest requires its profile");
+        return;
+    }
+    if (s->test_profile) {
+        GnwH7B0Dma2dTimingProfile profile = {
+            .identity = DMA2D_TEST_PROFILE_ID,
+            .eligible = true,
+            .supported_modes = (1U << DMA2D_MODE_R2M) |
+                               (1U << DMA2D_MODE_M2M),
+            .setup_cycles = 4,
+            .cycles_per_pixel_num = 1,
+            .cycles_per_line_num = s->test_cycles_per_line,
+            .cycles_per_pixel_den = 1,
+        };
+        gnw_h7b0_dma2d_set_timing_profile(s, &profile);
+        gnw_h7b0_dma2d_set_clock_info(s, s->test_clock_known,
+                                      s->test_clock_hz, true);
+    } else if (s->dma_engine_successor_profile) {
+        GnwH7B0Dma2dTimingProfile profile = {
+            .identity = DMA2D_DMA_ENGINE_R1_PROFILE_ID,
+            .eligible = true,
+            .supported_modes = (1U << DMA2D_MODE_M2M) |
+                               (1U << DMA2D_MODE_R2M),
+            .cycles_per_pixel_num = 1,
+            .cycles_per_pixel_den = 1,
+        };
+        gnw_h7b0_dma2d_set_timing_profile(s, &profile);
+        s->evidence_reference_hz = 280000000;
+        s->evidence_required_clock_hz = 280000000;
+        s->mode_timing[DMA2D_MODE_M2M] = (GnwH7B0Dma2dModeTiming) {
+            .setup_num = 36672, .cycles_per_pixel_num = 372,
+            .cycles_per_pixel_den = 224,
+        };
+        s->mode_timing[DMA2D_MODE_R2M] = (GnwH7B0Dma2dModeTiming) {
+            .setup_num = 53408, .cycles_per_pixel_num = 217,
+            .cycles_per_pixel_den = 240,
+        };
+    } else if (s->dma2d_poll_r4_profile || s->dma2d_poll_r6_profile) {
+        GnwH7B0Dma2dTimingProfile profile = {
+            .identity = s->dma2d_poll_r4_profile ? DMA2D_POLL_R4_PROFILE_ID :
+                                                   DMA2D_POLL_R6_PROFILE_ID,
+            .eligible = true,
+            .supported_modes = 1U << DMA2D_MODE_M2M,
+            .cycles_per_pixel_num = DMA2D_POLL_R4_PIXEL_NUM,
+            .cycles_per_pixel_den = DMA2D_POLL_R4_DEN,
+        };
+        gnw_h7b0_dma2d_set_timing_profile(s, &profile);
+        s->evidence_reference_hz = DMA2D_POLL_R4_REFERENCE_HZ;
+        s->evidence_required_clock_hz = DMA2D_POLL_R4_REFERENCE_HZ;
+        s->mode_timing[DMA2D_MODE_M2M] = (GnwH7B0Dma2dModeTiming) {
+            .setup_num = DMA2D_POLL_R4_SETUP_NUM,
+            .cycles_per_pixel_num = DMA2D_POLL_R4_PIXEL_NUM,
+            .cycles_per_pixel_den = DMA2D_POLL_R4_DEN,
+        };
+    }
+}
+
+static const Property gnw_h7b0_dma2d_properties[] = {
+    DEFINE_PROP_BOOL("timing-mode", GnwH7B0Dma2dState, timing_mode, false),
+    DEFINE_PROP_BOOL("x-test-profile", GnwH7B0Dma2dState,
+                     test_profile, false),
+    DEFINE_PROP_BOOL("x-dma-engine-successor-r1-profile", GnwH7B0Dma2dState,
+                     dma_engine_successor_profile, false),
+    DEFINE_PROP_STRING("x-dma-engine-successor-r1-receipt-sha256",
+                       GnwH7B0Dma2dState, dma_engine_successor_receipt_sha256),
+    DEFINE_PROP_BOOL("x-dma2d-poll-r4-profile", GnwH7B0Dma2dState,
+                     dma2d_poll_r4_profile, false),
+    DEFINE_PROP_STRING("x-dma2d-poll-r4-receipt-sha256",
+                       GnwH7B0Dma2dState, dma2d_poll_r4_receipt_sha256),
+    DEFINE_PROP_BOOL("x-dma2d-poll-r6-comparison-profile", GnwH7B0Dma2dState,
+                     dma2d_poll_r6_profile, false),
+    DEFINE_PROP_STRING("x-dma2d-poll-r6-scope-sha256",
+                       GnwH7B0Dma2dState, dma2d_poll_r6_scope_sha256),
+    DEFINE_PROP_UINT32("x-test-cycles-per-line", GnwH7B0Dma2dState,
+                       test_cycles_per_line, 0),
+    DEFINE_PROP("x-test-clock-known", GnwH7B0Dma2dState, test_clock_known,
+                gnw_h7b0_dma2d_test_known_prop, bool),
+    DEFINE_PROP("x-test-clock-hz", GnwH7B0Dma2dState, test_clock_hz,
+                gnw_h7b0_dma2d_test_clock_prop, uint32_t),
 };
 
 static void gnw_h7b0_dma2d_class_init(ObjectClass *klass, const void *data)
@@ -732,6 +1562,8 @@ static void gnw_h7b0_dma2d_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->vmsd = &vmstate_gnw_h7b0_dma2d;
+    dc->realize = gnw_h7b0_dma2d_realize;
+    device_class_set_props(dc, gnw_h7b0_dma2d_properties);
     device_class_set_legacy_reset(dc, gnw_h7b0_dma2d_reset);
 }
 

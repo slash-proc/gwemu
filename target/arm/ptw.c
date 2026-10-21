@@ -2612,6 +2612,10 @@ static bool get_phys_addr_pmsav7(CPUARMState *env,
     result->f.phys_addr = address;
     result->f.lg_page_size = TARGET_PAGE_BITS;
     result->f.prot = 0;
+    result->f.extra.arm.pmsa_valid = false;
+    result->f.extra.arm.pmsa_region = UINT8_MAX;
+    result->f.extra.arm.pmsa_attrs = 0;
+    result->f.extra.arm.pmsa_source = CPUTLB_ARM_PMSA_NONE;
 
     if (regime_translation_disabled(env, mmu_idx, ptw->in_space) ||
         m_is_ppb_region(env, address)) {
@@ -2623,6 +2627,9 @@ static bool get_phys_addr_pmsav7(CPUARMState *env,
          * which always does a direct read using address_space_ldl(), rather
          * than going via this function, so we don't need to check that here.
          */
+        result->f.extra.arm.pmsa_source =
+            m_is_ppb_region(env, address) ? CPUTLB_ARM_PMSA_PPB :
+                                           CPUTLB_ARM_PMSA_DISABLED;
         get_phys_addr_pmsav7_default(env, mmu_idx, address, &result->f.prot);
     } else { /* MPU enabled */
         for (n = (int)cpu->pmsav7_dregion - 1; n >= 0; n--) {
@@ -2716,9 +2723,22 @@ static bool get_phys_addr_pmsav7(CPUARMState *env,
             }
             get_phys_addr_pmsav7_default(env, mmu_idx, address,
                                          &result->f.prot);
+            result->f.extra.arm.pmsa_source =
+                CPUTLB_ARM_PMSA_BACKGROUND;
         } else { /* a MPU hit! */
             uint32_t ap = extract32(env->pmsav7.dracr[n], 8, 3);
             uint32_t xn = extract32(env->pmsav7.dracr[n], 12, 1);
+
+            /*
+             * Preserve the selected PMSAv7 MPU region and its raw
+             * TEX/S/C/B attributes.  These are not MAIR-format attributes,
+             * so they must not be folded into cacheattrs.attrs.
+             */
+            result->f.extra.arm.pmsa_valid = true;
+            result->f.extra.arm.pmsa_source = CPUTLB_ARM_PMSA_REGION;
+            result->f.extra.arm.pmsa_region = n;
+            result->f.extra.arm.pmsa_attrs =
+                extract32(env->pmsav7.dracr[n], 0, 6);
 
             if (m_is_system_region(env, address)) {
                 /* System space is always execute never */

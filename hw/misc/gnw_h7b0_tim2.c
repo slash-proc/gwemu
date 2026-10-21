@@ -2,8 +2,11 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "migration/vmstate.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/irq.h"
 #include "hw/misc/gnw_h7b0_tim2.h"
 #include "hw/misc/gnw_h7b0_regs_tim2.h"
+#include "hw/misc/gnw_h7b0_timer_clock.h"
 #include "hw/misc/gnw_env.h"
 
 /*
@@ -49,111 +52,246 @@ static int gnw_h7b0_tim2_instance_index(hwaddr addr)
     return idx < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT ? (int)idx : -1;
 }
 
-static uint64_t gnw_h7b0_tim2_period_ns(GnwH7B0Tim2State *s, int idx)
+static QEMUTimer *gnw_h7b0_tim2_count_timer(GnwH7B0Tim2State *s, int idx)
 {
-    hwaddr base = (hwaddr)idx * 0x400;
-    uint32_t psc = s->regs[(base + GNW_H7B0_TIM2_PSC_OFFSET) >> 2];
-    uint32_t arr = s->regs[(base + GNW_H7B0_TIM2_ARR_OFFSET) >> 2];
-    uint64_t clk_hz = GNW_H7B0_TIM2_APPROX_CLK_HZ;
-    uint64_t period_ns;
-
-    if (s->rcc) {
-        uint32_t live_hz = gnw_h7b0_rcc_get_timer_ker_hz(s->rcc);
-        if (live_hz != 0) {
-            clk_hz = live_hz;
-        }
-    }
-
-    /*
-     * Widen BEFORE incrementing. `arr` is uint32_t, so a plain (arr + 1)
-     * is evaluated in 32-bit and wraps to 0 for the single most important
-     * case there is: ARR = 0xffffffff, which is both the reset value and
-     * exactly how firmware sets up a free-running 32-bit microsecond time
-     * base (real example, stock Mario: CR1=1, PSC=0x15, ARR=0xffffffff).
-     * The old (uint64_t)(arr + 1) cast the *already-wrapped* result, making
-     * period_ns 0, which the MIN clamp below then turned into 1us -- a
-     * ~277-second update event modelled as a 1MHz one. The timer re-armed
-     * itself as fast as the main loop could dispatch it (~130-180k times a
-     * second, measured), and that flood of virtual-clock expiries, not any
-     * per-instruction emulation cost, was what saturated QEMU's main loop.
-     *
-     * The product needs a 128-bit intermediate too: (2^32) * 22 * 1e9
-     * overflows uint64_t, so muldiv64() rather than a bare multiply.
-     */
-    period_ns = muldiv64(((uint64_t)arr + 1) * ((uint64_t)psc + 1),
-                         NANOSECONDS_PER_SECOND, clk_hz);
-
-    period_ns = MAX(period_ns, GNW_H7B0_TIM2_MIN_PERIOD_NS);
-    period_ns = MIN(period_ns, GNW_H7B0_TIM2_MAX_PERIOD_NS);
-    return period_ns;
+    return idx < GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT ?
+        s->count_timer[idx] : s->late_count_timer[
+            idx - GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT];
 }
 
-/*
- * Counter tick rate for this instance: kernel clock after the prescaler.
- * Same clock source gnw_h7b0_tim2_period_ns() uses, kept separate so the
- * CNT extrapolation below doesn't have to re-derive the update period.
- */
-static uint64_t gnw_h7b0_tim2_tick_hz(GnwH7B0Tim2State *s, int idx)
+static uint32_t gnw_h7b0_tim2_counter_mask(int idx)
 {
-    hwaddr base = (hwaddr)idx * 0x400;
-    uint32_t psc = s->regs[(base + GNW_H7B0_TIM2_PSC_OFFSET) >> 2];
-    uint64_t clk_hz = GNW_H7B0_TIM2_APPROX_CLK_HZ;
-
-    if (s->rcc) {
-        uint32_t live_hz = gnw_h7b0_rcc_get_timer_ker_hz(s->rcc);
-        if (live_hz != 0) {
-            clk_hz = live_hz;
-        }
-    }
-    return clk_hz / ((uint64_t)psc + 1);
+    return idx < GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT ? UINT32_MAX : 0xffffu;
 }
 
-/*
- * CNT as it would read *right now*: cnt_base plus however many ticks have
- * elapsed since cnt_ref_ns, wrapped at ARR+1. While CR1.CEN is clear the
- * counter is frozen, so cnt_base is the answer verbatim.
- */
-static uint32_t gnw_h7b0_tim2_live_cnt(GnwH7B0Tim2State *s, int idx)
+static uint32_t gnw_h7b0_tim2_write_mask(int idx, uint32_t offset)
+{
+    if (idx < GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT) {
+        return get_tim2_write_mask(offset);
+    }
+
+    /* TIM12/13/14 only expose the base timer controls modeled below. */
+    switch (offset) {
+    case GNW_H7B0_TIM2_CR1_OFFSET:
+        return 0x000003ffu;
+    case GNW_H7B0_TIM2_DIER_OFFSET:
+    case GNW_H7B0_TIM2_SR_OFFSET:
+    case GNW_H7B0_TIM2_EGR_OFFSET:
+        return 0x1u;
+    case GNW_H7B0_TIM2_CNT_OFFSET:
+    case GNW_H7B0_TIM2_ARR_OFFSET:
+    case GNW_H7B0_TIM2_PSC_OFFSET:
+        return 0xffffu;
+    default:
+        return 0;
+    }
+}
+
+static void gnw_h7b0_tim2_update_irq(GnwH7B0Tim2State *s, int idx)
+{
+    hwaddr base = (hwaddr)idx * 0x400;
+    uint32_t dier = s->regs[(base + GNW_H7B0_TIM2_DIER_OFFSET) >> 2];
+    uint32_t sr = s->regs[(base + GNW_H7B0_TIM2_SR_OFFSET) >> 2];
+
+    qemu_set_irq(s->irq[idx], (dier & sr & 1u) != 0);
+}
+
+/* Kernel clock used by both update timing and the live CNT calculation. */
+static uint32_t gnw_h7b0_tim2_kernel_hz(GnwH7B0Tim2State *s)
+{
+    if (s->rcc) {
+        /* A wired zero is a stopped clock, not an unavailable clock model. */
+        return gnw_h7b0_rcc_get_timer_ker_hz(s->rcc);
+    }
+    return GNW_H7B0_TIM2_APPROX_CLK_HZ;
+}
+
+static void gnw_h7b0_tim2_settle(GnwH7B0Tim2State *s, int idx,
+                                  uint64_t now, uint32_t kernel_hz)
 {
     hwaddr base = (hwaddr)idx * 0x400;
     uint32_t cr1 = s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2];
-    uint32_t arr = s->regs[(base + GNW_H7B0_TIM2_ARR_OFFSET) >> 2];
+    uint32_t psc = s->regs[(base + GNW_H7B0_TIM2_PSC_OFFSET) >> 2] &
+                   GNW_H7B0_TIM2_PRESCALER_MASK;
+    uint32_t arr = s->regs[(base + GNW_H7B0_TIM2_ARR_OFFSET) >> 2] &
+                   gnw_h7b0_tim2_counter_mask(idx);
     uint64_t modulus = (uint64_t)arr + 1;
-    uint64_t now, elapsed_ns, ticks;
+    uint64_t elapsed_ns, kernel_cycles, ticks, remainder;
 
-    if (!(cr1 & 0x1u) || modulus == 0) {
-        return s->cnt_base[idx];
+    if (s->timing_mode && icount_enabled()) {
+        IcountCycleStamp stamp;
+
+        icount_get_cycle_stamp(&stamp);
+        if (!gnw_h7b0_cycle_phase_settle(
+                &s->cycle_phase[idx], stamp, (cr1 & 1u) ? kernel_hz : 0,
+                &ticks)) {
+            g_assert_not_reached();
+        }
+        if (cr1 & 1u) {
+            uint64_t prescale = (uint64_t)psc + 1;
+            uint64_t total = ticks + s->psc_remainder[idx];
+
+            s->psc_remainder[idx] = total % prescale;
+            s->cnt_base[idx] = ((uint64_t)s->cnt_base[idx] +
+                (total / prescale) % modulus) % modulus;
+        }
+        s->regs[(base + GNW_H7B0_TIM2_CNT_OFFSET) >> 2] =
+            s->cnt_base[idx];
+        s->cnt_ref_ns[idx] = now;
+        return;
     }
 
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    if (now <= s->cnt_ref_ns[idx]) {
-        return s->cnt_base[idx];
+    if (!(cr1 & 0x1u) || now <= s->cnt_ref_ns[idx]) {
+        return;
     }
     elapsed_ns = now - s->cnt_ref_ns[idx];
-
-    /* ticks = elapsed_ns * tick_hz / 1e9, in 128-bit to avoid overflow. */
-    ticks = muldiv64(elapsed_ns, gnw_h7b0_tim2_tick_hz(s, idx),
-                     NANOSECONDS_PER_SECOND);
-
-    return (uint32_t)(((uint64_t)s->cnt_base[idx] + ticks) % modulus);
+    kernel_cycles = gnw_h7b0_timer_elapsed_kernel_cycles(
+        elapsed_ns, kernel_hz, &s->kernel_fraction[idx]);
+    ticks = kernel_cycles / ((uint64_t)psc + 1);
+    remainder = kernel_cycles % ((uint64_t)psc + 1);
+    remainder += s->psc_remainder[idx];
+    if (remainder >= (uint64_t)psc + 1) {
+        remainder -= (uint64_t)psc + 1;
+        ticks++;
+    }
+    s->psc_remainder[idx] = remainder;
+    s->cnt_base[idx] = ((uint64_t)s->cnt_base[idx] + ticks % modulus) %
+                       modulus;
+    s->regs[(base + GNW_H7B0_TIM2_CNT_OFFSET) >> 2] = s->cnt_base[idx];
+    s->cnt_ref_ns[idx] = now;
 }
 
-/*
- * Pin CNT's extrapolation to "now". Must be called BEFORE changing
- * anything the extrapolation depends on (PSC, ARR, CEN, CNT itself),
- * so the elapsed time so far is accounted against the old parameters.
- */
 static void gnw_h7b0_tim2_latch_cnt(GnwH7B0Tim2State *s, int idx)
 {
-    s->cnt_base[idx] = gnw_h7b0_tim2_live_cnt(s, idx);
-    s->cnt_ref_ns[idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    gnw_h7b0_tim2_settle(s, idx,
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+        gnw_h7b0_tim2_kernel_hz(s));
+}
+
+static uint64_t gnw_h7b0_tim2_remaining_ns_exact(GnwH7B0Tim2State *s,
+                                                  int idx,
+                                                  uint32_t kernel_hz)
+{
+    hwaddr base = (hwaddr)idx * 0x400;
+    uint32_t psc = s->regs[(base + GNW_H7B0_TIM2_PSC_OFFSET) >> 2] &
+                   GNW_H7B0_TIM2_PRESCALER_MASK;
+    uint32_t arr = s->regs[(base + GNW_H7B0_TIM2_ARR_OFFSET) >> 2] &
+                   gnw_h7b0_tim2_counter_mask(idx);
+    uint64_t modulus = (uint64_t)arr + 1;
+    uint64_t remaining_ticks = modulus - (s->cnt_base[idx] % modulus);
+    uint64_t kernel_cycles = remaining_ticks * ((uint64_t)psc + 1) -
+                             s->psc_remainder[idx];
+    if (s->timing_mode && icount_enabled()) {
+        uint64_t interval = gnw_h7b0_timer_kernel_q64_to_ns_ceil(
+            kernel_cycles, s->cycle_phase[idx].fraction_q64, kernel_hz);
+
+        return interval ? interval : 1;
+    }
+    return gnw_h7b0_timer_kernel_cycles_to_ns_ceil(
+        kernel_cycles, s->kernel_fraction[idx], kernel_hz);
+}
+
+static uint64_t gnw_h7b0_tim2_remaining_ns(GnwH7B0Tim2State *s, int idx,
+                                           uint32_t kernel_hz)
+{
+    uint64_t interval = gnw_h7b0_tim2_remaining_ns_exact(s, idx, kernel_hz);
+
+    return gnw_h7b0_timer_apply_period_limits(
+        interval, s->timing_mode, GNW_H7B0_TIM2_MIN_PERIOD_NS,
+        GNW_H7B0_TIM2_MAX_PERIOD_NS);
+}
+
+static void gnw_h7b0_tim2_schedule(GnwH7B0Tim2State *s, int idx,
+                                    uint32_t kernel_hz)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!kernel_hz) {
+        timer_del(gnw_h7b0_tim2_count_timer(s, idx));
+        return;
+    }
+    timer_mod(gnw_h7b0_tim2_count_timer(s, idx), gnw_h7b0_timer_deadline_sat(
+                  now, gnw_h7b0_tim2_remaining_ns(s, idx, kernel_hz)));
 }
 
 static void gnw_h7b0_tim2_start_counting(GnwH7B0Tim2State *s, int idx)
 {
-    timer_mod(s->count_timer[idx],
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              gnw_h7b0_tim2_period_ns(s, idx));
+    s->cnt_ref_ns[idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (s->timing_mode && icount_enabled()) {
+        IcountCycleStamp stamp;
+
+        icount_get_cycle_stamp(&stamp);
+        g_assert(gnw_h7b0_cycle_phase_init(&s->cycle_phase[idx], stamp));
+    }
+    gnw_h7b0_tim2_schedule(s, idx, gnw_h7b0_tim2_kernel_hz(s));
+}
+
+static bool gnw_h7b0_tim2_timing_prepare(
+    void *opaque, const IcountCycleStamp *before, uint32_t old_hz)
+{
+    GnwH7B0Tim2State *s = opaque;
+
+    for (int idx = 0; idx < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; idx++) {
+        hwaddr base = (hwaddr)idx * 0x400;
+        bool counting = s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2] & 1u;
+        uint64_t ticks;
+
+        s->pending_cycle_phase[idx] = s->cycle_phase[idx];
+        s->pending_cnt_base[idx] = s->cnt_base[idx];
+        s->pending_psc_remainder[idx] = s->psc_remainder[idx];
+        if (!gnw_h7b0_cycle_phase_settle(&s->pending_cycle_phase[idx],
+                                          *before, counting ? old_hz : 0,
+                                          &ticks)) {
+            s->pending_phase_valid = false;
+            return false;
+        }
+        if (counting) {
+            uint32_t psc = s->regs[(base + GNW_H7B0_TIM2_PSC_OFFSET) >> 2] &
+                           GNW_H7B0_TIM2_PRESCALER_MASK;
+            uint32_t arr = s->regs[(base + GNW_H7B0_TIM2_ARR_OFFSET) >> 2] &
+                           gnw_h7b0_tim2_counter_mask(idx);
+            uint64_t prescale = (uint64_t)psc + 1;
+            uint64_t modulus = (uint64_t)arr + 1;
+            uint64_t total = ticks + s->pending_psc_remainder[idx];
+
+            s->pending_psc_remainder[idx] = total % prescale;
+            s->pending_cnt_base[idx] =
+                (s->pending_cnt_base[idx] + (total / prescale) % modulus) %
+                modulus;
+        }
+    }
+    s->pending_phase_valid = true;
+    return true;
+}
+
+static void gnw_h7b0_tim2_timing_commit(
+    void *opaque, const IcountCycleStamp *before,
+    const IcountCycleStamp *after, uint32_t new_hz)
+{
+    GnwH7B0Tim2State *s = opaque;
+
+    g_assert(s->pending_phase_valid);
+    for (int idx = 0; idx < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; idx++) {
+        hwaddr base = (hwaddr)idx * 0x400;
+
+        g_assert(gnw_h7b0_cycle_phase_rebase(&s->pending_cycle_phase[idx],
+                                              *before, *after));
+        s->cycle_phase[idx] = s->pending_cycle_phase[idx];
+        s->cnt_base[idx] = s->pending_cnt_base[idx];
+        s->psc_remainder[idx] = s->pending_psc_remainder[idx];
+        s->regs[(base + GNW_H7B0_TIM2_CNT_OFFSET) >> 2] = s->cnt_base[idx];
+        if (s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2] & 1u) {
+            gnw_h7b0_tim2_schedule(s, idx, new_hz);
+        }
+    }
+    s->pending_phase_valid = false;
+}
+
+static void gnw_h7b0_tim2_timing_abort(void *opaque)
+{
+    GnwH7B0Tim2State *s = opaque;
+
+    s->pending_phase_valid = false;
 }
 
 /* Env-gated (GNW_TIMER_LATE): per-instance update-expiry counter,
@@ -198,24 +336,97 @@ static void gnw_h7b0_tim2_timer_tick(void *opaque)
     gnw_h7b0_tim2_count_expiry(idx);
     hwaddr base = (hwaddr)idx * 0x400;
     uint32_t cr1 = s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2];
+    uint32_t kernel_hz = gnw_h7b0_tim2_kernel_hz(s);
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bool elapsed_update = !s->timing_mode && now > s->cnt_ref_ns[idx] &&
+        now - s->cnt_ref_ns[idx] >=
+            gnw_h7b0_tim2_remaining_ns_exact(s, idx, kernel_hz);
 
+    /* A capped default-mode deadline is a scheduling checkpoint when the
+     * actual timer period is longer than the cap. Settle elapsed cycles and
+     * reschedule without manufacturing UIF or an update interrupt. */
+    if (!s->timing_mode && !elapsed_update &&
+        gnw_h7b0_tim2_remaining_ns_exact(s, idx, kernel_hz) >
+            GNW_H7B0_TIM2_MAX_PERIOD_NS) {
+        gnw_h7b0_tim2_settle(s, idx,
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), kernel_hz);
+        gnw_h7b0_tim2_schedule(s, idx, kernel_hz);
+        return;
+    }
+
+    if (s->timing_mode || elapsed_update) {
+        gnw_h7b0_tim2_settle(s, idx,
+            now,
+            kernel_hz);
+    } else {
+        s->cnt_base[idx] = 0;
+        s->regs[(base + GNW_H7B0_TIM2_CNT_OFFSET) >> 2] = 0;
+        s->kernel_fraction[idx] = 0;
+        s->psc_remainder[idx] = 0;
+        s->cnt_ref_ns[idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
     s->regs[(base + GNW_H7B0_TIM2_SR_OFFSET) >> 2] |= 0x1u; /* UIF */
+    gnw_h7b0_tim2_update_irq(s, idx);
+    if ((s->regs[(base + GNW_H7B0_TIM2_DIER_OFFSET) >> 2] & (1u << 8)) &&
+        s->update_notifier) {
+        s->update_notifier(s->update_notifier_opaque, idx);
+    }
 
     if (cr1 & (1u << 3)) {
         /* OPM (one-pulse mode): counter stops itself after the update
          * event, same as real hardware. */
+        if (elapsed_update) {
+            s->cnt_base[idx] = 0;
+            s->regs[(base + GNW_H7B0_TIM2_CNT_OFFSET) >> 2] = 0;
+            s->kernel_fraction[idx] = 0;
+            s->psc_remainder[idx] = 0;
+        }
         s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2] = cr1 & ~0x1u;
         return;
     }
 
     if (cr1 & 0x1u) {
-        gnw_h7b0_tim2_start_counting(s, idx);
+        gnw_h7b0_tim2_schedule(s, idx, kernel_hz);
+    }
+}
+
+void gnw_h7b0_tim2_set_update_notifier(GnwH7B0Tim2State *s,
+                                        GnwH7B0Tim2UpdateNotifier notifier,
+                                        void *opaque)
+{
+    s->update_notifier = notifier;
+    s->update_notifier_opaque = opaque;
+}
+
+static void gnw_h7b0_tim2_clock_changed(void *opaque, uint32_t old_hz,
+                                         uint32_t new_hz)
+{
+    GnwH7B0Tim2State *s = opaque;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (int idx = 0; idx < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; idx++) {
+        hwaddr base = (hwaddr)idx * 0x400;
+
+        if (!(s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2] & 0x1u)) {
+            continue;
+        }
+        gnw_h7b0_tim2_settle(s, idx, now, old_hz);
+        gnw_h7b0_tim2_schedule(s, idx, new_hz);
     }
 }
 
 void gnw_h7b0_tim2_set_rcc(GnwH7B0Tim2State *s, GnwH7B0RccState *rcc)
 {
     s->rcc = rcc;
+    gnw_h7b0_rcc_add_timer_clock_observer(
+        rcc, GNW_H7B0_RCC_TIMER_APB1, gnw_h7b0_tim2_clock_changed, s);
+    if (s->timing_mode && icount_enabled()) {
+        gnw_h7b0_rcc_add_timing_observer(
+            rcc, GNW_H7B0_RCC_TIMING_APB1,
+            gnw_h7b0_tim2_timing_prepare,
+            gnw_h7b0_tim2_timing_commit,
+            gnw_h7b0_tim2_timing_abort, s);
+    }
 }
 
 static void gnw_h7b0_tim2_reset(DeviceState *dev)
@@ -225,9 +436,21 @@ static void gnw_h7b0_tim2_reset(DeviceState *dev)
         s->regs[i] = get_tim2_reset_value((i * 4) & 0x3ffu);
     }
     for (int i = 0; i < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; i++) {
-        timer_del(s->count_timer[i]);
+        timer_del(gnw_h7b0_tim2_count_timer(s, i));
         s->cnt_base[i] = 0;
         s->cnt_ref_ns[i] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->kernel_fraction[i] = 0;
+        s->psc_remainder[i] = 0;
+        if (s->timing_mode && icount_enabled()) {
+            IcountCycleStamp stamp;
+
+            icount_get_cycle_stamp(&stamp);
+            if (stamp.core_hz) {
+                g_assert(gnw_h7b0_cycle_phase_init(&s->cycle_phase[i],
+                                                    stamp));
+            }
+        }
+        gnw_h7b0_tim2_update_irq(s, i);
     }
 }
 
@@ -250,7 +473,10 @@ static uint64_t gnw_h7b0_tim2_read(void *opaque, hwaddr addr, unsigned int size)
     if ((addr & 0x3ffu) == GNW_H7B0_TIM2_CNT_OFFSET) {
         int idx = gnw_h7b0_tim2_instance_index(addr);
         if (idx >= 0) {
-            uint32_t v = gnw_h7b0_tim2_live_cnt(s, idx);
+            uint32_t v;
+
+            gnw_h7b0_tim2_latch_cnt(s, idx);
+            v = s->cnt_base[idx] & gnw_h7b0_tim2_counter_mask(idx);
             /* Cached: firmware polls CNT at busy-wait rates, and
              * msvcrt's getenv() is a locked linear scan -- calling it
              * per-read measurably slowed the whole guest on Windows. */
@@ -294,9 +520,11 @@ static void gnw_h7b0_tim2_write(void *opaque, hwaddr addr, uint64_t val64, unsig
      * the EGR/CR1 side-effect logic below already correctly does.
      */
     uint32_t local_addr = addr & 0x3ffu;
-    uint32_t mask = get_tim2_write_mask(local_addr);
     uint32_t old_value = s->regs[addr >> 2];
     int cnt_idx = gnw_h7b0_tim2_instance_index(addr);
+    uint32_t mask = cnt_idx >= 0 ?
+        gnw_h7b0_tim2_write_mask(cnt_idx, local_addr) :
+        get_tim2_write_mask(local_addr);
 
     /*
      * Anything that changes how CNT extrapolates (its own value, the
@@ -304,18 +532,39 @@ static void gnw_h7b0_tim2_write(void *opaque, hwaddr addr, uint64_t val64, unsig
      * against the OLD parameters first -- hence latching before the store
      * below, not after.
      */
-    if (cnt_idx >= 0 && (local_addr == GNW_H7B0_TIM2_CNT_OFFSET ||
-                         local_addr == GNW_H7B0_TIM2_PSC_OFFSET ||
-                         local_addr == GNW_H7B0_TIM2_ARR_OFFSET)) {
+    if (cnt_idx >= 0 &&
+        (local_addr == GNW_H7B0_TIM2_CNT_OFFSET ||
+         local_addr == GNW_H7B0_TIM2_PSC_OFFSET ||
+         local_addr == GNW_H7B0_TIM2_ARR_OFFSET ||
+         local_addr == GNW_H7B0_TIM2_CR1_OFFSET ||
+         (local_addr == GNW_H7B0_TIM2_EGR_OFFSET && (val64 & 1u))) &&
+        (s->regs[(addr - local_addr + GNW_H7B0_TIM2_CR1_OFFSET) >> 2] &
+         0x1u)) {
         gnw_h7b0_tim2_latch_cnt(s, cnt_idx);
     }
 
-    s->regs[addr >> 2] = (old_value & ~mask) | ((uint32_t)val64 & mask);
+    if (local_addr == GNW_H7B0_TIM2_SR_OFFSET) {
+        /* STM32 timer status flags are rc_w0: writing 0 clears a set
+         * flag, while writing 1 leaves it unchanged. */
+        s->regs[addr >> 2] = old_value & ((uint32_t)val64 | ~mask);
+    } else {
+        s->regs[addr >> 2] = (old_value & ~mask) | ((uint32_t)val64 & mask);
+    }
 
     /* A write to CNT sets the counter outright. */
     if (cnt_idx >= 0 && local_addr == GNW_H7B0_TIM2_CNT_OFFSET) {
         s->cnt_base[cnt_idx] = s->regs[addr >> 2];
         s->cnt_ref_ns[cnt_idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    } else if (cnt_idx >= 0 &&
+               local_addr == GNW_H7B0_TIM2_PSC_OFFSET) {
+        s->psc_remainder[cnt_idx] = 0;
+    } else if (cnt_idx >= 0 &&
+               local_addr == GNW_H7B0_TIM2_ARR_OFFSET) {
+        uint64_t modulus = (uint64_t)s->regs[addr >> 2] + 1;
+
+        s->cnt_base[cnt_idx] %= modulus;
+        s->regs[(addr - local_addr + GNW_H7B0_TIM2_CNT_OFFSET) >> 2] =
+            s->cnt_base[cnt_idx];
     }
 
     /*
@@ -339,11 +588,28 @@ static void gnw_h7b0_tim2_write(void *opaque, hwaddr addr, uint64_t val64, unsig
     if ((addr & 0x3ffu) == GNW_H7B0_TIM2_EGR_OFFSET && (val64 & 0x1u)) {
         uint32_t sr_addr = (addr & ~0x3ffu) + GNW_H7B0_TIM2_SR_OFFSET;
         s->regs[sr_addr >> 2] |= 0x1u; /* UIF */
+        if (cnt_idx >= 0) {
+            gnw_h7b0_tim2_update_irq(s, cnt_idx);
+        }
         /* UG re-initializes the counter (and reloads the prescaler) on
          * real hardware, so restart the extrapolation from zero. */
         if (cnt_idx >= 0) {
             s->cnt_base[cnt_idx] = 0;
             s->cnt_ref_ns[cnt_idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            s->psc_remainder[cnt_idx] = 0;
+            s->regs[(addr - local_addr + GNW_H7B0_TIM2_CNT_OFFSET) >> 2] = 0;
+            if (s->timing_mode && icount_enabled()) {
+                IcountCycleStamp stamp;
+
+                icount_get_cycle_stamp(&stamp);
+                g_assert(gnw_h7b0_cycle_phase_init(
+                    &s->cycle_phase[cnt_idx], stamp));
+            }
+            if (s->regs[(addr - local_addr +
+                         GNW_H7B0_TIM2_CR1_OFFSET) >> 2] & 0x1u) {
+                gnw_h7b0_tim2_schedule(
+                    s, cnt_idx, gnw_h7b0_tim2_kernel_hz(s));
+            }
         }
     }
 
@@ -369,13 +635,22 @@ static void gnw_h7b0_tim2_write(void *opaque, hwaddr addr, uint64_t val64, unsig
                 s->cnt_ref_ns[idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
                 gnw_h7b0_tim2_start_counting(s, idx);
             } else if (!(new_cr1 & 0x1u)) {
-                if (old_value & 0x1u) {
-                    /* Freeze CNT where it had got to. */
-                    gnw_h7b0_tim2_latch_cnt(s, idx);
-                }
-                timer_del(s->count_timer[idx]);
+                timer_del(gnw_h7b0_tim2_count_timer(s, idx));
             }
         }
+    } else if (cnt_idx >= 0 &&
+               (local_addr == GNW_H7B0_TIM2_CNT_OFFSET ||
+                local_addr == GNW_H7B0_TIM2_PSC_OFFSET ||
+                local_addr == GNW_H7B0_TIM2_ARR_OFFSET) &&
+               (s->regs[(addr - local_addr +
+                         GNW_H7B0_TIM2_CR1_OFFSET) >> 2] & 0x1u)) {
+        gnw_h7b0_tim2_schedule(s, cnt_idx, gnw_h7b0_tim2_kernel_hz(s));
+    }
+
+    if (cnt_idx >= 0 &&
+        (local_addr == GNW_H7B0_TIM2_DIER_OFFSET ||
+         local_addr == GNW_H7B0_TIM2_SR_OFFSET)) {
+        gnw_h7b0_tim2_update_irq(s, cnt_idx);
     }
 }
 
@@ -396,24 +671,169 @@ static void gnw_h7b0_tim2_init(Object *obj)
     for (int i = 0; i < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; i++) {
         s->timer_ctx[i].s = s;
         s->timer_ctx[i].idx = i;
-        s->count_timer[i] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
-                                          gnw_h7b0_tim2_timer_tick,
-                                          &s->timer_ctx[i]);
+        QEMUTimer **timer = i < GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT ?
+            &s->count_timer[i] : &s->late_count_timer[
+                i - GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT];
+
+        *timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                              gnw_h7b0_tim2_timer_tick,
+                              &s->timer_ctx[i]);
+        sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq[i]);
     }
 }
 
+static const Property gnw_h7b0_tim2_properties[] = {
+    DEFINE_PROP_BOOL("timing-mode", GnwH7B0Tim2State, timing_mode, false),
+};
+
+static int gnw_h7b0_tim2_pre_save(void *opaque)
+{
+    GnwH7B0Tim2State *s = opaque;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t kernel_hz = gnw_h7b0_tim2_kernel_hz(s);
+
+    for (int idx = 0; idx < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; idx++) {
+        gnw_h7b0_tim2_settle(s, idx, now, kernel_hz);
+    }
+    if (s->pending_phase_valid) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static int gnw_h7b0_tim2_post_load(void *opaque, int version_id)
+{
+    GnwH7B0Tim2State *s = opaque;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    for (int idx = 0; idx < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; idx++) {
+        hwaddr base = (hwaddr)idx * 0x400;
+        uint32_t psc = s->regs[(base + GNW_H7B0_TIM2_PSC_OFFSET) >> 2] &
+                       GNW_H7B0_TIM2_PRESCALER_MASK;
+
+        if (idx >= GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT && version_id < 5) {
+            /* v2-v4 did not carry TIM12/13/14 runtime state. Start from the
+             * migrated CNT shadow at the destination clock epoch. */
+            s->cnt_base[idx] = s->regs[(base + GNW_H7B0_TIM2_CNT_OFFSET) >> 2] &
+                               gnw_h7b0_tim2_counter_mask(idx);
+            s->kernel_fraction[idx] = 0;
+            s->psc_remainder[idx] = 0;
+            s->cnt_ref_ns[idx] = now;
+            if (s->timing_mode && icount_enabled()) {
+                IcountCycleStamp stamp;
+
+                icount_get_cycle_stamp(&stamp);
+                if (!gnw_h7b0_cycle_phase_init(&s->cycle_phase[idx], stamp)) {
+                    return -EINVAL;
+                }
+            }
+            if (s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2] & 1u) {
+                gnw_h7b0_tim2_schedule(s, idx, gnw_h7b0_tim2_kernel_hz(s));
+            }
+        } else if (version_id < 3) {
+            s->kernel_fraction[idx] = 0;
+            s->psc_remainder[idx] = 0;
+            s->cnt_ref_ns[idx] = now;
+            if (s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2] & 0x1u) {
+                gnw_h7b0_tim2_schedule(
+                    s, idx, gnw_h7b0_tim2_kernel_hz(s));
+            }
+        } else if (s->kernel_fraction[idx] >= NANOSECONDS_PER_SECOND ||
+                   s->psc_remainder[idx] > psc) {
+            return -EINVAL;
+        } else {
+            s->cnt_ref_ns[idx] = now;
+        }
+        if (s->timing_mode && icount_enabled()) {
+            IcountCycleStamp stamp;
+
+            icount_get_cycle_stamp(&stamp);
+            if (version_id >= 4) {
+                if (!gnw_h7b0_cycle_phase_stamp_equal(
+                        &s->cycle_phase[idx].stamp, &stamp)) {
+                    return -EINVAL;
+                }
+            } else if (!gnw_h7b0_cycle_phase_init(
+                           &s->cycle_phase[idx], stamp)) {
+                return -EINVAL;
+            }
+        }
+        if (s->timing_mode &&
+            (s->regs[(base + GNW_H7B0_TIM2_CR1_OFFSET) >> 2] & 1u)) {
+            gnw_h7b0_tim2_schedule(s, idx, gnw_h7b0_tim2_kernel_hz(s));
+        }
+        gnw_h7b0_tim2_update_irq(s, idx);
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_gnw_h7b0_cycle_phase = {
+    .name = "gnw-h7b0-cycle-phase",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_INT64(stamp.modeled_cycles, GnwH7B0CyclePhase),
+        VMSTATE_INT64(stamp.idle_ns, GnwH7B0CyclePhase),
+        VMSTATE_UINT64(stamp.core_hz, GnwH7B0CyclePhase),
+        VMSTATE_UINT64(stamp.generation, GnwH7B0CyclePhase),
+        VMSTATE_UINT64(fraction_q64, GnwH7B0CyclePhase),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_gnw_h7b0_tim2 = {
     .name = TYPE_GNW_H7B0_TIM2,
-    .version_id = 2,
+    .version_id = 5,
     .minimum_version_id = 2,
+    .pre_save = gnw_h7b0_tim2_pre_save,
+    .post_load = gnw_h7b0_tim2_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, GnwH7B0Tim2State, GNW_H7B0_TIM2_SIZE / 4),
         /* CNT is derived, so its reference point has to travel with the
          * snapshot or the counter jumps on restore. */
-        VMSTATE_UINT64_ARRAY(cnt_ref_ns, GnwH7B0Tim2State,
-                             GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT),
-        VMSTATE_UINT32_ARRAY(cnt_base, GnwH7B0Tim2State,
-                             GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT),
+        VMSTATE_SUB_ARRAY(cnt_ref_ns, GnwH7B0Tim2State, 0,
+                          GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT, 0,
+                          vmstate_info_uint64, uint64_t),
+        VMSTATE_SUB_ARRAY(cnt_base, GnwH7B0Tim2State, 0,
+                          GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT, 0,
+                          vmstate_info_uint32, uint32_t),
+        VMSTATE_ARRAY_OF_POINTER(count_timer, GnwH7B0Tim2State,
+                                 GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT, 3,
+                                 vmstate_info_timer, QEMUTimer *),
+        VMSTATE_SUB_ARRAY(kernel_fraction, GnwH7B0Tim2State, 0,
+                          GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT, 3,
+                          vmstate_info_uint64, uint64_t),
+        VMSTATE_SUB_ARRAY(psc_remainder, GnwH7B0Tim2State, 0,
+                          GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT, 3,
+                          vmstate_info_uint32, uint32_t),
+        VMSTATE_STRUCT_SUB_ARRAY(cycle_phase, GnwH7B0Tim2State, 0,
+                                 GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT, 4,
+                                 vmstate_gnw_h7b0_cycle_phase,
+                                 GnwH7B0CyclePhase),
+        VMSTATE_SUB_ARRAY(cnt_ref_ns, GnwH7B0Tim2State,
+                          GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT,
+                          GNW_H7B0_TIM2_LATE_INSTANCE_COUNT, 5,
+                          vmstate_info_uint64, uint64_t),
+        VMSTATE_SUB_ARRAY(cnt_base, GnwH7B0Tim2State,
+                          GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT,
+                          GNW_H7B0_TIM2_LATE_INSTANCE_COUNT, 5,
+                          vmstate_info_uint32, uint32_t),
+        VMSTATE_ARRAY_OF_POINTER(late_count_timer, GnwH7B0Tim2State,
+                                 GNW_H7B0_TIM2_LATE_INSTANCE_COUNT, 5,
+                                 vmstate_info_timer, QEMUTimer *),
+        VMSTATE_SUB_ARRAY(kernel_fraction, GnwH7B0Tim2State,
+                          GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT,
+                          GNW_H7B0_TIM2_LATE_INSTANCE_COUNT, 5,
+                          vmstate_info_uint64, uint64_t),
+        VMSTATE_SUB_ARRAY(psc_remainder, GnwH7B0Tim2State,
+                          GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT,
+                          GNW_H7B0_TIM2_LATE_INSTANCE_COUNT, 5,
+                          vmstate_info_uint32, uint32_t),
+        VMSTATE_STRUCT_SUB_ARRAY(cycle_phase, GnwH7B0Tim2State,
+                                 GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT,
+                                 GNW_H7B0_TIM2_LATE_INSTANCE_COUNT, 5,
+                                 vmstate_gnw_h7b0_cycle_phase,
+                                 GnwH7B0CyclePhase),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -421,6 +841,7 @@ static const VMStateDescription vmstate_gnw_h7b0_tim2 = {
 static void gnw_h7b0_tim2_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    device_class_set_props(dc, gnw_h7b0_tim2_properties);
     dc->vmsd = &vmstate_gnw_h7b0_tim2;
     device_class_set_legacy_reset(dc, gnw_h7b0_tim2_reset);
 }

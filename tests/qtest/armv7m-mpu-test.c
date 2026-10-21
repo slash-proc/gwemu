@@ -21,6 +21,9 @@
 #define MPU_RNR  0xe000ed98
 #define MPU_RBAR 0xe000ed9c
 #define MPU_RASR 0xe000eda0
+#define SCB_ACTLR 0xe000e008
+#define ACTLR_DISFOLD (1 << 2)
+#define ACTLR_DISITMATBFLUSH (1 << 12)
 
 /* Region 2, base 0x20000000, 1KB, full access, enabled. */
 #define BASE_R2  0x20000000
@@ -59,6 +62,47 @@ static void test_mpu_type(void)
 
     g_assert_cmpuint((qtest_readl(qts, MPU_TYPE) >> 8) & 0xff, ==, 8);
 
+    qtest_quit(qts);
+}
+
+static void test_actlr_disfold_m7(void)
+{
+    QTestState *qts = qtest_init("-machine mps2-an500");
+    uint32_t cpuid = qtest_readl(qts, 0xe000ed00);
+
+    /* MPS2 AN500 uses Cortex-M7 (part number 0xC27). */
+    g_assert_cmphex((cpuid >> 4) & 0xfff, ==, 0xc27);
+    g_assert_cmphex(qtest_readl(qts, SCB_ACTLR), ==,
+                    ACTLR_DISITMATBFLUSH);
+
+    qtest_writel(qts, SCB_ACTLR, UINT32_MAX);
+    g_assert_cmphex(qtest_readl(qts, SCB_ACTLR), ==,
+                    ACTLR_DISFOLD | ACTLR_DISITMATBFLUSH);
+    qtest_writel(qts, SCB_ACTLR, ACTLR_DISITMATBFLUSH);
+    g_assert_cmphex(qtest_readl(qts, SCB_ACTLR), ==,
+                    ACTLR_DISITMATBFLUSH);
+
+    qtest_writel(qts, SCB_ACTLR, ACTLR_DISITMATBFLUSH | ACTLR_DISFOLD);
+    g_assert_cmphex(qtest_readl(qts, SCB_ACTLR), ==,
+                    ACTLR_DISITMATBFLUSH | ACTLR_DISFOLD);
+    qtest_writel(qts, SCB_ACTLR, ACTLR_DISITMATBFLUSH);
+    g_assert_cmphex(qtest_readl(qts, SCB_ACTLR), ==,
+                    ACTLR_DISITMATBFLUSH);
+
+    qtest_writel(qts, SCB_ACTLR, ACTLR_DISFOLD);
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, SCB_ACTLR), ==,
+                    ACTLR_DISITMATBFLUSH);
+    qtest_quit(qts);
+}
+
+static void test_actlr_disfold_non_m7_is_raz_wi(void)
+{
+    QTestState *qts = qtest_init("-machine mps2-an385");
+
+    g_assert_cmphex(qtest_readl(qts, SCB_ACTLR), ==, 0);
+    qtest_writel(qts, SCB_ACTLR, ACTLR_DISFOLD);
+    g_assert_cmphex(qtest_readl(qts, SCB_ACTLR), ==, 0);
     qtest_quit(qts);
 }
 
@@ -141,6 +185,10 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
 
     qtest_add_func("/armv7m-mpu/type", test_mpu_type);
+    qtest_add_func("/armv7m-mpu/actlr/disfold-m7",
+                   test_actlr_disfold_m7);
+    qtest_add_func("/armv7m-mpu/actlr/disfold-non-m7-raz-wi",
+                   test_actlr_disfold_non_m7_is_raz_wi);
     qtest_add_func("/armv7m-mpu/rbar-valid-in-range", test_rbar_valid_in_range);
     qtest_add_func("/armv7m-mpu/rbar-valid-out-of-range",
                    test_rbar_valid_out_of_range);

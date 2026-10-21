@@ -31,11 +31,13 @@
 #include "system/runstate.h"
 #include "ui/console.h"
 #include "hw/misc/gnw_h7b0_gpio.h"
+#include "hw/misc/gnw_h7b0_sai1.h"
 #include "hw/misc/gnw_timeline.h"
 
 typedef enum GnwTlKind {
     GNW_TL_BUTTON,      /* set one button up/down */
     GNW_TL_SCREENSHOT,
+    GNW_TL_CHECKPOINT,
     GNW_TL_QUIT,
 } GnwTlKind;
 
@@ -59,9 +61,64 @@ static uint64_t tl_frame_count;
 static QEMUTimer *tl_timer;
 static GnwH7B0GpioState *tl_gpio;
 static const char *tl_out_dir;
+static FILE *tl_checkpoint_file;
 
 /* 100ms, matching GNW_AUTO_INPUT's historical tap duration. */
 #define GNW_TL_TAP_NS (100 * 1000000LL)
+
+static void gnw_timeline_checkpoint(const char *name)
+{
+    QemuConsole *con = qemu_console_lookup_by_index(0);
+    DisplaySurface *surface = con ? qemu_console_surface(con) : NULL;
+    g_autoptr(GChecksum) sum = g_checksum_new(G_CHECKSUM_SHA256);
+    GnwH7B0Sai1Telemetry audio;
+    bool have_audio = gnw_h7b0_sai1_get_telemetry(&audio);
+    int width = surface ? surface_width(surface) : 0;
+    int height = surface ? surface_height(surface) : 0;
+    int bpp = surface ? surface_bytes_per_pixel(surface) : 0;
+
+    if (!tl_checkpoint_file) {
+        const char *configured = getenv("GNW_CHECKPOINTS");
+        g_autofree char *path = configured ? g_strdup(configured) :
+            g_build_filename(tl_out_dir ?: ".", "checkpoints.jsonl", NULL);
+        tl_checkpoint_file = fopen(path, "a");
+        if (!tl_checkpoint_file) {
+            error_report("gnw-timeline: cannot open checkpoint output %s: %s",
+                         path, strerror(errno));
+            exit(1);
+        }
+    }
+    if (surface && width > 0 && height > 0 && bpp > 0) {
+        for (int y = 0; y < height; y++) {
+            g_checksum_update(sum, surface_data(surface) +
+                              y * surface_stride(surface),
+                              (gsize)width * bpp);
+        }
+    }
+    fprintf(tl_checkpoint_file,
+            "{\"schema\":\"gnw-timeline-checkpoint-v1\","
+            "\"name\":\"%s\",\"virtual_ns\":%" PRId64 ","
+            "\"vblank_count\":%" PRIu64 ","
+            "\"framebuffer\":{\"width\":%d,\"height\":%d,"
+            "\"sha256\":\"%s\"},\"audio\":",
+            name, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), tl_frame_count,
+            width, height, g_checksum_get_string(sum));
+    if (have_audio) {
+        fprintf(tl_checkpoint_file,
+                "{\"configured_rate_hz\":%u,\"queued_bytes\":%u,"
+                "\"produced_bytes\":%" PRIu64 ","
+                "\"consumed_bytes\":%" PRIu64 ","
+                "\"starvation_callbacks\":%" PRIu64 ","
+                "\"dropped_bytes\":%" PRIu64 "}",
+                audio.configured_rate_hz, audio.queued_bytes,
+                audio.produced_bytes, audio.consumed_bytes,
+                audio.starvation_callbacks, audio.dropped_bytes);
+    } else {
+        fputs("null", tl_checkpoint_file);
+    }
+    fputs("}\n", tl_checkpoint_file);
+    fflush(tl_checkpoint_file);
+}
 
 static void gnw_timeline_exec(const GnwTlEvent *ev)
 {
@@ -81,6 +138,9 @@ static void gnw_timeline_exec(const GnwTlEvent *ev)
         }
         break;
     }
+    case GNW_TL_CHECKPOINT:
+        gnw_timeline_checkpoint(ev->path);
+        break;
     case GNW_TL_QUIT:
         fprintf(stderr, "gnw-timeline: quit\n");
         qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP_QUIT);
@@ -316,11 +376,20 @@ void gnw_timeline_init(GnwH7B0GpioState *gpio)
                     }
                 }
             }
-        } else if (!strcmp(act, "screenshot")) {
+        } else if (!strcmp(act, "screenshot") || !strcmp(act, "checkpoint")) {
             if (ntok < 3) {
                 goto bad;
             }
-            gnw_timeline_add(arr, by_frame, ns, frame, GNW_TL_SCREENSHOT,
+            static const char checkpoint_chars[] =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                "0123456789_.-";
+            if (!strcmp(act, "checkpoint") &&
+                strspn(tok[2], checkpoint_chars) != strlen(tok[2])) {
+                goto bad;
+            }
+            gnw_timeline_add(arr, by_frame, ns, frame,
+                             !strcmp(act, "checkpoint") ?
+                             GNW_TL_CHECKPOINT : GNW_TL_SCREENSHOT,
                              0, false, tok[2]);
         } else if (!strcmp(act, "quit")) {
             gnw_timeline_add(arr, by_frame, ns, frame, GNW_TL_QUIT,

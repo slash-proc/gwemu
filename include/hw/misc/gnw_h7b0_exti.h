@@ -3,7 +3,8 @@
  * STM32H7B0.
  *
  * Real edge-triggered interrupt delivery for lines 0-21 (group 1, the only
- * group any board line we care about maps into), wired to NVIC. Real
+ * group any board line we care about maps into), wired to NVIC. Line 19 is
+ * the internal RTC wakeup path and has its dedicated RTC_WKUP output. Real
  * register semantics for RTSR1/FTSR1 (rising/falling trigger select) and
  * CPUIMR1/CPUPR1 (interrupt mask / pending, CPU domain -- D3PMR1 and the
  * D1/D2-domain variants aren't modeled, this SoC has no dual-core split
@@ -26,14 +27,14 @@
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0ExtiState, GNW_H7B0_EXTI)
 
 #define GNW_H7B0_EXTI_SIZE 0x400
-#define GNW_H7B0_EXTI_NUM_IRQ_OUTPUTS 7
+#define GNW_H7B0_EXTI_NUM_IRQ_OUTPUTS 8
+#define GNW_H7B0_EXTI_RTC_WKUP_OUTPUT 7
 
 struct GnwH7B0ExtiState {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
     uint32_t regs[GNW_H7B0_EXTI_SIZE / 4];
-    /* EXTI0, EXTI1, EXTI2, EXTI3, EXTI4, EXTI9_5, EXTI15_10, in that order
-     * (matches the real NVIC vector table's IRQ grouping for lines 0-15). */
+    /* EXTI0..4, EXTI9_5, EXTI15_10, RTC_WKUP (EXTI19), in that order. */
     qemu_irq irq[GNW_H7B0_EXTI_NUM_IRQ_OUTPUTS];
     /* Last level seen per line 0-21, for edge detection. */
     bool line_level[22];

@@ -103,6 +103,11 @@ struct DisasContextBase {
  * @insn_start:
  *      Emit the tcg_gen_insn_start opcode.
  *
+ * @modeled_budget_exit:
+ *      Emit a restartable exit before the current instruction when a
+ *      per-instruction modeled-time budget is exhausted. The target must
+ *      publish the current PC and any control state required to restart it.
+ *
  * @translate_insn:
  *      Disassemble one instruction and set db->pc_next for the start
  *      of the following instruction.  Set db->is_jmp as necessary to
@@ -118,6 +123,7 @@ typedef struct TranslatorOps {
     void (*init_disas_context)(DisasContextBase *db, CPUState *cpu);
     void (*tb_start)(DisasContextBase *db, CPUState *cpu);
     void (*insn_start)(DisasContextBase *db, CPUState *cpu);
+    void (*modeled_budget_exit)(DisasContextBase *db, CPUState *cpu);
     void (*translate_insn)(DisasContextBase *db, CPUState *cpu);
     void (*tb_stop)(DisasContextBase *db, CPUState *cpu);
     bool (*disas_log)(const DisasContextBase *db, CPUState *cpu, FILE *f);
@@ -168,6 +174,14 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest);
  * Otherwise return false.
  */
 bool translator_io_start(DisasContextBase *db);
+
+/*
+ * Permit an in-TB helper to publish time after the target has emitted a
+ * precise post-instruction PC and architectural control state.  Unlike
+ * translator_io_start(), this does not end the TB.  The common modeled-time
+ * instruction prologue revokes permission before another instruction runs.
+ */
+void translator_io_checkpoint(DisasContextBase *db);
 
 /*
  * Translator Load Functions

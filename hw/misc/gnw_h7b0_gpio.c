@@ -355,11 +355,37 @@ void gnw_h7b0_gpio_set_unlock_handoff(GnwH7B0GpioState *s, CPUState *cpu,
 static FILE *rec_file = NULL;
 static bool rec_inited = false;
 
+static bool G_GNUC_PRINTF(1, 2)
+gnw_timeline_record_line(const char *format, ...)
+{
+    va_list ap;
+    int written;
+
+    if (!rec_file) {
+        return false;
+    }
+
+    va_start(ap, format);
+    written = vfprintf(rec_file, format, ap);
+    va_end(ap);
+    if (written < 0 || fflush(rec_file) != 0 ||
+        qemu_fdatasync(fileno(rec_file)) < 0) {
+        error_report("gnw-gpio: timeline recording write failed: %s",
+                     g_strerror(errno));
+        fclose(rec_file);
+        rec_file = NULL;
+        return false;
+    }
+    return true;
+}
+
 void gnw_timeline_record_quit(void)
 {
     if (rec_file) {
         double t = (double)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000.0;
-        fprintf(rec_file, "%.3f quit\n", t + 0.5);
+        gnw_timeline_record_line("%.3f quit\n", t + 0.5);
+    }
+    if (rec_file) {
         fclose(rec_file);
         rec_file = NULL;
     }
@@ -383,7 +409,8 @@ static void gnw_h7b0_gpio_input_event(DeviceState *dev, QemuConsole *src,
                 rec_file = NULL;
             } else {
                 /* Keep every write visible even if QEMU crashes. */
-                fprintf(rec_file, "# Automatically recorded timeline\n");
+                gnw_timeline_record_line(
+                    "# Automatically recorded timeline\n");
             }
         }
         rec_inited = true;
@@ -406,9 +433,10 @@ static void gnw_h7b0_gpio_input_event(DeviceState *dev, QemuConsole *src,
                 gnw_h7b0_gpio_set_button(s, i, key->down);
                 if (rec_file) {
                     double t = (double)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000000.0;
-                    fprintf(rec_file, "%.3f %s %s\n", t,
-                            key->down ? "down" : "release",
-                            gnw_h7b0_button_names[i]);
+                    gnw_timeline_record_line(
+                        "%.3f %s %s\n", t,
+                        key->down ? "down" : "release",
+                        gnw_h7b0_button_names[i]);
                 }
                 break;
             }
@@ -501,13 +529,30 @@ static uint64_t gnw_h7b0_gpio_read(void *opaque, hwaddr addr,
                                     unsigned int size)
 {
     GnwH7B0GpioState *s = GNW_H7B0_GPIO(opaque);
+    hwaddr reg = addr & ~3ULL;
+    unsigned int shift = (addr & 3) * 8;
+    uint32_t value;
 
-    if (addr >= GNW_H7B0_GPIO_SIZE) {
+    if (addr + size > GNW_H7B0_GPIO_SIZE || shift + size * 8 > 32) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%"HWADDR_PRIx"\n",
                       __func__, addr);
         return 0;
     }
-    return s->regs[addr >> 2];
+    value = s->regs[reg >> 2];
+
+    /* PC8 senses the shared board revision. With its digital input enabled,
+     * the PC5-TIME board presents a low level. Keep the existing reset/analog
+     * readback and general-purpose output loopback intact. This is a board
+     * input, independent of the guest firmware and the button mapping. */
+    if (reg == 2 * GNW_H7B0_GPIO_PORT_SIZE + GNW_H7B0_GPIO_IDR_OFFSET) {
+        uint32_t moder = s->regs[(2 * GNW_H7B0_GPIO_PORT_SIZE +
+                                  GNW_H7B0_GPIO_MODER_OFFSET) >> 2];
+
+        if (((moder >> 16) & 3U) == 0) {
+            value &= ~(1U << 8);
+        }
+    }
+    return extract32(value, shift, size * 8);
 }
 
 /*
@@ -547,16 +592,21 @@ static void gnw_h7b0_gpio_write(void *opaque, hwaddr addr,
                                  uint64_t val64, unsigned int size)
 {
     GnwH7B0GpioState *s = GNW_H7B0_GPIO(opaque);
+    hwaddr reg = addr & ~3ULL;
+    unsigned int shift = (addr & 3) * 8;
+    uint32_t value;
 
-    if (addr >= GNW_H7B0_GPIO_SIZE) {
+    if (addr + size > GNW_H7B0_GPIO_SIZE || shift + size * 8 > 32) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%"HWADDR_PRIx"\n",
                       __func__, addr);
         return;
     }
 
-    uint32_t port_offset = addr % GNW_H7B0_GPIO_PORT_SIZE;
+    uint32_t port_offset = reg % GNW_H7B0_GPIO_PORT_SIZE;
     uint32_t mask = get_gpio_write_mask(port_offset);
-    s->regs[addr >> 2] = (s->regs[addr >> 2] & ~mask) | (val64 & mask);
+    value = size == 4 ? val64 :
+        deposit32(s->regs[reg >> 2], shift, size * 8, val64);
+    s->regs[reg >> 2] = (s->regs[reg >> 2] & ~mask) | (value & mask);
     if (port_offset == GNW_H7B0_GPIO_BSRR_OFFSET) {
         /*
          * BUG FIX: BSRR was stored into its own register word and
@@ -571,16 +621,17 @@ static void gnw_h7b0_gpio_write(void *opaque, hwaddr addr,
          * gnw_h7b0_gpio_sync_output_idr()) to still reflect it
          * afterward -- previously ODR just never changed.
          */
-        uint32_t set_bits = (uint32_t)val64 & 0xFFFFu;
-        uint32_t reset_bits = ((uint32_t)val64 >> 16) & 0xFFFFu;
-        hwaddr odr_addr = (addr - port_offset) + GNW_H7B0_GPIO_ODR_OFFSET;
+        uint32_t command = (uint32_t)val64 << shift;
+        uint32_t set_bits = command & 0xFFFFu;
+        uint32_t reset_bits = (command >> 16) & 0xFFFFu;
+        hwaddr odr_addr = (reg - port_offset) + GNW_H7B0_GPIO_ODR_OFFSET;
         s->regs[odr_addr >> 2] = (s->regs[odr_addr >> 2] | set_bits) & ~reset_bits;
-        s->regs[addr >> 2] = 0;
+        s->regs[reg >> 2] = 0;
     }
     if (port_offset == GNW_H7B0_GPIO_MODER_OFFSET ||
         port_offset == GNW_H7B0_GPIO_ODR_OFFSET ||
         port_offset == GNW_H7B0_GPIO_BSRR_OFFSET) {
-        int port = (int)(addr / GNW_H7B0_GPIO_PORT_SIZE);
+        int port = (int)(reg / GNW_H7B0_GPIO_PORT_SIZE);
         gnw_h7b0_gpio_sync_output_idr(s, port);
     }
 }
@@ -588,7 +639,7 @@ static void gnw_h7b0_gpio_write(void *opaque, hwaddr addr,
 static const MemoryRegionOps gnw_h7b0_gpio_ops = {
     .read = gnw_h7b0_gpio_read,
     .write = gnw_h7b0_gpio_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
         .max_access_size = 4,

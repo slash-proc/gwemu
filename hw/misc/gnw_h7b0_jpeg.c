@@ -3,6 +3,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "migration/vmstate.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/gnw_h7b0_jpeg.h"
 #include "hw/misc/gnw_h7b0_regs_jpeg.h"
 
@@ -2062,9 +2063,11 @@ static void gnw_h7b0_jpeg_write(void *opaque, hwaddr addr, uint64_t val64, unsig
                         s->lock_inited = true;
                     }
 
-                    if (s->inbuf->len <= GNW_H7B0_JPEG_INLINE_MAX_BYTES) {
+                    if (s->timing_mode ||
+                        s->inbuf->len <= GNW_H7B0_JPEG_INLINE_MAX_BYTES) {
                         /*
-                         * Small input: decode NOW, inline on the BQL
+                         * Small input (or any input in opt-in timing
+                         * mode): decode NOW, inline on the BQL
                          * thread, so the result is already published
                          * when firmware's very first SR poll lands --
                          * eliminating the entire wait-poll phase
@@ -2164,6 +2167,10 @@ static const MemoryRegionOps gnw_h7b0_jpeg_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+static const Property gnw_h7b0_jpeg_properties[] = {
+    DEFINE_PROP_BOOL("timing-mode", GnwH7B0JpegState, timing_mode, false),
+};
+
 static void gnw_h7b0_jpeg_init(Object *obj)
 {
     GnwH7B0JpegState *s = GNW_H7B0_JPEG(obj);
@@ -2212,6 +2219,7 @@ static void gnw_h7b0_jpeg_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->vmsd = &vmstate_gnw_h7b0_jpeg;
     device_class_set_legacy_reset(dc, gnw_h7b0_jpeg_reset);
+    device_class_set_props(dc, gnw_h7b0_jpeg_properties);
 }
 
 static const TypeInfo gnw_h7b0_jpeg_info = {

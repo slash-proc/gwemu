@@ -19,6 +19,7 @@
 #define HW_MISC_GNW_H7B0_FLASH_R_H
 
 #include "hw/core/sysbus.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_FLASH_R "gnw-h7b0-flash_r"
@@ -37,6 +38,18 @@ struct GnwH7B0FlashRState {
      * created before flash_r in the SoC's realize()). */
     MemoryRegion *bank1_mr;
     MemoryRegion *bank2_mr;
+
+    /* Opt-in command-erase timing. The test profile is arbitrary; the
+     * conservative profile uses datasheet maxima and is not calibrated. */
+    bool timing_mode;
+    bool test_erase_timing;
+    bool conservative_erase_timing;
+    QEMUTimer *erase_timer;
+    bool erase_pending;
+    bool erase_bank;
+    uint8_t erase_bank_index;
+    uint32_t erase_sector;
+    uint32_t erase_profile_id;
 
     bool initial_locked;
     char *rdp_image;

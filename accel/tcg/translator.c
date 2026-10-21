@@ -19,6 +19,7 @@
 #include "tcg/tcg-op-common.h"
 #include "internal-common.h"
 #include "disas/disas.h"
+#include "exec/icount.h"
 #include "tb-internal.h"
 
 /*
@@ -101,6 +102,11 @@ bool translator_io_start(DisasContextBase *db)
     return true;
 }
 
+void translator_io_checkpoint(DisasContextBase *db)
+{
+    set_can_do_io(db, true);
+}
+
 static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
 {
     TCGv_i32 count = NULL;
@@ -144,6 +150,47 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
     }
 
     return icount_start_insn;
+}
+
+static void gen_cycle_model_insn_start(DisasContextBase *db, CPUState *cpu,
+                                       const TranslatorOps *ops,
+                                       uint32_t cflags)
+{
+    TCGv_i32 count;
+    TCGLabel *within_budget;
+
+    if (!(cflags & CF_USE_ICOUNT) || !icount_cycle_model_enabled()) {
+        return;
+    }
+    /* A prior instruction checkpoint leaves I/O enabled so the main loop is
+     * safe if it exits there.  Revoke it before any next instruction can
+     * change architectural state. */
+    set_can_do_io(db, false);
+    count = tcg_temp_new_i32();
+    tcg_gen_ld_i32(count, tcg_env,
+                   offsetof(CPUState, neg.icount_decr.u32) -
+                   sizeof(CPUState));
+    tcg_gen_subi_i32(count, count, 1);
+    if (!(cflags & CF_NOIRQ)) {
+        /* The shared TB exit label only knows the TB-entry PC. A local exit
+         * needs target state for this exact instruction before it can leave. */
+        within_budget = gen_new_label();
+        tcg_gen_brcondi_i32(TCG_COND_GE, count, 0, within_budget);
+        /* This path returns to the main loop before an instruction begins;
+         * restore the I/O permission that was revoked above so timer
+         * dispatch can replenish the exhausted budget. */
+        set_can_do_io(db, true);
+        if (ops->modeled_budget_exit) {
+            ops->modeled_budget_exit(db, cpu);
+        } else {
+            /* Preserve the pre-existing generic cycle-model behavior. */
+            tcg_gen_exit_tb(db->tb, TB_EXIT_REQUESTED);
+        }
+        gen_set_label(within_budget);
+    }
+    tcg_gen_st16_i32(count, tcg_env,
+                     offsetof(CPUState, neg.icount_decr.u16.low) -
+                     sizeof(CPUState));
 }
 
 static void gen_tb_end(const TranslationBlock *tb, uint32_t cflags,
@@ -228,6 +275,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
     while (true) {
         *max_insns = ++db->num_insns;
+        gen_cycle_model_insn_start(db, cpu, ops, cflags);
         ops->insn_start(db, cpu);
         db->insn_start = tcg_last_op();
         if (first_insn_start == NULL) {
@@ -282,7 +330,8 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
     ops->tb_stop(db, cpu);
-    gen_tb_end(tb, cflags, icount_start_insn, db->num_insns);
+    gen_tb_end(tb, cflags, icount_start_insn,
+               icount_cycle_model_enabled() ? 0 : db->num_insns);
 
     /*
      * Manage can_do_io for the translation block: set to false before

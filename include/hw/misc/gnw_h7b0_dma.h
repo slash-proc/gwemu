@@ -53,6 +53,30 @@ typedef void (*GnwH7B0DmaStreamNotifier)(void *opaque, bool half,
 typedef uint32_t (*GnwH7B0DmaStreamRateFn)(void *opaque);
 
 /*
+ * Optional exact request-cadence provider.  UNKNOWN deliberately differs
+ * from STOPPED: UNKNOWN retains the legacy assumed-rate/clamp fallback,
+ * while STOPPED is an authoritative zero clock and preserves transfer phase.
+ */
+typedef enum GnwH7B0DmaRateState {
+    GNW_H7B0_DMA_RATE_UNKNOWN = 0,
+    GNW_H7B0_DMA_RATE_STOPPED = 1,
+    GNW_H7B0_DMA_RATE_RUNNING = 2,
+} GnwH7B0DmaRateState;
+
+typedef struct GnwH7B0DmaRequestState {
+    GnwH7B0DmaRateState rate_state;
+    /* RUNNING cadence in items/second. Both are nonzero only for RUNNING;
+     * UNKNOWN and STOPPED require both zero. */
+    uint32_t item_rate_num;
+    uint32_t item_rate_den;
+    bool request_active;
+    uint32_t provider_identity;
+} GnwH7B0DmaRequestState;
+
+typedef GnwH7B0DmaRequestState
+    (*GnwH7B0DmaRequestStateFn)(void *opaque);
+
+/*
  * "Is the peripheral this stream is wired to actually requesting DMA
  * right now?"
  *
@@ -84,6 +108,8 @@ typedef struct GnwH7B0DmaReqReg {
     void *rate_opaque;
     GnwH7B0DmaStreamActiveFn active_fn;
     void *active_opaque;
+    GnwH7B0DmaRequestStateFn state_fn;
+    void *state_opaque;
     /* See gnw_h7b0_dma_set_request_notifier()'s low_latency parameter. */
     bool low_latency;
     int bound_stream; /* -1 = unbound */
@@ -95,9 +121,17 @@ typedef struct GnwH7B0DmaReqReg {
  * peripherals. Overflowing this is only a LOG_GUEST_ERROR and a silently
  * dropped registration, so keep the headroom. */
 #define GNW_H7B0_DMA_REQ_REG_COUNT 8
+#define GNW_H7B0_DMA_TRANSITION_QUEUE_DEPTH 16
+#define GNW_H7B0_DMA_TRANSITION_SLOT_COUNT \
+    (GNW_H7B0_DMA_STREAM_COUNT * GNW_H7B0_DMA_TRANSITION_QUEUE_DEPTH)
 
 struct GnwH7B0DmaState {
     SysBusDevice parent_obj;
+    bool timing_mode;
+    bool migration_timing_mode;
+    int64_t migration_clock_ns;
+    uint32_t migration_live_rate_identity;
+    bool suppress_rebind_state_refresh;
     MemoryRegion mmio;
     uint32_t regs[GNW_H7B0_DMA_SIZE / 4];
 
@@ -131,6 +165,38 @@ struct GnwH7B0DmaState {
     /* See GnwH7B0DmaStreamActiveFn. NULL = always requesting. */
     GnwH7B0DmaStreamActiveFn stream_active_fn[GNW_H7B0_DMA_STREAM_COUNT];
     void *stream_active_fn_opaque[GNW_H7B0_DMA_STREAM_COUNT];
+    GnwH7B0DmaRequestStateFn stream_state_fn[GNW_H7B0_DMA_STREAM_COUNT];
+    void *stream_state_fn_opaque[GNW_H7B0_DMA_STREAM_COUNT];
+
+    /* Exact typed-provider cadence state (timing-mode only). */
+    bool stream_exact_timing[GNW_H7B0_DMA_STREAM_COUNT];
+    uint32_t stream_phase_items[GNW_H7B0_DMA_STREAM_COUNT];
+    uint64_t stream_phase_progress_num[GNW_H7B0_DMA_STREAM_COUNT];
+    uint8_t stream_rate_state[GNW_H7B0_DMA_STREAM_COUNT];
+    uint32_t stream_rate_num[GNW_H7B0_DMA_STREAM_COUNT];
+    uint32_t stream_rate_den[GNW_H7B0_DMA_STREAM_COUNT];
+    uint32_t stream_phase_subnum[GNW_H7B0_DMA_STREAM_COUNT];
+    uint32_t stream_phase_subden[GNW_H7B0_DMA_STREAM_COUNT];
+    bool stream_request_active[GNW_H7B0_DMA_STREAM_COUNT];
+    uint32_t stream_provider_identity[GNW_H7B0_DMA_STREAM_COUNT];
+    int64_t stream_last_update_ns[GNW_H7B0_DMA_STREAM_COUNT];
+
+    /*
+     * A provider notification can arrive after more completed phases than a
+     * single bounded settlement pass may deliver.  Keep the replacement
+     * snapshot pending until every old-rate phase through transition_ns has
+     * been observed; immediate timer callbacks finish that work in bounded
+     * batches before installing the new state.
+     */
+    uint8_t stream_transition_head[GNW_H7B0_DMA_STREAM_COUNT];
+    uint8_t stream_transition_count[GNW_H7B0_DMA_STREAM_COUNT];
+    bool stream_transition_overflow[GNW_H7B0_DMA_STREAM_COUNT];
+    int64_t transition_ns[GNW_H7B0_DMA_TRANSITION_SLOT_COUNT];
+    uint8_t pending_rate_state[GNW_H7B0_DMA_TRANSITION_SLOT_COUNT];
+    uint32_t pending_rate_num[GNW_H7B0_DMA_TRANSITION_SLOT_COUNT];
+    uint32_t pending_rate_den[GNW_H7B0_DMA_TRANSITION_SLOT_COUNT];
+    bool pending_request_active[GNW_H7B0_DMA_TRANSITION_SLOT_COUNT];
+    uint32_t pending_provider_identity[GNW_H7B0_DMA_TRANSITION_SLOT_COUNT];
 
     /* Per-stream mirror of the owning request registration's
      * low_latency flag (see gnw_h7b0_dma_set_request_notifier()) --
@@ -160,6 +226,15 @@ struct GnwH7B0DmaState {
      * audio path re-registered after boot).
      */
     GnwH7B0DmaReqReg req_reg[GNW_H7B0_DMA_REQ_REG_COUNT];
+
+    /* Hidden, default-off qtest provider; never used by guest firmware. */
+    bool test_provider;
+    uint32_t test_request;
+    uint32_t test_rate_state;
+    uint32_t test_rate_num;
+    uint32_t test_rate_den;
+    bool test_request_active;
+    uint32_t test_provider_identity;
 };
 
 void gnw_h7b0_dma_set_stream_notifier(GnwH7B0DmaState *s, int stream,
@@ -221,6 +296,18 @@ void gnw_h7b0_dma_set_request_active_fn(GnwH7B0DmaState *s, int request,
                                          void *opaque);
 
 /*
+ * Attach an exact typed provider to an already registered request.  Providers
+ * call request_state_changed() synchronously after changing any register or
+ * clock input reflected by fn(). DMA captures the replacement snapshot, but
+ * does not install it until every old-state phase through that virtual
+ * timestamp has been delivered.
+ */
+void gnw_h7b0_dma_set_request_state_fn(GnwH7B0DmaState *s, int request,
+                                        GnwH7B0DmaRequestStateFn fn,
+                                        void *opaque);
+void gnw_h7b0_dma_request_state_changed(GnwH7B0DmaState *s, int request);
+
+/*
  * Current M0AR/NDTR of whichever stream `request` is bound to, for a
  * peripheral that needs to see a *different* request's buffer than the
  * one whose notifier is firing -- SPI1's RX notifier does the real byte
@@ -245,5 +332,6 @@ bool gnw_h7b0_dma_get_request_stream_regs(GnwH7B0DmaState *s, int request,
  * is bound to an enabled, low_latency, currently-active stream.
  */
 void gnw_h7b0_dma_kick_request(GnwH7B0DmaState *s, int request);
+bool gnw_h7b0_dma_peripheral_request(GnwH7B0DmaState *s, int request);
 
 #endif

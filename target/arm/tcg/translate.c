@@ -29,6 +29,7 @@
 #include "exec/target_page.h"
 #include "helper.h"
 #include "helper-mve.h"
+#include "exec/gnw-cycle-model.h"
 
 #define ENABLE_ARCH_4T    arm_dc_feature(s, ARM_FEATURE_V4T)
 #define ENABLE_ARCH_5     arm_dc_feature(s, ARM_FEATURE_V5)
@@ -2008,6 +2009,13 @@ static void gen_logicq_cc(TCGv_i32 lo, TCGv_i32 hi)
     tcg_gen_or_i32(cpu_ZF, lo, hi);
 }
 
+static void gen_gnw_memory_event(DisasContext *s, TCGv_i32 address,
+                                TCGv_i32 kind, MemOp mop, int mem_idx,
+                                unsigned access_index,
+                                unsigned access_count,
+                                unsigned access_flags,
+                                TCGv_i32 store_succeeded);
+
 /* Load/Store exclusive instructions are implemented by remembering
    the value/address loaded, and seeing if these are the same
    when the store is performed.  This should be sufficient to implement
@@ -2049,6 +2057,12 @@ static void gen_load_exclusive(DisasContext *s, int rt, int rt2,
         tcg_gen_extu_i32_i64(cpu_exclusive_val, tmp);
     }
 
+    gen_gnw_memory_event(s, addr,
+                         tcg_constant_i32(GNW_CYCLE_MEMORY_LOAD), opc,
+                         get_mem_index(s), 0, 1,
+                         GNW_CYCLE_MEMORY_ACCESS_EXCLUSIVE,
+                         tcg_constant_i32(false));
+
     store_reg(s, rt, tmp);
     tcg_gen_extu_i32_i64(cpu_exclusive_addr, addr);
 }
@@ -2061,7 +2075,7 @@ static void gen_clrex(DisasContext *s)
 static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
                                 TCGv_i32 addr, int size)
 {
-    TCGv_i32 t0, t1, t2;
+    TCGv_i32 t0, t1, t2, access_kind, store_succeeded;
     TCGv_i64 extaddr;
     TCGv taddr;
     TCGLabel *done_label;
@@ -2115,6 +2129,19 @@ static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
         tcg_gen_atomic_cmpxchg_i32(t0, taddr, t2, t1, get_mem_index(s), opc);
         tcg_gen_setcond_i32(TCG_COND_NE, t0, t0, t2);
     }
+
+    store_succeeded = tcg_temp_new_i32();
+    tcg_gen_xori_i32(store_succeeded, t0, 1);
+    access_kind = tcg_temp_new_i32();
+    tcg_gen_movcond_i32(TCG_COND_EQ, access_kind, t0,
+                        tcg_constant_i32(0),
+                        tcg_constant_i32(GNW_CYCLE_MEMORY_STORE),
+                        tcg_constant_i32(GNW_CYCLE_MEMORY_LOAD));
+    gen_gnw_memory_event(s, addr, access_kind, opc, get_mem_index(s),
+                         0, 1,
+                         GNW_CYCLE_MEMORY_ACCESS_EXCLUSIVE |
+                         GNW_CYCLE_MEMORY_ACCESS_CONDITIONAL_STORE,
+                         store_succeeded);
     tcg_gen_mov_i32(cpu_R[rd], t0);
     tcg_gen_br(done_label);
 
@@ -2577,13 +2604,211 @@ static bool op_s_rxi_rot(DisasContext *s, arg_s_rri_rot *a,
     return store_reg_kind(s, a->rd, tmp, kind);
 }
 
-#define DO_ANY3(NAME, OP, L, K)                                         \
+typedef enum GnwDataProcessingKind {
+    GNW_DP_NONE,
+    GNW_DP_EOR,
+    GNW_DP_ADC,
+    GNW_DP_ADD,
+    GNW_DP_SUB,
+    GNW_DP_CMP,
+} GnwDataProcessingKind;
+
+static uint8_t gnw_condition_apsr_reads(unsigned cond)
+{
+    static const uint8_t cond_reads[14] = {
+        GNW_CYCLE_APSR_Z, GNW_CYCLE_APSR_Z,
+        GNW_CYCLE_APSR_C, GNW_CYCLE_APSR_C,
+        GNW_CYCLE_APSR_N, GNW_CYCLE_APSR_N,
+        GNW_CYCLE_APSR_V, GNW_CYCLE_APSR_V,
+        GNW_CYCLE_APSR_C | GNW_CYCLE_APSR_Z,
+        GNW_CYCLE_APSR_C | GNW_CYCLE_APSR_Z,
+        GNW_CYCLE_APSR_N | GNW_CYCLE_APSR_V,
+        GNW_CYCLE_APSR_N | GNW_CYCLE_APSR_V,
+        GNW_CYCLE_APSR_N | GNW_CYCLE_APSR_V | GNW_CYCLE_APSR_Z,
+        GNW_CYCLE_APSR_N | GNW_CYCLE_APSR_V | GNW_CYCLE_APSR_Z,
+    };
+
+    g_assert(cond < ARRAY_SIZE(cond_reads));
+    return cond_reads[cond];
+}
+
+static void gen_gnw_cycle_refine(DisasContext *s, uint8_t insn_class,
+                                 uint16_t reads, uint16_t writes,
+                                 uint16_t address_reads,
+                                 uint16_t store_data_reads,
+                                 uint8_t apsr_reads, uint8_t apsr_writes,
+                                 uint8_t extra_flags, bool supported)
+{
+    uint8_t flags = extra_flags;
+    uint8_t reason = GNW_CYCLE_FALLBACK_UNSUPPORTED_CLASS;
+    uint64_t header, masks, details;
+
+    if (!s->gnw_m7_cycle_model || !s->thumb || curr_insn_len(s) != 4) {
+        return;
+    }
+    if (supported) {
+        flags |= GNW_CYCLE_META_SUPPORTED;
+        reason = GNW_CYCLE_FALLBACK_NONE;
+    }
+    header = insn_class | ((uint64_t)flags << 8) |
+             ((uint64_t)reason << 16);
+    masks = reads | ((uint64_t)writes << 16) |
+            ((uint64_t)store_data_reads << 32) |
+            ((uint64_t)address_reads << 48);
+    details = apsr_reads | ((uint64_t)apsr_writes << 8);
+    gen_helper_gnw_cycle_refine(tcg_env, tcg_constant_i64(header),
+                                tcg_constant_i64(masks),
+                                tcg_constant_i64(details));
+}
+
+static void gen_gnw_dp_rrri(DisasContext *s, arg_s_rrr_shi *a,
+                            GnwDataProcessingKind kind)
+{
+    uint8_t apsr_reads = kind == GNW_DP_ADC ? GNW_CYCLE_APSR_C : 0;
+    uint8_t apsr_writes = a->s ? GNW_CYCLE_APSR_NZCV : 0;
+    bool supported = (kind == GNW_DP_EOR || kind == GNW_DP_ADD ||
+                      kind == GNW_DP_SUB) && !a->s && a->rd != 15 &&
+                     a->rn != 15 && a->rm != 15;
+
+    if (kind == GNW_DP_NONE) {
+        return;
+    }
+    gen_gnw_cycle_refine(s, GNW_CYCLE_INSN_ALU,
+                         (1U << a->rn) | (1U << a->rm), 1U << a->rd,
+                         0, 0, apsr_reads, apsr_writes, 0, supported);
+}
+
+static void gen_gnw_dp_rrrr(DisasContext *s, arg_s_rrr_shr *a,
+                            GnwDataProcessingKind kind)
+{
+    uint8_t apsr_reads = kind == GNW_DP_ADC ? GNW_CYCLE_APSR_C : 0;
+    uint8_t apsr_writes = a->s ? GNW_CYCLE_APSR_NZCV : 0;
+
+    if (kind == GNW_DP_NONE) {
+        return;
+    }
+    gen_gnw_cycle_refine(s, GNW_CYCLE_INSN_ALU,
+                         (1U << a->rn) | (1U << a->rm) | (1U << a->rs),
+                         1U << a->rd, 0, 0, apsr_reads, apsr_writes, 0,
+                         false);
+}
+
+static void gen_gnw_dp_rri(DisasContext *s, arg_s_rri_rot *a,
+                           GnwDataProcessingKind kind)
+{
+    uint8_t apsr_reads = kind == GNW_DP_ADC ? GNW_CYCLE_APSR_C : 0;
+    uint8_t apsr_writes = a->s ? GNW_CYCLE_APSR_NZCV : 0;
+    bool supported = (kind == GNW_DP_EOR || kind == GNW_DP_ADD ||
+                      kind == GNW_DP_SUB) && !a->s && a->rd != 15 &&
+                     a->rn != 15;
+
+    if (kind == GNW_DP_NONE) {
+        return;
+    }
+    gen_gnw_cycle_refine(s, GNW_CYCLE_INSN_ALU, 1U << a->rn,
+                         1U << a->rd, 0, 0, apsr_reads, apsr_writes, 0,
+                         supported);
+}
+
+static void gen_gnw_cmp_rrri(DisasContext *s, arg_s_rrr_shi *a,
+                             GnwDataProcessingKind kind)
+{
+    if (kind == GNW_DP_CMP) {
+        gen_gnw_cycle_refine(s, GNW_CYCLE_INSN_ALU,
+                             (1U << a->rn) | (1U << a->rm), 0, 0, 0, 0,
+                             GNW_CYCLE_APSR_NZCV, 0, false);
+    }
+}
+
+static void gen_gnw_cmp_rrrr(DisasContext *s, arg_s_rrr_shr *a,
+                             GnwDataProcessingKind kind)
+{
+    if (kind == GNW_DP_CMP) {
+        gen_gnw_cycle_refine(s, GNW_CYCLE_INSN_ALU,
+                             (1U << a->rn) | (1U << a->rm) |
+                             (1U << a->rs), 0, 0, 0, 0,
+                             GNW_CYCLE_APSR_NZCV, 0, false);
+    }
+}
+
+static void gen_gnw_cmp_rri(DisasContext *s, arg_s_rri_rot *a,
+                            GnwDataProcessingKind kind)
+{
+    if (kind == GNW_DP_CMP) {
+        gen_gnw_cycle_refine(s, GNW_CYCLE_INSN_ALU, 1U << a->rn, 0,
+                             0, 0, 0, GNW_CYCLE_APSR_NZCV, 0, false);
+    }
+}
+
+static void gen_gnw_memory_refine(DisasContext *s, bool store, MemOp mop,
+                                  uint16_t reads, uint16_t writes,
+                                  uint16_t address_reads,
+                                  uint16_t store_data_reads)
+{
+    uint8_t flags = GNW_CYCLE_META_MEMORY;
+    uint64_t header, masks, details;
+
+    /* Scalar, paired, exclusive and integer multiple-register T16/T32
+     * accesses call this after their complete operand masks are known.
+     * MVE/NEON and other vector/block forms remain unsupported here. */
+    if (!s->gnw_m7_cycle_model || !s->thumb) {
+        return;
+    }
+    header = GNW_CYCLE_INSN_UNSUPPORTED | ((uint64_t)flags << 8) |
+             ((uint64_t)GNW_CYCLE_FALLBACK_MEMORY << 16);
+    masks = reads | ((uint64_t)writes << 16) |
+            ((uint64_t)store_data_reads << 32) |
+            ((uint64_t)address_reads << 48);
+    details = ((uint64_t)(store ? GNW_CYCLE_MEMORY_STORE :
+                                  GNW_CYCLE_MEMORY_LOAD) << 16) |
+              ((uint64_t)memop_size(mop) << 24);
+    gen_helper_gnw_cycle_refine(tcg_env, tcg_constant_i64(header),
+                                tcg_constant_i64(masks),
+                                tcg_constant_i64(details));
+}
+
+static void gen_gnw_memory_event(DisasContext *s, TCGv_i32 address,
+                                 TCGv_i32 kind, MemOp mop, int mem_idx,
+                                 unsigned access_index,
+                                 unsigned access_count,
+                                 unsigned access_flags,
+                                 TCGv_i32 store_succeeded)
+{
+    if (s->gnw_m7_cycle_model) {
+        MemOp final_mop = finalize_memop(s, mop);
+        uint32_t access_meta = (access_index & 0xff) |
+                               ((access_count & 0xff) << 8) |
+                               ((access_flags & 0xff) << 16);
+
+        gen_helper_gnw_cycle_memory(tcg_env, address,
+                                    kind,
+                                    tcg_constant_i32(final_mop),
+                                    tcg_constant_i32(mem_idx),
+                                    tcg_constant_i32(access_meta),
+                                    store_succeeded);
+    }
+}
+
+static void gen_gnw_memory_address(DisasContext *s, TCGv_i32 address,
+                                   bool store, MemOp mop, int mem_idx)
+{
+    gen_gnw_memory_event(s, address,
+                         tcg_constant_i32(store ? GNW_CYCLE_MEMORY_STORE :
+                                                   GNW_CYCLE_MEMORY_LOAD),
+                         mop, mem_idx, 0, 1, 0,
+                         tcg_constant_i32(store));
+}
+
+#define DO_ANY3(NAME, OP, L, K, M)                                      \
     static bool trans_##NAME##_rrri(DisasContext *s, arg_s_rrr_shi *a)  \
-    { StoreRegKind k = (K); return op_s_rrr_shi(s, a, OP, L, k); }      \
+    { gen_gnw_dp_rrri(s, a, M); StoreRegKind k = (K);                    \
+      return op_s_rrr_shi(s, a, OP, L, k); }                             \
     static bool trans_##NAME##_rrrr(DisasContext *s, arg_s_rrr_shr *a)  \
-    { StoreRegKind k = (K); return op_s_rrr_shr(s, a, OP, L, k); }      \
+    { gen_gnw_dp_rrrr(s, a, M); StoreRegKind k = (K);                    \
+      return op_s_rrr_shr(s, a, OP, L, k); }                             \
     static bool trans_##NAME##_rri(DisasContext *s, arg_s_rri_rot *a)   \
-    { StoreRegKind k = (K); return op_s_rri_rot(s, a, OP, L, k); }
+    { gen_gnw_dp_rri(s, a, M); StoreRegKind k = (K);                     \
+      return op_s_rri_rot(s, a, OP, L, k); }
 
 #define DO_ANY2(NAME, OP, L, K)                                         \
     static bool trans_##NAME##_rxri(DisasContext *s, arg_s_rrr_shi *a)  \
@@ -2593,31 +2818,37 @@ static bool op_s_rxi_rot(DisasContext *s, arg_s_rri_rot *a,
     static bool trans_##NAME##_rxi(DisasContext *s, arg_s_rri_rot *a)   \
     { StoreRegKind k = (K); return op_s_rxi_rot(s, a, OP, L, k); }
 
-#define DO_CMP2(NAME, OP, L)                                            \
+#define DO_CMP2(NAME, OP, L, M)                                         \
     static bool trans_##NAME##_xrri(DisasContext *s, arg_s_rrr_shi *a)  \
-    { return op_s_rrr_shi(s, a, OP, L, STREG_NONE); }                   \
+    { gen_gnw_cmp_rrri(s, a, M);                                        \
+      return op_s_rrr_shi(s, a, OP, L, STREG_NONE); }                   \
     static bool trans_##NAME##_xrrr(DisasContext *s, arg_s_rrr_shr *a)  \
-    { return op_s_rrr_shr(s, a, OP, L, STREG_NONE); }                   \
+    { gen_gnw_cmp_rrrr(s, a, M);                                        \
+      return op_s_rrr_shr(s, a, OP, L, STREG_NONE); }                   \
     static bool trans_##NAME##_xri(DisasContext *s, arg_s_rri_rot *a)   \
-    { return op_s_rri_rot(s, a, OP, L, STREG_NONE); }
+    { gen_gnw_cmp_rri(s, a, M);                                         \
+      return op_s_rri_rot(s, a, OP, L, STREG_NONE); }
 
-DO_ANY3(AND, tcg_gen_and_i32, a->s, STREG_NORMAL)
-DO_ANY3(EOR, tcg_gen_xor_i32, a->s, STREG_NORMAL)
-DO_ANY3(ORR, tcg_gen_or_i32, a->s, STREG_NORMAL)
-DO_ANY3(BIC, tcg_gen_andc_i32, a->s, STREG_NORMAL)
+DO_ANY3(AND, tcg_gen_and_i32, a->s, STREG_NORMAL, GNW_DP_NONE)
+DO_ANY3(EOR, tcg_gen_xor_i32, a->s, STREG_NORMAL, GNW_DP_EOR)
+DO_ANY3(ORR, tcg_gen_or_i32, a->s, STREG_NORMAL, GNW_DP_NONE)
+DO_ANY3(BIC, tcg_gen_andc_i32, a->s, STREG_NORMAL, GNW_DP_NONE)
 
-DO_ANY3(RSB, a->s ? gen_rsb_CC : gen_rsb, false, STREG_NORMAL)
-DO_ANY3(ADC, a->s ? gen_adc_CC : gen_add_carry, false, STREG_NORMAL)
-DO_ANY3(SBC, a->s ? gen_sbc_CC : gen_sub_carry, false, STREG_NORMAL)
-DO_ANY3(RSC, a->s ? gen_rsc_CC : gen_rsc, false, STREG_NORMAL)
+DO_ANY3(RSB, a->s ? gen_rsb_CC : gen_rsb, false, STREG_NORMAL, GNW_DP_NONE)
+DO_ANY3(ADC, a->s ? gen_adc_CC : gen_add_carry, false, STREG_NORMAL,
+        GNW_DP_ADC)
+DO_ANY3(SBC, a->s ? gen_sbc_CC : gen_sub_carry, false, STREG_NORMAL,
+        GNW_DP_NONE)
+DO_ANY3(RSC, a->s ? gen_rsc_CC : gen_rsc, false, STREG_NORMAL, GNW_DP_NONE)
 
-DO_CMP2(TST, tcg_gen_and_i32, true)
-DO_CMP2(TEQ, tcg_gen_xor_i32, true)
-DO_CMP2(CMN, gen_add_CC, false)
-DO_CMP2(CMP, gen_sub_CC, false)
+DO_CMP2(TST, tcg_gen_and_i32, true, GNW_DP_NONE)
+DO_CMP2(TEQ, tcg_gen_xor_i32, true, GNW_DP_NONE)
+DO_CMP2(CMN, gen_add_CC, false, GNW_DP_NONE)
+DO_CMP2(CMP, gen_sub_CC, false, GNW_DP_CMP)
 
 DO_ANY3(ADD, a->s ? gen_add_CC : tcg_gen_add_i32, false,
-        a->rd == 13 && a->rn == 13 ? STREG_SP_CHECK : STREG_NORMAL)
+        a->rd == 13 && a->rn == 13 ? STREG_SP_CHECK : STREG_NORMAL,
+        GNW_DP_ADD)
 
 /*
  * Note for the computation of StoreRegKind we return out of the
@@ -2644,7 +2875,7 @@ DO_ANY3(SUB, a->s ? gen_sub_CC : tcg_gen_sub_i32, false,
                 ret = STREG_SP_CHECK;
             }
             ret;
-        }))
+        }), GNW_DP_SUB)
 
 DO_ANY2(MOV, tcg_gen_mov_i32, a->s,
         ({
@@ -2987,6 +3218,12 @@ static bool trans_MUL(DisasContext *s, arg_MUL *a)
 
 static bool trans_MLA(DisasContext *s, arg_MLA *a)
 {
+    gen_gnw_cycle_refine(s, GNW_CYCLE_INSN_MAC,
+                         (1U << a->rn) | (1U << a->rm) | (1U << a->ra),
+                         1U << a->rd, 0, 0, 0,
+                         a->s ? GNW_CYCLE_APSR_NZCV : 0, 0,
+                         !a->s && a->rd != 15 && a->rn != 15 &&
+                         a->rm != 15 && a->ra != 15);
     return op_mla(s, a, true);
 }
 
@@ -3726,10 +3963,15 @@ static bool op_load_rr(DisasContext *s, arg_ldst_rr *a,
     ISSInfo issinfo = make_issinfo(s, a->rt, a->p, a->w);
     TCGv_i32 addr, tmp;
 
+    gen_gnw_memory_refine(s, false, mop,
+                          (1U << a->rn) | (1U << a->rm),
+                          (1U << a->rt) |
+                          ((!a->p || a->w) ? (1U << a->rn) : 0),
+                          (1U << a->rn) | (1U << a->rm), 0);
     addr = op_addr_rr_pre(s, a);
-
     tmp = tcg_temp_new_i32();
     gen_aa32_ld_i32(s, tmp, addr, mem_idx, mop);
+    gen_gnw_memory_address(s, addr, false, mop, mem_idx);
     disas_set_da_iss(s, mop, issinfo);
 
     /*
@@ -3755,10 +3997,14 @@ static bool op_store_rr(DisasContext *s, arg_ldst_rr *a,
         return false;
     }
 
+    gen_gnw_memory_refine(s, true, mop,
+                          (1U << a->rn) | (1U << a->rm) | (1U << a->rt),
+                          (!a->p || a->w) ? (1U << a->rn) : 0,
+                          (1U << a->rn) | (1U << a->rm), 1U << a->rt);
     addr = op_addr_rr_pre(s, a);
-
     tmp = load_reg(s, a->rt);
     gen_aa32_st_i32(s, tmp, addr, mem_idx, mop);
+    gen_gnw_memory_address(s, addr, true, mop, mem_idx);
     disas_set_da_iss(s, mop, issinfo);
 
     op_addr_rr_post(s, a, addr);
@@ -3796,6 +4042,9 @@ static void do_ldrd_load(DisasContext *s, TCGv_i32 addr, int rt, int rt2)
     TCGv_i32 tmp2 = tcg_temp_new_i32();
 
     tcg_gen_qemu_ld_i64(t64, taddr, mem_idx, opc);
+    gen_gnw_memory_event(s, addr,
+                         tcg_constant_i32(GNW_CYCLE_MEMORY_LOAD), opc,
+                         mem_idx, 0, 1, 0, tcg_constant_i32(false));
     if (s->be_data == MO_BE) {
         tcg_gen_extr_i64_i32(tmp2, tmp, t64);
     } else {
@@ -3816,6 +4065,12 @@ static bool trans_LDRD_rr(DisasContext *s, arg_ldst_rr *a)
         unallocated_encoding(s);
         return true;
     }
+    gen_gnw_memory_refine(s, false,
+                          MO_64 | MO_ALIGN_4 | MO_ATOM_SUBALIGN | s->be_data,
+                          (1U << a->rn) | (1U << a->rm),
+                          (1U << a->rt) | (1U << (a->rt + 1)) |
+                          ((!a->p || a->w) ? (1U << a->rn) : 0),
+                          (1U << a->rn) | (1U << a->rm), 0);
     addr = op_addr_rr_pre(s, a);
 
     do_ldrd_load(s, addr, a->rt, a->rt + 1);
@@ -3856,6 +4111,9 @@ static void do_strd_store(DisasContext *s, TCGv_i32 addr, int rt, int rt2)
         tcg_gen_concat_i32_i64(t64, t1, t2);
     }
     tcg_gen_qemu_st_i64(t64, taddr, mem_idx, opc);
+    gen_gnw_memory_event(s, addr,
+                         tcg_constant_i32(GNW_CYCLE_MEMORY_STORE), opc,
+                         mem_idx, 0, 1, 0, tcg_constant_i32(true));
 }
 
 static bool trans_STRD_rr(DisasContext *s, arg_ldst_rr *a)
@@ -3869,6 +4127,13 @@ static bool trans_STRD_rr(DisasContext *s, arg_ldst_rr *a)
         unallocated_encoding(s);
         return true;
     }
+    gen_gnw_memory_refine(s, true,
+                          MO_64 | MO_ALIGN_4 | MO_ATOM_SUBALIGN | s->be_data,
+                          (1U << a->rn) | (1U << a->rm) |
+                          (1U << a->rt) | (1U << (a->rt + 1)),
+                          (!a->p || a->w) ? (1U << a->rn) : 0,
+                          (1U << a->rn) | (1U << a->rm),
+                          (1U << a->rt) | (1U << (a->rt + 1)));
     addr = op_addr_rr_pre(s, a);
 
     do_strd_store(s, addr, a->rt, a->rt + 1);
@@ -3931,10 +4196,14 @@ static bool op_load_ri(DisasContext *s, arg_ldst_ri *a,
     ISSInfo issinfo = make_issinfo(s, a->rt, a->p, a->w);
     TCGv_i32 addr, tmp;
 
+    gen_gnw_memory_refine(s, false, mop, 1U << a->rn,
+                          (1U << a->rt) |
+                          ((!a->p || a->w) ? (1U << a->rn) : 0),
+                          1U << a->rn, 0);
     addr = op_addr_ri_pre(s, a);
-
     tmp = tcg_temp_new_i32();
     gen_aa32_ld_i32(s, tmp, addr, mem_idx, mop);
+    gen_gnw_memory_address(s, addr, false, mop, mem_idx);
     disas_set_da_iss(s, mop, issinfo);
 
     /*
@@ -3960,10 +4229,14 @@ static bool op_store_ri(DisasContext *s, arg_ldst_ri *a,
         return false;
     }
 
+    gen_gnw_memory_refine(s, true, mop,
+                          (1U << a->rn) | (1U << a->rt),
+                          (!a->p || a->w) ? (1U << a->rn) : 0,
+                          1U << a->rn, 1U << a->rt);
     addr = op_addr_ri_pre(s, a);
-
     tmp = load_reg(s, a->rt);
     gen_aa32_st_i32(s, tmp, addr, mem_idx, mop);
+    gen_gnw_memory_address(s, addr, true, mop, mem_idx);
     disas_set_da_iss(s, mop, issinfo);
 
     op_addr_ri_post(s, a, addr);
@@ -3974,6 +4247,12 @@ static bool op_ldrd_ri(DisasContext *s, arg_ldst_ri *a, int rt2)
 {
     TCGv_i32 addr;
 
+    gen_gnw_memory_refine(s, false,
+                          MO_64 | MO_ALIGN_4 | MO_ATOM_SUBALIGN | s->be_data,
+                          1U << a->rn,
+                          (1U << a->rt) | (1U << rt2) |
+                          ((!a->p || a->w) ? (1U << a->rn) : 0),
+                          1U << a->rn, 0);
     addr = op_addr_ri_pre(s, a);
 
     do_ldrd_load(s, addr, a->rt, rt2);
@@ -4004,6 +4283,12 @@ static bool op_strd_ri(DisasContext *s, arg_ldst_ri *a, int rt2)
 {
     TCGv_i32 addr;
 
+    gen_gnw_memory_refine(s, true,
+                          MO_64 | MO_ALIGN_4 | MO_ATOM_SUBALIGN | s->be_data,
+                          (1U << a->rn) | (1U << a->rt) | (1U << rt2),
+                          (!a->p || a->w) ? (1U << a->rn) : 0,
+                          1U << a->rn,
+                          (1U << a->rt) | (1U << rt2));
     addr = op_addr_ri_pre(s, a);
 
     do_strd_store(s, addr, a->rt, rt2);
@@ -4110,6 +4395,13 @@ static bool op_strex(DisasContext *s, arg_STREX *a, MemOp mop, bool rel)
         unallocated_encoding(s);
         return true;
     }
+
+    gen_gnw_memory_refine(s, true, mop | MO_ALIGN | s->be_data,
+                          (1U << a->rn) | (1U << a->rt) |
+                          (mop == MO_64 ? (1U << a->rt2) : 0),
+                          1U << a->rd, 1U << a->rn,
+                          (1U << a->rt) |
+                          (mop == MO_64 ? (1U << a->rt2) : 0));
 
     if (rel) {
         tcg_gen_mb(TCG_MO_ALL | TCG_BAR_STRL);
@@ -4264,6 +4556,12 @@ static bool op_ldrex(DisasContext *s, arg_LDREX *a, MemOp mop, bool acq)
         unallocated_encoding(s);
         return true;
     }
+
+    gen_gnw_memory_refine(s, false, mop | MO_ALIGN | s->be_data,
+                          1U << a->rn,
+                          (1U << a->rt) |
+                          (mop == MO_64 ? (1U << a->rt2) : 0),
+                          1U << a->rn, 0);
 
     addr = tcg_temp_new_i32();
     load_reg_var(s, addr, a->rn);
@@ -5130,6 +5428,11 @@ static bool op_stm(DisasContext *s, arg_ldst_block *a)
         return true;
     }
 
+    gen_gnw_memory_refine(s, true, MO_UL | MO_ALIGN,
+                          (1U << a->rn) | list,
+                          a->w ? (1U << a->rn) : 0,
+                          1U << a->rn, list);
+
     s->eci_handled = true;
 
     addr = op_addr_block_pre(s, a, n);
@@ -5147,6 +5450,10 @@ static bool op_stm(DisasContext *s, arg_ldst_block *a)
             tmp = load_reg(s, i);
         }
         gen_aa32_st_i32(s, tmp, addr, mem_idx, MO_UL | MO_ALIGN);
+        gen_gnw_memory_event(s, addr,
+                             tcg_constant_i32(GNW_CYCLE_MEMORY_STORE),
+                             MO_UL | MO_ALIGN, mem_idx, j, n, 0,
+                             tcg_constant_i32(true));
 
         /* No need to add after the last transfer.  */
         if (++j != n) {
@@ -5215,6 +5522,11 @@ static bool do_ldm(DisasContext *s, arg_ldst_block *a)
         return true;
     }
 
+    gen_gnw_memory_refine(s, false, MO_UL | MO_ALIGN,
+                          1U << a->rn,
+                          list | (a->w ? (1U << a->rn) : 0),
+                          1U << a->rn, 0);
+
     s->eci_handled = true;
 
     addr = op_addr_block_pre(s, a, n);
@@ -5229,6 +5541,10 @@ static bool do_ldm(DisasContext *s, arg_ldst_block *a)
 
         tmp = tcg_temp_new_i32();
         gen_aa32_ld_i32(s, tmp, addr, mem_idx, MO_UL | MO_ALIGN);
+        gen_gnw_memory_event(s, addr,
+                             tcg_constant_i32(GNW_CYCLE_MEMORY_LOAD),
+                             MO_UL | MO_ALIGN, mem_idx, j, n, 0,
+                             tcg_constant_i32(false));
         if (user) {
             gen_helper_set_user_reg(tcg_env, tcg_constant_i32(i), tmp);
         } else if (i == a->rn) {
@@ -5340,6 +5656,9 @@ static bool trans_CLRM(DisasContext *s, arg_CLRM *a)
 
 static bool trans_B(DisasContext *s, arg_i *a)
 {
+    gen_gnw_cycle_refine(s, GNW_CYCLE_INSN_BRANCH, 0, 0, 0, 0, 0, 0,
+                         GNW_CYCLE_META_BRANCH |
+                         GNW_CYCLE_META_DIRECT_BRANCH, true);
     gen_jmp(s, jmp_diff(s, a->imm));
     return true;
 }
@@ -5354,6 +5673,11 @@ static bool trans_B_cond_thumb(DisasContext *s, arg_ci *a)
         unallocated_encoding(s);
         return true;
     }
+    gen_gnw_cycle_refine(s, GNW_CYCLE_INSN_BRANCH, 0, 0, 0, 0,
+                         gnw_condition_apsr_reads(a->cond), 0,
+                         GNW_CYCLE_META_BRANCH |
+                         GNW_CYCLE_META_DIRECT_BRANCH |
+                         GNW_CYCLE_META_CONDITIONAL, false);
     arm_skip_unless(s, a->cond);
     gen_jmp(s, jmp_diff(s, a->imm));
     return true;
@@ -6292,6 +6616,220 @@ static bool insn_crosses_page(CPUARMState *env, DisasContext *s)
     return !thumb_insn_is_16bit(s, s->base.pc_next, insn);
 }
 
+#ifndef CONFIG_USER_ONLY
+static GnwCycleInsnMetadata gnw_decode_thumb_metadata(uint32_t pc,
+                                                       uint32_t insn,
+                                                       bool is_16bit)
+{
+    GnwCycleInsnMetadata m = {
+        .pc = pc,
+        .encoding = insn,
+        .size = is_16bit ? 2 : 4,
+        .insn_class = GNW_CYCLE_INSN_UNSUPPORTED,
+        .fallback_reason = GNW_CYCLE_FALLBACK_UNSUPPORTED_DECODE,
+    };
+    uint16_t i = insn;
+    unsigned op, rd, rn, rm;
+
+    if (!is_16bit) {
+        return m;
+    }
+    if (i == 0xbf00) {
+        m.flags = GNW_CYCLE_META_SUPPORTED;
+        m.insn_class = GNW_CYCLE_INSN_NOP;
+        m.fallback_reason = GNW_CYCLE_FALLBACK_NONE;
+        return m;
+    }
+    if ((i & 0xf800) <= 0x1000) { /* LSL/LSR/ASR (immediate). */
+        rm = (i >> 3) & 7;
+        rd = i & 7;
+        m.gpr_reads = 1U << rm;
+        m.gpr_writes = 1U << rd;
+        m.flags = 0;
+        m.apsr_writes = GNW_CYCLE_APSR_NZCV;
+        m.insn_class = GNW_CYCLE_INSN_ALU;
+        m.fallback_reason = GNW_CYCLE_FALLBACK_UNSUPPORTED_CLASS;
+        return m;
+    }
+    if ((i & 0xf800) == 0x1800) { /* ADD/SUB register or immediate3. */
+        rn = (i >> 3) & 7;
+        rd = i & 7;
+        m.gpr_reads = 1U << rn;
+        if (!(i & (1U << 10))) {
+            m.gpr_reads |= 1U << ((i >> 6) & 7);
+        }
+        m.gpr_writes = 1U << rd;
+        m.flags = GNW_CYCLE_META_SUPPORTED;
+        m.apsr_writes = GNW_CYCLE_APSR_NZCV;
+        m.insn_class = GNW_CYCLE_INSN_EARLY_ADD_SUB;
+        m.fallback_reason = GNW_CYCLE_FALLBACK_NONE;
+        return m;
+    }
+    if ((i & 0xe000) == 0x2000) { /* MOV/CMP/ADD/SUB immediate8. */
+        op = (i >> 11) & 3;
+        rd = (i >> 8) & 7;
+        if (op != 0) {
+            m.gpr_reads = 1U << rd;
+        }
+        if (op != 1) {
+            m.gpr_writes = 1U << rd;
+        }
+        m.flags = op >= 1 ? GNW_CYCLE_META_SUPPORTED : 0;
+        m.apsr_writes = GNW_CYCLE_APSR_NZCV;
+        m.insn_class = op == 2 || op == 3 ?
+            GNW_CYCLE_INSN_EARLY_ADD_SUB : GNW_CYCLE_INSN_ALU;
+        m.fallback_reason = op >= 1 ? GNW_CYCLE_FALLBACK_NONE :
+                                      GNW_CYCLE_FALLBACK_UNSUPPORTED_CLASS;
+        return m;
+    }
+    if ((i & 0xfc00) == 0x4400 && ((i >> 8) & 3) == 1) {
+        /* CMP high-register (including LR/PC operands). */
+        rd = (i & 7) | ((i >> 4) & 8);
+        rm = (i >> 3) & 15;
+        m.gpr_reads = (1U << rd) | (1U << rm);
+        m.apsr_writes = GNW_CYCLE_APSR_NZCV;
+        m.flags = GNW_CYCLE_META_SUPPORTED;
+        m.insn_class = GNW_CYCLE_INSN_ALU;
+        m.fallback_reason = GNW_CYCLE_FALLBACK_NONE;
+        return m;
+    }
+    if ((i & 0xfc00) == 0x4000) { /* Data-processing registers. */
+        op = (i >> 6) & 15;
+        rm = (i >> 3) & 7;
+        rd = i & 7;
+        if (op == 13) { /* MUL latency/pairing is deliberately unsupported. */
+            return m;
+        }
+        m.gpr_reads = (1U << rm) | (1U << rd);
+        if (op != 8 && op != 10 && op != 11) {
+            m.gpr_writes = 1U << rd;
+        }
+        if (op == 5 || op == 6) {
+            m.apsr_reads = GNW_CYCLE_APSR_C;
+        }
+        if (op == 9) { /* RSB/NEG uses only Rm as its data source. */
+            m.gpr_reads = 1U << rm;
+        }
+        /* T16 ANDS/EORS have ordinary scalar ALU issue behavior.  Keeping
+         * them in the serialized fallback loses the M7 early ADD result pair
+         * for `ADDS Rd,...; ANDS Rd,...` and also hides their real register
+         * and APSR dependencies from the issue model. */
+        if (op == 0 || op == 1 || op == 10) {
+            m.flags = GNW_CYCLE_META_SUPPORTED;
+            m.fallback_reason = GNW_CYCLE_FALLBACK_NONE;
+        } else {
+            m.flags &= ~GNW_CYCLE_META_SUPPORTED;
+            m.fallback_reason = GNW_CYCLE_FALLBACK_UNSUPPORTED_CLASS;
+        }
+        m.apsr_writes = (op == 0 || op == 1) ?
+            (GNW_CYCLE_APSR_N | GNW_CYCLE_APSR_Z) :
+            GNW_CYCLE_APSR_NZCV;
+        m.insn_class = op == 9 ? GNW_CYCLE_INSN_EARLY_ADD_SUB :
+                                GNW_CYCLE_INSN_ALU;
+        return m;
+    }
+    if ((i & 0xf500) == 0xb100) { /* CBZ/CBNZ. */
+        m.gpr_reads = 1U << (i & 7);
+        m.flags = GNW_CYCLE_META_SUPPORTED | GNW_CYCLE_META_BRANCH |
+                  GNW_CYCLE_META_DIRECT_BRANCH |
+                  GNW_CYCLE_META_CONDITIONAL;
+        m.insn_class = GNW_CYCLE_INSN_BRANCH;
+        m.fallback_reason = GNW_CYCLE_FALLBACK_NONE;
+        return m;
+    }
+    if ((i & 0xf000) == 0xd000 && (i & 0x0f00) < 0x0e00) {
+        unsigned cond = (i >> 8) & 15;
+        m.flags = GNW_CYCLE_META_SUPPORTED | GNW_CYCLE_META_BRANCH |
+                  GNW_CYCLE_META_DIRECT_BRANCH |
+                  GNW_CYCLE_META_CONDITIONAL;
+        m.apsr_reads = gnw_condition_apsr_reads(cond);
+        m.insn_class = GNW_CYCLE_INSN_BRANCH;
+        m.fallback_reason = GNW_CYCLE_FALLBACK_NONE;
+        return m;
+    }
+    if ((i & 0xf800) == 0xe000) {
+        m.flags = GNW_CYCLE_META_SUPPORTED | GNW_CYCLE_META_BRANCH |
+                  GNW_CYCLE_META_DIRECT_BRANCH;
+        m.insn_class = GNW_CYCLE_INSN_BRANCH;
+        m.fallback_reason = GNW_CYCLE_FALLBACK_NONE;
+        return m;
+    }
+
+    if ((i >= 0x4800 && i < 0xa000) || (i & 0xf000) == 0xc000 ||
+        (i & 0xfe00) == 0xb400 || (i & 0xfe00) == 0xbc00) {
+        m.flags = GNW_CYCLE_META_MEMORY;
+        m.fallback_reason = GNW_CYCLE_FALLBACK_MEMORY;
+    } else if ((i & 0xff00) == 0xbe00 || (i & 0xff00) == 0xbf00 ||
+               (i & 0xff00) == 0xdf00) {
+        m.flags = GNW_CYCLE_META_SYSTEM;
+        m.fallback_reason = GNW_CYCLE_FALLBACK_SYSTEM;
+    }
+    return m;
+}
+
+static void gen_gnw_cycle_begin(DisasContext *dc, uint32_t insn,
+                                bool is_16bit, bool include_fetch)
+{
+    GnwCycleInsnMetadata m =
+        gnw_decode_thumb_metadata(dc->pc_curr, insn, is_16bit);
+    uint64_t header = m.encoding | ((uint64_t)m.size << 32) |
+                      ((uint64_t)m.insn_class << 40) |
+                      ((uint64_t)m.flags << 48) |
+                      ((uint64_t)m.fallback_reason << 56);
+    uint64_t masks = m.gpr_reads | ((uint64_t)m.gpr_writes << 16) |
+                     ((uint64_t)m.store_data_reads << 32) |
+                     ((uint64_t)m.address_reads << 48);
+    uint64_t details = m.apsr_reads | ((uint64_t)m.apsr_writes << 8) |
+                       ((uint64_t)m.memory_kind << 16) |
+                       ((uint64_t)m.memory_size << 24);
+
+    if (include_fetch) {
+        gen_helper_gnw_cycle_instruction_fetch_begin(
+            tcg_env, tcg_constant_i32(dc->pc_curr),
+            tcg_constant_i32(is_16bit ? 2 : 4),
+            tcg_constant_i32(get_mem_index(dc)),
+            tcg_constant_i64(header), tcg_constant_i64(masks),
+            tcg_constant_i64(details));
+    } else {
+        gen_helper_gnw_cycle_begin(tcg_env, tcg_constant_i64(m.pc),
+                                   tcg_constant_i64(header),
+                                   tcg_constant_i64(masks),
+                                   tcg_constant_i64(details));
+    }
+}
+
+static void gen_gnw_cycle_finish_checkpoint(DisasContext *dc)
+{
+    TCGv_i32 expired = tcg_temp_new_i32();
+    TCGLabel *continuation = gen_new_label();
+    int pc_save = dc->pc_save;
+
+    /* Clock publication is an I/O boundary.  Preserve the architectural
+     * control state before enabling it, but publish the post-instruction PC
+     * only on the path that actually exits.  Updating PC before the helper
+     * also changes the continuing in-TB path and can corrupt later control
+     * flow when a precise checkpoint does not expire. */
+    /* A checkpoint may leave this TB and re-enter after the IT block has
+     * completed. gen_set_condexec() intentionally skips zero at normal TB
+     * entry, but an earlier checkpoint may have published a nonzero state. */
+    if (dc->condexec_mask) {
+        gen_set_condexec(dc);
+    } else {
+        store_cpu_field_constant(0, condexec_bits);
+    }
+    translator_io_checkpoint(&dc->base);
+    gen_helper_gnw_cycle_finish(expired, tcg_env);
+    tcg_gen_brcondi_i32(TCG_COND_EQ, expired, 0, continuation);
+    /* gen_update_pc() takes a displacement from pc_curr.  The continuing
+     * path deliberately leaves pc_save at the TB entry, so an exit after
+     * this instruction publishes the next instruction PC with its length. */
+    gen_update_pc(dc, curr_insn_len(dc));
+    dc->pc_save = pc_save;
+    tcg_gen_exit_tb(NULL, 0);
+    gen_set_label(continuation);
+}
+#endif
+
 static void arm_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
@@ -6305,6 +6843,11 @@ static void arm_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     dc->pc_save = dc->base.pc_first;
     dc->aarch64 = false;
     dc->thumb = EX_TBFLAG_AM32(tb_flags, THUMB);
+#ifndef CONFIG_USER_ONLY
+    dc->gnw_m7_cycle_model = cpu->gnw_m7_cycle_model;
+#else
+    dc->gnw_m7_cycle_model = false;
+#endif
     dc->be_data = EX_TBFLAG_ANY(tb_flags, BE_DATA) ? MO_BE : MO_LE;
     condexec = EX_TBFLAG_AM32(tb_flags, CONDEXEC);
     /*
@@ -6609,6 +7152,9 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     uint32_t pc = dc->base.pc_next;
     uint32_t insn;
     bool is_16bit;
+#ifndef CONFIG_USER_ONLY
+    bool combined_cycle_helper;
+#endif
     /* TCG op to rewind to if this turns out to be an invalid ECI state */
     TCGOp *insn_eci_rewind = NULL;
     target_ulong insn_eci_pc_save = -1;
@@ -6632,6 +7178,21 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     }
     dc->base.pc_next = pc;
     dc->insn = insn;
+
+#ifndef CONFIG_USER_ONLY
+    combined_cycle_helper = dc->gnw_m7_cycle_model && !dc->pstate_il &&
+                            !dc->eci && !dc->condexec_mask;
+    if (dc->gnw_m7_cycle_model) {
+        if (!combined_cycle_helper) {
+            /* Preserve fetch accounting for predicated, ECI, and illegal
+             * paths, where instruction begin has different control flow. */
+            gen_helper_gnw_cycle_instruction_fetch(
+                tcg_env, tcg_constant_i32(dc->pc_curr),
+                tcg_constant_i32(is_16bit ? 2 : 4),
+                tcg_constant_i32(get_mem_index(dc)));
+        }
+    }
+#endif
 
     if (dc->pstate_il) {
         /*
@@ -6689,6 +7250,13 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         }
     }
 
+#ifndef CONFIG_USER_ONLY
+    if (dc->gnw_m7_cycle_model) {
+        /* The predicate-failed path jumps over this begin callback. */
+        gen_gnw_cycle_begin(dc, insn, is_16bit, combined_cycle_helper);
+    }
+#endif
+
     if (is_16bit) {
         disas_thumb_insn(dc, insn);
     } else {
@@ -6717,6 +7285,14 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     }
 
     arm_post_translate_insn(dc);
+
+#ifndef CONFIG_USER_ONLY
+    if (dc->gnw_m7_cycle_model &&
+        (dc->base.is_jmp == DISAS_NEXT ||
+         dc->base.is_jmp == DISAS_TOO_MANY)) {
+        gen_gnw_cycle_finish_checkpoint(dc);
+    }
+#endif
 
     /* Thumb is a variable-length ISA.  Stop translation when the next insn
      * will touch a new page.  This ensures that prefetch aborts occur at
@@ -6858,10 +7434,42 @@ static void arm_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     emit_delayed_exceptions(dc);
 }
 
+static void arm_tr_modeled_budget_exit(DisasContextBase *dcbase,
+                                       CPUState *cpu)
+{
+    DisasContext *dc = container_of(dcbase, DisasContext, base);
+    int pc_save = dc->pc_save;
+    uint32_t pc_curr = dc->pc_curr;
+
+    (void)cpu;
+
+    /* This exit occurs before the current instruction. Preserve the current
+     * Thumb IT/ICI state and publish its PC so the main loop restarts it. */
+    if (dc->condexec_mask) {
+        gen_set_condexec(dc);
+    } else {
+        store_cpu_field_constant(0, condexec_bits);
+    }
+    /* The generic translator emits this callback before translate_insn(),
+     * so pc_curr still describes the preceding instruction.  pc_next is
+     * the current unexecuted instruction at this boundary.  Use it only
+     * while emitting the exit-side PC update; preserve translation state
+     * for the continuing path. */
+    dc->pc_curr = dcbase->pc_next;
+    gen_update_pc(dc, 0);
+    dc->pc_curr = pc_curr;
+    dc->pc_save = pc_save;
+    /* Tell cpu_loop_exec_tb() that the icount decrementer expired.  A
+     * normal exit would merely dispatch this same PC again with a zero
+     * budget; only TB_EXIT_REQUESTED advances/refills the icount slice. */
+    tcg_gen_exit_tb(dcbase->tb, TB_EXIT_REQUESTED);
+}
+
 static const TranslatorOps arm_translator_ops = {
     .init_disas_context = arm_tr_init_disas_context,
     .tb_start           = arm_tr_tb_start,
     .insn_start         = arm_tr_insn_start,
+    .modeled_budget_exit = arm_tr_modeled_budget_exit,
     .translate_insn     = arm_tr_translate_insn,
     .tb_stop            = arm_tr_tb_stop,
 };
@@ -6870,6 +7478,7 @@ static const TranslatorOps thumb_translator_ops = {
     .init_disas_context = arm_tr_init_disas_context,
     .tb_start           = arm_tr_tb_start,
     .insn_start         = arm_tr_insn_start,
+    .modeled_budget_exit = arm_tr_modeled_budget_exit,
     .translate_insn     = thumb_tr_translate_insn,
     .tb_stop            = arm_tr_tb_stop,
 };

@@ -22,12 +22,13 @@
  * content. Confirmed live: DWT_CYCCNT read back as 0x0 across 2 full
  * real seconds of active gameplay.
  *
- * Only CYCCNT is modeled as real (a free-running counter derived from
- * QEMU_CLOCK_VIRTUAL, scaled by the SoC's SYSCLK_FRQ so 1 count
- * approximates 1 real CPU cycle at 280MHz, matching what firmware's
- * cycle-budget math assumes) -- CTRL/LAR/other DWT registers are
- * plain read/write shadows; comparators and the other counters
- * (CPICNT/EXCCNT/etc) aren't used by any code path seen so far.
+ * CYCCNT is a free-running counter derived from QEMU_CLOCK_VIRTUAL and the
+ * live SYSCLK input. In the opt-in GNW timing baseline, precise TCG icount
+ * drives that virtual clock at one modeled cycle per instruction, while QEMU's
+ * idle-time warp also advances CYCCNT during WFI. This baseline does not yet
+ * represent Cortex-M7 stalls, cache misses, or bus effects.
+ * CTRL/LAR/other DWT registers are plain read/write shadows; comparators and
+ * counters (CPICNT/EXCCNT/etc) aren't used by any code path seen so far.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -51,7 +52,10 @@
 #define HW_MISC_GNW_H7B0_DWT_H
 
 #include "hw/core/sysbus.h"
+#include "hw/core/clock.h"
 #include "qom/object.h"
+#include "hw/misc/gnw_h7b0_cycle_phase.h"
+#include "hw/misc/gnw_h7b0_rcc.h"
 
 #define TYPE_GNW_H7B0_DWT "gnw-h7b0-dwt"
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0DwtState, GNW_H7B0_DWT)
@@ -63,12 +67,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0DwtState, GNW_H7B0_DWT)
 #define GNW_H7B0_DWT_CYCCNT_OFFSET 0x004
 #define GNW_H7B0_DWT_LAR_OFFSET    0xFB0
 
-/* Matches SYSCLK_FRQ in hw/arm/gnw_h7b0.c -- real STM32H7B0 max clock. */
-#define GNW_H7B0_DWT_CYCLE_HZ 280000000ULL
-
 struct GnwH7B0DwtState {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
+    Clock *sysclk;
     uint32_t regs[GNW_H7B0_DWT_SIZE / 4];
 
     /* CYCCNT = base_count + elapsed-since-enabled scaled to cycles,
@@ -78,7 +80,19 @@ struct GnwH7B0DwtState {
      * paused/resumed. */
     uint64_t base_count;
     int64_t enabled_since_ns;
+    int64_t enabled_since_cycles;
+    uint64_t frequency_hz;
     bool enabled;
+    bool trace_enabled;
+    bool timing_mode;
+    /* Serialized configuration contract, distinct from the live property. */
+    bool migration_timing_mode;
+    GnwH7B0CyclePhase cycle_phase;
+    GnwH7B0CyclePhase pending_cycle_phase;
+    uint64_t pending_base_count;
+    bool pending_phase_valid;
 };
+
+void gnw_h7b0_dwt_set_rcc(GnwH7B0DwtState *s, GnwH7B0RccState *rcc);
 
 #endif

@@ -40,6 +40,13 @@ static uint32_t gnw_h7b0_lptim1_cnt(GnwH7B0Lptim1State *s)
 
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t elapsed_ns = now - s->enabled_since_ns;
+
+    /* Migration destinations have their own virtual-clock epoch.  post_load
+     * rebases this timestamp, but retain a fail-closed guard for legacy or
+     * malformed streams rather than converting a negative delta to uint64_t. */
+    if (elapsed_ns <= 0) {
+        return s->base_count % modulus;
+    }
     uint64_t elapsed_counts = (uint64_t)elapsed_ns * GNW_H7B0_LPTIM1_ASSUMED_HZ
                                / NANOSECONDS_PER_SECOND;
 
@@ -164,10 +171,35 @@ static void gnw_h7b0_lptim1_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
+static int gnw_h7b0_lptim1_pre_save(void *opaque)
+{
+    GnwH7B0Lptim1State *s = opaque;
+
+    if (s->running) {
+        s->base_count = gnw_h7b0_lptim1_cnt(s);
+    }
+    s->enabled_since_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return 0;
+}
+
+static int gnw_h7b0_lptim1_post_load(void *opaque, int version_id)
+{
+    GnwH7B0Lptim1State *s = opaque;
+
+    (void)version_id;
+
+    /* base_count contains all source elapsed time from pre_save.  Never carry
+     * the source's absolute virtual-clock epoch into the destination. */
+    s->enabled_since_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return 0;
+}
+
 static const VMStateDescription vmstate_gnw_h7b0_lptim1 = {
     .name = TYPE_GNW_H7B0_LPTIM1,
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = gnw_h7b0_lptim1_pre_save,
+    .post_load = gnw_h7b0_lptim1_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, GnwH7B0Lptim1State,
                               GNW_H7B0_LPTIM1_SIZE / 4),

@@ -6,6 +6,16 @@ exec_tb(void *tb, uintptr_t pc) "tb:%p pc=0x%"PRIxPTR
 exec_tb_nocache(void *tb, uintptr_t pc) "tb:%p pc=0x%"PRIxPTR
 exec_tb_exit(void *last_tb, unsigned int flags) "tb:%p flags=0x%x"
 
+# gnw-cycle-model.c
+gnw_cycle_memory(int cpu, uint64_t pc, uint64_t vaddr, uint64_t paddr, unsigned kind, unsigned size, unsigned address_reads, unsigned store_data_reads) "cpu=%d pc=0x%"PRIx64" vaddr=0x%"PRIx64" paddr=0x%"PRIx64" kind=%u size=%u address_reads=0x%x store_data_reads=0x%x"
+gnw_cycle_memory_attrs(int cpu, uint64_t pc, unsigned memop, unsigned mmu_idx, bool pmsa_valid, unsigned pmsa_region, unsigned pmsa_attrs, unsigned pmsa_source, bool secure, bool user) "cpu=%d pc=0x%"PRIx64" memop=0x%x mmu_idx=%u pmsa_valid=%d pmsa_region=%u pmsa_attrs=0x%x pmsa_source=%u secure=%d user=%d"
+gnw_cycle_memory_completion(int cpu, uint64_t pc, unsigned access_index, unsigned access_count, unsigned access_flags, bool store_succeeded) "cpu=%d pc=0x%"PRIx64" access_index=%u access_count=%u access_flags=0x%x store_succeeded=%d"
+gnw_cycle_load_path(int cpu, uint64_t pc, unsigned region, unsigned classification, bool accepted, uint64_t issue_fp, uint64_t ready_fp, uint64_t epoch_cycles, uint64_t critical_fp) "cpu=%d pc=0x%"PRIx64" region=%u classification=%u accepted=%d issue_fp=0x%"PRIx64" ready_fp=0x%"PRIx64" epoch_cycles=%"PRIu64" critical_fp=0x%"PRIx64""
+gnw_cycle_instruction_fetch(int cpu, uint64_t vaddr, uint64_t paddr, unsigned size, bool pmsa_valid, unsigned pmsa_region, unsigned pmsa_attrs, unsigned pmsa_source, bool known_cacheable, unsigned access_flags) "cpu=%d vaddr=0x%"PRIx64" paddr=0x%"PRIx64" size=%u pmsa_valid=%d pmsa_region=%u pmsa_attrs=0x%x pmsa_source=%u known_cacheable=%d access_flags=0x%x"
+gnw_cycle_cache_maintenance(int cpu, unsigned op, uint32_t operand, bool ic_enabled, bool dc_enabled) "cpu=%d op=%u operand=0x%"PRIx32" ic_enabled=%d dc_enabled=%d"
+gnw_cycle_cache_control(int cpu, bool old_ic, bool new_ic, bool old_dc, bool new_dc) "cpu=%d old_ic=%d new_ic=%d old_dc=%d new_dc=%d"
+gnw_cycle_xip_service_commit(int cpu, uint64_t slice, uint64_t remaining, uint64_t modeled_before, uint64_t modeled_after) "cpu=%d slice=%"PRIu64" remaining=%"PRIu64" modeled_before=%"PRIu64" modeled_after=%"PRIu64""
+
 # cputlb.c
 memory_notdirty_write_access(uint64_t vaddr, uint64_t ram_addr, unsigned size) "0x%" PRIx64 " ram_addr 0x%" PRIx64 " size %u"
 memory_notdirty_set_dirty(uint64_t vaddr) "0x%" PRIx64

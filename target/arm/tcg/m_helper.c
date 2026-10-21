@@ -16,6 +16,7 @@
 #include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "exec/page-protection.h"
+#include "exec/gnw-cycle-model.h"
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-ldst.h"
 #include "semihosting/common-semi.h"
@@ -834,7 +835,8 @@ static bool v7m_push_callee_stack(ARMCPU *cpu, uint32_t lr, bool dotailchain,
 }
 
 static void v7m_exception_taken(ARMCPU *cpu, uint32_t lr, bool dotailchain,
-                                bool ignore_stackfaults)
+                                bool ignore_stackfaults,
+                                bool model_transition)
 {
     /*
      * Do the "take the exception" parts of exception entry,
@@ -960,14 +962,14 @@ static void v7m_exception_taken(ARMCPU *cpu, uint32_t lr, bool dotailchain,
          */
         qemu_log_mask(CPU_LOG_INT,
                       "...derived exception on callee-saves register stacking");
-        v7m_exception_taken(cpu, lr, true, true);
+        v7m_exception_taken(cpu, lr, true, true, false);
         return;
     }
 
     if (!arm_v7m_load_vector(cpu, exc, targets_secure, &addr)) {
         /* Vector load failed: derived exception */
         qemu_log_mask(CPU_LOG_INT, "...derived exception on vector table load");
-        v7m_exception_taken(cpu, lr, true, true);
+        v7m_exception_taken(cpu, lr, true, true, false);
         return;
     }
 
@@ -993,6 +995,11 @@ static void v7m_exception_taken(ARMCPU *cpu, uint32_t lr, bool dotailchain,
     env->regs[15] = addr & 0xfffffffe;
     env->thumb = addr & 1;
     arm_rebuild_hflags(env);
+    if (model_transition && gnw_cycle_model_exception_transition(
+            CPU(cpu), dotailchain ? GNW_CYCLE_EXCEPTION_TAIL_CHAIN :
+                                   GNW_CYCLE_EXCEPTION_ENTRY)) {
+        cpu_exit(CPU(cpu));
+    }
 }
 
 static void v7m_update_fpccr(CPUARMState *env, uint32_t frameptr,
@@ -1557,7 +1564,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
             armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_SECURE, false);
             qemu_log_mask(CPU_LOG_INT, "...taking SecureFault on existing "
                           "stackframe: error during lazy state deactivation\n");
-            v7m_exception_taken(cpu, excret, true, false);
+            v7m_exception_taken(cpu, excret, true, false, false);
             return;
         } else {
             if (arm_feature(env, ARM_FEATURE_V8_1M)) {
@@ -1570,7 +1577,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
                     env->v7m.cfsr[M_REG_S] |= R_V7M_CFSR_NOCP_MASK;
                     qemu_log_mask(CPU_LOG_INT, "...taking UsageFault on existing "
                         "stackframe: NSACR prevents clearing FPU registers\n");
-                    v7m_exception_taken(cpu, excret, true, false);
+                    v7m_exception_taken(cpu, excret, true, false, false);
                     return;
                 } else if (!cpacr_pass) {
                     armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_USAGE,
@@ -1578,7 +1585,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
                     env->v7m.cfsr[exc_secure] |= R_V7M_CFSR_NOCP_MASK;
                     qemu_log_mask(CPU_LOG_INT, "...taking UsageFault on existing "
                         "stackframe: CPACR prevents clearing FPU registers\n");
-                    v7m_exception_taken(cpu, excret, true, false);
+                    v7m_exception_taken(cpu, excret, true, false, false);
                     return;
                 }
             }
@@ -1600,7 +1607,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
         armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_SECURE, false);
         qemu_log_mask(CPU_LOG_INT, "...taking SecureFault on existing "
                       "stackframe: failed EXC_RETURN.ES validity check\n");
-        v7m_exception_taken(cpu, excret, true, false);
+        v7m_exception_taken(cpu, excret, true, false, false);
         return;
     }
 
@@ -1613,7 +1620,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
         armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_USAGE, env->v7m.secure);
         qemu_log_mask(CPU_LOG_INT, "...taking UsageFault on existing "
                       "stackframe: failed exception return integrity check\n");
-        v7m_exception_taken(cpu, excret, true, false);
+        v7m_exception_taken(cpu, excret, true, false, false);
         return;
     }
 
@@ -1629,7 +1636,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
      */
     if (armv7m_nvic_can_take_pending_exception(env->nvic)) {
         qemu_log_mask(CPU_LOG_INT, "...tailchaining to pending exception\n");
-        v7m_exception_taken(cpu, excret, true, false);
+        v7m_exception_taken(cpu, excret, true, false, true);
         return;
     }
 
@@ -1680,7 +1687,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
                 qemu_log_mask(CPU_LOG_INT, "...taking SecureFault on existing "
                               "stackframe: failed exception return integrity "
                               "signature check\n");
-                v7m_exception_taken(cpu, excret, true, false);
+                v7m_exception_taken(cpu, excret, true, false, false);
                 return;
             }
 
@@ -1714,7 +1721,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
              * chained exception on the same stack frame)
              */
             qemu_log_mask(CPU_LOG_INT, "...derived exception on unstacking\n");
-            v7m_exception_taken(cpu, excret, true, false);
+            v7m_exception_taken(cpu, excret, true, false, false);
             return;
         }
 
@@ -1756,7 +1763,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
                 qemu_log_mask(CPU_LOG_INT, "...taking UsageFault on existing "
                               "stackframe: failed exception return integrity "
                               "check\n");
-                v7m_exception_taken(cpu, excret, true, false);
+                v7m_exception_taken(cpu, excret, true, false, false);
                 return;
             }
         }
@@ -1771,7 +1778,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
                               "...taking SecureFault on existing stackframe: "
                               "Secure LSPACT set but exception return is "
                               "not to secure state\n");
-                v7m_exception_taken(cpu, excret, true, false);
+                v7m_exception_taken(cpu, excret, true, false, false);
                 return;
             }
 
@@ -1799,7 +1806,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
                                   "...taking UsageFault on existing "
                                   "stackframe: CPACR.CP10 prevents unstacking "
                                   "FP regs\n");
-                    v7m_exception_taken(cpu, excret, true, false);
+                    v7m_exception_taken(cpu, excret, true, false, false);
                     return;
                 } else if (!nsacr_pass) {
                     armv7m_nvic_set_pending(env->nvic, ARMV7M_EXCP_USAGE, true);
@@ -1808,7 +1815,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
                                   "...taking Secure UsageFault on existing "
                                   "stackframe: NSACR.CP10 prevents unstacking "
                                   "FP regs\n");
-                    v7m_exception_taken(cpu, excret, true, false);
+                    v7m_exception_taken(cpu, excret, true, false, false);
                     return;
                 }
 
@@ -1914,7 +1921,7 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
         ignore_stackfaults = v7m_push_stack(cpu);
         qemu_log_mask(CPU_LOG_INT, "...taking UsageFault on new stackframe: "
                       "failed exception return integrity check\n");
-        v7m_exception_taken(cpu, excret, false, ignore_stackfaults);
+        v7m_exception_taken(cpu, excret, false, ignore_stackfaults, false);
         return;
     }
 
@@ -1925,6 +1932,10 @@ static void do_v7m_exception_exit(ARMCPU *cpu)
     /* Exception return sets the event register (ARM ARM R_BPBR) */
     env->event_register = true;
     qemu_log_mask(CPU_LOG_INT, "...successful exception return\n");
+    if (gnw_cycle_model_exception_transition(
+            CPU(cpu), GNW_CYCLE_EXCEPTION_RETURN)) {
+        cpu_exit(CPU(cpu));
+    }
 }
 
 static bool do_v7m_function_return(ARMCPU *cpu)
@@ -2447,7 +2458,8 @@ void arm_v7m_cpu_do_interrupt(CPUState *cs)
     }
 
     ignore_stackfaults = v7m_push_stack(cpu);
-    v7m_exception_taken(cpu, lr, false, ignore_stackfaults);
+    v7m_exception_taken(cpu, lr, false, ignore_stackfaults,
+                        !ignore_stackfaults);
 
     arm_do_plugin_vcpu_discon_cb(cs, last_pc);
 }

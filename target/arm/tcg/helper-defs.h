@@ -62,6 +62,14 @@ DEF_HELPER_2(pre_smc, void, env, i32)
 DEF_HELPER_1(vesb, void, env)
 DEF_HELPER_1(sev, void, env)
 
+DEF_HELPER_5(gnw_cycle_begin, void, env, i64, i64, i64, i64)
+DEF_HELPER_4(gnw_cycle_refine, void, env, i64, i64, i64)
+DEF_HELPER_7(gnw_cycle_memory, void, env, i32, i32, i32, i32, i32, i32)
+DEF_HELPER_4(gnw_cycle_instruction_fetch, void, env, i32, i32, i32)
+DEF_HELPER_7(gnw_cycle_instruction_fetch_begin, void, env, i32, i32, i32,
+            i64, i64, i64)
+DEF_HELPER_1(gnw_cycle_finish, i32, env)
+
 DEF_HELPER_3(cpsr_write, void, env, i32, i32)
 DEF_HELPER_2(cpsr_write_eret, void, env, i32)
 DEF_HELPER_1(cpsr_read, i32, env)

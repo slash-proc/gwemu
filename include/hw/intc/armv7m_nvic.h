@@ -87,6 +87,7 @@ struct NVICState {
     uint32_t num_irq;
     qemu_irq excpout;
     qemu_irq sysresetreq;
+    qemu_irq trace_enable_out;
 };
 
 /* Interface between CPU and Interrupt controller.  */
@@ -103,6 +104,7 @@ struct NVICState {
  * of architecturally banked exceptions.
  */
 void armv7m_nvic_set_pending(NVICState *s, int irq, bool secure);
+void armv7m_nvic_set_trace_enable(NVICState *s, bool enabled);
 /**
  * armv7m_nvic_set_pending_derived: mark this derived exception as pending
  * @s: the NVIC

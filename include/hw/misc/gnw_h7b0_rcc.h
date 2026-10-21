@@ -33,6 +33,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
+#include "exec/icount.h"
 #include "qom/object.h"
 
 #define TYPE_GNW_H7B0_RCC "gnw-h7b0-rcc"
@@ -76,6 +77,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
 #define GNW_H7B0_RCC_BDCR   0x70
 #define RCC_BDCR_LSEON      (1U << 0)
 #define RCC_BDCR_LSERDY     (1U << 1)
+#define RCC_BDCR_BDRST      (1U << 16)
 
 /*
  * RCC_RSR (reset status/cause flags) resets to 0x01680000 here --
@@ -109,7 +111,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0RccState, GNW_H7B0_RCC)
  * Setting SFTRSTF unconditionally simulates "this looks like a stage0
  * handoff" without actually chainloading a stage0 image.
  */
-#define GNW_H7B0_RCC_RSR        0x130
+#define GNW_H7B0_RCC_RSR        0x0d0
 #define RCC_RSR_RESET_VALUE     0x01680000U
 #define RCC_RSR_RMVF            (1U << 16)
 
@@ -225,28 +227,167 @@ typedef struct GnwH7B0RccResetTarget {
 
 #define GNW_H7B0_RCC_RESET_TARGET_MAX 8
 
+/* APB timer-kernel clock domains observable by the timer models. */
+typedef enum GnwH7B0RccTimerClockDomain {
+    GNW_H7B0_RCC_TIMER_APB1,
+    GNW_H7B0_RCC_TIMER_APB2,
+} GnwH7B0RccTimerClockDomain;
+
+typedef void (*GnwH7B0RccTimerClockChangeFn)(void *opaque,
+                                              uint32_t old_hz,
+                                              uint32_t new_hz);
+
+typedef struct GnwH7B0RccTimerClockObserver {
+    GnwH7B0RccTimerClockDomain domain;
+    GnwH7B0RccTimerClockChangeFn callback;
+    void *opaque;
+} GnwH7B0RccTimerClockObserver;
+
+typedef enum GnwH7B0RccTimingDomain {
+    GNW_H7B0_RCC_TIMING_CORE,
+    GNW_H7B0_RCC_TIMING_APB1,
+    GNW_H7B0_RCC_TIMING_APB2,
+} GnwH7B0RccTimingDomain;
+
+typedef bool (*GnwH7B0RccTimingPrepareFn)(
+    void *opaque, const IcountCycleStamp *before, uint32_t peripheral_hz);
+typedef void (*GnwH7B0RccTimingCommitFn)(
+    void *opaque, const IcountCycleStamp *before,
+    const IcountCycleStamp *after, uint32_t peripheral_hz);
+typedef void (*GnwH7B0RccTimingAbortFn)(void *opaque);
+
+typedef struct GnwH7B0RccTimingObserver {
+    GnwH7B0RccTimingDomain domain;
+    GnwH7B0RccTimingPrepareFn prepare;
+    GnwH7B0RccTimingCommitFn commit;
+    GnwH7B0RccTimingAbortFn abort;
+    void *opaque;
+} GnwH7B0RccTimingObserver;
+
+/* ADC1/ADC2 have both an RCC-selected asynchronous kernel input and a
+ * synchronous input derived from sys_ck_cpu/HPRE. Notify the shared ADC12
+ * block whenever either input rate changes; it selects the active mode and
+ * applies its common CCR prescaler. */
+typedef void (*GnwH7B0RccAdcClockChangeFn)(void *opaque);
+
+typedef struct GnwH7B0RccAdcClockObserver {
+    GnwH7B0RccAdcClockChangeFn callback;
+    void *opaque;
+} GnwH7B0RccAdcClockObserver;
+
+/* OCTOSPI1/2 share CDCCIP2R.OCTOSPISEL and the per_ck mux. */
+typedef void (*GnwH7B0RccOctospiClockChangeFn)(void *opaque,
+                                               uint32_t old_hz,
+                                               uint32_t new_hz);
+
+typedef struct GnwH7B0RccOctospiClockObserver {
+    GnwH7B0RccOctospiClockChangeFn callback;
+    void *opaque;
+} GnwH7B0RccOctospiClockObserver;
+
+/* `known` separates modeled internal SAI1SEL sources from external I2S_CKIN;
+ * `kernel_hz == 0` is an authoritative stopped/reserved source. The APB2
+ * peripheral gate is reported separately because a live kernel can be gated
+ * at SAI1. */
+typedef struct GnwH7B0RccSai1ClockInfo {
+    bool known;
+    bool enabled;
+    uint32_t kernel_hz;
+} GnwH7B0RccSai1ClockInfo;
+
+typedef void (*GnwH7B0RccSai1ClockChangeFn)(void *opaque);
+
+typedef struct GnwH7B0RccSai1ClockObserver {
+    GnwH7B0RccSai1ClockChangeFn callback;
+    void *opaque;
+} GnwH7B0RccSai1ClockObserver;
+
+/* AHB3 engine reference clocks; rates do not imply service throughput. */
+typedef enum GnwH7B0RccEngine {
+    GNW_H7B0_RCC_ENGINE_MDMA,
+    GNW_H7B0_RCC_ENGINE_DMA2D,
+    GNW_H7B0_RCC_ENGINE_COUNT,
+} GnwH7B0RccEngine;
+
+typedef struct GnwH7B0RccEngineClockInfo {
+    bool known;
+    bool enabled;
+    uint32_t reference_hz;
+} GnwH7B0RccEngineClockInfo;
+
+typedef void (*GnwH7B0RccEngineClockChangeFn)(
+    void *opaque, GnwH7B0RccEngineClockInfo old_info,
+    GnwH7B0RccEngineClockInfo new_info);
+
+typedef struct GnwH7B0RccEngineClockObserver {
+    GnwH7B0RccEngine engine;
+    GnwH7B0RccEngineClockChangeFn callback;
+    void *opaque;
+} GnwH7B0RccEngineClockObserver;
+
+typedef void (*GnwH7B0RccBackupDomainResetFn)(void *opaque);
+
+#define GNW_H7B0_RCC_ENGINE_CLOCK_OBSERVER_MAX 4
+
+#define GNW_H7B0_RCC_TIMER_CLOCK_OBSERVER_MAX 8
+#define GNW_H7B0_RCC_TIMING_OBSERVER_MAX 8
+#define GNW_H7B0_RCC_ADC_CLOCK_OBSERVER_MAX 4
+#define GNW_H7B0_RCC_OCTOSPI_CLOCK_OBSERVER_MAX 8
+#define GNW_H7B0_RCC_SAI1_CLOCK_OBSERVER_MAX 4
+
 struct GnwH7B0RccState {
     SysBusDevice parent_obj;
 
     MemoryRegion mmio;
     uint32_t regs[GNW_H7B0_RCC_SIZE / 4];
+    /* FRACR is a writable shadow; hardware latches FRACN on FRACEN 0->1. */
+    uint32_t pll1_fracn_latched;
+    uint32_t pll2_fracn_latched;
+    uint32_t pll3_fracn_latched;
     GnwH7B0RccResetTarget reset_targets[GNW_H7B0_RCC_RESET_TARGET_MAX];
     int n_reset_targets;
+    GnwH7B0RccTimerClockObserver
+        timer_clock_observers[GNW_H7B0_RCC_TIMER_CLOCK_OBSERVER_MAX];
+    int n_timer_clock_observers;
+    GnwH7B0RccTimingObserver
+        timing_observers[GNW_H7B0_RCC_TIMING_OBSERVER_MAX];
+    int n_timing_observers;
+    GnwH7B0RccAdcClockObserver
+        adc_clock_observers[GNW_H7B0_RCC_ADC_CLOCK_OBSERVER_MAX];
+    int n_adc_clock_observers;
+    GnwH7B0RccOctospiClockObserver
+        octospi_clock_observers[GNW_H7B0_RCC_OCTOSPI_CLOCK_OBSERVER_MAX];
+    int n_octospi_clock_observers;
+    GnwH7B0RccSai1ClockObserver
+        sai1_clock_observers[GNW_H7B0_RCC_SAI1_CLOCK_OBSERVER_MAX];
+    int n_sai1_clock_observers;
 
-    /* Not owned; set by the board via gnw_h7b0_rcc_set_sysclk() so PLL1/
-     * SYSCLK register writes can push a live recompute out through the
-     * existing sysclk Clock -> ARMv7M cpuclk/refclk wiring (gnw_h7b0.c/
-     * gnw_h7b0_soc.c already own and connect that Clock; RCC only gets a
-     * pointer to push updates into it, same as sai1_set_rcc()'s pattern
-     * for the reverse direction). May be NULL (e.g. in unit tests that
-     * instantiate RCC standalone) -- callers must check before use. */
+    GnwH7B0RccEngineClockObserver
+        engine_clock_observers[GNW_H7B0_RCC_ENGINE_CLOCK_OBSERVER_MAX];
+    int n_engine_clock_observers;
+
+    GnwH7B0RccBackupDomainResetFn backup_domain_reset;
+    void *backup_domain_reset_opaque;
+
+    /* Not owned; set by the SoC so RCC writes can update the Cortex-M core
+     * clock and SysTick's HCLK/8 reference clock independently. May be NULL
+     * in standalone RCC tests. */
     Clock *sysclk;
+    Clock *systick_refclk;
 };
 
 uint32_t gnw_h7b0_rcc_get_pll2p_hz(GnwH7B0RccState *s);
 /* True while RCC_APB2ENR.SAI1EN is set, i.e. SAI1 is clocked at all. */
 bool gnw_h7b0_rcc_sai1_clock_enabled(GnwH7B0RccState *s);
-
+/* Return the effective SAI1 kernel frequency for modeled internal mux
+ * sources. Supported but stopped sources return true with *kernel_hz == 0;
+ * unmodeled external sources return false, distinguishing UNKNOWN from
+ * STOPPED for timing consumers. */
+bool gnw_h7b0_rcc_get_sai1_clock_info(GnwH7B0RccState *s,
+                                      uint32_t *kernel_hz);
+void gnw_h7b0_rcc_add_sai1_clock_observer(
+    GnwH7B0RccState *s, GnwH7B0RccSai1ClockChangeFn callback,
+    void *opaque);
 /*
  * Register a device to be held in reset by one of RCC's peripheral-reset
  * (xxxRSTR) bits: writing the bit to 1 asserts the peripheral's reset,
@@ -262,15 +403,66 @@ bool gnw_h7b0_rcc_sai1_clock_enabled(GnwH7B0RccState *s);
  */
 void gnw_h7b0_rcc_add_reset_target(GnwH7B0RccState *s, hwaddr rstr_offset,
                                     unsigned bit, DeviceState *dev);
+void gnw_h7b0_rcc_set_backup_domain_reset(
+    GnwH7B0RccState *s, GnwH7B0RccBackupDomainResetFn callback,
+    void *opaque);
+/* Register a callback for a changed APB timer kernel clock. The callback is
+ * invoked synchronously after RCC registers are updated, only when the
+ * selected domain's effective kernel frequency changes. */
+void gnw_h7b0_rcc_add_timer_clock_observer(
+    GnwH7B0RccState *s, GnwH7B0RccTimerClockDomain domain,
+    GnwH7B0RccTimerClockChangeFn callback, void *opaque);
+void gnw_h7b0_rcc_add_timing_observer(
+    GnwH7B0RccState *s, GnwH7B0RccTimingDomain domain,
+    GnwH7B0RccTimingPrepareFn prepare,
+    GnwH7B0RccTimingCommitFn commit, GnwH7B0RccTimingAbortFn abort,
+    void *opaque);
+void gnw_h7b0_rcc_add_adc_clock_observer(
+    GnwH7B0RccState *s, GnwH7B0RccAdcClockChangeFn callback, void *opaque);
+/* Return the effective shared OCTOSPI kernel frequency, or zero when its
+ * selected source/output is stopped or reserved. */
+uint32_t gnw_h7b0_rcc_get_octospi_kernel_hz(GnwH7B0RccState *s);
+/* Called synchronously after a cold register change changes effective rate;
+ * migration post-load deliberately rebuilds consumers without notification. */
+void gnw_h7b0_rcc_add_octospi_clock_observer(
+    GnwH7B0RccState *s, GnwH7B0RccOctospiClockChangeFn callback,
+    void *opaque);
 uint32_t gnw_h7b0_rcc_get_pll1p_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_pll3r_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_sysclk_hz(GnwH7B0RccState *s);
+/* SYSCLK divided by RCC.CDCFGR1.CDCPRE (Cortex-M7 core frequency). */
+uint32_t gnw_h7b0_rcc_get_core_hz(GnwH7B0RccState *s);
+/* Core frequency divided by RCC.CDCFGR1.HPRE (AHB/HCLK frequency). */
 uint32_t gnw_h7b0_rcc_get_hclk_hz(GnwH7B0RccState *s);
+GnwH7B0RccEngineClockInfo gnw_h7b0_rcc_engine_clock_info(
+    GnwH7B0RccState *s, GnwH7B0RccEngine engine);
+void gnw_h7b0_rcc_add_engine_clock_observer(
+    GnwH7B0RccState *s, GnwH7B0RccEngine engine,
+    GnwH7B0RccEngineClockChangeFn callback, void *opaque);
+
 /* TIM2-TIM7 kernel clock (APB1 prescaler + the x2/x4 timer rule applied,
  * NOT simply HCLK) -- see the definition for why this distinction is
  * load-bearing for stock-firmware audio. */
 uint32_t gnw_h7b0_rcc_get_timer_ker_hz(GnwH7B0RccState *s);
+/* TIM1/TIM8 timer kernel clock (APB2 prescaler + TIMPRE rule). */
+uint32_t gnw_h7b0_rcc_get_timer_apb2_ker_hz(GnwH7B0RccState *s);
 uint32_t gnw_h7b0_rcc_get_sai1_kernel_hz(GnwH7B0RccState *s);
+/* RCC-selected ADC asynchronous source and effective ADC12 kernel rate.
+ * `common_ccr` is ADC12_COMMON.CCR; the helper applies CKMODE/PRESC and the
+ * fixed analog-path divide-by-two from RM0455. */
+uint32_t gnw_h7b0_rcc_get_adc_source_hz(GnwH7B0RccState *s);
+uint32_t gnw_h7b0_rcc_get_adc_kernel_hz(GnwH7B0RccState *s,
+                                        uint32_t common_ccr);
+/* As above, but return false when the selected mux/prescaler is not modeled;
+ * a supported source that is stopped is known and returns true with 0 Hz. */
+bool gnw_h7b0_rcc_get_adc_clock_info(GnwH7B0RccState *s,
+                                     uint32_t common_ccr,
+                                     uint32_t *kernel_hz);
 void gnw_h7b0_rcc_set_sysclk(GnwH7B0RccState *s, Clock *sysclk);
+/* Establish the initial icount cycle rate before timing consumers initialize.
+ * RCC remains the sole owner of subsequent cycle-clock boundaries. */
+void gnw_h7b0_rcc_init_timing_clock(GnwH7B0RccState *s);
+void gnw_h7b0_rcc_set_systick_refclk(GnwH7B0RccState *s,
+                                     Clock *systick_refclk);
 
 #endif

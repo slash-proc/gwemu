@@ -113,6 +113,8 @@ static void cpu_common_reset_hold(Object *obj, ResetType type)
     cpu->halted = cpu->start_powered_off;
     cpu->mem_io_pc = 0;
     cpu->icount_extra = 0;
+    cpu->icount_model_pending_retired = 0;
+    cpu->icount_model_pending_cycles = 0;
     qatomic_set(&cpu->neg.icount_decr.u32, 0);
     cpu->neg.can_do_io = true;
     cpu->exception_index = -1;

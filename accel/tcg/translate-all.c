@@ -181,11 +181,18 @@ void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
         return;
     }
 
-    if (tb_cflags(tb) & CF_USE_ICOUNT) {
+    if ((tb_cflags(tb) & CF_USE_ICOUNT) &&
+        !icount_cycle_model_enabled()) {
         assert(icount_enabled());
         /*
          * Reset the cycle counter to the start of the block and
          * shift if to the number of actually executed instructions.
+         *
+         * The cycle model debits the counter immediately before each
+         * instruction instead of reserving the whole block at entry.  Its
+         * decrementer therefore already describes the precise restored
+         * point; adding the unexecuted suffix would create instruction
+         * credit and make icount_get_executed_in_slice() negative.
          */
         cpu->neg.icount_decr.u16.low += insns_left;
     }

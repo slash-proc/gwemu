@@ -59,6 +59,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ARMv7MState, ARMV7M)
  * + Property "mpu-s-regions": number of Secure MPU regions (default is
  *   whatever the default for the CPU is; must currently be set to the same
  *   value as mpu-ns-regions if the CPU implements the Security Extension)
+ * + Property "itcm-size": Cortex-M7 ITCM implementation size, or zero
+ * + Property "itcm-init-enable": model the implementation INITTCMEN signal
+ * + Property "itcm-init-rmw-enable": model the implementation INITRMWEN signal
  * + Clock input "refclk" is the external reference clock for the systick timers
  * + Clock input "cpuclk" is the main CPU clock
  */
@@ -109,6 +112,10 @@ struct ARMv7MState {
     uint32_t init_nsvtor;
     uint32_t mpu_ns_regions;
     uint32_t mpu_s_regions;
+    uint32_t itcm_size;
+    bool itcm_init_enable;
+    bool itcm_init_rmw_enable;
+    bool x_gnw_m7_cycle_model;
     bool enable_bitband;
     bool start_powered_off;
     bool vfp;

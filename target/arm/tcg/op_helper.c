@@ -25,10 +25,326 @@
 #include "cpu-features.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/probe.h"
+#include "exec/tlb-flags.h"
 #include "cpregs.h"
+#include "trace-accel_tcg.h"
+#ifndef CONFIG_USER_ONLY
+#include "exec/gnw-cycle-model.h"
+#include "exec/icount.h"
+#endif
 
 #define SIGNBIT (uint32_t)0x80000000
 #define SIGNBIT64 ((uint64_t)1 << 63)
+
+void HELPER(gnw_cycle_begin)(CPUARMState *env, uint64_t pc,
+                             uint64_t header, uint64_t masks,
+                             uint64_t details)
+{
+    GnwCycleInsnMetadata metadata = {
+        .pc = pc,
+        .encoding = header,
+        .gpr_reads = masks,
+        .gpr_writes = masks >> 16,
+        .store_data_reads = masks >> 32,
+        .address_reads = masks >> 48,
+        .size = header >> 32,
+        .insn_class = header >> 40,
+        .flags = header >> 48,
+        .fallback_reason = header >> 56,
+        .apsr_reads = details,
+        .apsr_writes = details >> 8,
+        .memory_kind = details >> 16,
+        .memory_size = details >> 24,
+        .argument_gpr0 = env->regs[0],
+    };
+
+#ifndef CONFIG_USER_ONLY
+    gnw_cycle_model_begin(env_cpu(env), &metadata,
+                          env->v7m.actlr & (1U << 2));
+#else
+    (void)env;
+    (void)metadata;
+#endif
+}
+
+void HELPER(gnw_cycle_refine)(CPUARMState *env, uint64_t header,
+                              uint64_t masks, uint64_t details)
+{
+    GnwCycleInsnMetadata metadata = {
+        .gpr_reads = masks,
+        .gpr_writes = masks >> 16,
+        .store_data_reads = masks >> 32,
+        .address_reads = masks >> 48,
+        .insn_class = header,
+        .flags = header >> 8,
+        .fallback_reason = header >> 16,
+        .apsr_reads = details,
+        .apsr_writes = details >> 8,
+        .memory_kind = details >> 16,
+        .memory_size = details >> 24,
+    };
+
+#ifndef CONFIG_USER_ONLY
+    gnw_cycle_model_refine(env_cpu(env), &metadata);
+#else
+    (void)env;
+    (void)metadata;
+#endif
+}
+
+uint32_t HELPER(gnw_cycle_finish)(CPUARMState *env)
+{
+#ifndef CONFIG_USER_ONLY
+    CPUState *cs = env_cpu(env);
+
+    if (gnw_cycle_model_xip_service_needs_defer(cs)) {
+        gnw_cycle_model_defer_finish(cs);
+        return 1;
+    }
+    gnw_cycle_model_finish(cs);
+    return icount_commit_model_cycles(cs);
+#else
+    (void)env;
+    return 0;
+#endif
+}
+
+void HELPER(gnw_cycle_memory)(CPUARMState *env, uint32_t address,
+                              uint32_t kind, uint32_t memop,
+                              uint32_t mmu_idx, uint32_t access_meta,
+                              uint32_t store_succeeded)
+{
+#ifndef CONFIG_USER_ONLY
+    CPUState *cs = env_cpu(env);
+    GnwCycleModelState *state = &cs->gnw_cycle_model;
+    GnwCycleMemoryObservation observation = {
+        .virtual_address = address,
+        .kind = kind,
+        .size = memop_size(memop),
+        .access_index = access_meta & 0xff,
+        .access_count = (access_meta >> 8) & 0xff,
+        .access_flags = (access_meta >> 16) & 0xff,
+        .memop = memop,
+        .mmu_idx = mmu_idx,
+        .store_succeeded = store_succeeded,
+    };
+    CPUTLBEntryFull *full;
+    void *host;
+    MMUAccessType access_type;
+    int flags;
+
+    if (!gnw_cycle_model_enabled(cs) || !state->pending_valid) {
+        return;
+    }
+    observation.address_reads = state->pending.address_reads;
+    observation.store_data_reads = state->pending.store_data_reads;
+    access_type = kind == GNW_CYCLE_MEMORY_STORE ?
+                  MMU_DATA_STORE : MMU_DATA_LOAD;
+    flags = probe_access_full_mmu(env, address, observation.size,
+                                  access_type, mmu_idx, &host, &full);
+    if (flags & TLB_INVALID_MASK) {
+        return;
+    }
+    observation.translation_valid = true;
+    observation.physical_address =
+        full->phys_addr | (address & ~TARGET_PAGE_MASK);
+    observation.secure = full->attrs.secure;
+    observation.user = full->attrs.user;
+    observation.pmsa_valid = full->extra.arm.pmsa_valid;
+    observation.pmsa_region = full->extra.arm.pmsa_region;
+    observation.pmsa_attrs = full->extra.arm.pmsa_attrs;
+    observation.pmsa_source = (GnwCyclePMSASource)full->extra.arm.pmsa_source;
+    observation.dcache_enabled =
+        (env->v7m.ccr[env->v7m.secure] & R_V7M_CCR_DC_MASK) != 0;
+    gnw_cycle_model_memory_completed(cs, &observation);
+#else
+    (void)env;
+    (void)address;
+    (void)kind;
+    (void)memop;
+    (void)mmu_idx;
+    (void)access_meta;
+    (void)store_succeeded;
+#endif
+}
+
+#ifndef CONFIG_USER_ONLY
+static bool gnw_fetch_attrs_match(const GnwCycleFetchObservation *segment,
+                                  const CPUTLBEntryFull *full)
+{
+    return segment->pmsa_valid == full->extra.arm.pmsa_valid &&
+           segment->pmsa_region == full->extra.arm.pmsa_region &&
+           segment->pmsa_attrs == full->extra.arm.pmsa_attrs &&
+           segment->pmsa_source == full->extra.arm.pmsa_source &&
+           segment->secure == full->attrs.secure &&
+           segment->user == full->attrs.user;
+}
+
+static void gnw_fetch_exact_body_region(GnwCycleFetchObservation *segment,
+                                        uint64_t physical_address,
+                                        bool known_cacheable)
+{
+    if (physical_address < 0x00010000) {
+        segment->exact_body_region = GNW_M7_EXACT_BODY_REGION_ITCM;
+        segment->exact_body_region_state_verified = true;
+    } else if (physical_address >= 0x24000000 &&
+               physical_address < 0x24100000 && known_cacheable) {
+        segment->exact_body_region =
+            GNW_M7_EXACT_BODY_REGION_AXI_SRAM_PRIMED;
+        /* Attributes identify cacheable AXI SRAM, but cannot prove priming. */
+        segment->exact_body_region_state_verified = false;
+    }
+}
+
+static void gnw_cycle_fetch_emit(CPUState *cs,
+                                 GnwCycleFetchObservation *segment)
+{
+    if (segment->size) {
+        gnw_cycle_model_instruction_fetch(cs, segment);
+        segment->size = 0;
+    }
+}
+#endif
+
+void HELPER(gnw_cycle_instruction_fetch)(CPUARMState *env, uint32_t address,
+                                         uint32_t size, uint32_t mmu_idx)
+{
+#ifndef CONFIG_USER_ONLY
+    CPUState *cs = env_cpu(env);
+    GnwCycleFetchObservation segment = { 0 };
+    uint64_t previous_paddr = 0;
+    unsigned i;
+
+    if (!gnw_cycle_model_enabled(cs) || (size != 2 && size != 4)) {
+        return;
+    }
+    gnw_cycle_model_instruction_fetch_attempt(cs);
+    segment.disfold_set = (env->v7m.actlr & (1U << 2)) != 0;
+    segment.gpr0 = env->regs[0];
+    segment.gpr1 = env->regs[1];
+    segment.gpr2 = env->regs[2];
+
+    /*
+     * Thumb instructions are at most four bytes.  A same-page access has one
+     * translation and one set of PMSA attributes, so probing each byte adds
+     * host work without adding an observable fetch segment.  Preserve the
+     * bytewise path for the only case where translations can differ: a
+     * 32-bit instruction straddling a target page boundary.
+     */
+    if (address <= UINT32_MAX - (size - 1) &&
+        (address & ~TARGET_PAGE_MASK) <= TARGET_PAGE_SIZE - size) {
+        CPUTLBEntryFull *full;
+        void *host;
+        int flags = probe_access_full_mmu(env, address, size,
+                                          MMU_INST_FETCH, mmu_idx,
+                                          &host, &full);
+
+        if (!(flags & TLB_INVALID_MASK) && host) {
+            uint64_t paddr = full->phys_addr |
+                             (address & ~TARGET_PAGE_MASK);
+            bool known_cacheable = full->extra.arm.pmsa_valid &&
+                full->extra.arm.pmsa_source == GNW_CYCLE_PMSA_REGION &&
+                full->extra.arm.pmsa_attrs ==
+                    GNW_CYCLE_PMSA_ATTR_NORMAL_WBWA_NSH;
+
+            segment.virtual_address = address;
+            segment.physical_address = paddr;
+            segment.size = size;
+            segment.pmsa_valid = full->extra.arm.pmsa_valid;
+            segment.pmsa_region = full->extra.arm.pmsa_region;
+            segment.pmsa_attrs = full->extra.arm.pmsa_attrs;
+            segment.pmsa_source = full->extra.arm.pmsa_source;
+            segment.known_cacheable = known_cacheable;
+            segment.instruction_cache_enabled =
+                (env->v7m.ccr[env->v7m.secure] & R_V7M_CCR_IC_MASK) != 0;
+            segment.secure = full->attrs.secure;
+            segment.user = full->attrs.user;
+            gnw_fetch_exact_body_region(&segment, paddr, known_cacheable);
+            memcpy(segment.bytes, host, size);
+            gnw_cycle_fetch_emit(cs, &segment);
+            gnw_cycle_model_instruction_fetch_complete(cs);
+        } else {
+            gnw_cycle_model_instruction_fetch_incomplete(cs);
+        }
+        return;
+    }
+    for (i = 0; i < size; i++) {
+        uint32_t vaddr;
+        uint64_t paddr;
+        CPUTLBEntryFull *full;
+        void *host;
+        int flags;
+        bool known_cacheable;
+
+        if (address > UINT32_MAX - i) {
+            break;
+        }
+        vaddr = address + i;
+        flags = probe_access_full_mmu(env, vaddr, 1, MMU_INST_FETCH,
+                                      mmu_idx, &host, &full);
+        if (flags & TLB_INVALID_MASK) {
+            break;
+        }
+        paddr = full->phys_addr | (vaddr & ~TARGET_PAGE_MASK);
+        known_cacheable = full->extra.arm.pmsa_valid &&
+            full->extra.arm.pmsa_source == GNW_CYCLE_PMSA_REGION &&
+            full->extra.arm.pmsa_attrs ==
+                GNW_CYCLE_PMSA_ATTR_NORMAL_WBWA_NSH;
+
+        if (segment.size &&
+            (segment.virtual_address + segment.size != vaddr ||
+             previous_paddr + 1 != paddr ||
+             !gnw_fetch_attrs_match(&segment, full) ||
+             segment.known_cacheable != known_cacheable)) {
+            gnw_cycle_fetch_emit(cs, &segment);
+        }
+        if (!segment.size) {
+            segment.virtual_address = vaddr;
+            segment.physical_address = paddr;
+            segment.pmsa_valid = full->extra.arm.pmsa_valid;
+            segment.pmsa_region = full->extra.arm.pmsa_region;
+            segment.pmsa_attrs = full->extra.arm.pmsa_attrs;
+            segment.pmsa_source = full->extra.arm.pmsa_source;
+            segment.known_cacheable = known_cacheable;
+            segment.instruction_cache_enabled =
+                (env->v7m.ccr[env->v7m.secure] & R_V7M_CCR_IC_MASK) != 0;
+            segment.secure = full->attrs.secure;
+            segment.user = full->attrs.user;
+            gnw_fetch_exact_body_region(&segment, paddr, known_cacheable);
+        }
+        if (!host) {
+            break;
+        }
+        segment.bytes[segment.size] = *(const uint8_t *)host;
+        segment.size++;
+        previous_paddr = paddr;
+    }
+    gnw_cycle_fetch_emit(cs, &segment);
+    if (i != size) {
+        gnw_cycle_model_instruction_fetch_incomplete(cs);
+    } else {
+        gnw_cycle_model_instruction_fetch_complete(cs);
+    }
+#else
+    (void)env;
+    (void)address;
+    (void)size;
+    (void)mmu_idx;
+#endif
+}
+
+/* The common, non-predicated Thumb path needs both observations. Keep the
+ * pair in one TCG helper call to avoid a second host/TCG dispatch per guest
+ * instruction. Conditional instructions retain the separate callbacks so a
+ * failed predicate records the fetch without creating a pending instruction.
+ */
+void HELPER(gnw_cycle_instruction_fetch_begin)(
+    CPUARMState *env, uint32_t address, uint32_t size, uint32_t mmu_idx,
+    uint64_t header, uint64_t masks, uint64_t details)
+{
+    HELPER(gnw_cycle_instruction_fetch)(env, address, size, mmu_idx);
+    HELPER(gnw_cycle_begin)(env, (uint64_t)address, header, masks, details);
+}
 
 int exception_target_el(CPUARMState *env)
 {

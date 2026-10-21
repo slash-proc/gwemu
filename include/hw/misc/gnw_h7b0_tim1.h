@@ -14,6 +14,7 @@
 #include "qom/object.h"
 #include "qemu/timer.h"
 #include "hw/misc/gnw_h7b0_rcc.h"
+#include "hw/misc/gnw_h7b0_cycle_phase.h"
 
 #define TYPE_GNW_H7B0_TIM1 "gnw-h7b0-tim1"
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0Tim1State, GNW_H7B0_TIM1)
@@ -23,16 +24,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0Tim1State, GNW_H7B0_TIM1)
 struct GnwH7B0Tim1State {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
+    qemu_irq irq;
     uint32_t regs[GNW_H7B0_TIM1_SIZE / 4];
     QEMUTimer *count_timer;
+    bool timing_mode;
 
-    /* Virtual-clock timestamp of the last counter (re)start -- CR1.CEN
-     * 0->1 transition or an EGR.UG forced reload while counting. CNT is
-     * computed lazily on read from elapsed time since this point, same
-     * idea as gnw_h7b0_ltdc.c's vblank-phase computation elsewhere in
-     * this project: cheap, and correct regardless of how often (or
-     * rarely) the guest actually polls CNT. */
-    int64_t count_start_ns;
+    /*
+     * Exact lazy counter phase at cnt_ref_ns. kernel_fraction is the
+     * numerator of a fractional kernel cycle with a 1e9 denominator;
+     * psc_remainder is the number of whole kernel cycles accumulated toward
+     * the next prescaled CNT tick.  Both survive live RCC rate changes.
+     */
+    uint64_t cnt_ref_ns;
+    uint64_t kernel_fraction;
+    uint32_t psc_remainder;
+    uint32_t cnt_base;
+    GnwH7B0CyclePhase cycle_phase;
+    GnwH7B0CyclePhase pending_cycle_phase;
+    uint32_t pending_psc_remainder;
+    uint32_t pending_cnt_base;
+    bool pending_phase_valid;
 
     /* Not owned; set by the board via gnw_h7b0_tim1_set_rcc() once both
      * TIM1 and RCC are realized, same pattern as gnw_h7b0_tim2_set_rcc()

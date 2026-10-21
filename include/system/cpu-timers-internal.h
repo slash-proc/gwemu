@@ -49,6 +49,22 @@ typedef struct TimersState {
     /* Compensate for varying guest execution speed.  */
     int64_t qemu_icount_bias;
 
+    /* Optional cycle-frequency conversion for the GNW H7 base timing mode. */
+    int64_t icount_cycle_clock_hz;
+    int64_t icount_cycle_anchor;
+    int64_t icount_cycle_anchor_ns;
+    uint64_t icount_cycle_clock_generation;
+    /* Modeled stalls, separate from retired instructions and TB budgets. */
+    int64_t icount_cycle_penalties;
+    /* Cycles hidden by issue overlap; separate from retired instructions. */
+    int64_t icount_cycle_credits;
+    /* Preserve monotonic virtual time when modeled cycles are adjusted. */
+    int64_t icount_cycle_highwater;
+    /* Migration-checked identities for cycle conversion and its producer. */
+    uint32_t icount_cycle_clock_config;
+    uint32_t icount_cycle_model_config;
+    uint32_t icount_test_cycle_scale;
+
     int64_t vm_clock_warp_start;
     int64_t cpu_clock_offset;
 

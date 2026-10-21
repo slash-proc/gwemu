@@ -335,6 +335,19 @@ static void armv7m_realize(DeviceState *dev, Error **errp)
     object_property_set_bool(OBJECT(s->cpu), "start-powered-off",
                              s->start_powered_off, &error_abort);
 
+    if (s->x_gnw_m7_cycle_model) {
+        if (!object_property_find(OBJECT(s->cpu),
+                                  "x-gnw-m7-cycle-model")) {
+            error_setg(errp, "x-gnw-m7-cycle-model requires a CPU that "
+                       "supports the experimental M7 cycle producer");
+            return;
+        }
+        if (!object_property_set_bool(OBJECT(s->cpu),
+                                      "x-gnw-m7-cycle-model", true, errp)) {
+            return;
+        }
+    }
+
     /*
      * Real M-profile hardware can be configured with a different number of
      * MPU regions for Secure vs NonSecure. QEMU's CPU implementation doesn't
@@ -360,6 +373,29 @@ static void armv7m_realize(DeviceState *dev, Error **errp)
      */
     s->cpu->env.nvic = &s->nvic;
     s->nvic.cpu = s->cpu;
+
+    if (s->itcm_size && (!is_power_of_2(s->itcm_size) ||
+                         s->itcm_size < 4 * 1024 ||
+                         s->itcm_size > 16 * 1024 * 1024)) {
+        error_setg(errp, "itcm-size must be zero or a power of two from 4KiB to 16MiB");
+        return;
+    }
+    if (s->itcm_size &&
+        (s->cpu->midr & 0xff0ffff0) != 0x410fc270) {
+        error_setg(errp, "itcm-size is only supported for Cortex-M7");
+        return;
+    }
+    if (s->itcm_init_enable && !s->itcm_size) {
+        error_setg(errp, "itcm-init-enable requires nonzero itcm-size");
+        return;
+    }
+    if (s->itcm_init_rmw_enable && !s->itcm_size) {
+        error_setg(errp, "itcm-init-rmw-enable requires nonzero itcm-size");
+        return;
+    }
+    s->cpu->itcm_size = s->itcm_size;
+    s->cpu->itcm_init_enable = s->itcm_init_enable;
+    s->cpu->itcm_init_rmw_enable = s->itcm_init_rmw_enable;
 
     if (!qdev_realize(DEVICE(s->cpu), NULL, errp)) {
         return;
@@ -584,6 +620,12 @@ static const Property armv7m_properties[] = {
     DEFINE_PROP_BOOL("dsp", ARMv7MState, dsp, true),
     DEFINE_PROP_UINT32("mpu-ns-regions", ARMv7MState, mpu_ns_regions, UINT_MAX),
     DEFINE_PROP_UINT32("mpu-s-regions", ARMv7MState, mpu_s_regions, UINT_MAX),
+    DEFINE_PROP_UINT32("itcm-size", ARMv7MState, itcm_size, 0),
+    DEFINE_PROP_BOOL("itcm-init-enable", ARMv7MState, itcm_init_enable, false),
+    DEFINE_PROP_BOOL("itcm-init-rmw-enable", ARMv7MState,
+                     itcm_init_rmw_enable, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-cycle-model", ARMv7MState,
+                     x_gnw_m7_cycle_model, false),
 };
 
 static const VMStateDescription vmstate_armv7m = {

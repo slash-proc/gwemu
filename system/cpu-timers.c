@@ -157,6 +157,20 @@ static bool icount_shift_state_needed(void *opaque)
     return icount_enabled() == ICOUNT_ADAPTATIVE;
 }
 
+static int icount_timers_pre_save(void *opaque)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        if (cpu->icount_model_pending_retired ||
+            cpu->icount_model_pending_cycles) {
+            error_report("cannot migrate an uncommitted icount model slice");
+            return -EINVAL;
+        }
+    }
+    return 0;
+}
+
 /*
  * Subsection for warp timer migration is optional, because may not be created
  */
@@ -196,17 +210,55 @@ static const VMStateDescription icount_vmstate_shift = {
     }
 };
 
+static int icount_timers_post_load(void *opaque, int version_id)
+{
+    TimersState *s = opaque;
+
+    if (version_id < 6) {
+        s->icount_cycle_clock_generation = 0;
+    }
+
+    /*
+     * Versions before 5 carry no configuration identity.  Accept only a
+     * legacy default stream into a default destination; older experimental
+     * cycle-timing snapshots cannot prove compatible conversion or costs.
+     */
+    if (version_id < 5 && (s->icount_cycle_clock_hz ||
+                           s->icount_cycle_clock_config ||
+                           s->icount_cycle_model_config ||
+                           s->icount_test_cycle_scale)) {
+        error_report("cannot load pre-v5 icount state with cycle timing");
+        return -EINVAL;
+    }
+    return 0;
+}
+
 /*
  * This is a subsection for icount migration.
  */
 static const VMStateDescription icount_vmstate_timers = {
     .name = "timer/icount",
-    .version_id = 1,
+    .version_id = 6,
     .minimum_version_id = 1,
     .needed = icount_state_needed,
+    .pre_save = icount_timers_pre_save,
+    .post_load = icount_timers_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_INT64(qemu_icount_bias, TimersState),
         VMSTATE_INT64(qemu_icount, TimersState),
+        VMSTATE_INT64_V(icount_cycle_clock_hz, TimersState, 2),
+        VMSTATE_INT64_V(icount_cycle_anchor, TimersState, 2),
+        VMSTATE_INT64_V(icount_cycle_anchor_ns, TimersState, 2),
+        VMSTATE_INT64_V(icount_cycle_penalties, TimersState, 3),
+        VMSTATE_INT64_V(icount_cycle_credits, TimersState, 4),
+        VMSTATE_INT64_V(icount_cycle_highwater, TimersState, 4),
+        VMSTATE_UINT32_EQUAL_V(icount_cycle_clock_config, TimersState, 5,
+                               "icount cycle clock mode differs"),
+        VMSTATE_UINT32_EQUAL_V(icount_cycle_model_config, TimersState, 5,
+                               "icount cycle model mode differs"),
+        VMSTATE_UINT32_EQUAL_V(icount_test_cycle_scale, TimersState, 5,
+                               "icount test cycle scale differs"),
+        VMSTATE_UINT64_V(icount_cycle_clock_generation, TimersState, 6),
         VMSTATE_END_OF_LIST()
     },
     .subsections = (const VMStateDescription * const []) {

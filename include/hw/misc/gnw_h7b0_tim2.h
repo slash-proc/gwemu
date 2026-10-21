@@ -12,6 +12,7 @@
 #include "qom/object.h"
 #include "qemu/timer.h"
 #include "hw/misc/gnw_h7b0_rcc.h"
+#include "hw/misc/gnw_h7b0_cycle_phase.h"
 
 #define TYPE_GNW_H7B0_TIM2 "gnw-h7b0-tim2"
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0Tim2State, GNW_H7B0_TIM2)
@@ -29,12 +30,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0Tim2State, GNW_H7B0_TIM2)
  * after the real LPTIM1 device was added this session. */
 #define GNW_H7B0_TIM2_SIZE 0x2400
 
-/* TIM2/3/4/5/6/7 sit on a uniform 0x400 stride within this block (see
- * gnw_h7b0_tim2.c's EGR/CR1 handling); TIM12/13/14 don't and aren't
- * covered by the counter model below. */
-#define GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT 6
+/* TIM2/3/4/5/6/7 and TIM12/13/14 use 0x400-spaced windows in this block.
+ * The latter three have independent runtime state and 16-bit counters. */
+#define GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT 6
+#define GNW_H7B0_TIM2_LATE_INSTANCE_COUNT 3
+#define GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT \
+    (GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT + GNW_H7B0_TIM2_LATE_INSTANCE_COUNT)
 
 struct GnwH7B0Tim2State;
+typedef void (*GnwH7B0Tim2UpdateNotifier)(void *opaque, int instance);
 
 typedef struct GnwH7B0Tim2TimerCtx {
     struct GnwH7B0Tim2State *s;
@@ -44,8 +48,12 @@ typedef struct GnwH7B0Tim2TimerCtx {
 struct GnwH7B0Tim2State {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
+    qemu_irq irq[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
     uint32_t regs[GNW_H7B0_TIM2_SIZE / 4];
-    QEMUTimer *count_timer[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+    bool timing_mode;
+    /* Preserve the original six-entry v4 field and append late timers in v5. */
+    QEMUTimer *count_timer[GNW_H7B0_TIM2_LEGACY_INSTANCE_COUNT];
+    QEMUTimer *late_count_timer[GNW_H7B0_TIM2_LATE_INSTANCE_COUNT];
     GnwH7B0Tim2TimerCtx timer_ctx[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
 
     /*
@@ -68,7 +76,14 @@ struct GnwH7B0Tim2State {
      * discontinuity exactly at DMA half-buffer seams vs mid-chunk).
      */
     uint64_t cnt_ref_ns[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+    uint64_t kernel_fraction[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+    uint32_t psc_remainder[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
     uint32_t cnt_base[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+    GnwH7B0CyclePhase cycle_phase[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+    GnwH7B0CyclePhase pending_cycle_phase[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+    uint32_t pending_psc_remainder[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+    uint32_t pending_cnt_base[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT];
+    bool pending_phase_valid;
 
     /* Not owned; set by the board via gnw_h7b0_tim2_set_rcc() once both
      * TIM2 and RCC are realized, same pattern as gnw_h7b0_sai1_set_rcc()
@@ -77,8 +92,13 @@ struct GnwH7B0Tim2State {
      * feature) instead of a fixed guess. May be NULL (e.g. unit tests
      * instantiating TIM2 standalone) -- callers must check before use. */
     GnwH7B0RccState *rcc;
+    GnwH7B0Tim2UpdateNotifier update_notifier;
+    void *update_notifier_opaque;
 };
 
 void gnw_h7b0_tim2_set_rcc(GnwH7B0Tim2State *s, GnwH7B0RccState *rcc);
+void gnw_h7b0_tim2_set_update_notifier(GnwH7B0Tim2State *s,
+                                        GnwH7B0Tim2UpdateNotifier notifier,
+                                        void *opaque);
 
 #endif

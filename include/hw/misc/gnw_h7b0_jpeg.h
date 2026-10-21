@@ -15,6 +15,10 @@ struct GnwH7B0JpegState {
     SysBusDevice parent_obj;
     MemoryRegion mmio;
     uint32_t regs[GNW_H7B0_JPEG_SIZE / 4];
+    /* When enabled by the SoC's opt-in timing mode, decode inline so
+     * guest-visible completion does not depend on host worker scheduling.
+     * This does not model the codec's hardware latency. */
+    bool timing_mode;
 
     GByteArray *inbuf;
 

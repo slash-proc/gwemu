@@ -24,6 +24,9 @@
 #include "target/arm/cpu-features.h"
 #include "exec/cputlb.h"
 #include "exec/memop.h"
+#ifdef CONFIG_TCG
+#include "exec/gnw-cycle-model.h"
+#endif
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
@@ -1156,6 +1159,26 @@ static void nvic_nmi_trigger(void *opaque, int n, int level)
     }
 }
 
+/* Cortex-M7 implements ACTLR.DISFOLD at bit 2. Other M-profile CPUs
+ * retain the existing RAZ/WI behavior for this implementation-defined slot.
+ */
+#define R_V7M_ACTLR_DISFOLD       BIT(2)
+#define R_V7M_ACTLR_DISITMATBFLUSH BIT(12)
+#define R_V7M_ACTLR_IMPLEMENTED   (R_V7M_ACTLR_DISFOLD | \
+                                   R_V7M_ACTLR_DISITMATBFLUSH)
+#define R_V7M_TCMCR_WRITABLE      0x7
+#define R_V7M_DEMCR_TRCENA         BIT(24)
+
+static bool nvic_is_cortex_m7(const ARMCPU *cpu)
+{
+    return (cpu->midr & 0xff0ffff0) == 0x410fc270;
+}
+
+void armv7m_nvic_set_trace_enable(NVICState *s, bool enabled)
+{
+    qemu_set_irq(s->trace_enable_out, enabled);
+}
+
 static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
 {
     ARMCPU *cpu = s->cpu;
@@ -1163,6 +1186,11 @@ static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
     uint32_t val;
 
     switch (offset) {
+    case 0x008: /* Auxiliary Control Register (ACTLR) */
+        if (nvic_is_cortex_m7(cpu)) {
+            return cpu->env.v7m.actlr & R_V7M_ACTLR_IMPLEMENTED;
+        }
+        return 0;
     case 4: /* Interrupt Control Type.  */
         if (!arm_feature(&cpu->env, ARM_FEATURE_V7)) {
             goto bad_offset;
@@ -1522,6 +1550,14 @@ static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
             return 0;
         }
         return cpu->env.v7m.nsacr;
+    case 0xdfc: /* Debug Exception and Monitor Control (DEMCR) */
+        return cpu->env.v7m.demcr;
+    case 0xf90: /* Instruction TCM Control Register (ITCMCR) */
+        if (!nvic_is_cortex_m7(cpu) || !cpu->itcm_size) {
+            return 0;
+        }
+        return cpu->env.v7m.itcmcr |
+               ((ctz32(cpu->itcm_size / (4 * 1024)) + 3) << 3);
     /* TODO: Implement debug registers.  */
     case 0xd90: /* MPU_TYPE */
         /* Unified MPU; if the MPU is not present this value is zero */
@@ -1728,6 +1764,26 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
     ARMCPU *cpu = s->cpu;
 
     switch (offset) {
+    case 0x008: /* Auxiliary Control Register (ACTLR) */
+        if (nvic_is_cortex_m7(cpu)) {
+            cpu->env.v7m.actlr = value & R_V7M_ACTLR_IMPLEMENTED;
+        }
+        break;
+    case 0xdfc: /* Debug Exception and Monitor Control (DEMCR) */
+        /* QEMU does not implement DebugMonitor/vector-catch behavior yet.
+         * Model TRCENA, which gates trace/DWT software use; other fields
+         * remain RAZ/WI rather than advertising unsupported behavior. */
+        cpu->env.v7m.demcr = value & R_V7M_DEMCR_TRCENA;
+        qemu_set_irq(s->trace_enable_out,
+                     !!(cpu->env.v7m.demcr & R_V7M_DEMCR_TRCENA));
+        break;
+    case 0xf90: /* Instruction TCM Control Register (ITCMCR) */
+        if (nvic_is_cortex_m7(cpu) && cpu->itcm_size) {
+            /* Control-state model only: boards retain ownership of their
+             * memory map, so EN does not dynamically remap address zero. */
+            cpu->env.v7m.itcmcr = value & R_V7M_TCMCR_WRITABLE;
+        }
+        break;
     case 0xc: /* CPPWR */
         if (!arm_feature(&cpu->env, ARM_FEATURE_V8)) {
             goto bad_offset;
@@ -1837,6 +1893,7 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
     case 0xd14: /* Configuration Control.  */
     {
         uint32_t mask;
+        uint32_t old_value = cpu->env.v7m.ccr[attrs.secure];
 
         if (!arm_feature(&cpu->env, ARM_FEATURE_M_MAIN)) {
             goto bad_offset;
@@ -1849,6 +1906,15 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
             R_V7M_CCR_UNALIGN_TRP_MASK |
             R_V7M_CCR_USERSETMPEND_MASK |
             R_V7M_CCR_NONBASETHRDENA_MASK;
+        if (nvic_is_cortex_m7(cpu)) {
+            /*
+             * Cortex-M7 implements the cache enable controls.  QEMU does
+             * not model the caches themselves, but the architectural state
+             * is software-visible and is already reset and migrated as part
+             * of env.v7m.ccr[]; retain writes to IC and DC accordingly.
+             */
+            mask |= R_V7M_CCR_IC_MASK | R_V7M_CCR_DC_MASK;
+        }
         if (arm_feature(&cpu->env, ARM_FEATURE_V8_1M) && attrs.secure) {
             /* TRD is always RAZ/WI from NS */
             mask |= R_V7M_CCR_TRD_MASK;
@@ -1878,6 +1944,24 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
         }
 
         cpu->env.v7m.ccr[attrs.secure] = value;
+#ifdef CONFIG_TCG
+        if (nvic_is_cortex_m7(cpu) &&
+            ((old_value ^ value) &
+             (R_V7M_CCR_IC_MASK | R_V7M_CCR_DC_MASK))) {
+            GnwCycleCacheControlObservation observation = {
+                .old_instruction_cache_enabled =
+                    old_value & R_V7M_CCR_IC_MASK,
+                .new_instruction_cache_enabled =
+                    value & R_V7M_CCR_IC_MASK,
+                .old_data_cache_enabled =
+                    old_value & R_V7M_CCR_DC_MASK,
+                .new_data_cache_enabled =
+                    value & R_V7M_CCR_DC_MASK,
+            };
+
+            gnw_cycle_model_cache_control(CPU(cpu), &observation);
+        }
+#endif
         break;
     }
     case 0xd24: /* System Handler Control and State (SHCSR) */
@@ -2343,6 +2427,55 @@ static void nvic_writel(NVICState *s, uint32_t offset, uint32_t value,
     case 0xf74: /* DCCISW */
     case 0xf78: /* BPIALL */
         /* Cache and branch predictor maintenance: for QEMU these always NOP */
+#ifdef CONFIG_TCG
+        if (nvic_is_cortex_m7(cpu)) {
+            GnwCycleCacheMaintenanceObservation observation = {
+                .operand = value,
+                .instruction_cache_enabled =
+                    cpu->env.v7m.ccr[attrs.secure] &
+                    R_V7M_CCR_IC_MASK,
+                .data_cache_enabled =
+                    cpu->env.v7m.ccr[attrs.secure] &
+                    R_V7M_CCR_DC_MASK,
+            };
+
+            switch (offset) {
+            case 0xf50:
+                observation.op = GNW_CYCLE_CACHE_ICIALLU;
+                break;
+            case 0xf58:
+                observation.op = GNW_CYCLE_CACHE_ICIMVAU;
+                break;
+            case 0xf5c:
+                observation.op = GNW_CYCLE_CACHE_DCIMVAC;
+                break;
+            case 0xf60:
+                observation.op = GNW_CYCLE_CACHE_DCISW;
+                break;
+            case 0xf64:
+                observation.op = GNW_CYCLE_CACHE_DCCMVAU;
+                break;
+            case 0xf68:
+                observation.op = GNW_CYCLE_CACHE_DCCMVAC;
+                break;
+            case 0xf6c:
+                observation.op = GNW_CYCLE_CACHE_DCCSW;
+                break;
+            case 0xf70:
+                observation.op = GNW_CYCLE_CACHE_DCCIMVAC;
+                break;
+            case 0xf74:
+                observation.op = GNW_CYCLE_CACHE_DCCISW;
+                break;
+            case 0xf78:
+                observation.op = GNW_CYCLE_CACHE_BPIALL;
+                break;
+            default:
+                g_assert_not_reached();
+            }
+            gnw_cycle_model_cache_maintenance(CPU(cpu), &observation);
+        }
+#endif
         break;
     default:
     bad_offset:
@@ -2786,6 +2919,7 @@ static void armv7m_nvic_reset(DeviceState *dev)
     NVICState *s = NVIC(dev);
 
     s->locked_up = false;
+    qemu_set_irq(s->trace_enable_out, 0);
     if (s->lockup_timer) {
         timer_del(s->lockup_timer);
     }
@@ -2935,6 +3069,8 @@ static void armv7m_nvic_instance_init(Object *obj)
 
     sysbus_init_irq(sbd, &nvic->excpout);
     qdev_init_gpio_out_named(dev, &nvic->sysresetreq, "SYSRESETREQ", 1);
+    qdev_init_gpio_out_named(dev, &nvic->trace_enable_out,
+                             "trace-enable", 1);
     qdev_init_gpio_in_named(dev, nvic_systick_trigger, "systick-trigger",
                             M_REG_NUM_BANKS);
     qdev_init_gpio_in_named(dev, nvic_nmi_trigger, "NMI", 1);

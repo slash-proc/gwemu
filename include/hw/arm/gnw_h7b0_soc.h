@@ -376,6 +376,18 @@ OBJECT_DECLARE_TYPE(GnwH7B0State, GnwH7B0StateClass, GNW_H7B0_SOC)
 #define EXTI9_5_IRQn 23
 #define EXTI15_10_IRQn 40
 
+/* Per sdk/CMSIS/Device/ST/STM32H7xx/Include/stm32h7b0xx.h. */
+#define TIM1_UP_IRQn 25
+#define TIM2_IRQn 28
+#define TIM3_IRQn 29
+#define TIM4_IRQn 30
+#define TIM5_IRQn 50
+#define TIM6_DAC_IRQn 54
+#define TIM7_IRQn 55
+#define TIM8_BRK_TIM12_IRQn 43
+#define TIM8_UP_TIM13_IRQn 44
+#define TIM8_TRG_COM_TIM14_IRQn 45
+
 /*
  * SPI2, per STM32H7B0.svd baseAddress 0x40003800. This is also the
  * LCD-panel init-command path (separate from the LTDC pixel-data
@@ -491,9 +503,8 @@ OBJECT_DECLARE_TYPE(GnwH7B0State, GnwH7B0StateClass, GNW_H7B0_SOC)
  */
 #define RTC_BASE_ADDRESS 0x58004000
 #define RTC_SIZE          0x400
-/* Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type:
- * RTC_Alarm_IRQn = 41 (Alarm A/B only; the wakeup-timer's separate IRQ
- * line, RTC_WKUP_IRQn, isn't modeled -- see gnw_h7b0_rtc.h). */
+/* Per sdk/cmsis-device-h7/Include/stm32h7b0xx.h's IRQn_Type. */
+#define RTC_WKUP_IRQn 3
 #define RTC_Alarm_IRQn 41
 
 /*
@@ -595,6 +606,9 @@ struct GnwH7B0State {
     bool ui_reset_to_fault_pending;
 
     Clock *sysclk;
+    /* SysTick's external source is HCLK / 8, distinct from cpuclk when
+     * CDCPRE or HPRE divides the H7B0 clock tree. */
+    Clock *systick_refclk;
 
     /*
      * Optional mmap-backed persistence for flash_bank1/flash_bank2/extflash
@@ -625,6 +639,18 @@ struct GnwH7B0State {
     char *rdp_image;
     /* Start with STM32 readout protection level 1 instead of level 0. */
     bool rdp_locked;
+    /* Opt-in one-instruction/one-cycle baseline; requires precise -icount. */
+    bool timing_mode;
+    bool x_modeled_timing;
+    bool cpu_cache_dma2d_v2_profile;
+    char *cpu_cache_dma2d_v2_runtime_receipt_sha256;
+    char *mdma_axi1_runtime_receipt_sha256;
+    bool mdma_axi1_comparison_mode;
+    char *mdma_v37_bwm_fit_receipt_sha256;
+    bool mdma_v37_bwm_comparison_mode;
+    /* Unstable validation-only producer; zero leaves production costs off. */
+    uint32_t x_timing_test_cycles_per_insn;
+    bool x_timing_test_half_rate;
 };
 
 /* UI action: clear volatile device state, reset the SoC, then press POWER. */

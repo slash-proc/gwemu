@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/qemu-print.h"
+#include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
 #include "exec/page-vary.h"
@@ -52,6 +53,10 @@
 #include "cpregs.h"
 #include "target/arm/cpu-qom.h"
 #include "target/arm/gtimer.h"
+#ifndef CONFIG_USER_ONLY
+#include "exec/icount.h"
+#include "exec/gnw-cycle-model.h"
+#endif
 
 #include "trace.h"
 
@@ -239,6 +244,9 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
     if (acc->parent_phases.hold) {
         acc->parent_phases.hold(obj, type);
     }
+#ifndef CONFIG_USER_ONLY
+    gnw_cycle_model_reset(cs);
+#endif
 
     memset(env, 0, offsetof(CPUARMState, end_reset_fields));
 
@@ -381,6 +389,14 @@ static void arm_cpu_reset_hold(Object *obj, ResetType type)
 #endif
 
     if (arm_feature(env, ARM_FEATURE_M)) {
+        /* ACTLR is implemented only for Cortex-M7 here. The H7B0 reset value
+         * has DISITMATBFLUSH set; DISFOLD resets clear (dual-issue enabled).
+         */
+        env->v7m.actlr = (cpu->midr & 0xff0ffff0) == 0x410fc270 ?
+                         (1 << 12) : 0;
+        env->v7m.itcmcr = (cpu->itcm_init_enable ? 1 : 0) |
+                          (cpu->itcm_init_rmw_enable ? 2 : 0);
+        env->v7m.demcr = 0;
 #ifndef CONFIG_USER_ONLY
         uint32_t initial_msp; /* Loaded from 0x0 */
         uint32_t initial_pc; /* Loaded from 0x4 */
@@ -1109,6 +1125,221 @@ static void arm_cpu_initfn(Object *obj)
     QLIST_INIT(&cpu->pre_el_change_hooks);
     QLIST_INIT(&cpu->el_change_hooks);
 
+#ifndef CONFIG_USER_ONLY
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-modeled-whole-cycles",
+        &CPU(cpu)->gnw_cycle_model.modeled_whole_cycles,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-fallback-unsupported-decode",
+        &CPU(cpu)->gnw_cycle_model.fallback[
+            GNW_CYCLE_FALLBACK_UNSUPPORTED_DECODE],
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-fallback-unsupported-class",
+        &CPU(cpu)->gnw_cycle_model.fallback[
+            GNW_CYCLE_FALLBACK_UNSUPPORTED_CLASS],
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-fallback-memory",
+        &CPU(cpu)->gnw_cycle_model.fallback[GNW_CYCLE_FALLBACK_MEMORY],
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-fallback-system",
+        &CPU(cpu)->gnw_cycle_model.fallback[GNW_CYCLE_FALLBACK_SYSTEM],
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-fallback-predicate-skip",
+        &CPU(cpu)->gnw_cycle_model.fallback[
+            GNW_CYCLE_FALLBACK_PREDICATE_SKIP],
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-fallback-exception-attempt",
+        &CPU(cpu)->gnw_cycle_model.fallback[
+            GNW_CYCLE_FALLBACK_EXCEPTION_ATTEMPT],
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-cpu-ram-itcm-profile-accepted",
+        &CPU(cpu)->gnw_cycle_model.cpu_ram_itcm_profile_accepted,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-cpu-ram-itcm-profile-rejected",
+        &CPU(cpu)->gnw_cycle_model.cpu_ram_itcm_profile_rejected,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-instruction-fetch-attempts",
+        &CPU(cpu)->gnw_cycle_model.instruction_fetch_attempts,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-instruction-fetch-segments",
+        &CPU(cpu)->gnw_cycle_model.instruction_fetch_segments,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-instruction-fetch-bytes",
+        &CPU(cpu)->gnw_cycle_model.instruction_fetch_bytes,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-instruction-fetch-incomplete",
+        &CPU(cpu)->gnw_cycle_model.instruction_fetch_incomplete,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-fetch-residual-charges",
+        &CPU(cpu)->gnw_cycle_model.fetch_residual_charges,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-fetch-residual-cycles",
+        &CPU(cpu)->gnw_cycle_model.fetch_residual_cycles,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-memory-residual-accepted",
+        &CPU(cpu)->gnw_cycle_model.memory_residual_accepted,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-memory-residual-rejected",
+        &CPU(cpu)->gnw_cycle_model.memory_residual_rejected,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-memory-residual-cycles",
+        &CPU(cpu)->gnw_cycle_model.memory_residual_cycles,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-fetch-accesses",
+        &CPU(cpu)->gnw_cycle_model.flash_fetch.accesses,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-fetch-hits",
+        &CPU(cpu)->gnw_cycle_model.flash_fetch.hits,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-fetch-misses",
+        &CPU(cpu)->gnw_cycle_model.flash_fetch.misses,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-fetch-bytes",
+        &CPU(cpu)->gnw_cycle_model.flash_fetch.bytes,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-schedule-accepted",
+        &CPU(cpu)->gnw_cycle_model.flash_schedule.accepted_total,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-schedule-rejected",
+        &CPU(cpu)->gnw_cycle_model.flash_schedule.rejected,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-fetch-phase-0",
+        &CPU(cpu)->gnw_cycle_model.flash_fetch.phase_segments[0],
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-fetch-phase-2",
+        &CPU(cpu)->gnw_cycle_model.flash_fetch.phase_segments[2],
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-fetch-phase-4",
+        &CPU(cpu)->gnw_cycle_model.flash_fetch.phase_segments[4],
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-fetch-phase-6",
+        &CPU(cpu)->gnw_cycle_model.flash_fetch.phase_segments[6],
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-fetch-iciallu",
+        &CPU(cpu)->gnw_cycle_model.flash_fetch.invalidations_all,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-flash-fetch-icimvau",
+        &CPU(cpu)->gnw_cycle_model.flash_fetch.invalidations_mva,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-xip-service-requests",
+        &CPU(cpu)->gnw_cycle_model.xip_service_requests,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-xip-service-cycles",
+        &CPU(cpu)->gnw_cycle_model.xip_service_cycles,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-xip-service-remaining-cycles",
+        &CPU(cpu)->gnw_cycle_model.xip_service_remaining_cycles,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(
+        obj, "x-gnw-m7-xip-service-profile-identity",
+        &CPU(cpu)->gnw_cycle_model.xip_service_profile_identity,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-xip-service-qualified-bytes",
+        &CPU(cpu)->gnw_cycle_model.xip_unseen_qualified_bytes,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-xip-service-streams",
+        &CPU(cpu)->gnw_cycle_model.xip_unseen_streams,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-bus-contention-observations",
+        &CPU(cpu)->gnw_cycle_model.bus_contention_observations,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-bus-contention-matches",
+        &CPU(cpu)->gnw_cycle_model.bus_contention_matches,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-bus-contention-cycles",
+        &CPU(cpu)->gnw_cycle_model.bus_contention_cycles,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-valid-lines",
+        &CPU(cpu)->gnw_cycle_model.dcache.valid_lines,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-dirty-lines",
+        &CPU(cpu)->gnw_cycle_model.dcache.dirty_lines,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-uncertain-sets",
+        &CPU(cpu)->gnw_cycle_model.dcache.uncertain_sets,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-accesses",
+        &CPU(cpu)->gnw_cycle_model.dcache.accesses,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-hits",
+        &CPU(cpu)->gnw_cycle_model.dcache.hits,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-misses",
+        &CPU(cpu)->gnw_cycle_model.dcache.misses,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-allocations",
+        &CPU(cpu)->gnw_cycle_model.dcache.allocations,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-dirty-evictions",
+        &CPU(cpu)->gnw_cycle_model.dcache.dirty_evictions,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-ambiguous-accesses",
+        &CPU(cpu)->gnw_cycle_model.dcache.ambiguous_accesses,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-rejected-disabled",
+        &CPU(cpu)->gnw_cycle_model.dcache.rejected_disabled,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-rejected-path",
+        &CPU(cpu)->gnw_cycle_model.dcache.rejected_path,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-rejected-attributes",
+        &CPU(cpu)->gnw_cycle_model.dcache.rejected_attributes,
+        OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(
+        obj, "x-gnw-m7-dcache-dirty-discards",
+        &CPU(cpu)->gnw_cycle_model.dcache.dirty_discards,
+        OBJ_PROP_FLAG_READ);
+#endif
+
 #ifdef CONFIG_USER_ONLY
 # ifdef TARGET_AARCH64
     /*
@@ -1612,6 +1843,29 @@ void arm_cpu_finalize_features(ARMCPU *cpu, Error **errp)
     }
 }
 
+#ifndef CONFIG_USER_ONLY
+static bool arm_gnw_dcache_policy_parse(ARMCPU *cpu, Error **errp)
+{
+    const char *name = cpu->gnw_m7_dcache_policy_name;
+
+    if (!name || !strcmp(name, "off")) {
+        cpu->gnw_m7_dcache_policy = GNW_M7_DCACHE_OFF;
+    } else if (!strcmp(name, "tags-no-replacement")) {
+        cpu->gnw_m7_dcache_policy = GNW_M7_DCACHE_TAGS_NO_REPLACEMENT;
+    } else if (!strcmp(name, "round-robin-hypothesis")) {
+        cpu->gnw_m7_dcache_policy = GNW_M7_DCACHE_ROUND_ROBIN_HYPOTHESIS;
+    } else if (!strcmp(name, "tree-plru-hypothesis")) {
+        cpu->gnw_m7_dcache_policy = GNW_M7_DCACHE_TREE_PLRU_HYPOTHESIS;
+    } else if (!strcmp(name, "true-lru-hypothesis")) {
+        cpu->gnw_m7_dcache_policy = GNW_M7_DCACHE_TRUE_LRU_HYPOTHESIS;
+    } else {
+        error_setg(errp, "invalid x-gnw-m7-dcache-policy '%s'", name);
+        return false;
+    }
+    return true;
+}
+#endif
+
 static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
 {
     CPUState *cs = CPU(dev);
@@ -1620,6 +1874,262 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
     ARMCPUClass *acc = ARM_CPU_GET_CLASS(dev);
     CPUARMState *env = &cpu->env;
     Error *local_err = NULL;
+
+#ifndef CONFIG_USER_ONLY
+    if (!arm_gnw_dcache_policy_parse(cpu, errp)) {
+        return;
+    }
+    if (cpu->gnw_m7_dcache_policy != GNW_M7_DCACHE_OFF &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-dcache-policy requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_cycle_model_test_near_rebase &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-cycle-model-test-near-rebase requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_xip_service_test_profile &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-xip-service-test-profile requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_xip_service_unseen_v1_profile &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-xip-service-unseen-v1 requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_xip_service_test_profile &&
+        cpu->gnw_m7_xip_service_unseen_v1_profile) {
+        error_setg(errp, "XIP service profiles are mutually exclusive");
+        return;
+    }
+    if (cpu->gnw_m7_bus_contention_test_profile &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-bus-contention-test-profile requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_bus_contention_mdma_axi1_profile &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-bus-contention-mdma-axi1-v1 requires x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_bus_contention_v37_bwm_comparison &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-bus-contention-v37-bwm-comparison "
+                   "requires x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_bus_contention_v46_bwm_17_4 &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-bus-contention-v46-bwm-17over4 "
+                   "requires x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_cpu_ram_itcm_profile && !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-cpu-ram-itcm-v1 requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_exception_transition_profile &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-exception-transition-v6 requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_fetch_residual_profile &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-fetch-residual-v1 requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_memory_residual_profile &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-memory-residual-v1 requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_schedule_history_profile &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-schedule-history-v4 requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_load_path_candidate && !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-load-path-v5-candidate requires "
+                   "x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_flash_schedule_diagnostic_sha256 &&
+        !cpu->gnw_m7_cycle_model) {
+        error_setg(errp, "x-gnw-m7-flash-schedule-diagnostic-sha256 "
+                   "requires x-gnw-m7-cycle-model");
+        return;
+    }
+    if (cpu->gnw_m7_bus_contention_test_profile &&
+        (cpu->gnw_m7_bus_contention_mdma_axi1_profile ||
+         cpu->gnw_m7_bus_contention_v37_bwm_comparison ||
+         cpu->gnw_m7_bus_contention_v46_bwm_17_4)) {
+        error_setg(errp, "bus contention profiles are mutually exclusive");
+        return;
+    }
+    if (cpu->gnw_m7_bus_contention_mdma_axi1_profile &&
+        (cpu->gnw_m7_bus_contention_v37_bwm_comparison ||
+         cpu->gnw_m7_bus_contention_v46_bwm_17_4)) {
+        error_setg(errp, "bus contention profiles are mutually exclusive");
+        return;
+    }
+    if (cpu->gnw_m7_bus_contention_v37_bwm_comparison &&
+        cpu->gnw_m7_bus_contention_v46_bwm_17_4) {
+        error_setg(errp, "bus contention profiles are mutually exclusive");
+        return;
+    }
+    cpu->gnw_m7_cycle_model_migration_config =
+        cpu->gnw_m7_cycle_model ?
+        ((cpu->gnw_m7_cycle_model_test_near_rebase ? 2 : 1) |
+         ((uint32_t)cpu->gnw_m7_dcache_policy << 8) |
+         (cpu->gnw_m7_xip_service_test_profile ? (1U << 16) : 0) |
+         (cpu->gnw_m7_bus_contention_test_profile ? (1U << 17) : 0) |
+         (cpu->gnw_m7_bus_contention_mdma_axi1_profile ? (1U << 18) : 0) |
+         (cpu->gnw_m7_bus_contention_v37_bwm_comparison ? (1U << 25) : 0) |
+         (cpu->gnw_m7_bus_contention_v46_bwm_17_4 ? (1U << 26) : 0) |
+         (cpu->gnw_m7_xip_service_unseen_v1_profile ? (1U << 27) : 0) |
+         (cpu->gnw_m7_cpu_ram_itcm_profile ? (1U << 19) : 0) |
+         (cpu->gnw_m7_exception_transition_profile ? (1U << 20) : 0) |
+         (cpu->gnw_m7_fetch_residual_profile ? (1U << 21) : 0) |
+         (cpu->gnw_m7_memory_residual_profile ? (1U << 22) : 0)) : 0;
+    if (cpu->gnw_m7_schedule_history_profile) {
+        cpu->gnw_m7_cycle_model_migration_config |= 1U << 23;
+    }
+    if (cpu->gnw_m7_load_path_candidate) {
+        cpu->gnw_m7_cycle_model_migration_config |= 1U << 24;
+    }
+    if (cpu->gnw_m7_cycle_model ||
+        cpu->gnw_m7_cycle_model_test_near_rebase) {
+        if (!tcg_enabled() || qtest_enabled() ||
+            icount_enabled() != ICOUNT_PRECISE ||
+            !arm_feature(env, ARM_FEATURE_M) ||
+            (cpu->midr & 0xff0ffff0) != 0x410fc270) {
+            error_setg(errp, "x-gnw-m7-cycle-model requires Cortex-M7, "
+                       "TCG, and precise icount");
+            return;
+        }
+        if (!icount_enable_experimental_m7_cycle_model()) {
+            error_setg(errp, "x-gnw-m7-cycle-model conflicts with another "
+                       "cycle producer");
+            return;
+        }
+        gnw_cycle_model_enable(cs,
+                               cpu->gnw_m7_cycle_model_test_near_rebase,
+                               cpu->gnw_m7_dcache_policy,
+                               cpu->gnw_m7_xip_service_test_profile,
+                               cpu->gnw_m7_xip_service_unseen_v1_profile,
+                               cpu->gnw_m7_bus_contention_test_profile,
+                               cpu->gnw_m7_bus_contention_mdma_axi1_profile,
+                               cpu->gnw_m7_bus_contention_v37_bwm_comparison,
+                               cpu->gnw_m7_bus_contention_v46_bwm_17_4,
+                               cpu->gnw_m7_cpu_ram_itcm_profile,
+                               cpu->gnw_m7_exception_transition_profile,
+                               cpu->gnw_m7_fetch_residual_profile,
+                               cpu->gnw_m7_memory_residual_profile,
+                               cpu->gnw_m7_schedule_history_profile,
+                               cpu->gnw_m7_load_path_candidate);
+        if (!gnw_cycle_model_set_flash_schedule_diagnostic_artifact(
+                cs, cpu->gnw_m7_flash_schedule_diagnostic_sha256)) {
+            error_setg(errp, "x-gnw-m7-flash-schedule-diagnostic-sha256 "
+                       "does not name the exact supported identity artifact");
+            return;
+        }
+        warn_report_once("x-gnw-m7-cycle-model is experimental and "
+                         "not validated for timing accuracy");
+        if (cpu->gnw_m7_dcache_policy != GNW_M7_DCACHE_OFF) {
+            warn_report("x-gnw-m7-dcache-policy=%s is a zero-cost "
+                        "diagnostic shadow; replacement behavior is "
+                        "unvalidated",
+                        cpu->gnw_m7_dcache_policy_name);
+        }
+        if (cpu->gnw_m7_xip_service_test_profile) {
+            warn_report("x-gnw-m7-xip-service-test-profile uses a fixed "
+                        "mechanism-test cost with no hardware timing meaning");
+        }
+        if (cpu->gnw_m7_xip_service_unseen_v1_profile) {
+            warn_report("x-gnw-m7-xip-service-unseen-v1 applies a frozen "
+                        "physical fit only under its exact H7B0 OSPI, HCLK, "
+                        "Normal-NC byte-stream and no-contention predicate; "
+                        "experimental and not release-authorized");
+        }
+        if (cpu->gnw_m7_bus_contention_test_profile) {
+            warn_report("x-gnw-m7-bus-contention-test-profile uses a fixed "
+                        "mechanism-test cost with no hardware timing meaning");
+        }
+        if (cpu->gnw_m7_bus_contention_mdma_axi1_profile) {
+            warn_report("x-gnw-m7-bus-contention-mdma-axi1-v1 is calibrated only for the validated CPU/MDMA AXI-SRAM1 workload");
+        }
+        if (cpu->gnw_m7_bus_contention_v37_bwm_comparison) {
+            warn_report("x-gnw-m7-bus-contention-v37-bwm-comparison is a FIT-derived comparison-only 9/2-cycle-per-match BWM overlap candidate; not runtime-authorized");
+        }
+        if (cpu->gnw_m7_bus_contention_v46_bwm_17_4) {
+            warn_report("x-gnw-m7-bus-contention-v46-bwm-17over4 applies the V46 FIT-selected 17/4-cycle coefficient only to its exact dependent T16 Normal-NC AXI1 BWM workload; broader bus runtime behavior remains unvalidated");
+        }
+        if (cpu->gnw_m7_cpu_ram_itcm_profile) {
+            warn_report("x-gnw-m7-cpu-ram-itcm-v1 admits only the exact "
+                        "held-out dependent ITCM body at 0x7c");
+        }
+        if (cpu->gnw_m7_exception_transition_profile) {
+            warn_report("x-gnw-m7-exception-transition-v6 uses the "
+                        "independently held-out v5 entry/return/tail-chain "
+                        "coefficients; runtime authorization remains "
+                        "experimental");
+        }
+        if (cpu->gnw_m7_fetch_residual_profile) {
+            warn_report("x-gnw-m7-fetch-residual-v1 is a FIT-only candidate "
+                        "restricted to the matched-kernel-v5 AXI fetch "
+                        "geometry; runtime authorization remains false");
+        }
+        if (cpu->gnw_m7_memory_residual_profile) {
+            warn_report("x-gnw-m7-memory-residual-v1 is restricted to the "
+                        "retained matched-kernel-v5 gnw_memory_u8 body and "
+                        "argument geometry; runtime authorization remains "
+                        "false");
+        }
+        if (cpu->gnw_m7_schedule_history_profile) {
+            warn_report("x-gnw-m7-schedule-history-v4 is restricted to "
+                        "the exact matched-v5 schedule kernels, 4096 "
+                        "iterations, and stable eight-outcome schedule");
+        }
+        if (cpu->gnw_m7_load_path_candidate) {
+            warn_report("x-gnw-m7-load-path-v5-candidate only records the "
+                        "narrow FIT-derived LDR.W diagnostic timeline; it "
+                        "does not charge runtime cycles or authorize a "
+                        "general D-cache miss penalty");
+        }
+    }
+#else
+    if (cpu->gnw_m7_cycle_model ||
+        cpu->gnw_m7_cycle_model_test_near_rebase ||
+        cpu->gnw_m7_xip_service_test_profile ||
+        cpu->gnw_m7_xip_service_unseen_v1_profile ||
+        cpu->gnw_m7_bus_contention_test_profile ||
+        cpu->gnw_m7_bus_contention_mdma_axi1_profile ||
+        cpu->gnw_m7_bus_contention_v37_bwm_comparison ||
+        cpu->gnw_m7_bus_contention_v46_bwm_17_4 ||
+        cpu->gnw_m7_cpu_ram_itcm_profile ||
+        cpu->gnw_m7_exception_transition_profile ||
+        cpu->gnw_m7_fetch_residual_profile ||
+        cpu->gnw_m7_memory_residual_profile ||
+        cpu->gnw_m7_schedule_history_profile ||
+        cpu->gnw_m7_load_path_candidate ||
+        cpu->gnw_m7_flash_schedule_diagnostic_sha256 ||
+        cpu->gnw_m7_dcache_policy_name) {
+        error_setg(errp, "x-gnw-m7-cycle-model is unavailable in user mode");
+        return;
+    }
+#endif
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
     /* Use pc-relative instructions in system-mode */
@@ -2242,6 +2752,38 @@ static const Property arm_cpu_properties[] = {
     DEFINE_PROP_BOOL("backcompat-cntfrq", ARMCPU, backcompat_cntfrq, false),
     DEFINE_PROP_BOOL("backcompat-pauth-default-use-qarma5", ARMCPU,
                       backcompat_pauth_default_use_qarma5, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-cycle-model", ARMCPU,
+                     gnw_m7_cycle_model, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-cycle-model-test-near-rebase", ARMCPU,
+                     gnw_m7_cycle_model_test_near_rebase, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-xip-service-test-profile", ARMCPU,
+                     gnw_m7_xip_service_test_profile, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-xip-service-unseen-v1", ARMCPU,
+                     gnw_m7_xip_service_unseen_v1_profile, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-bus-contention-test-profile", ARMCPU,
+                     gnw_m7_bus_contention_test_profile, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-bus-contention-mdma-axi1-v1", ARMCPU,
+                     gnw_m7_bus_contention_mdma_axi1_profile, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-bus-contention-v37-bwm-comparison", ARMCPU,
+                     gnw_m7_bus_contention_v37_bwm_comparison, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-bus-contention-v46-bwm-17over4", ARMCPU,
+                     gnw_m7_bus_contention_v46_bwm_17_4, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-cpu-ram-itcm-v1", ARMCPU,
+                     gnw_m7_cpu_ram_itcm_profile, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-exception-transition-v6", ARMCPU,
+                     gnw_m7_exception_transition_profile, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-fetch-residual-v1", ARMCPU,
+                     gnw_m7_fetch_residual_profile, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-memory-residual-v1", ARMCPU,
+                     gnw_m7_memory_residual_profile, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-schedule-history-v4", ARMCPU,
+                     gnw_m7_schedule_history_profile, false),
+    DEFINE_PROP_BOOL("x-gnw-m7-load-path-v5-candidate", ARMCPU,
+                     gnw_m7_load_path_candidate, false),
+    DEFINE_PROP_STRING("x-gnw-m7-flash-schedule-diagnostic-sha256", ARMCPU,
+                       gnw_m7_flash_schedule_diagnostic_sha256),
+    DEFINE_PROP_STRING("x-gnw-m7-dcache-policy", ARMCPU,
+                       gnw_m7_dcache_policy_name),
 };
 
 static const gchar *arm_gdb_arch_name(CPUState *cs)

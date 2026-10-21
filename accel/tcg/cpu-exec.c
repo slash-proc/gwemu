@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/type-helpers.h"
@@ -37,6 +38,7 @@
 #include "exec/log.h"
 #include "qemu/main-loop.h"
 #include "exec/icount.h"
+#include "exec/gnw-cycle-model.h"
 #include "exec/replay-core.h"
 #include "system/tcg.h"
 #include "exec/helper-proto-common.h"
@@ -76,9 +78,18 @@ static void align_clocks(SyncClocks *sc, CPUState *cpu)
         return;
     }
 
-    cpu_icount = cpu->icount_extra + cpu->neg.icount_decr.u16.low;
-    sc->diff_clk += icount_to_ns(sc->last_cpu_icount - cpu_icount);
-    sc->last_cpu_icount = cpu_icount;
+    if (icount_cycle_model_enabled()) {
+        /* Completed modeled time includes stalls, issue credits and clock
+         * transitions. Retired-instruction deltas cannot pace that clock.
+         * This runs after the TB's modeled costs have been committed. */
+        sc->realtime_clock = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT);
+        sc->diff_clk = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                       sc->realtime_clock;
+    } else {
+        cpu_icount = cpu->icount_extra + cpu->neg.icount_decr.u16.low;
+        sc->diff_clk += icount_to_ns(sc->last_cpu_icount - cpu_icount);
+        sc->last_cpu_icount = cpu_icount;
+    }
 
     if (sc->diff_clk > VM_CLOCK_ADVANCE) {
 #ifndef _WIN32
@@ -110,9 +121,9 @@ static void print_delay(const SyncClocks *sc)
             (-sc->diff_clk / (float)1000000000LL <
              (threshold_delay - THRESHOLD_REDUCE))) {
             threshold_delay = (-sc->diff_clk / 1000000000LL) + 1;
-            qemu_printf("Warning: The guest is now late by %.1f to %.1f seconds\n",
-                        threshold_delay - 1,
-                        threshold_delay);
+            /* stdout may carry QMP; timing diagnostics belong on stderr. */
+            warn_report("The guest is now late by %.1f to %.1f seconds",
+                        threshold_delay - 1, threshold_delay);
             nb_prints++;
             last_realtime_clock = sc->realtime_clock;
         }
@@ -532,6 +543,17 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
 
+#ifndef CONFIG_USER_ONLY
+    if (icount_cycle_model_enabled()) {
+        if (gnw_cycle_model_enabled(cpu)) {
+            /* cpu_loop_exit_restore() restored the exact partial TB. */
+            gnw_cycle_model_abort(cpu,
+                                  icount_get_executed_in_slice(cpu) != 0);
+        }
+        icount_commit_model_cycles(cpu);
+    }
+#endif
+
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();
     if (have_mmap_lock()) {
@@ -600,6 +622,20 @@ void cpu_exec_step_atomic(CPUState *cpu)
         /* execute the generated code */
         trace_exec_tb(tb, s.pc);
         cpu_tb_exec(cpu, tb, &tb_exit);
+#ifndef CONFIG_USER_ONLY
+        if (icount_cycle_model_enabled() && gnw_cycle_model_enabled(cpu)) {
+            if (gnw_cycle_model_xip_service_needs_defer(cpu)) {
+                gnw_cycle_model_defer_finish(cpu);
+            } else if (icount_get_executed_in_slice(cpu) &&
+                       !gnw_cycle_model_xip_service_pending(cpu)) {
+                gnw_cycle_model_finish(cpu);
+            }
+        }
+        if (icount_cycle_model_enabled() &&
+            icount_commit_model_cycles(cpu)) {
+            cpu_exit(cpu);
+        }
+#endif
         cpu_exec_exit(cpu);
     } else {
         cpu_exec_longjmp_cleanup(cpu);
@@ -809,6 +845,16 @@ static inline bool icount_exit_request(CPUState *cpu)
 static inline bool cpu_handle_interrupt(CPUState *cpu,
                                         TranslationBlock **last_tb)
 {
+#ifndef CONFIG_USER_ONLY
+    if (icount_cycle_model_enabled() && gnw_cycle_model_enabled(cpu) &&
+        gnw_cycle_model_xip_service_pending(cpu)) {
+        *last_tb = NULL;
+        if (gnw_cycle_model_drain_xip_service(cpu)) {
+            cpu->exception_index = EXCP_INTERRUPT;
+            return true;
+        }
+    }
+#endif
     /*
      * If we have requested custom cflags with CF_NOIRQ we should
      * skip checking here. Any pending interrupts will get picked up
@@ -919,6 +965,26 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 {
     trace_exec_tb(tb, pc);
     tb = cpu_tb_exec(cpu, tb, tb_exit);
+#ifndef CONFIG_USER_ONLY
+    if (icount_cycle_model_enabled() && gnw_cycle_model_enabled(cpu)) {
+        if (gnw_cycle_model_xip_service_needs_defer(cpu)) {
+            gnw_cycle_model_defer_finish(cpu);
+            *last_tb = NULL;
+            return;
+        }
+        if (icount_get_executed_in_slice(cpu) &&
+            !gnw_cycle_model_xip_service_pending(cpu)) {
+            gnw_cycle_model_finish(cpu);
+        }
+    }
+    if (icount_cycle_model_enabled() &&
+        icount_commit_model_cycles(cpu)) {
+        /* Let expired virtual timers run before another instruction retires. */
+        *last_tb = NULL;
+        cpu_exit(cpu);
+        return;
+    }
+#endif
     if (*tb_exit != TB_EXIT_REQUESTED) {
         *last_tb = tb;
         return;
@@ -987,6 +1053,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 s.cflags = curr_cflags(cpu);
             } else {
                 cpu->cflags_next_tb = -1;
+            }
+
+            if (icount_cycle_model_enabled()) {
+                /* Return to C after every modeled instruction to commit time. */
+                s.cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR;
             }
 
             if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {

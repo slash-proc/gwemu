@@ -27,6 +27,7 @@
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/host-utils.h"
 #include "system/cpus.h"
 #include "system/qtest.h"
 #include "qemu/main-loop.h"
@@ -53,6 +54,23 @@ bool icount_align_option;
 /* Do not count executed instructions */
 ICountMode use_icount = ICOUNT_DISABLED;
 
+bool icount_sleep_enabled(void)
+{
+    return icount_sleep;
+}
+
+bool icount_alignment_enabled(void)
+{
+    return icount_align_option;
+}
+
+enum {
+    ICOUNT_CYCLE_MODEL_NONE,
+    ICOUNT_CYCLE_MODEL_DYNAMIC,
+    ICOUNT_CYCLE_MODEL_TEST_HALF_RATE,
+    ICOUNT_CYCLE_MODEL_EXPERIMENTAL_M7,
+};
+
 static void icount_enable_precise(void)
 {
     /* Fixed conversion of insn to ns via "shift" option */
@@ -72,8 +90,30 @@ static void icount_enable_adaptive(void)
  */
 static int64_t icount_get_executed(CPUState *cpu)
 {
-    return (cpu->icount_budget -
-            (cpu->neg.icount_decr.u16.low + cpu->icount_extra));
+    int64_t executed = (cpu->icount_budget -
+                        (cpu->neg.icount_decr.u16.low + cpu->icount_extra));
+
+    /*
+     * A modeled CF_NOIRQ TB cannot take the normal budget-exhaustion exit.
+     * Its per-instruction decrement can therefore roll the 16-bit low half
+     * from zero to 0xffff before the TB reaches its commit boundary.  The
+     * linear subtraction above reads that single-instruction rollover as
+     * -65535.  Recover the modular distance; a TB is capped at 65535
+     * instructions, so at most one wrap can occur between commits.
+     */
+    if (icount_cycle_model_enabled() && executed < 0 &&
+        executed >= -UINT16_MAX) {
+        executed += 1ULL << 16;
+    }
+    return executed;
+}
+
+uint64_t icount_get_executed_in_slice(CPUState *cpu)
+{
+    int64_t executed = icount_get_executed(cpu);
+
+    g_assert(executed >= 0);
+    return executed;
 }
 
 /*
@@ -84,10 +124,183 @@ static int64_t icount_get_executed(CPUState *cpu)
 static void icount_update_locked(CPUState *cpu)
 {
     int64_t executed = icount_get_executed(cpu);
+    uint64_t modeled_retired = cpu->icount_model_pending_retired;
+    uint64_t modeled_cycles = cpu->icount_model_pending_cycles;
+
+    g_assert(executed >= 0);
+    if (timers_state.icount_test_cycle_scale) {
+        g_assert(modeled_retired == 0 && modeled_cycles == 0);
+        modeled_retired = executed;
+        g_assert((uint64_t)executed <=
+                 UINT64_MAX / timers_state.icount_test_cycle_scale);
+        modeled_cycles = (uint64_t)executed *
+                         timers_state.icount_test_cycle_scale;
+    } else if (timers_state.icount_cycle_model_config ==
+               ICOUNT_CYCLE_MODEL_TEST_HALF_RATE &&
+               modeled_retired == 0 && modeled_cycles == 0) {
+        uint64_t start = qatomic_read(&timers_state.qemu_icount);
+
+        modeled_retired = executed;
+        /* Deterministic 0,1,0,1... cost, phase derived from migrated icount. */
+        modeled_cycles = ((start & 1) + (uint64_t)executed) / 2;
+    }
+    /* A producer may only describe instructions QEMU actually retired. */
+    g_assert(modeled_retired <= executed);
+
+    if (modeled_cycles >= modeled_retired) {
+        uint64_t penalty = modeled_cycles - modeled_retired;
+        int64_t old = qatomic_read(&timers_state.icount_cycle_penalties);
+
+        g_assert(penalty <= INT64_MAX - old);
+        qatomic_set(&timers_state.icount_cycle_penalties, old + penalty);
+    } else {
+        uint64_t credit = modeled_retired - modeled_cycles;
+        int64_t old = qatomic_read(&timers_state.icount_cycle_credits);
+
+        g_assert(credit <= INT64_MAX - old);
+        qatomic_set(&timers_state.icount_cycle_credits, old + credit);
+    }
+    cpu->icount_model_pending_retired = 0;
+    cpu->icount_model_pending_cycles = 0;
     cpu->icount_budget -= executed;
+    /*
+     * Model checkpoints may commit exactly as the 16-bit decrementer rolls
+     * over.  Rebase both parts onto the reduced budget here; otherwise the
+     * refill can restore low while leaving extra relative to the old budget,
+     * making the next executed count negative by 0xffff instructions.
+     */
+    cpu->neg.icount_decr.u16.low = MIN(0xffff, cpu->icount_budget);
+    cpu->icount_extra = cpu->icount_budget -
+                       cpu->neg.icount_decr.u16.low;
 
     qatomic_set(&timers_state.qemu_icount,
                 timers_state.qemu_icount + executed);
+}
+
+bool icount_cycle_model_enabled(void)
+{
+    return qatomic_read(&timers_state.icount_cycle_model_config) != 0;
+}
+
+void icount_enable_cycle_model(void)
+{
+    g_assert(icount_enabled() == ICOUNT_PRECISE);
+    if (qatomic_read(&timers_state.icount_cycle_model_config) ==
+        ICOUNT_CYCLE_MODEL_NONE) {
+        qatomic_set(&timers_state.icount_cycle_model_config,
+                    ICOUNT_CYCLE_MODEL_DYNAMIC);
+    }
+}
+
+bool icount_enable_experimental_m7_cycle_model(void)
+{
+    uint32_t config;
+
+    g_assert(icount_enabled() == ICOUNT_PRECISE);
+    if (qatomic_read(&timers_state.icount_test_cycle_scale)) {
+        return false;
+    }
+    config = qatomic_read(&timers_state.icount_cycle_model_config);
+    if (config == ICOUNT_CYCLE_MODEL_NONE ||
+        config == ICOUNT_CYCLE_MODEL_DYNAMIC) {
+        qatomic_set(&timers_state.icount_cycle_model_config,
+                    ICOUNT_CYCLE_MODEL_EXPERIMENTAL_M7);
+        return true;
+    }
+    return config == ICOUNT_CYCLE_MODEL_EXPERIMENTAL_M7;
+}
+
+void icount_set_test_cycle_scale(unsigned cycles)
+{
+    g_assert(cycles > 0);
+    g_assert(!qatomic_read(&timers_state.icount_test_cycle_scale));
+    qatomic_set(&timers_state.icount_test_cycle_scale, cycles);
+    icount_enable_cycle_model();
+}
+
+void icount_set_test_half_rate(void)
+{
+    g_assert(icount_enabled() == ICOUNT_PRECISE);
+    g_assert(!qatomic_read(&timers_state.icount_cycle_model_config));
+    g_assert(!qatomic_read(&timers_state.icount_test_cycle_scale));
+    qatomic_set(&timers_state.icount_cycle_model_config,
+                ICOUNT_CYCLE_MODEL_TEST_HALF_RATE);
+}
+
+void icount_test_account_mmio_read(void)
+{
+    uint64_t start;
+
+    if (qatomic_read(&timers_state.icount_cycle_model_config) !=
+        ICOUNT_CYCLE_MODEL_TEST_HALF_RATE || !current_cpu ||
+        !current_cpu->running) {
+        return;
+    }
+    g_assert(current_cpu->icount_model_pending_retired == 0);
+    g_assert(current_cpu->icount_model_pending_cycles == 0);
+    start = qatomic_read(&timers_state.qemu_icount);
+    icount_account_cycles(current_cpu, 1, start & 1);
+}
+
+void icount_account_cycles(CPUState *cpu, uint64_t retired, uint64_t cycles)
+{
+    g_assert(cpu == current_cpu);
+    g_assert(icount_cycle_model_enabled());
+    g_assert(retired <= UINT64_MAX - cpu->icount_model_pending_retired);
+    g_assert(cycles <= UINT64_MAX - cpu->icount_model_pending_cycles);
+
+    cpu->icount_model_pending_retired += retired;
+    cpu->icount_model_pending_cycles += cycles;
+}
+
+bool icount_commit_model_cycles(CPUState *cpu)
+{
+    bool expired;
+
+    g_assert(icount_cycle_model_enabled());
+    icount_update(cpu);
+    expired = qemu_clock_expired(QEMU_CLOCK_VIRTUAL);
+    if (expired) {
+        qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+    }
+    return expired;
+}
+
+bool icount_commit_stall_cycles(CPUState *cpu, uint64_t cycles)
+{
+    int64_t old;
+    bool expired;
+
+    g_assert(cpu == current_cpu);
+    g_assert(icount_cycle_model_enabled());
+    g_assert(cpu->icount_model_pending_retired == 0);
+    g_assert(cpu->icount_model_pending_cycles == 0);
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    old = qatomic_read(&timers_state.icount_cycle_penalties);
+    g_assert(cycles <= INT64_MAX - old);
+    qatomic_set(&timers_state.icount_cycle_penalties, old + cycles);
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+    expired = qemu_clock_expired(QEMU_CLOCK_VIRTUAL);
+    if (expired) {
+        qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+    }
+    return expired;
+}
+
+void icount_retract_cycle_credit(uint64_t cycles)
+{
+    int64_t old;
+
+    g_assert(icount_cycle_model_enabled());
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    old = qatomic_read(&timers_state.icount_cycle_credits);
+    g_assert(cycles <= old);
+    qatomic_set(&timers_state.icount_cycle_credits, old - cycles);
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
 }
 
 /*
@@ -113,17 +326,115 @@ static int64_t icount_get_raw_locked(void)
             error_report("Bad icount read");
             exit(1);
         }
-        /* Take into account what has run */
-        icount_update_locked(cpu);
+        /*
+         * Ordinary icount exposes the current TB's pre-decremented count.
+         * A dynamic cycle model cannot publish that in-flight instruction:
+         * its completed cost is not known until the TB/exception boundary,
+         * and a later credit would move an already observed clock backward.
+         */
+        if (!icount_cycle_model_enabled()) {
+            icount_update_locked(cpu);
+        }
     }
     /* The read is protected by the seqlock, but needs atomic to avoid UB */
     return qatomic_read(&timers_state.qemu_icount);
 }
 
+static int64_t icount_ns_from_count(int64_t count)
+{
+    int64_t frequency = qatomic_read(&timers_state.icount_cycle_clock_hz);
+
+    if (frequency) {
+        if (count < 0) {
+            return -muldiv64(-count, NANOSECONDS_PER_SECOND, frequency);
+        }
+        return muldiv64(count, NANOSECONDS_PER_SECOND, frequency);
+    }
+    return count << qatomic_read(&timers_state.icount_time_shift);
+}
+
+static int64_t icount_time_at(int64_t icount)
+{
+    int64_t frequency = qatomic_read(&timers_state.icount_cycle_clock_hz);
+
+    if (frequency) {
+        int64_t anchor = qatomic_read(&timers_state.icount_cycle_anchor);
+        int64_t anchor_ns = qatomic_read(&timers_state.icount_cycle_anchor_ns);
+
+        return anchor_ns + icount_ns_from_count(icount - anchor);
+    }
+    return icount_ns_from_count(icount);
+}
+
+/*
+ * Convert the retired-instruction timeline into modeled CPU cycles.  Stalls
+ * add cycles, while issue overlap can retire instructions without advancing
+ * the modeled cycle count by the same amount.  A correction that would move
+ * time behind the high-water mark is a producer accounting bug: completed
+ * costs must be committed before a clock-visible helper runs.
+ */
+static int64_t icount_get_modeled_cycles(int64_t instructions)
+{
+    int64_t penalties = qatomic_read(&timers_state.icount_cycle_penalties);
+    int64_t credits = qatomic_read(&timers_state.icount_cycle_credits);
+    int64_t cycles;
+    int64_t highwater;
+
+    g_assert(instructions >= 0);
+    g_assert(penalties <= INT64_MAX - instructions);
+    cycles = instructions + penalties;
+    /* Credits are valid only when committed with their retired slice. */
+    g_assert(credits <= cycles);
+    cycles -= credits;
+
+    highwater = qatomic_read(&timers_state.icount_cycle_highwater);
+    /* A retrospective credit is a producer bug; never hide it by freezing. */
+    g_assert(cycles >= highwater);
+    while (cycles > highwater) {
+        int64_t old = qatomic_cmpxchg(&timers_state.icount_cycle_highwater,
+                                     highwater, cycles);
+        if (old == highwater) {
+            return cycles;
+        }
+        highwater = old;
+    }
+    return highwater;
+}
+
 static int64_t icount_get_locked(void)
 {
     int64_t icount = icount_get_raw_locked();
-    return qatomic_read(&timers_state.qemu_icount_bias) + icount_to_ns(icount);
+
+    if (!icount_cycle_model_enabled()) {
+        /*
+         * Preserve ordinary icount as a read-only lockless timeline.  The
+         * modeled-cycle high-water mark is validation state for signed
+         * producers; touching it here would let concurrent default-mode
+         * readers race before their seqlock retry.
+         */
+        return qatomic_read(&timers_state.qemu_icount_bias) +
+               icount_time_at(icount);
+    }
+    return qatomic_read(&timers_state.qemu_icount_bias) +
+           icount_time_at(icount_get_modeled_cycles(icount));
+}
+
+void icount_add_cycle_penalty(uint64_t cycles)
+{
+    if (!cycles) {
+        return;
+    }
+    g_assert(qatomic_read(&timers_state.icount_cycle_clock_hz) > 0);
+    icount_account_cycles(current_cpu, 0, cycles);
+}
+
+void icount_add_cycle_credit(uint64_t cycles)
+{
+    if (!cycles) {
+        return;
+    }
+    g_assert(qatomic_read(&timers_state.icount_cycle_clock_hz) > 0);
+    icount_account_cycles(current_cpu, cycles, 0);
 }
 
 int64_t icount_get_raw(void)
@@ -139,11 +450,99 @@ int64_t icount_get_raw(void)
     return icount;
 }
 
+int64_t icount_get_cycle_count(int64_t *idle_ns)
+{
+    IcountCycleStamp stamp;
+
+    icount_get_cycle_stamp(&stamp);
+    if (idle_ns) {
+        *idle_ns = stamp.idle_ns;
+    }
+    return stamp.modeled_cycles;
+}
+
+static void icount_get_cycle_stamp_locked(IcountCycleStamp *stamp)
+{
+    int64_t cycles;
+    int64_t core_hz = qatomic_read(&timers_state.icount_cycle_clock_hz);
+
+    g_assert(core_hz >= 0);
+
+    if (icount_cycle_model_enabled()) {
+        cycles = icount_get_modeled_cycles(
+            qatomic_read(&timers_state.qemu_icount));
+    } else {
+        cycles = qatomic_read(&timers_state.qemu_icount);
+        if (current_cpu && current_cpu->running) {
+            int64_t executed = icount_get_executed(current_cpu);
+
+            /*
+             * An MMIO helper runs before the current instruction completes.
+             * Include the earlier instructions in its TB, but keep that
+             * observer instruction outside its own cycle sample.
+             */
+            g_assert(executed >= 0);
+            if (executed > 0) {
+                g_assert(executed - 1 <= INT64_MAX - cycles);
+                cycles += executed - 1;
+            }
+        }
+    }
+    *stamp = (IcountCycleStamp) {
+        .modeled_cycles = cycles,
+        .idle_ns = qatomic_read(&timers_state.qemu_icount_bias),
+        .core_hz = core_hz,
+        .generation = qatomic_read(
+            &timers_state.icount_cycle_clock_generation),
+    };
+}
+
+void icount_get_cycle_stamp(IcountCycleStamp *stamp)
+{
+    unsigned start;
+
+    g_assert(icount_enabled());
+    g_assert(stamp);
+    if (icount_cycle_model_enabled()) {
+        /* Keep the instruction count and its signed adjustments coherent. */
+        seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                           &timers_state.vm_clock_lock);
+        icount_get_cycle_stamp_locked(stamp);
+        seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                             &timers_state.vm_clock_lock);
+        return;
+    }
+
+    do {
+        start = seqlock_read_begin(&timers_state.vm_clock_seqlock);
+        icount_get_cycle_stamp_locked(stamp);
+    } while (seqlock_read_retry(&timers_state.vm_clock_seqlock, start));
+}
+
 /* Return the virtual CPU time, based on the instruction counter.  */
 int64_t icount_get(void)
 {
     int64_t icount;
     unsigned start;
+
+    if (icount_cycle_model_enabled()) {
+        /*
+         * Modeled time combines qemu_icount with signed adjustments that
+         * are published in the same seqlock write section.  A lockless
+         * reader may transiently pair the old instruction count with new
+         * credits before seqlock_read_retry() notices the writer.  Do not
+         * run high-water validation on that torn tuple: cycle-model mode is
+         * already restricted to one-instruction TBs, so serialize its clock
+         * reads with the existing writer lock and validate one coherent
+         * committed prefix.
+         */
+        seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                           &timers_state.vm_clock_lock);
+        icount = icount_get_locked();
+        seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                             &timers_state.vm_clock_lock);
+        return icount;
+    }
 
     do {
         start = seqlock_read_begin(&timers_state.vm_clock_seqlock);
@@ -153,9 +552,118 @@ int64_t icount_get(void)
     return icount;
 }
 
+/*
+ * Return the diagnostic virtual-time position at the last committed
+ * cycle-model instruction prefix.  Unlike icount_get(), this deliberately
+ * does not inspect or update the current CPU's in-flight TB state, so it is
+ * suitable for read-only probes called from an in-flight memory callback
+ * while can_do_io is false.  It is not a general-purpose side-effect clock
+ * read; device operations must use the normal virtual clock APIs at a safe
+ * I/O boundary.
+ */
+int64_t icount_get_committed_time_ns(void)
+{
+    int64_t instructions, cycles;
+
+    g_assert(icount_cycle_model_enabled());
+
+    /* The count and signed cycle adjustments must describe one prefix. */
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    instructions = qatomic_read(&timers_state.qemu_icount);
+    cycles = icount_get_modeled_cycles(instructions);
+    cycles = qatomic_read(&timers_state.qemu_icount_bias) +
+             icount_time_at(cycles);
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+    return cycles;
+}
+
 int64_t icount_to_ns(int64_t icount)
 {
-    return icount << qatomic_read(&timers_state.icount_time_shift);
+    return icount_ns_from_count(icount);
+}
+
+void icount_cycle_clock_boundary(uint64_t frequency_hz,
+                                 bool force_generation,
+                                 IcountCycleStamp *before,
+                                 IcountCycleStamp *after)
+{
+    IcountCycleStamp old_stamp;
+    int64_t raw, now_ns;
+    uint64_t generation;
+
+    g_assert(icount_enabled());
+    g_assert(frequency_hz > 0 && frequency_hz <= INT64_MAX);
+    qatomic_set(&timers_state.icount_cycle_clock_config, 1);
+
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    icount_get_cycle_stamp_locked(&old_stamp);
+    raw = old_stamp.modeled_cycles;
+    now_ns = qatomic_read(&timers_state.qemu_icount_bias) +
+             icount_time_at(raw);
+    qatomic_set(&timers_state.icount_cycle_anchor, raw);
+    qatomic_set(&timers_state.icount_cycle_anchor_ns,
+                now_ns - qatomic_read(&timers_state.qemu_icount_bias));
+    qatomic_set(&timers_state.icount_cycle_clock_hz, frequency_hz);
+    generation = old_stamp.generation;
+    if (force_generation || old_stamp.core_hz != frequency_hz) {
+        g_assert(generation != UINT64_MAX);
+        generation++;
+        qatomic_set(&timers_state.icount_cycle_clock_generation, generation);
+    }
+    if (before) {
+        *before = old_stamp;
+    }
+    if (after) {
+        *after = (IcountCycleStamp) {
+            .modeled_cycles = old_stamp.modeled_cycles,
+            .idle_ns = old_stamp.idle_ns,
+            .core_hz = frequency_hz,
+            .generation = generation,
+        };
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
+}
+
+void icount_set_cycle_clock_hz(uint64_t frequency_hz)
+{
+    int64_t old_frequency, raw, now_ns;
+    uint64_t generation;
+
+    g_assert(icount_enabled());
+    g_assert(frequency_hz > 0 && frequency_hz <= INT64_MAX);
+    qatomic_set(&timers_state.icount_cycle_clock_config, 1);
+
+    /*
+     * Preserve this legacy API's treatment of an in-flight ordinary icount
+     * slice.  New coordinated device boundaries use the stamp-based API
+     * above, whose coordinates deliberately match icount_get_cycle_count().
+     */
+    seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                       &timers_state.vm_clock_lock);
+    raw = icount_get_raw_locked();
+    if (icount_cycle_model_enabled()) {
+        raw = icount_get_modeled_cycles(raw);
+    }
+    now_ns = qatomic_read(&timers_state.qemu_icount_bias) +
+             icount_time_at(raw);
+    old_frequency = qatomic_read(&timers_state.icount_cycle_clock_hz);
+    qatomic_set(&timers_state.icount_cycle_anchor, raw);
+    qatomic_set(&timers_state.icount_cycle_anchor_ns,
+                now_ns - qatomic_read(&timers_state.qemu_icount_bias));
+    qatomic_set(&timers_state.icount_cycle_clock_hz, frequency_hz);
+    if (old_frequency != frequency_hz) {
+        generation = qatomic_read(
+            &timers_state.icount_cycle_clock_generation);
+        g_assert(generation != UINT64_MAX);
+        qatomic_set(&timers_state.icount_cycle_clock_generation,
+                    generation + 1);
+    }
+    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                         &timers_state.vm_clock_lock);
 }
 
 /*
@@ -224,7 +732,20 @@ static void icount_adjust_vm(void *opaque)
 
 int64_t icount_round(int64_t count)
 {
+    int64_t frequency = qatomic_read(&timers_state.icount_cycle_clock_hz);
     int shift = qatomic_read(&timers_state.icount_time_shift);
+
+    if (frequency) {
+        int64_t instructions = muldiv64(count, frequency,
+                                        NANOSECONDS_PER_SECOND);
+
+        /* Round a deadline up to the first instruction at or after it. */
+        if (muldiv64(instructions, NANOSECONDS_PER_SECOND, frequency) <
+            count) {
+            instructions++;
+        }
+        return instructions;
+    }
     return (count + (1 << shift) - 1) >> shift;
 }
 

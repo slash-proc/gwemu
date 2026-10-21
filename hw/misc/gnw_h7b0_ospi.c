@@ -24,6 +24,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/units.h"
+#include "qapi/visitor.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
@@ -31,6 +33,10 @@
 #include "hw/misc/gnw_h7b0_nor.h"
 #include "hw/misc/gnw_h7b0_regs_ospi.h"
 #include "hw/misc/gnw_h7b0_stub_log.h"
+
+#define OSPI_TIMING_CONFIG_ID 5U
+#define OSPI_SR_FLEVEL_SHIFT 8
+#define OSPI_SR_FLEVEL_MASK (0x3fU << OSPI_SR_FLEVEL_SHIFT)
 
 /*
  * XIP window availability
@@ -190,6 +196,10 @@ static void gnw_h7b0_ospi_reset(DeviceState *dev)
 {
     GnwH7B0OspiState *s = GNW_H7B0_OSPI(dev);
 
+    if (s->timing_timer) {
+        timer_del(s->timing_timer);
+    }
+
     for (int i = 0; i < (GNW_H7B0_OSPI_SIZE / 4); i++) {
         s->regs[i] = get_ospi_reset_value(i * 4);
     }
@@ -198,6 +208,30 @@ static void gnw_h7b0_ospi_reset(DeviceState *dev)
     s->pending_addr = 0;
     s->dr_pos = 0;
     s->wel = false;
+    s->timing_active = false;
+    s->timing_wire_complete = false;
+    s->timing_ncs_released = false;
+    s->timing_instruction_delivered = false;
+    s->timing_fallback_logged = false;
+    s->timing_phase = GNW_H7B0_OSPI_PHASE_IDLE;
+    s->fifo_head = 0;
+    s->fifo_level = 0;
+    memset(s->fifo, 0, sizeof(s->fifo));
+    memset(s->delivered_program, 0, sizeof(s->delivered_program));
+    s->delivered_program_len = 0;
+    s->timing_config_identity = s->timing_mode ? OSPI_TIMING_CONFIG_ID : 0;
+    /* Peripheral reset does not stop the externally supplied RCC clock. */
+    if (s->test_kernel_clock_hz) {
+        s->kernel_clock_hz = s->test_kernel_clock_hz;
+    }
+    s->active_length = 0;
+    s->active_delivered = 0;
+    s->active_consumed = 0;
+    s->phase_remaining_quanta = 0;
+    s->phase_progress_num = 0;
+    s->migrated_ncs_release_elapsed_ns = 0;
+    s->phase_last_update_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->ncs_release_ns = s->phase_last_update_ns;
     s->xip_fault_logged = false;
     /*
      * CR resets with EN=0/FMODE=00, so the window comes up dead -- as
@@ -389,7 +423,6 @@ static bool ospi_expected_adsize(GnwH7B0OspiState *s, uint8_t instr,
             ospi_chip_erase_size(s, instr)) {
             switch (ospi_chip(s)->profile) {
             case GNW_NOR_PROFILE_MX_24:
-            case GNW_NOR_PROFILE_MX_32_54:
             case GNW_NOR_PROFILE_ISSI_24:
             case GNW_NOR_PROFILE_WINBOND_24:
                 *adsize = OSPI_ADSIZE_24B;
@@ -418,13 +451,11 @@ static void ospi_backing_erase(GnwH7B0OspiState *s, uint32_t addr,
 }
 
 /*
- * Side effects of commands that have no data phase at all (WREN/
- * RSTEN/RST/write-enable-gated erase & program), applied the moment
- * the command is triggered -- since indirect-write commands with a
- * data phase still see their DR bytes silently dropped (no backing
- * store unification with the memory-mapped XIP region yet, see
- * gnw_h7b0_ospi.h), it's simplest to just clear WEL here too for any
- * instruction that real hardware would treat as consuming it.
+ * Side effects for the instant functional fallback. Timed transactions
+ * apply erase and delivered page-program data in
+ * ospi_timing_commit_transaction() when NCS is released. This path is
+ * used only when the timing frame is unsupported, so preserve the
+ * command-level WEL behavior without claiming timed flash completion.
  */
 static void ospi_cmd_triggered(GnwH7B0OspiState *s)
 {
@@ -512,6 +543,621 @@ static void ospi_update_irq(GnwH7B0OspiState *s)
     qemu_set_irq(s->irq, pending);
 }
 
+static uint32_t ospi_timing_fmode(GnwH7B0OspiState *s)
+{
+    return (s->regs[GNW_H7B0_OSPI_CR >> 2] & OSPI_CR_FMODE_MASK) >>
+           OSPI_CR_FMODE_SHIFT;
+}
+
+static uint32_t ospi_timing_threshold(GnwH7B0OspiState *s)
+{
+    return ((s->regs[GNW_H7B0_OSPI_CR >> 2] & OSPI_CR_FTHRES_MASK) >>
+            OSPI_CR_FTHRES_SHIFT) + 1;
+}
+
+static void ospi_timing_update_status(GnwH7B0OspiState *s)
+{
+    uint32_t *sr = &s->regs[GNW_H7B0_OSPI_SR >> 2];
+    uint32_t cr = s->regs[GNW_H7B0_OSPI_CR >> 2];
+    uint32_t threshold = ospi_timing_threshold(s);
+    uint32_t fmode = ospi_timing_fmode(s);
+    bool ftf = false;
+
+    *sr = (*sr & ~OSPI_SR_FLEVEL_MASK) |
+          ((uint32_t)s->fifo_level << OSPI_SR_FLEVEL_SHIFT);
+    if (cr & OSPI_CR_EN) {
+        if (fmode == OSPI_FMODE_INDIRECT_WRITE) {
+            ftf = GNW_H7B0_OSPI_FIFO_SIZE - s->fifo_level >= threshold;
+        } else if (fmode == OSPI_FMODE_INDIRECT_READ) {
+            ftf = s->fifo_level >= threshold ||
+                  (s->timing_wire_complete && s->fifo_level != 0);
+        }
+    }
+    if (ftf) {
+        *sr |= OSPI_SR_FTF;
+    } else {
+        *sr &= ~OSPI_SR_FTF;
+    }
+    ospi_update_irq(s);
+}
+
+static void ospi_timing_fifo_reset(GnwH7B0OspiState *s)
+{
+    s->fifo_head = 0;
+    s->fifo_level = 0;
+    memset(s->fifo, 0, sizeof(s->fifo));
+}
+
+static void ospi_timing_fifo_push(GnwH7B0OspiState *s, uint8_t value)
+{
+    unsigned tail;
+
+    g_assert(s->fifo_level < GNW_H7B0_OSPI_FIFO_SIZE);
+    tail = (s->fifo_head + s->fifo_level) % GNW_H7B0_OSPI_FIFO_SIZE;
+    s->fifo[tail] = value;
+    s->fifo_level++;
+}
+
+static uint8_t ospi_timing_fifo_pop(GnwH7B0OspiState *s)
+{
+    uint8_t value;
+
+    g_assert(s->fifo_level);
+    value = s->fifo[s->fifo_head];
+    s->fifo_head = (s->fifo_head + 1) % GNW_H7B0_OSPI_FIFO_SIZE;
+    s->fifo_level--;
+    return value;
+}
+
+static unsigned ospi_timing_lanes(uint32_t mode)
+{
+    switch (mode) {
+    case 1: return 1;
+    case 2: return 2;
+    case 3: return 4;
+    case 4: return 8;
+    default: return 0;
+    }
+}
+
+static uint64_t ospi_timing_phase_quanta(uint32_t bits, uint32_t mode,
+                                         bool dtr)
+{
+    unsigned lanes = ospi_timing_lanes(mode);
+    uint64_t transfers;
+
+    if (!lanes) {
+        return 0;
+    }
+    transfers = DIV_ROUND_UP(bits, lanes);
+    return dtr ? transfers : transfers * 2;
+}
+
+static uint64_t ospi_timing_denominator(GnwH7B0OspiState *s)
+{
+    uint64_t divider = (s->active_dcr2 & OSPI_DCR2_PRESCALER_MASK) + 1;
+
+    return divider * NANOSECONDS_PER_SECOND;
+}
+
+static uint64_t ospi_timing_phase_max_quanta(uint8_t phase)
+{
+    switch (phase) {
+    case GNW_H7B0_OSPI_PHASE_IDLE:
+        return 0;
+    case GNW_H7B0_OSPI_PHASE_CS_HIGH:
+        return 16;
+    case GNW_H7B0_OSPI_PHASE_PREAMBLE:
+    case GNW_H7B0_OSPI_PHASE_POSTAMBLE:
+        return 2;
+    case GNW_H7B0_OSPI_PHASE_INSTRUCTION:
+    case GNW_H7B0_OSPI_PHASE_ADDRESS:
+    case GNW_H7B0_OSPI_PHASE_ALTERNATE:
+        return 64;
+    case GNW_H7B0_OSPI_PHASE_DUMMY:
+        return 62;
+    case GNW_H7B0_OSPI_PHASE_DATA:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+static void ospi_timing_settle(GnwH7B0OspiState *s, int64_t now)
+{
+    uint64_t denominator, rate, elapsed;
+    unsigned __int128 advance, phase_work;
+
+    if (!s->timing_active || !s->phase_remaining_quanta ||
+        !s->kernel_clock_hz || now <= s->phase_last_update_ns) {
+        s->phase_last_update_ns = now;
+        return;
+    }
+    denominator = ospi_timing_denominator(s);
+    rate = (uint64_t)s->kernel_clock_hz * 2;
+    elapsed = now - s->phase_last_update_ns;
+    advance = (unsigned __int128)elapsed * rate + s->phase_progress_num;
+    phase_work = (unsigned __int128)s->phase_remaining_quanta * denominator;
+    if (advance >= phase_work) {
+        s->phase_remaining_quanta = 0;
+        advance -= phase_work;
+        /*
+         * QEMU invokes the timer at its integer-ns deadline, so normal
+         * overshoot is below one nanosecond.  Saturation only protects an
+         * unexpectedly late callback from corrupting state.
+         */
+        s->phase_progress_num = MIN(advance,
+                                    (unsigned __int128)UINT64_MAX);
+    } else {
+        s->phase_remaining_quanta -= (uint64_t)(advance / denominator);
+        s->phase_progress_num = advance % denominator;
+    }
+    s->phase_last_update_ns = now;
+}
+
+static void ospi_timing_schedule(GnwH7B0OspiState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t needed, delay;
+
+    timer_del(s->timing_timer);
+    s->phase_last_update_ns = now;
+    if (!s->timing_active || !s->phase_remaining_quanta ||
+        !s->kernel_clock_hz) {
+        return;
+    }
+    needed = s->phase_remaining_quanta * ospi_timing_denominator(s) -
+             s->phase_progress_num;
+    delay = DIV_ROUND_UP(needed, (uint64_t)s->kernel_clock_hz * 2);
+    delay = MAX(delay, 1);
+    timer_mod(s->timing_timer,
+              delay > INT64_MAX - now ? INT64_MAX : now + delay);
+}
+
+static void ospi_timing_phase_complete(GnwH7B0OspiState *s);
+
+static void ospi_timing_begin_phase(GnwH7B0OspiState *s,
+                                    GnwH7B0OspiPhase phase,
+                                    uint64_t quanta)
+{
+    uint64_t denominator = ospi_timing_denominator(s);
+    unsigned __int128 phase_work = (unsigned __int128)quanta * denominator;
+
+    s->timing_phase = phase;
+    s->phase_remaining_quanta = quanta;
+    if (s->phase_progress_num >= phase_work) {
+        s->phase_progress_num -= phase_work;
+        s->phase_remaining_quanta = 0;
+        ospi_timing_phase_complete(s);
+        return;
+    }
+    s->phase_remaining_quanta -= s->phase_progress_num / denominator;
+    s->phase_progress_num %= denominator;
+    ospi_timing_schedule(s);
+}
+
+static bool ospi_timing_frame_supported(GnwH7B0OspiState *s)
+{
+    uint32_t ccr = s->regs[GNW_H7B0_OSPI_CCR >> 2];
+    uint32_t dcr1 = s->regs[GNW_H7B0_OSPI_DCR1 >> 2];
+    uint32_t cr = s->regs[GNW_H7B0_OSPI_CR >> 2];
+    uint32_t modes[] = {
+        (ccr & OSPI_CCR_IMODE_MASK) >> OSPI_CCR_IMODE_SHIFT,
+        (ccr & OSPI_CCR_ADMODE_MASK) >> OSPI_CCR_ADMODE_SHIFT,
+        (ccr & OSPI_CCR_ABMODE_MASK) >> OSPI_CCR_ABMODE_SHIFT,
+        (ccr & OSPI_CCR_DMODE_MASK) >> OSPI_CCR_DMODE_SHIFT,
+    };
+    unsigned i;
+
+    if ((cr & OSPI_CR_DQM) ||
+        ((dcr1 & OSPI_DCR1_MTYP_MASK) >> OSPI_DCR1_MTYP_SHIFT) ==
+            OSPI_DCR1_MTYP_HYPERBUS ||
+        ospi_timing_fmode(s) > OSPI_FMODE_INDIRECT_READ) {
+        return false;
+    }
+    for (i = 0; i < ARRAY_SIZE(modes); i++) {
+        if (modes[i] > 4) {
+            return false;
+        }
+    }
+    if ((s->pending_instr == OSPI_CMD_PP) &&
+        (uint64_t)s->regs[GNW_H7B0_OSPI_DLR >> 2] + 1 >
+            GNW_H7B0_OSPI_PROGRAM_BUFFER_SIZE) {
+        return false;
+    }
+    return true;
+}
+
+static void ospi_timing_log_fallback(GnwH7B0OspiState *s)
+{
+    if (s->timing_fallback_logged) {
+        return;
+    }
+    s->timing_fallback_logged = true;
+    qemu_log_mask(LOG_UNIMP,
+                  "%s: unsupported OCTOSPI timing frame; using instant "
+                  "functional fallback (no accuracy claim)\n", __func__);
+}
+
+static void ospi_timing_commit_transaction(GnwH7B0OspiState *s)
+{
+    uint64_t size;
+
+    switch (s->active_instr) {
+    case OSPI_CMD_WREN:
+        s->wel = true;
+        break;
+    case OSPI_CMD_RDID:
+    case OSPI_CMD_RDSR:
+    case OSPI_CMD_RDCR:
+    case OSPI_CMD_SFDP:
+    case OSPI_CMD_RSTEN:
+    case OSPI_CMD_RST:
+    case OSPI_CMD_READ:
+        break;
+    case OSPI_CMD_CE:
+        ospi_backing_erase(s, 0, s->flash_size);
+        s->wel = false;
+        break;
+    case OSPI_CMD_SE:
+        ospi_backing_erase(s, s->active_addr, 4 * KiB);
+        s->wel = false;
+        break;
+    case OSPI_CMD_BE32K:
+        ospi_backing_erase(s, s->active_addr, 32 * KiB);
+        s->wel = false;
+        break;
+    case OSPI_CMD_BE64K:
+        ospi_backing_erase(s, s->active_addr, 64 * KiB);
+        s->wel = false;
+        break;
+    case OSPI_CMD_PP:
+        size = MIN((uint64_t)s->delivered_program_len,
+                   s->flash_size > s->active_addr ?
+                       s->flash_size - s->active_addr : 0);
+        if (s->backing && size) {
+            memcpy(s->backing + s->active_addr,
+                   s->delivered_program, size);
+        }
+        s->wel = false;
+        break;
+    default:
+        s->wel = false;
+        break;
+    }
+    s->delivered_program_len = 0;
+}
+
+static void ospi_timing_finish_if_idle(GnwH7B0OspiState *s)
+{
+    if (!s->timing_wire_complete || !s->timing_ncs_released ||
+        s->fifo_level) {
+        return;
+    }
+    s->timing_active = false;
+    s->timing_phase = GNW_H7B0_OSPI_PHASE_IDLE;
+    s->regs[GNW_H7B0_OSPI_SR >> 2] &= ~OSPI_SR_BUSY;
+    ospi_timing_update_status(s);
+}
+
+static void ospi_timing_advance(GnwH7B0OspiState *s);
+
+static void ospi_timing_phase_complete(GnwH7B0OspiState *s)
+{
+    uint8_t value;
+
+    switch (s->timing_phase) {
+    case GNW_H7B0_OSPI_PHASE_CS_HIGH:
+        break;
+    case GNW_H7B0_OSPI_PHASE_INSTRUCTION:
+        s->timing_instruction_delivered = true;
+        break;
+    case GNW_H7B0_OSPI_PHASE_DATA:
+        if (ospi_timing_fmode(s) == OSPI_FMODE_INDIRECT_READ) {
+            g_assert(s->fifo_level < GNW_H7B0_OSPI_FIFO_SIZE);
+            value = ospi_gen_read_byte(s, s->active_delivered);
+            ospi_timing_fifo_push(s, value);
+        } else {
+            value = ospi_timing_fifo_pop(s);
+            if (s->active_instr == OSPI_CMD_PP) {
+                g_assert(s->delivered_program_len <
+                         GNW_H7B0_OSPI_PROGRAM_BUFFER_SIZE);
+                s->delivered_program[s->delivered_program_len++] = value;
+            }
+        }
+        s->active_delivered++;
+        ospi_timing_update_status(s);
+        if (s->active_delivered == s->active_length) {
+            s->timing_wire_complete = true;
+            s->regs[GNW_H7B0_OSPI_SR >> 2] |= OSPI_SR_TCF;
+            if (ospi_timing_fmode(s) == OSPI_FMODE_INDIRECT_WRITE) {
+                ospi_timing_fifo_reset(s);
+            }
+            ospi_timing_update_status(s);
+            ospi_timing_begin_phase(s, GNW_H7B0_OSPI_PHASE_POSTAMBLE, 2);
+            return;
+        }
+        break;
+    case GNW_H7B0_OSPI_PHASE_POSTAMBLE:
+        /*
+         * The wire is idle after NCS release; don't pre-run a future
+         * command.
+         */
+        s->phase_progress_num = 0;
+        ospi_timing_commit_transaction(s);
+        s->timing_ncs_released = true;
+        s->ncs_release_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        ospi_timing_finish_if_idle(s);
+        return;
+    default:
+        break;
+    }
+    ospi_timing_advance(s);
+}
+
+static void ospi_timing_advance(GnwH7B0OspiState *s)
+{
+    uint32_t ccr = s->active_ccr;
+    uint32_t mode, size;
+    uint64_t quanta;
+
+    for (;;) {
+        switch (s->timing_phase) {
+        case GNW_H7B0_OSPI_PHASE_CS_HIGH:
+            ospi_timing_begin_phase(s, GNW_H7B0_OSPI_PHASE_PREAMBLE, 2);
+            return;
+        case GNW_H7B0_OSPI_PHASE_PREAMBLE:
+            mode = (ccr & OSPI_CCR_IMODE_MASK) >> OSPI_CCR_IMODE_SHIFT;
+            size = ((ccr & OSPI_CCR_ISIZE_MASK) >> OSPI_CCR_ISIZE_SHIFT) + 1;
+            quanta = ospi_timing_phase_quanta(size * 8, mode,
+                                               ccr & OSPI_CCR_IDTR);
+            s->timing_phase = GNW_H7B0_OSPI_PHASE_INSTRUCTION;
+            break;
+        case GNW_H7B0_OSPI_PHASE_INSTRUCTION:
+            mode = (ccr & OSPI_CCR_ADMODE_MASK) >> OSPI_CCR_ADMODE_SHIFT;
+            size = ((ccr & OSPI_CCR_ADSIZE_MASK) >> OSPI_CCR_ADSIZE_SHIFT) + 1;
+            quanta = ospi_timing_phase_quanta(size * 8, mode,
+                                               ccr & OSPI_CCR_ADDTR);
+            s->timing_phase = GNW_H7B0_OSPI_PHASE_ADDRESS;
+            break;
+        case GNW_H7B0_OSPI_PHASE_ADDRESS:
+            mode = (ccr & OSPI_CCR_ABMODE_MASK) >> OSPI_CCR_ABMODE_SHIFT;
+            size = ((ccr & OSPI_CCR_ABSIZE_MASK) >> OSPI_CCR_ABSIZE_SHIFT) + 1;
+            quanta = ospi_timing_phase_quanta(size * 8, mode,
+                                               ccr & OSPI_CCR_ABDTR);
+            s->timing_phase = GNW_H7B0_OSPI_PHASE_ALTERNATE;
+            break;
+        case GNW_H7B0_OSPI_PHASE_ALTERNATE:
+            mode = (ccr & OSPI_CCR_DMODE_MASK) >> OSPI_CCR_DMODE_SHIFT;
+            quanta = mode ? 2 * (s->active_tcr & OSPI_TCR_DCYC_MASK) : 0;
+            s->timing_phase = GNW_H7B0_OSPI_PHASE_DUMMY;
+            break;
+        case GNW_H7B0_OSPI_PHASE_DUMMY:
+            if (!s->active_length) {
+                s->timing_wire_complete = true;
+                s->regs[GNW_H7B0_OSPI_SR >> 2] |= OSPI_SR_TCF;
+                ospi_timing_update_status(s);
+                ospi_timing_begin_phase(s,
+                                        GNW_H7B0_OSPI_PHASE_POSTAMBLE, 2);
+                return;
+            }
+            s->timing_phase = GNW_H7B0_OSPI_PHASE_DATA;
+            quanta = 0;
+            break;
+        case GNW_H7B0_OSPI_PHASE_DATA:
+            if (ospi_timing_fmode(s) == OSPI_FMODE_INDIRECT_READ) {
+                if (s->fifo_level == GNW_H7B0_OSPI_FIFO_SIZE) {
+                    s->phase_remaining_quanta = 0;
+                    s->phase_progress_num = 0;
+                    timer_del(s->timing_timer);
+                    return;
+                }
+            } else if (!s->fifo_level) {
+                s->phase_remaining_quanta = 0;
+                s->phase_progress_num = 0;
+                timer_del(s->timing_timer);
+                return;
+            }
+            mode = (ccr & OSPI_CCR_DMODE_MASK) >> OSPI_CCR_DMODE_SHIFT;
+            quanta = ospi_timing_phase_quanta(8, mode,
+                                               ccr & OSPI_CCR_DDTR);
+            break;
+        default:
+            return;
+        }
+        if (quanta) {
+            ospi_timing_begin_phase(s, s->timing_phase, quanta);
+            return;
+        }
+    }
+}
+
+static void ospi_timing_timer_cb(void *opaque)
+{
+    GnwH7B0OspiState *s = opaque;
+
+    ospi_timing_settle(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (!s->phase_remaining_quanta) {
+        ospi_timing_phase_complete(s);
+    } else {
+        ospi_timing_schedule(s);
+    }
+}
+
+static bool ospi_timing_start(GnwH7B0OspiState *s)
+{
+    uint32_t ccr = s->regs[GNW_H7B0_OSPI_CCR >> 2];
+    uint32_t dmode = (ccr & OSPI_CCR_DMODE_MASK) >> OSPI_CCR_DMODE_SHIFT;
+    uint64_t length = dmode ?
+        (uint64_t)s->regs[GNW_H7B0_OSPI_DLR >> 2] + 1 : 0;
+
+    if (!(s->regs[GNW_H7B0_OSPI_CR >> 2] & OSPI_CR_EN) ||
+        !ospi_timing_frame_supported(s)) {
+        ospi_timing_log_fallback(s);
+        return false;
+    }
+    if (s->timing_active) {
+        return true;
+    }
+    s->active_ccr = ccr;
+    s->active_tcr = s->regs[GNW_H7B0_OSPI_TCR >> 2];
+    s->active_dcr1 = s->regs[GNW_H7B0_OSPI_DCR1 >> 2];
+    s->active_dcr2 = s->regs[GNW_H7B0_OSPI_DCR2 >> 2];
+    s->active_instr = s->pending_instr;
+    s->active_addr = s->pending_addr;
+    s->active_length = length;
+    s->active_delivered = 0;
+    s->active_consumed = 0;
+    s->delivered_program_len = 0;
+    s->phase_progress_num = 0;
+    s->timing_active = true;
+    s->timing_wire_complete = false;
+    s->timing_instruction_delivered = false;
+    s->regs[GNW_H7B0_OSPI_SR >> 2] &= ~(OSPI_SR_TCF | OSPI_SR_TEF);
+    s->regs[GNW_H7B0_OSPI_SR >> 2] |= OSPI_SR_BUSY;
+    ospi_timing_update_status(s);
+    if (s->timing_ncs_released) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        uint64_t denominator = ospi_timing_denominator(s);
+        uint64_t quanta =
+            2 * (((s->active_dcr1 & OSPI_DCR1_CSHT_MASK) >>
+                  OSPI_DCR1_CSHT_SHIFT) + 1);
+        unsigned __int128 required =
+            (unsigned __int128)quanta * denominator;
+        unsigned __int128 idle_credit = 0;
+
+        ospi_timing_begin_phase(s, GNW_H7B0_OSPI_PHASE_CS_HIGH, quanta);
+        if (s->kernel_clock_hz && now > s->ncs_release_ns) {
+            idle_credit = (unsigned __int128)(now - s->ncs_release_ns) *
+                          s->kernel_clock_hz * 2;
+            idle_credit = MIN(idle_credit, required);
+        }
+        s->phase_remaining_quanta -= idle_credit / denominator;
+        s->phase_progress_num = idle_credit % denominator;
+        s->phase_last_update_ns = now;
+        if (idle_credit == required) {
+            /*
+             * Time before the trigger can satisfy CSHT, but cannot run any
+             * part of the newly triggered command.
+             */
+            s->phase_progress_num = 0;
+            s->phase_remaining_quanta = 0;
+            ospi_timing_phase_complete(s);
+        } else {
+            ospi_timing_schedule(s);
+        }
+    } else {
+        ospi_timing_begin_phase(s, GNW_H7B0_OSPI_PHASE_PREAMBLE, 2);
+    }
+    s->timing_ncs_released = false;
+    return true;
+}
+
+static bool ospi_timing_should_trigger(GnwH7B0OspiState *s, hwaddr addr)
+{
+    uint32_t ccr = s->regs[GNW_H7B0_OSPI_CCR >> 2];
+    uint32_t admode = (ccr & OSPI_CCR_ADMODE_MASK) >> OSPI_CCR_ADMODE_SHIFT;
+    uint32_t dmode = (ccr & OSPI_CCR_DMODE_MASK) >> OSPI_CCR_DMODE_SHIFT;
+    uint32_t fmode = ospi_timing_fmode(s);
+
+    if (fmode > OSPI_FMODE_INDIRECT_READ) {
+        return false;
+    }
+    if (addr == GNW_H7B0_OSPI_DR) {
+        return fmode == OSPI_FMODE_INDIRECT_WRITE && dmode != 0;
+    }
+    if (addr == GNW_H7B0_OSPI_IR) {
+        return admode == 0 &&
+               (fmode == OSPI_FMODE_INDIRECT_READ || dmode == 0);
+    }
+    return addr == GNW_H7B0_OSPI_AR && admode != 0 &&
+           (fmode == OSPI_FMODE_INDIRECT_READ || dmode == 0);
+}
+
+static void ospi_timing_abort(GnwH7B0OspiState *s)
+{
+    if (s->timing_active) {
+        bool phase_was_running = s->phase_remaining_quanta != 0;
+
+        ospi_timing_settle(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        if (phase_was_running && !s->phase_remaining_quanta) {
+            ospi_timing_phase_complete(s);
+        }
+        timer_del(s->timing_timer);
+        /* NCS closes only a command which actually reached the device. */
+        if (s->timing_active && s->timing_instruction_delivered) {
+            ospi_timing_commit_transaction(s);
+        } else if (s->timing_active) {
+            s->delivered_program_len = 0;
+        }
+    }
+    ospi_timing_fifo_reset(s);
+    s->timing_active = false;
+    s->timing_wire_complete = false;
+    s->timing_instruction_delivered = false;
+    s->timing_ncs_released = true;
+    s->ncs_release_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->timing_phase = GNW_H7B0_OSPI_PHASE_IDLE;
+    s->phase_remaining_quanta = 0;
+    s->phase_progress_num = 0;
+    s->regs[GNW_H7B0_OSPI_SR >> 2] &= ~OSPI_SR_BUSY;
+    s->regs[GNW_H7B0_OSPI_SR >> 2] |= OSPI_SR_TCF;
+    ospi_timing_update_status(s);
+}
+
+void gnw_h7b0_ospi_set_kernel_clock_hz(GnwH7B0OspiState *s, uint32_t hz)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bool phase_was_running = s->phase_remaining_quanta != 0;
+
+    if (s->timing_mode) {
+        ospi_timing_settle(s, now);
+        if (phase_was_running && !s->phase_remaining_quanta) {
+            ospi_timing_phase_complete(s);
+        }
+    }
+    s->kernel_clock_hz = hz;
+    if (s->timing_mode) {
+        ospi_timing_schedule(s);
+    }
+}
+
+void gnw_h7b0_ospi_kernel_clock_changed(void *opaque,
+                                         uint32_t old_hz,
+                                         uint32_t new_hz)
+{
+    GnwH7B0OspiState *s = opaque;
+
+    if (s->kernel_clock_hz != old_hz) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: stale OCTOSPI old clock %u (device has %u)\n",
+                      __func__, old_hz, s->kernel_clock_hz);
+    }
+    gnw_h7b0_ospi_set_kernel_clock_hz(s, new_hz);
+}
+
+static void ospi_test_clock_get(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    GnwH7B0OspiState *s = GNW_H7B0_OSPI(obj);
+    uint32_t hz = s->test_kernel_clock_hz;
+
+    visit_type_uint32(v, name, &hz, errp);
+}
+
+static void ospi_test_clock_set(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    GnwH7B0OspiState *s = GNW_H7B0_OSPI(obj);
+    uint32_t hz;
+
+    if (!visit_type_uint32(v, name, &hz, errp)) {
+        return;
+    }
+    s->test_kernel_clock_hz = hz;
+    gnw_h7b0_ospi_set_kernel_clock_hz(s, hz);
+}
+
 static uint64_t gnw_h7b0_ospi_read(void *opaque, hwaddr addr,
                                     unsigned int size)
 {
@@ -524,11 +1170,33 @@ static uint64_t gnw_h7b0_ospi_read(void *opaque, hwaddr addr,
     }
 
     if (addr == GNW_H7B0_OSPI_DR) {
+        if (s->timing_mode && s->timing_active &&
+            ospi_timing_fmode(s) == OSPI_FMODE_INDIRECT_READ) {
+            uint64_t value = 0;
+
+            for (unsigned i = 0; i < size; i++) {
+                uint8_t byte = 0xff;
+
+                if (s->fifo_level) {
+                    byte = ospi_timing_fifo_pop(s);
+                    s->active_consumed++;
+                }
+                value |= (uint64_t)byte << (i * 8);
+            }
+            ospi_timing_update_status(s);
+            if (!s->timing_wire_complete &&
+                s->timing_phase == GNW_H7B0_OSPI_PHASE_DATA &&
+                !s->phase_remaining_quanta) {
+                ospi_timing_advance(s);
+            }
+            ospi_timing_finish_if_idle(s);
+            return value;
+        }
         /*
          * HAL_OSPI_Receive() reads DR one byte at a time (see
          * gnw_h7b0_ospi.h); real hardware auto-increments through the
-         * FIFO/data-phase per access regardless of the access size
-         * used, so just always hand back the next byte here too.
+         * FIFO/data-phase for each byte transferred.  Consume every byte
+         * represented by a wide DR access, matching the timed FIFO path.
          *
          * DLR holds NbData-1 (see stm32h7xx_hal_ospi.c's "DLR =
          * NbData - 1U" in both HAL_OSPI_Command() and the DMA path),
@@ -543,13 +1211,23 @@ static uint64_t gnw_h7b0_ospi_read(void *opaque, hwaddr addr,
          * actually means (e.g. re-reading stale RDID/SFDP bytes).
          */
         uint32_t dlr = s->regs[GNW_H7B0_OSPI_DLR >> 2];
+        uint64_t value = 0;
 
-        if (s->dr_pos > dlr) {
-            return 0xFF;
+        for (unsigned i = 0; i < size; i++) {
+            uint8_t byte = 0xff;
+
+            if (s->dr_pos <= dlr) {
+                byte = ospi_gen_read_byte(s, s->dr_pos);
+                s->dr_pos++;
+            }
+            value |= (uint64_t)byte << (i * 8);
         }
-        uint8_t b = ospi_gen_read_byte(s, s->dr_pos);
-        s->dr_pos++;
-        return b;
+        return value;
+    }
+
+    if (addr == GNW_H7B0_OSPI_SR && s->timing_mode &&
+        ospi_timing_frame_supported(s)) {
+        ospi_timing_update_status(s);
     }
 
     return s->regs[addr >> 2];
@@ -569,6 +1247,15 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
 
     uint32_t mask = get_ospi_write_mask(addr);
     value = (s->regs[addr >> 2] & ~mask) | (value & mask);
+
+    if (s->timing_mode && s->timing_active &&
+        addr != GNW_H7B0_OSPI_CR && addr != GNW_H7B0_OSPI_FCR &&
+        addr != GNW_H7B0_OSPI_DR) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: ignoring OCTOSPI register write 0x%" HWADDR_PRIx
+                      " while BUSY\n", __func__, addr);
+        return;
+    }
 
     switch (addr) {
     case GNW_H7B0_OSPI_IR:
@@ -622,19 +1309,29 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
                                   actual_adsize, expected_adsize);
                 }
             }
-            /*
-             * Sector/block erase have an address phase but no data
-             * phase -- real hardware erases the moment the address is
-             * latched, so do the same here (chip erase has no address
-             * phase at all; that's handled in ospi_cmd_triggered()
-             * on the IR-only trigger instead).
-             */
+        }
+        s->dr_pos = 0;
+        if (s->timing_mode) {
+            if (ospi_timing_fmode(s) <= OSPI_FMODE_INDIRECT_READ &&
+                !ospi_timing_should_trigger(s, addr)) {
+                return;
+            }
+            if (ospi_timing_should_trigger(s, addr) &&
+                ospi_timing_start(s)) {
+                return;
+            }
+            if (ospi_timing_fmode(s) > OSPI_FMODE_INDIRECT_READ) {
+                ospi_timing_log_fallback(s);
+            }
+        }
+
+        if (addr == GNW_H7B0_OSPI_AR) {
+            /* Sector/block erase has an address phase but no data phase. */
             uint64_t erase_size = ospi_chip_erase_size(s, s->pending_instr);
             if (erase_size) {
                 ospi_backing_erase(s, s->pending_addr, erase_size);
             }
         }
-        s->dr_pos = 0;
         ospi_cmd_triggered(s);
         s->regs[GNW_H7B0_OSPI_SR >> 2] |= OSPI_SR_TCF | OSPI_SR_FTF;
         s->regs[GNW_H7B0_OSPI_SR >> 2] &= ~OSPI_SR_BUSY;
@@ -645,20 +1342,50 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
         ospi_update_irq(s);
         return;
     case GNW_H7B0_OSPI_DR:
+        if (s->timing_mode &&
+            (s->timing_active || ospi_timing_should_trigger(s, addr))) {
+            bool handled = s->timing_active || ospi_timing_start(s);
+
+            if (handled) {
+                uint64_t remaining = s->active_length >
+                                     s->active_delivered + s->fifo_level ?
+                    s->active_length - s->active_delivered - s->fifo_level : 0;
+                unsigned count = MIN((uint64_t)size, remaining);
+
+                count = MIN(count,
+                            GNW_H7B0_OSPI_FIFO_SIZE - s->fifo_level);
+                for (unsigned i = 0; i < count; i++) {
+                    ospi_timing_fifo_push(s, val64 >> (i * 8));
+                }
+                ospi_timing_update_status(s);
+                if (s->timing_phase == GNW_H7B0_OSPI_PHASE_DATA &&
+                    !s->phase_remaining_quanta) {
+                    ospi_timing_advance(s);
+                }
+                return;
+            }
+        }
         /*
-         * HAL_OSPI_Transmit() writes DR one byte at a time. For page
-         * program, persist each byte to the XIP backing store at
+         * HAL_OSPI_Transmit() normally writes DR one byte at a time. For page
+         * program, persist every byte represented by the access to the XIP
+         * backing store at
          * pending_addr+dr_pos (mirrors ospi_gen_read_byte()'s
          * addressing for indirect reads); any other write-class
          * command (e.g. WRSR) still has its byte dropped, since only
          * PP is modeled with a real data-phase effect.
          */
         if (s->pending_instr == ospi_chip_program_opcode(s) && s->backing) {
-            uint64_t off = s->pending_addr + s->dr_pos;
+            uint64_t length = (uint64_t)s->regs[GNW_H7B0_OSPI_DLR >> 2] + 1;
 
-            if (off < s->flash_size) {
-                s->backing[off] = (uint8_t)value;
+            for (unsigned i = 0; i < size && s->dr_pos < length; i++) {
+                uint64_t off = s->pending_addr + s->dr_pos;
+
+                if (off < s->flash_size) {
+                    s->backing[off] = val64 >> (i * 8);
+                }
+                s->dr_pos++;
             }
+            return;
         }
         s->dr_pos++;
         return;
@@ -668,22 +1395,45 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
     case GNW_H7B0_OSPI_FCR:
         /* Write-1-to-clear: FCR bit positions mirror SR's exactly. */
         s->regs[GNW_H7B0_OSPI_SR >> 2] &= ~value;
-        ospi_update_irq(s);
+        if (s->timing_mode && ospi_timing_frame_supported(s)) {
+            ospi_timing_update_status(s);
+        } else {
+            ospi_update_irq(s);
+        }
         return;
     case GNW_H7B0_OSPI_CR:
+    {
+        bool requested_abort = value & OSPI_CR_ABORT;
+
         /*
          * ABORT is self-clearing: RM0455 24.4.18 says BUSY and ABORT
          * are both reset once the abort completes, and our transfers
          * are instantaneous, so it never reads back as set.
          */
+        if (s->timing_mode && s->timing_active) {
+            uint32_t locked = OSPI_CR_EN | OSPI_CR_DQM |
+                              OSPI_CR_FTHRES_MASK | OSPI_CR_FMODE_MASK;
+
+            value = (value & ~locked) |
+                    (s->regs[addr >> 2] & locked);
+        }
         s->regs[addr >> 2] = value & ~OSPI_CR_ABORT;
-        if (value & OSPI_CR_ABORT) {
-            s->regs[GNW_H7B0_OSPI_SR >> 2] &= ~OSPI_SR_BUSY;
+        if (requested_abort) {
+            if (s->timing_mode && s->timing_active) {
+                ospi_timing_abort(s);
+            } else {
+                s->regs[GNW_H7B0_OSPI_SR >> 2] &= ~OSPI_SR_BUSY;
+            }
         }
         /* EN/FMODE decide whether the XIP window exists at all. */
         ospi_xip_gate_update(s);
-        ospi_update_irq(s);
+        if (s->timing_mode && ospi_timing_frame_supported(s)) {
+            ospi_timing_update_status(s);
+        } else {
+            ospi_update_irq(s);
+        }
         return;
+    }
     case GNW_H7B0_OSPI_SR:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: SR is read-only on real hardware (use FCR to "
@@ -736,6 +1486,10 @@ static void gnw_h7b0_ospi_init(Object *obj)
 {
     GnwH7B0OspiState *s = GNW_H7B0_OSPI(obj);
 
+    s->timing_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   ospi_timing_timer_cb, s);
+    object_property_add(obj, "x-kernel-clock-hz", "uint32",
+                        ospi_test_clock_get, ospi_test_clock_set, NULL, NULL);
     memory_region_init_io(&s->mmio, obj, &gnw_h7b0_ospi_ops, s,
                            TYPE_GNW_H7B0_OSPI, GNW_H7B0_OSPI_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
@@ -747,16 +1501,112 @@ static void gnw_h7b0_ospi_init(Object *obj)
  * FMODE), which is migrated, so re-derive it rather than migrating the
  * MemoryRegion mapping itself.
  */
+static int gnw_h7b0_ospi_pre_save(void *opaque)
+{
+    GnwH7B0OspiState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (s->timing_mode && s->timing_active) {
+        bool phase_was_running = s->phase_remaining_quanta != 0;
+
+        ospi_timing_settle(s, now);
+        if (phase_was_running && !s->phase_remaining_quanta) {
+            ospi_timing_phase_complete(s);
+        }
+    }
+    s->migrated_ncs_release_elapsed_ns =
+        s->timing_ncs_released && now > s->ncs_release_ns ?
+            now - s->ncs_release_ns : 0;
+    return 0;
+}
+
 static int gnw_h7b0_ospi_post_load(void *opaque, int version_id)
 {
-    ospi_xip_gate_update(opaque);
+    GnwH7B0OspiState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (version_id < 2) {
+        if (s->timing_mode) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: legacy OCTOSPI snapshot has no timing-mode "
+                          "identity\n", __func__);
+            return -EINVAL;
+        }
+    } else {
+        if (s->timing_config_identity !=
+                (s->timing_mode ? OSPI_TIMING_CONFIG_ID : 0) ||
+            s->fifo_head >= GNW_H7B0_OSPI_FIFO_SIZE ||
+            s->fifo_level > GNW_H7B0_OSPI_FIFO_SIZE ||
+            s->delivered_program_len > GNW_H7B0_OSPI_PROGRAM_BUFFER_SIZE ||
+            s->timing_phase > GNW_H7B0_OSPI_PHASE_POSTAMBLE ||
+            s->active_length > (UINT64_C(1) << 32) ||
+            s->phase_remaining_quanta >
+                ospi_timing_phase_max_quanta(s->timing_phase) ||
+            s->active_delivered > s->active_length ||
+            s->active_consumed > s->active_length ||
+            (s->timing_active &&
+             ospi_timing_fmode(s) == OSPI_FMODE_INDIRECT_READ &&
+             (s->active_consumed > s->active_delivered ||
+              s->active_delivered - s->active_consumed != s->fifo_level)) ||
+            (s->timing_active &&
+             ospi_timing_fmode(s) == OSPI_FMODE_INDIRECT_WRITE &&
+             (s->active_delivered + s->fifo_level > s->active_length)) ||
+            (s->timing_active && s->active_instr == OSPI_CMD_PP &&
+             s->delivered_program_len != s->active_delivered) ||
+            (s->active_instr != OSPI_CMD_PP &&
+             s->delivered_program_len != 0) ||
+            (!s->timing_active &&
+             (s->fifo_level || s->delivered_program_len)) ||
+            s->phase_progress_num >= ospi_timing_denominator(s) ||
+            (s->timing_active &&
+             s->timing_phase == GNW_H7B0_OSPI_PHASE_IDLE) ||
+            (s->timing_active && !s->phase_remaining_quanta &&
+             s->timing_phase != GNW_H7B0_OSPI_PHASE_DATA &&
+             !(s->timing_phase == GNW_H7B0_OSPI_PHASE_POSTAMBLE &&
+               s->timing_ncs_released && s->timing_wire_complete)) ||
+            (!s->timing_active &&
+             s->timing_phase != GNW_H7B0_OSPI_PHASE_IDLE) ||
+            (s->timing_wire_complete &&
+             s->active_delivered != s->active_length) ||
+            (s->timing_active && s->timing_ncs_released &&
+             (!s->timing_wire_complete ||
+              s->timing_phase != GNW_H7B0_OSPI_PHASE_POSTAMBLE)) ||
+            s->migrated_ncs_release_elapsed_ns > INT64_MAX) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: invalid OCTOSPI timing snapshot state\n",
+                          __func__);
+            return -EINVAL;
+        }
+        if (!s->timing_mode &&
+            (s->timing_active || s->fifo_level ||
+             s->timing_config_identity)) {
+            return -EINVAL;
+        }
+    }
+
+    timer_del(s->timing_timer);
+    if (s->timing_mode) {
+        s->phase_last_update_ns = now;
+        s->ncs_release_ns = now -
+            (int64_t)s->migrated_ncs_release_elapsed_ns;
+        ospi_timing_update_status(s);
+        if (s->timing_active && s->phase_remaining_quanta) {
+            ospi_timing_schedule(s);
+        } else if (s->timing_active &&
+                   s->timing_phase == GNW_H7B0_OSPI_PHASE_DATA) {
+            ospi_timing_advance(s);
+        }
+    }
+    ospi_xip_gate_update(s);
+    ospi_update_irq(s);
     return 0;
 }
 
 static const VMStateDescription vmstate_gnw_h7b0_ospi = {
     .name = TYPE_GNW_H7B0_OSPI,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .pre_save = gnw_h7b0_ospi_pre_save,
     .post_load = gnw_h7b0_ospi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, GnwH7B0OspiState, GNW_H7B0_OSPI_SIZE / 4),
@@ -764,6 +1614,37 @@ static const VMStateDescription vmstate_gnw_h7b0_ospi = {
         VMSTATE_UINT32(pending_addr, GnwH7B0OspiState),
         VMSTATE_UINT32(dr_pos, GnwH7B0OspiState),
         VMSTATE_BOOL(wel, GnwH7B0OspiState),
+        VMSTATE_UINT32_EQUAL_V(timing_config_identity, GnwH7B0OspiState,
+                               2, "OCTOSPI timing mode differs"),
+        VMSTATE_UINT32_EQUAL_V(test_kernel_clock_hz, GnwH7B0OspiState,
+                               2, "OCTOSPI test kernel clock differs"),
+        VMSTATE_BOOL_V(timing_active, GnwH7B0OspiState, 2),
+        VMSTATE_BOOL_V(timing_wire_complete, GnwH7B0OspiState, 2),
+        VMSTATE_BOOL_V(timing_ncs_released, GnwH7B0OspiState, 2),
+        VMSTATE_BOOL_V(timing_instruction_delivered, GnwH7B0OspiState, 2),
+        VMSTATE_UINT8_V(timing_phase, GnwH7B0OspiState, 2),
+        VMSTATE_UINT8_V(fifo_head, GnwH7B0OspiState, 2),
+        VMSTATE_UINT8_V(fifo_level, GnwH7B0OspiState, 2),
+        VMSTATE_UINT8_ARRAY_V(fifo, GnwH7B0OspiState,
+                              GNW_H7B0_OSPI_FIFO_SIZE, 2),
+        VMSTATE_UINT8_ARRAY_V(delivered_program, GnwH7B0OspiState,
+                              GNW_H7B0_OSPI_PROGRAM_BUFFER_SIZE, 2),
+        VMSTATE_UINT16_V(delivered_program_len, GnwH7B0OspiState, 2),
+        VMSTATE_UINT32_V(kernel_clock_hz, GnwH7B0OspiState, 2),
+        VMSTATE_UINT32_V(active_ccr, GnwH7B0OspiState, 2),
+        VMSTATE_UINT32_V(active_tcr, GnwH7B0OspiState, 2),
+        VMSTATE_UINT32_V(active_dcr1, GnwH7B0OspiState, 2),
+        VMSTATE_UINT32_V(active_dcr2, GnwH7B0OspiState, 2),
+        VMSTATE_UINT32_V(active_instr, GnwH7B0OspiState, 2),
+        VMSTATE_UINT32_V(active_addr, GnwH7B0OspiState, 2),
+        VMSTATE_UINT64_V(active_length, GnwH7B0OspiState, 2),
+        VMSTATE_UINT64_V(active_delivered, GnwH7B0OspiState, 2),
+        VMSTATE_UINT64_V(active_consumed, GnwH7B0OspiState, 2),
+        VMSTATE_UINT64_V(phase_remaining_quanta, GnwH7B0OspiState, 2),
+        VMSTATE_UINT64_V(phase_progress_num, GnwH7B0OspiState, 2),
+        VMSTATE_UINT64_V(migrated_ncs_release_elapsed_ns,
+                          GnwH7B0OspiState, 2),
+        VMSTATE_INT64_V(phase_last_update_ns, GnwH7B0OspiState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -772,6 +1653,7 @@ static const Property gnw_h7b0_ospi_properties[] = {
     DEFINE_PROP_UINT64("flash-size", GnwH7B0OspiState, flash_size,
                         OSPI_FLASH_DEFAULT_SIZE),
     DEFINE_PROP_UINT32("chip-index", GnwH7B0OspiState, chip_index, 6),
+    DEFINE_PROP_BOOL("timing-mode", GnwH7B0OspiState, timing_mode, false),
 };
 
 static void gnw_h7b0_ospi_class_init(ObjectClass *klass, const void *data)

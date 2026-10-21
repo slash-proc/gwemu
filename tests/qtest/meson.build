@@ -232,6 +232,9 @@ qtests_stm32l4x5 = \
    'stm32l4x5_usart-test']
 
 qtests_arm = \
+  (config_all_devices.has_key('CONFIG_GNW_H7B0') ?
+   ['gnw-h7b0-mdma-test', 'gnw-h7b0-flash-r-test', 'gnw-h7b0-dwt-test',
+    'gnw-h7b0-tamp-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MPS2') ? ['sse-timer-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MPS2') ? ['armv7m-mpu-test'] : []) + \
   (config_all_devices.has_key('CONFIG_CMSDK_APB_DUALTIMER') ? ['cmsdk-apb-dualtimer-test'] : []) + \
@@ -389,6 +392,11 @@ qtests = {
   'dbus-vmstate-test': files('migration/migration-qmp.c',
                              'migration/migration-util.c') + dbus_vmstate1,
   'erst-test': files('erst-test.c'),
+  'gnw-h7b0-flash-r-test': files('migration/migration-qmp.c',
+                                  'migration/migration-util.c'),
+  'gnw-h7b0-dwt-test': files('migration/migration-qmp.c',
+                              'migration/migration-util.c'),
+  'gnw-h7b0-tamp-test': [],
   'ivshmem-test': [rt, '../../contrib/ivshmem-server/ivshmem-server.c'],
   'migration-test': test_migration_files + migration_tls_files + migration_colo_files,
   'pxe-test': files('boot-sector.c'),
@@ -459,8 +467,12 @@ foreach dir : target_dirs
         src += test_ss.all_sources()
         deps += test_ss.all_dependencies()
       endif
+      test_c_args = []
+      if test == 'gnw-h7b0-mdma-test'
+        test_c_args += ['-DGNW_TIMING_PROJECT_ROOT="@0@"'.format(meson.project_source_root())]
+      endif
       qtest_executables += {
-        test: executable(test, src, dependencies: deps)
+        test: executable(test, src, dependencies: deps, c_args: test_c_args)
       }
     endif
 

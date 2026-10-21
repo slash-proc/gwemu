@@ -26,7 +26,10 @@
 #include "qemu/osdep.h"
 #include <glib/gstdio.h>
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/error-report.h"
+#include "exec/icount.h"
+#include "exec/replay-core.h"
 #include "system/address-spaces.h"
 #include "system/runstate.h"
 #include "system/reset.h"
@@ -44,6 +47,50 @@
 #include "hw/misc/gnw_h7b0_regs_rcc.h"
 #include "target/arm/cpu.h"
 #include "hw/misc/gnw_h7b0_nor.h"
+#include "hw/misc/gnw_h7b0_tamp.h"
+
+/* Runtime receipts are admitted only after a separate review of the retained
+ * FIT/freeze/HOLDOUT/replay chain.  The DMA-engine r1 review is recorded in
+ * docs/timing-calibration/dma-engine-geometry-supplement-r1/.
+ */
+#define GNW_MDMA_AXI1_AUTHORIZED_RECEIPT_SHA256 \
+    "c1db7d250d4bd947543883fd7f9cf4f7d621ffed98b95d22e6b6807e42aac9ce"
+#define GNW_MDMA_AXI1_COMPARISON_ADMISSION_SHA256 \
+    "b0ec6c7d4338d1ab2f74a133570c8283094801846ab39b7ed08e08fcfd0eb1e4"
+#define GNW_MDMA_V37_BWM_FIT_ADMISSION_SHA256 \
+    "26b6f9369987761bc91085adf11e57aa734f4f7ea58f485dc7a6494e7861bb8b"
+#define GNW_DMA_ENGINE_R1_AUTHORIZED_RECEIPT_SHA256 \
+    "a4cbac646ba40c21f0e345f5f83124cac638e5c42dcfbc782ec54559bddfeb8e"
+
+static void gnw_h7b0_bus_v6_dma_tc(void *opaque, bool half,
+                                    uint32_t m0ar, uint32_t ndtr)
+{
+    (void)m0ar;
+    (void)ndtr;
+    if (!half) {
+        gnw_h7b0_mdma_bus_v6_request(opaque, 7);
+    }
+}
+
+static void gnw_h7b0_soc_tamp_backup_domain_reset(void *opaque)
+{
+    gnw_h7b0_tamp_backup_domain_reset(GNW_H7B0_TAMP(opaque));
+}
+
+static void gnw_h7b0_bus_v6_tim_update(void *opaque, int instance)
+{
+    GnwH7B0State *s = opaque;
+
+    if (instance == 4 && s->mdma.bus_v6_request_path) {
+        /* TIM6 update is DMAMUX1 request 69. */
+        gnw_h7b0_dma_peripheral_request(&s->dma, 69);
+    }
+}
+
+/* This deliberately empty allowlist makes the prospective v2 profile
+ * impossible to activate until a reviewed receipt and an exact coefficient
+ * ABI are compiled into the same change. */
+#define GNW_CPU_CACHE_DMA2D_V2_AUTHORIZED_RECEIPT_SHA256 ""
 
 /* GnWManager's Zelda payload is placed at 0x30c3a8. Save that span plus the
  * 1,300-byte ITCM validation window; Mario's payload is at offset zero. */
@@ -256,6 +303,8 @@ static void gnw_h7b0_soc_initfn(Object *obj)
 
 
     s->sysclk = qdev_init_clock_in(DEVICE(s), "sysclk", NULL, NULL, 0);
+    s->systick_refclk = clock_new(obj, "systick-refclk");
+    clock_set_hz(s->systick_refclk, 8000000);
 }
 
 /* Extend a flash image explicitly with the erased NOR value, never sparse
@@ -489,6 +538,99 @@ static uint8_t *gnw_h7b0_load_unlock_baseline(const char *image_path,
     return baseline;
 }
 
+static void gnw_h7b0_mdma_clock_changed(
+    void *opaque, GnwH7B0RccEngineClockInfo old_info,
+    GnwH7B0RccEngineClockInfo new_info)
+{
+    gnw_h7b0_mdma_set_clock_info(opaque, new_info.known,
+                               new_info.reference_hz, new_info.enabled);
+}
+
+static void gnw_h7b0_dma2d_clock_changed(
+    void *opaque, GnwH7B0RccEngineClockInfo old_info,
+    GnwH7B0RccEngineClockInfo new_info)
+{
+    gnw_h7b0_dma2d_set_clock_info(opaque, new_info.known,
+                                new_info.reference_hz, new_info.enabled);
+}
+
+static uint32_t gnw_h7b0_bus_masters_for_range(void *opaque,
+                                                uint64_t address,
+                                                unsigned size,
+                                                int64_t guest_time_ns)
+{
+    GnwH7B0State *s = opaque;
+
+    return gnw_h7b0_mdma_contends_for_range(&s->mdma, address, size) |
+           gnw_h7b0_mdma_large_contends_for_range(&s->mdma, address, size) |
+           gnw_h7b0_mdma_v37_bwm_contends_for_range(
+               &s->mdma, address, size, guest_time_ns) |
+           gnw_h7b0_dma2d_contends_for_range(&s->dma2d, address, size);
+}
+
+/* Exact scope of the retained unseen-size OSPI measurement. This callback is
+ * queried on each candidate CPU byte load so clock/controller changes fail
+ * closed without a duplicated shadow of RCC or OCTOSPI state. */
+static bool gnw_h7b0_xip_unseen_scope_valid(void *opaque)
+{
+    GnwH7B0State *s = opaque;
+    GnwH7B0OspiState *o = &s->octospi1;
+    uint32_t cr = o->regs[GNW_H7B0_OSPI_CR >> 2];
+    uint32_t dcr1 = o->regs[GNW_H7B0_OSPI_DCR1 >> 2];
+    uint32_t ccr = o->regs[GNW_H7B0_OSPI_CCR >> 2];
+    const GnwNorChip *chip;
+
+    if (o->chip_index >= GNW_NOR_CHIP_COUNT) {
+        return false;
+    }
+    chip = &gnw_nor_chips[o->chip_index];
+    return gnw_h7b0_rcc_get_hclk_hz(&s->rcc) == 280000000 &&
+        gnw_h7b0_rcc_get_octospi_kernel_hz(&s->rcc) == 280000000 &&
+        o->flash_size == 64ULL * 1024 * 1024 &&
+        chip->jedec[0] == 0xc2 && chip->jedec[1] == 0x25 &&
+        chip->jedec[2] == 0x3a && cr == 0x30000301 &&
+        dcr1 == 0x011b0108 &&
+        o->regs[GNW_H7B0_OSPI_DCR2 >> 2] == 0 &&
+        o->regs[0x10 >> 2] == 0 && o->regs[0x14 >> 2] == 0 &&
+        ccr == 0x01002101 &&
+        o->regs[GNW_H7B0_OSPI_TCR >> 2] == 0x8;
+}
+
+/* Read-only model-derived clock diagnostics for the frozen OSPI replay.
+ * Keeping these on the SoC makes the replay verify the same RCC getters used
+ * by the live profile predicate. */
+static void gnw_h7b0_soc_get_hclk_hz(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    GnwH7B0State *s = GNW_H7B0_SOC(obj);
+    uint64_t value = gnw_h7b0_rcc_get_hclk_hz(&s->rcc);
+
+    (void)opaque;
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void gnw_h7b0_soc_get_octospi_kernel_hz(Object *obj, Visitor *v,
+                                              const char *name, void *opaque,
+                                              Error **errp)
+{
+    GnwH7B0State *s = GNW_H7B0_SOC(obj);
+    uint64_t value = gnw_h7b0_rcc_get_octospi_kernel_hz(&s->rcc);
+
+    (void)opaque;
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static bool gnw_h7b0_cpu_bwm_comparison_enabled(GnwH7B0State *s)
+{
+    Object *cpu = OBJECT(s->armv7m.cpu);
+
+    return object_property_get_bool(cpu,
+               "x-gnw-m7-bus-contention-v37-bwm-comparison", &error_abort) ||
+           object_property_get_bool(cpu,
+               "x-gnw-m7-bus-contention-v46-bwm-17over4", &error_abort);
+}
+
 static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
 {
     GnwH7B0State *s = GNW_H7B0_SOC(dev_soc);
@@ -505,9 +647,86 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     s->extflash_size = nor_chip->size_bytes;
 
+    if (s->cpu_cache_dma2d_v2_profile) {
+        if (!s->cpu_cache_dma2d_v2_runtime_receipt_sha256 ||
+            !GNW_CPU_CACHE_DMA2D_V2_AUTHORIZED_RECEIPT_SHA256[0] ||
+            strcmp(s->cpu_cache_dma2d_v2_runtime_receipt_sha256,
+                   GNW_CPU_CACHE_DMA2D_V2_AUTHORIZED_RECEIPT_SHA256)) {
+            error_setg(errp, "the CPU/memory/cache/DMA2D v2 profile requires "
+                       "an exact reviewed runtime receipt; no receipt is "
+                       "authorized");
+            return;
+        }
+        if (!s->x_modeled_timing) {
+            error_setg(errp, "the CPU/memory/cache/DMA2D v2 profile requires "
+                       "x-modeled-timing=on");
+            return;
+        }
+        /* No coefficient installation belongs here until the reviewed model
+         * config has an exact C ABI.  The empty digest above keeps this path
+         * unreachable in the meantime. */
+    } else if (s->cpu_cache_dma2d_v2_runtime_receipt_sha256) {
+        error_setg(errp, "x-cpu-cache-dma2d-v2-runtime-receipt-sha256 "
+                   "requires x-cpu-cache-dma2d-v2-profile=on");
+        return;
+    }
+
+    if (s->x_modeled_timing) {
+        if (use_icount != ICOUNT_PRECISE ||
+            (icount_sleep_enabled() && !icount_alignment_enabled())) {
+            error_setg(errp, "gnw-h7b0 experimental modeled timing requires "
+                       "precise TCG -icount with sleep disabled or "
+                       "realtime alignment enabled "
+                       "(-icount shift=0,sleep=off or "
+                       "shift=0,align=on,sleep=on)");
+            return;
+        }
+        if (s->x_timing_test_cycles_per_insn || s->x_timing_test_half_rate) {
+            error_setg(errp, "gnw-h7b0 experimental modeled timing cannot be "
+                       "combined with x-timing-test-cycle properties");
+            return;
+        }
+        if (!icount_enable_experimental_m7_cycle_model()) {
+            error_setg(errp, "gnw-h7b0 experimental modeled timing conflicts "
+                       "with another icount cycle model");
+            return;
+        }
+        s->timing_mode = true;
+        qdev_prop_set_bit(DEVICE(&s->armv7m),
+                          "x-gnw-m7-cycle-model", true);
+    }
+
     if (!clock_has_source(s->sysclk)) {
         error_setg(errp, "sysclk clock must be wired up by the board code");
         return;
+    }
+    if (s->timing_mode && use_icount != ICOUNT_PRECISE) {
+        error_setg(errp, "gnw-h7b0 timing mode requires precise TCG -icount "
+                   "(for example: -icount shift=0)");
+        return;
+    }
+    if (s->timing_mode && replay_mode != REPLAY_MODE_NONE) {
+        error_setg(errp, "gnw-h7b0 timing mode does not support record/replay");
+        return;
+    }
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->dwt), "timing-mode", true);
+    }
+    if (s->x_timing_test_cycles_per_insn && s->x_timing_test_half_rate) {
+        error_setg(errp, "x-timing-test-cycle properties are mutually exclusive");
+        return;
+    }
+    if (s->x_timing_test_cycles_per_insn || s->x_timing_test_half_rate) {
+        if (!s->timing_mode) {
+            error_setg(errp, "x-timing-test-cycle properties require "
+                       "gnw-h7b0 timing mode");
+            return;
+        }
+        if (s->x_timing_test_half_rate) {
+            icount_set_test_half_rate();
+        } else {
+            icount_set_test_cycle_scale(s->x_timing_test_cycles_per_insn);
+        }
     }
 
 #define INIT_RAM_REGION(field, name, base, size) \
@@ -698,6 +917,9 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     qdev_prop_set_uint32(armv7m, "num-irq", 160);
     qdev_prop_set_uint8(armv7m, "num-prio-bits", 4);
     qdev_prop_set_string(armv7m, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m7"));
+    qdev_prop_set_uint32(armv7m, "itcm-size", ITCM_SIZE);
+    qdev_prop_set_bit(armv7m, "itcm-init-enable", true);
+    qdev_prop_set_bit(armv7m, "itcm-init-rmw-enable", true);
     qdev_prop_set_bit(armv7m, "enable-bitband", true);
     /*
      * Real hardware boots from flash bank 1 at 0x08000000 via BOOT_ADD
@@ -716,7 +938,10 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      */
     qdev_prop_set_uint32(armv7m, "init-nsvtor", FLASH_BANK1_BASE_ADDRESS);
     qdev_connect_clock_in(armv7m, "cpuclk", s->sysclk);
-    qdev_connect_clock_in(armv7m, "refclk", s->sysclk);
+    /* The Cortex-M7 external SysTick reference is HCLK/8 independently of
+     * whether experimental modeled timing is enabled.  CLKSOURCE=1 remains
+     * connected to the processor clock above. */
+    qdev_connect_clock_in(armv7m, "refclk", s->systick_refclk);
     object_property_set_link(OBJECT(&s->armv7m), "memory",
                               OBJECT(system_memory), &error_abort);
     /*
@@ -732,16 +957,87 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
 
+    /*
+     * The calibrated CPU penalty and MDMA service rate are one measured
+     * contract.  Accepting either side alone would create an overlap window
+     * or a CPU coefficient that was never validated as a standalone mode.
+     * Check this only after the ARMv7-M container has realized its CPU.
+     */
+    bool mdma_axi1_profile = object_property_get_bool(
+        OBJECT(s->armv7m.cpu),
+        "x-gnw-m7-bus-contention-mdma-axi1-v1", &error_abort);
+    bool bwm_comparison_profile = gnw_h7b0_cpu_bwm_comparison_enabled(s);
+    bool mdma_axi1_runtime_authorized =
+        s->mdma_axi1_runtime_receipt_sha256 &&
+        GNW_MDMA_AXI1_AUTHORIZED_RECEIPT_SHA256[0] &&
+        !strcmp(s->mdma_axi1_runtime_receipt_sha256,
+                GNW_MDMA_AXI1_AUTHORIZED_RECEIPT_SHA256);
+    bool mdma_axi1_comparison_admitted =
+        s->mdma_axi1_comparison_mode &&
+        s->mdma_axi1_runtime_receipt_sha256 &&
+        !strcmp(s->mdma_axi1_runtime_receipt_sha256,
+                GNW_MDMA_AXI1_COMPARISON_ADMISSION_SHA256);
+    bool v37_bwm_comparison_admitted =
+        s->mdma_v37_bwm_comparison_mode &&
+        s->mdma_v37_bwm_fit_receipt_sha256 &&
+        !strcmp(s->mdma_v37_bwm_fit_receipt_sha256,
+                GNW_MDMA_V37_BWM_FIT_ADMISSION_SHA256);
+    if (bwm_comparison_profile &&
+        (!v37_bwm_comparison_admitted || !s->mdma.test_profile ||
+         !s->timing_mode || mdma_axi1_profile ||
+         object_property_get_bool(OBJECT(s->armv7m.cpu),
+             "x-gnw-m7-bus-contention-test-profile", &error_abort))) {
+        error_setg(errp, "the experimental BWM coefficient requires timing "
+                   "mode, the exact BWM admission receipt, the transient "
+                   "MDMA test profile, and no other contention profile");
+        return;
+    }
+    if ((s->mdma_v37_bwm_comparison_mode ||
+         s->mdma_v37_bwm_fit_receipt_sha256) &&
+        (!bwm_comparison_profile || !v37_bwm_comparison_admitted)) {
+        error_setg(errp, "v37 BWM comparison admission requires its exact "
+                   "receipt and paired CPU candidate");
+        return;
+    }
+    if (mdma_axi1_profile && !mdma_axi1_runtime_authorized &&
+        !mdma_axi1_comparison_admitted) {
+        error_setg(errp, "the MDMA AXI1 v1 coefficient requires an exact "
+                   "reviewed runtime receipt or frozen comparison admission");
+        return;
+    }
+    if (s->mdma_axi1_comparison_mode && !mdma_axi1_comparison_admitted) {
+        error_setg(errp, "x-mdma-axi1-comparison-mode requires the exact "
+                   "frozen comparison-only admission and paired profile");
+        return;
+    }
+    if (!mdma_axi1_profile && s->mdma_axi1_runtime_receipt_sha256) {
+        error_setg(errp, "x-mdma-axi1-runtime-receipt-sha256 requires the "
+                   "paired CPU/MDMA AXI1 v1 profiles");
+        return;
+    }
+
+    qdev_connect_gpio_out_named(DEVICE(&s->armv7m.nvic), "trace-enable", 0,
+        qdev_get_gpio_in_named(DEVICE(&s->dwt), "trace-enable", 0));
+    /* CPU stall accounting advances virtual time.  Requiring SoC timing mode
+     * keeps DWT and peripheral deadlines on the same timing contract. */
+    if (s->armv7m.cpu->gnw_m7_cycle_model && !s->timing_mode) {
+        error_setg(errp, "x-gnw-m7-cycle-model requires "
+                   "gnw-h7b0-soc.timing-mode=on");
+        return;
+    }
+
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->rcc), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->rcc), 0, RCC_BASE_ADDRESS);
-    /* s->sysclk is wired by the board (gnw_h7b0.c) before realize, same
-     * as the sai1_set_dma/sai1_set_rcc pattern below -- lets RCC push
-     * live PLL1/SYSCLK recomputes out to the ARMv7M cpuclk/refclk and
-     * anything else downstream, instead of the Clock staying pinned at
-     * its pre-realize bootstrap value forever. */
+    /* The board wires s->sysclk before realize; RCC updates it with the
+     * core rate and updates systick_refclk independently with HCLK / 8. */
     gnw_h7b0_rcc_set_sysclk(&s->rcc, s->sysclk);
+    gnw_h7b0_rcc_set_systick_refclk(&s->rcc, s->systick_refclk);
+    if (s->timing_mode) {
+        gnw_h7b0_rcc_init_timing_clock(&s->rcc);
+    }
+    gnw_h7b0_dwt_set_rcc(&s->dwt, &s->rcc);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->pwr), errp)) {
         return;
@@ -753,6 +1049,9 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     qdev_prop_set_uint64(DEVICE(&s->octospi1), "flash-size", s->extflash_size);
     qdev_prop_set_uint32(DEVICE(&s->octospi1), "chip-index",
                          (uint32_t)(nor_chip - gnw_nor_chips));
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->octospi1), "timing-mode", true);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->octospi1), errp)) {
         return;
     }
@@ -780,6 +1079,9 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     qdev_prop_set_uint64(DEVICE(&s->octospi2), "flash-size", s->extflash_size);
     qdev_prop_set_uint32(DEVICE(&s->octospi2), "chip-index",
                          (uint32_t)(nor_chip - gnw_nor_chips));
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->octospi2), "timing-mode", true);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->octospi2), errp)) {
         return;
     }
@@ -787,6 +1089,22 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->octospi2), 0,
                         qdev_get_gpio_in(armv7m, OCTOSPI2_IRQn));
 
+    gnw_h7b0_ospi_set_kernel_clock_hz(&s->octospi1,
+                                   gnw_h7b0_rcc_get_octospi_kernel_hz(&s->rcc));
+    gnw_h7b0_rcc_add_octospi_clock_observer(
+        &s->rcc, gnw_h7b0_ospi_kernel_clock_changed, &s->octospi1);
+    gnw_h7b0_ospi_set_kernel_clock_hz(&s->octospi2,
+                                   gnw_h7b0_rcc_get_octospi_kernel_hz(&s->rcc));
+    gnw_h7b0_rcc_add_octospi_clock_observer(
+        &s->rcc, gnw_h7b0_ospi_kernel_clock_changed, &s->octospi2);
+    gnw_h7b0_rcc_add_reset_target(&s->rcc, GNW_H7B0_RCC_AHB3RSTR_OFFSET, 14,
+                                DEVICE(&s->octospi1));
+    gnw_h7b0_rcc_add_reset_target(&s->rcc, GNW_H7B0_RCC_AHB3RSTR_OFFSET, 19,
+                                DEVICE(&s->octospi2));
+
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->adc), "timing-mode", true);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->adc), errp)) {
         return;
     }
@@ -809,12 +1127,35 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
                         qdev_get_gpio_in(armv7m, LTDC_IRQn));
     gnw_h7b0_ltdc_set_rcc(&s->ltdc, &s->rcc);
 
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->dma2d), "timing-mode", true);
+    }
+    if (GNW_DMA_ENGINE_R1_AUTHORIZED_RECEIPT_SHA256[0] &&
+        s->timing_mode && s->armv7m.cpu->gnw_m7_cycle_model &&
+        !s->dma2d.test_profile && !s->dma2d.dma2d_poll_r4_profile) {
+        qdev_prop_set_bit(DEVICE(&s->dma2d),
+                          "x-dma-engine-successor-r1-profile", true);
+        qdev_prop_set_string(DEVICE(&s->dma2d),
+            "x-dma-engine-successor-r1-receipt-sha256",
+            GNW_DMA_ENGINE_R1_AUTHORIZED_RECEIPT_SHA256);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dma2d), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->dma2d), 0, DMA2D_BASE_ADDRESS);
+    {
+        GnwH7B0RccEngineClockInfo info = gnw_h7b0_rcc_engine_clock_info(
+            &s->rcc, GNW_H7B0_RCC_ENGINE_DMA2D);
+        gnw_h7b0_dma2d_set_clock_info(&s->dma2d, info.known,
+                                   info.reference_hz, info.enabled);
+        gnw_h7b0_rcc_add_engine_clock_observer(
+            &s->rcc, GNW_H7B0_RCC_ENGINE_DMA2D,
+            gnw_h7b0_dma2d_clock_changed, &s->dma2d);
+    }
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->dma2d), 0,
                         qdev_get_gpio_in(armv7m, DMA2D_IRQn));
+    gnw_h7b0_rcc_add_reset_target(&s->rcc, GNW_H7B0_RCC_AHB3RSTR_OFFSET, 4,
+                                DEVICE(&s->dma2d));
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->spi2), errp)) {
         return;
@@ -828,12 +1169,24 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi1), 0,
                         qdev_get_gpio_in(armv7m, SPI1_IRQn));
 
+    /*
+     * Timing mode promises a reproducible guest timeline.  Leaving the RTC's
+     * default initial epoch at -1 would still sample time(NULL) here, making
+     * TR/DR depend on when (and in which host timezone) QEMU was launched.
+     * Keep the interactive default host-local clock, but give timing mode a
+     * deterministic UTC seed unless the caller supplied an explicit epoch.
+     */
+    if (s->timing_mode && s->rtc.initial_epoch == -1) {
+        s->rtc.initial_epoch = 0;
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->rtc), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->rtc), 0, RTC_BASE_ADDRESS);
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc), 0,
                         qdev_get_gpio_in(armv7m, RTC_Alarm_IRQn));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc), 1,
+                        qdev_get_gpio_in(DEVICE(&s->exti), 19));
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->crc), errp)) {
         return;
@@ -849,10 +1202,58 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      * gnw_h7b0_rng.c), so this line is HASH's alone for now. */
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->hash), 0, qdev_get_gpio_in(armv7m, 80));
 
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->mdma), "timing-mode", true);
+    }
+    if (GNW_DMA_ENGINE_R1_AUTHORIZED_RECEIPT_SHA256[0] &&
+        s->timing_mode && s->armv7m.cpu->gnw_m7_cycle_model &&
+        !s->mdma.test_profile && !s->mdma.mdma_axi1_v1_profile) {
+        qdev_prop_set_bit(DEVICE(&s->mdma),
+                          "x-dma-engine-successor-r1-profile", true);
+        qdev_prop_set_string(DEVICE(&s->mdma),
+            "x-dma-engine-successor-r1-receipt-sha256",
+            GNW_DMA_ENGINE_R1_AUTHORIZED_RECEIPT_SHA256);
+    }
+    if (mdma_axi1_runtime_authorized &&
+        (s->mdma.mdma_axi1_v1_profile ||
+         !s->mdma.dma_engine_successor_profile)) {
+        error_setg(errp, "the authorized MDMA AXI1 contention profile "
+                   "requires the exact large-transfer producer profile");
+        return;
+    }
+    if ((!mdma_axi1_profile && s->mdma.mdma_axi1_v1_profile) ||
+        (mdma_axi1_profile &&
+         !s->mdma.mdma_axi1_v1_profile &&
+         !s->mdma.dma_engine_successor_profile) ||
+        (s->mdma.mdma_axi1_v1_profile &&
+         s->mdma.dma_engine_successor_profile)) {
+        error_setg(errp, "the CPU contention profile requires exactly one "
+                   "paired MDMA timing profile");
+        return;
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->mdma), errp)) {
         return;
     }
+    gnw_cycle_model_set_bus_contention_probe(
+        CPU(s->armv7m.cpu), gnw_h7b0_bus_masters_for_range, s);
+    if (s->armv7m.cpu->gnw_m7_xip_service_unseen_v1_profile) {
+        gnw_cycle_model_set_xip_unseen_scope_probe(
+            CPU(s->armv7m.cpu), gnw_h7b0_xip_unseen_scope_valid, s);
+    }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->mdma), 0, MDMA_BASE_ADDRESS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->mdma), 0,
+                       qdev_get_gpio_in(armv7m, 122));
+    {
+        GnwH7B0RccEngineClockInfo info = gnw_h7b0_rcc_engine_clock_info(
+            &s->rcc, GNW_H7B0_RCC_ENGINE_MDMA);
+        gnw_h7b0_mdma_set_clock_info(&s->mdma, info.known,
+                                   info.reference_hz, info.enabled);
+        gnw_h7b0_rcc_add_engine_clock_observer(
+            &s->rcc, GNW_H7B0_RCC_ENGINE_MDMA,
+            gnw_h7b0_mdma_clock_changed, &s->mdma);
+    }
+    gnw_h7b0_rcc_add_reset_target(&s->rcc, GNW_H7B0_RCC_AHB3RSTR_OFFSET, 0,
+                                DEVICE(&s->mdma));
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->rng), errp)) {
         return;
@@ -877,10 +1278,14 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
      * for the CPU-architected 0xe0001000 DWT address. Still needs its
      * own realize for reset/vmstate registration.
      */
+    qdev_connect_clock_in(DEVICE(&s->dwt), "sysclk", s->sysclk);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dwt), errp)) {
         return;
     }
 
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->flash_r), "timing-mode", true);
+    }
     gnw_h7b0_flash_r_set_initial_locked(&s->flash_r, s->rdp_locked);
     if (s->rdp_image && s->rdp_image[0]) {
         gnw_h7b0_flash_r_set_rdp_image(&s->flash_r, s->rdp_image);
@@ -948,6 +1353,9 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
                         qdev_get_gpio_in(armv7m, EXTI9_5_IRQn));
     sysbus_connect_irq(SYS_BUS_DEVICE(&s->exti), 6,
                         qdev_get_gpio_in(armv7m, EXTI15_10_IRQn));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->exti),
+                        GNW_H7B0_EXTI_RTC_WKUP_OUTPUT,
+                        qdev_get_gpio_in(armv7m, RTC_WKUP_IRQn));
     /* GPIO's PA0-release logic needs to notify EXTI of a real edge -- see
      * gnw_h7b0_gpio.c. Both devices already exist and are realized by
      * this point; this just wires the pointer, not a QOM property, since
@@ -975,10 +1383,15 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->syscfg), 0, EXTI_SYSCFG_BASE_ADDRESS + 0x400);
 
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->dma), "timing-mode", true);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dma), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->dma), 0, DMA_BASE_ADDRESS);
+    gnw_h7b0_dma_set_stream_notifier(&s->dma, 7,
+                                      gnw_h7b0_bus_v6_dma_tc, &s->mdma);
     {
         /* DMA1 Stream0-6 (11-17), Stream7 (47); DMA2 Stream0-4 (56-60),
          * Stream5-7 (68-70) -- see stm32h7b0xx.h's IRQn_Type, not a
@@ -1017,6 +1430,9 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
                                    DEVICE(&s->sai1));
     gnw_h7b0_hash_set_dma(&s->hash, &s->dma);
     gnw_h7b0_adc_set_dma(&s->adc, &s->dma);
+    gnw_h7b0_adc_set_rcc(&s->adc, &s->rcc);
+    gnw_h7b0_rcc_add_reset_target(&s->rcc, GNW_H7B0_RCC_AHB1RSTR_OFFSET, 5,
+                                DEVICE(&s->adc));
     /* SPI1 only -- SPI2 drives the LCD panel with no DMA at all. */
     gnw_h7b0_spi_set_dma(&s->spi1, &s->dma);
 
@@ -1030,12 +1446,20 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->dac2), 0, DAC2_BASE_ADDRESS);
 
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->tim1), "timing-mode", true);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->tim1), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->tim1), 0, TIM1_BASE_ADDRESS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->tim1), 0,
+                       qdev_get_gpio_in(armv7m, TIM1_UP_IRQn));
     gnw_h7b0_tim1_set_rcc(&s->tim1, &s->rcc);
 
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->jpeg), "timing-mode", true);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->jpeg), errp)) {
         return;
     }
@@ -1045,17 +1469,32 @@ static void gnw_h7b0_soc_realize(DeviceState *dev_soc, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->tamp), 0, TAMP_BASE_ADDRESS);
+    gnw_h7b0_rcc_set_backup_domain_reset(
+        &s->rcc, gnw_h7b0_soc_tamp_backup_domain_reset, &s->tamp);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->wwdg), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->wwdg), 0, WWDG_BASE_ADDRESS);
 
+    if (s->timing_mode) {
+        qdev_prop_set_bit(DEVICE(&s->tim2), "timing-mode", true);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->tim2), errp)) {
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->tim2), 0, TIM2_BLOCK_BASE_ADDRESS);
+    static const int tim_irqs[GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT] = {
+        TIM2_IRQn, TIM3_IRQn, TIM4_IRQn, TIM5_IRQn, TIM6_DAC_IRQn, TIM7_IRQn,
+        TIM8_BRK_TIM12_IRQn, TIM8_UP_TIM13_IRQn, TIM8_TRG_COM_TIM14_IRQn,
+    };
+    for (int i = 0; i < GNW_H7B0_TIM2_BLOCK_INSTANCE_COUNT; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->tim2), i,
+                           qdev_get_gpio_in(armv7m, tim_irqs[i]));
+    }
     gnw_h7b0_tim2_set_rcc(&s->tim2, &s->rcc);
+    gnw_h7b0_tim2_set_update_notifier(&s->tim2,
+                                       gnw_h7b0_bus_v6_tim_update, s);
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->iwdg), errp)) {
         return;
@@ -1106,6 +1545,26 @@ static const Property gnw_h7b0_soc_properties[] = {
     DEFINE_PROP_STRING("extflash-chip", GnwH7B0State, extflash_chip),
     DEFINE_PROP_STRING("rdp-image", GnwH7B0State, rdp_image),
     DEFINE_PROP_BOOL("rdp-locked", GnwH7B0State, rdp_locked, false),
+    DEFINE_PROP_BOOL("timing-mode", GnwH7B0State, timing_mode, false),
+    DEFINE_PROP_BOOL("x-modeled-timing", GnwH7B0State,
+                     x_modeled_timing, false),
+    DEFINE_PROP_BOOL("x-cpu-cache-dma2d-v2-profile", GnwH7B0State,
+                     cpu_cache_dma2d_v2_profile, false),
+    DEFINE_PROP_STRING("x-cpu-cache-dma2d-v2-runtime-receipt-sha256",
+                       GnwH7B0State,
+                       cpu_cache_dma2d_v2_runtime_receipt_sha256),
+    DEFINE_PROP_STRING("x-mdma-axi1-runtime-receipt-sha256", GnwH7B0State,
+                       mdma_axi1_runtime_receipt_sha256),
+    DEFINE_PROP_BOOL("x-mdma-axi1-comparison-mode", GnwH7B0State,
+                     mdma_axi1_comparison_mode, false),
+    DEFINE_PROP_STRING("x-mdma-v37-bwm-fit-receipt-sha256", GnwH7B0State,
+                       mdma_v37_bwm_fit_receipt_sha256),
+    DEFINE_PROP_BOOL("x-mdma-v37-bwm-comparison-mode", GnwH7B0State,
+                     mdma_v37_bwm_comparison_mode, false),
+    DEFINE_PROP_UINT32("x-timing-test-cycles-per-insn", GnwH7B0State,
+                       x_timing_test_cycles_per_insn, 0),
+    DEFINE_PROP_BOOL("x-timing-test-half-rate", GnwH7B0State,
+                     x_timing_test_half_rate, false),
 };
 
 static void gnw_h7b0_soc_finalize(Object *obj)
@@ -1141,6 +1600,15 @@ static void gnw_h7b0_soc_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = gnw_h7b0_soc_realize;
     device_class_set_props(dc, gnw_h7b0_soc_properties);
+    object_class_property_add(klass, "x-hclk-hz", "uint64",
+                              gnw_h7b0_soc_get_hclk_hz, NULL, NULL, NULL);
+    object_class_property_set_description(klass, "x-hclk-hz",
+        "Read-only RCC model HCLK frequency in Hz");
+    object_class_property_add(klass, "x-octospi-kernel-hz", "uint64",
+                              gnw_h7b0_soc_get_octospi_kernel_hz,
+                              NULL, NULL, NULL);
+    object_class_property_set_description(klass, "x-octospi-kernel-hz",
+        "Read-only RCC model OCTOSPI kernel frequency in Hz");
 }
 
 static const TypeInfo gnw_h7b0_soc_info = {

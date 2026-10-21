@@ -27,6 +27,7 @@
 #include "exec/vaddr.h"
 #include "exec/memattrs.h"
 #include "exec/mmu-access-type.h"
+#include "exec/gnw-cycle-model.h"
 #include "exec/tlb-common.h"
 #include "qapi/qapi-types-machine.h"
 #include "qapi/qapi-types-run-state.h"
@@ -217,6 +218,14 @@ typedef uint32_t MMUIdxMap;
  * so the layout is not as critical as that of CPUTLBEntry. This is
  * also why we don't want to combine the two structs.
  */
+typedef enum CPUTLBArmPMSASource {
+    CPUTLB_ARM_PMSA_NONE,
+    CPUTLB_ARM_PMSA_REGION,
+    CPUTLB_ARM_PMSA_DISABLED,
+    CPUTLB_ARM_PMSA_BACKGROUND,
+    CPUTLB_ARM_PMSA_PPB,
+} CPUTLBArmPMSASource;
+
 struct CPUTLBEntryFull {
     /*
      * @xlat_offset: TARGET_PAGE_BITS aligned offset which must be added to
@@ -272,6 +281,15 @@ struct CPUTLBEntryFull {
             uint8_t pte_attrs;
             uint8_t shareability;
             bool guarded;
+            /*
+             * PMSAv7 MPU attributes do not use the MAIR format above.
+             * Preserve the selected region's raw RASR TEX/S/C/B fields
+             * separately for target-specific observers.
+             */
+            uint8_t pmsa_attrs;
+            uint8_t pmsa_region;
+            uint8_t pmsa_source;
+            bool pmsa_valid;
         } arm;
     } extra;
 };
@@ -514,6 +532,13 @@ struct CPUState {
     int singlestep_enabled;
     int64_t icount_budget;
     int64_t icount_extra;
+    /*
+     * Dynamic icount model output waiting for the next exact retired-insn
+     * checkpoint.  Only the owning vCPU thread accesses these fields.
+     */
+    uint64_t icount_model_pending_retired;
+    uint64_t icount_model_pending_cycles;
+    GnwCycleModelState gnw_cycle_model;
     uint64_t random_seed;
     sigjmp_buf jmp_env;
 

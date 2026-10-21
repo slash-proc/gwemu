@@ -10,10 +10,12 @@
  * silicon they live in the always-on VBAT domain and survive a CPU-only
  * reset (NVIC_SystemReset()/SYSRESETREQ) or any other non-power-on system
  * reset -- only VBAT loss or an explicit RCC_BDCR.BDRST backup-domain
- * reset clears them. QEMU's device reset() has no "cold power-on vs. warm
- * system reset" distinction and was previously clearing the whole TAMP
- * register file (including these) on every reset, which broke any
- * firmware relying on a backup register surviving NVIC_SystemReset() (see
+ * reset clears them. QEMU's device reset() is invoked on system reset, so
+ * preserve these registers after their initial values are established. A
+ * separate RCC BDRST hook clears them explicitly. Previously this reset
+ * callback assigned reset values to the whole BKP range on every reset,
+ * which broke firmware relying on a backup register surviving
+ * NVIC_SystemReset() (see
  * stm32h7b0-diag's case_boot_reset_cause.c, which plants a marker in
  * BKP0R across a deliberate self-reset -- confirmed empirically on real
  * hardware to survive, per that case's own header comment). Excluding
@@ -28,13 +30,30 @@ static void gnw_h7b0_tamp_reset(DeviceState *dev)
     GnwH7B0TampState *s = GNW_H7B0_TAMP(dev);
     for (int i = 0; i < (GNW_H7B0_TAMP_SIZE / 4); i++) {
         uint32_t offset = i * 4;
-        if (offset >= GNW_H7B0_TAMP_BKP_FIRST_OFFSET &&
-            offset <= GNW_H7B0_TAMP_BKP_LAST_OFFSET) {
-            s->regs[i] = (offset == GNW_H7B0_TAMP_BKP0R_OFFSET) ? 0x32F2 : get_tamp_reset_value(offset);
-        } else {
+        if (offset < GNW_H7B0_TAMP_BKP_FIRST_OFFSET ||
+            offset > GNW_H7B0_TAMP_BKP_LAST_OFFSET) {
             s->regs[i] = get_tamp_reset_value(offset);
         }
     }
+
+    if (!s->backup_domain_initialized) {
+        for (uint32_t offset = GNW_H7B0_TAMP_BKP_FIRST_OFFSET;
+             offset <= GNW_H7B0_TAMP_BKP_LAST_OFFSET; offset += 4) {
+            s->regs[offset >> 2] = get_tamp_reset_value(offset);
+        }
+        /* Preserve the emulator's established initial marker value. */
+        s->regs[GNW_H7B0_TAMP_BKP0R_OFFSET >> 2] = 0x32F2;
+        s->backup_domain_initialized = true;
+    }
+}
+
+void gnw_h7b0_tamp_backup_domain_reset(GnwH7B0TampState *s)
+{
+    for (uint32_t offset = GNW_H7B0_TAMP_BKP_FIRST_OFFSET;
+         offset <= GNW_H7B0_TAMP_BKP_LAST_OFFSET; offset += 4) {
+        s->regs[offset >> 2] = get_tamp_reset_value(offset);
+    }
+    s->backup_domain_initialized = true;
 }
 
 static uint64_t gnw_h7b0_tamp_read(void *opaque, hwaddr addr, unsigned int size)
@@ -73,14 +92,27 @@ static void gnw_h7b0_tamp_init(Object *obj)
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
 }
 
+static int gnw_h7b0_tamp_post_load(void *opaque, int version_id)
+{
+    GnwH7B0TampState *s = GNW_H7B0_TAMP(opaque);
+
+    /* Older migration streams contain the BKP values but not this latch. */
+    if (version_id < 2) {
+        s->backup_domain_initialized = true;
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_gnw_h7b0_tamp = {
     .name = TYPE_GNW_H7B0_TAMP,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, GnwH7B0TampState, GNW_H7B0_TAMP_SIZE / 4),
+        VMSTATE_BOOL_V(backup_domain_initialized, GnwH7B0TampState, 2),
         VMSTATE_END_OF_LIST()
-    }
+    },
+    .post_load = gnw_h7b0_tamp_post_load,
 };
 
 static void gnw_h7b0_tamp_class_init(ObjectClass *klass, const void *data)

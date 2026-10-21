@@ -616,6 +616,9 @@ typedef struct CPUArchState {
         uint32_t basepri[M_REG_NUM_BANKS];
         uint32_t control[M_REG_NUM_BANKS];
         uint32_t ccr[M_REG_NUM_BANKS]; /* Configuration and Control */
+        uint32_t actlr; /* Auxiliary Control (Cortex-M7 DISFOLD) */
+        uint32_t itcmcr; /* Cortex-M7 Instruction TCM Control */
+        uint32_t demcr; /* Debug Exception and Monitor Control */
         uint32_t cfsr[M_REG_NUM_BANKS]; /* Configurable Fault Status */
         uint32_t hfsr; /* HardFault Status */
         uint32_t dfsr; /* Debug Fault Status Register */
@@ -1068,6 +1071,29 @@ struct ArchCPU {
 
     /* QOM property to indicate we should use the back-compat CNTFRQ default */
     bool backcompat_cntfrq;
+    uint32_t itcm_size;
+    uint32_t itcm_init_enable;
+    uint32_t itcm_init_rmw_enable;
+    /* Hidden, unvalidated completed-instruction timing experiment. */
+    bool gnw_m7_cycle_model;
+    bool gnw_m7_cycle_model_test_near_rebase;
+    bool gnw_m7_xip_service_test_profile;
+    bool gnw_m7_xip_service_unseen_v1_profile;
+    bool gnw_m7_bus_contention_test_profile;
+    bool gnw_m7_bus_contention_mdma_axi1_profile;
+    bool gnw_m7_bus_contention_v37_bwm_comparison;
+    bool gnw_m7_bus_contention_v46_bwm_17_4;
+    bool gnw_m7_cpu_ram_itcm_profile;
+    bool gnw_m7_exception_transition_profile;
+    bool gnw_m7_fetch_residual_profile;
+    bool gnw_m7_memory_residual_profile;
+    bool gnw_m7_schedule_history_profile;
+    bool gnw_m7_load_path_candidate;
+    char *gnw_m7_flash_schedule_diagnostic_sha256;
+    char *gnw_m7_dcache_policy_name;
+    uint8_t gnw_m7_dcache_policy;
+    /* Always-migrated mode identity, including the disabled mode. */
+    uint32_t gnw_m7_cycle_model_migration_config;
 
     /* QOM property to indicate we should use the back-compat QARMA5 default */
     bool backcompat_pauth_default_use_qarma5;

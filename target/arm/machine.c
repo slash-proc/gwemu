@@ -12,6 +12,7 @@
 #include "migration/vmstate.h"
 #include "target/arm/gtimer.h"
 #include "hw/arm/machines-qom.h"
+#include "hw/intc/armv7m_nvic.h"
 
 static bool vfp_needed(void *opaque)
 {
@@ -387,6 +388,74 @@ static bool m_needed(void *opaque)
     return arm_feature(env, ARM_FEATURE_M);
 }
 
+static bool m_actlr_needed(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    return (cpu->midr & 0xff0ffff0) == 0x410fc270;
+}
+
+static const VMStateDescription vmstate_m_actlr = {
+    .name = "cpu/m/actlr",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = m_actlr_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(env.v7m.actlr, ARMCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool m_itcmcr_needed(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+    return m_actlr_needed(opaque) && cpu->itcm_size;
+}
+
+static int m_itcmcr_validate(void *opaque, int version_id)
+{
+    ARMCPU *cpu = opaque;
+    return cpu->env.v7m.itcmcr & ~0x7 ? -EINVAL : 0;
+}
+
+static const VMStateDescription vmstate_m_itcmcr = {
+    .name = "cpu/m/itcmcr",
+    .version_id = 2,
+    .minimum_version_id = 1,
+    .needed = m_itcmcr_needed,
+    .post_load = m_itcmcr_validate,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(itcm_size, ARMCPU, NULL),
+        VMSTATE_UINT32_EQUAL(itcm_init_enable, ARMCPU, NULL),
+        VMSTATE_UINT32_EQUAL_V(itcm_init_rmw_enable, ARMCPU, 2, NULL),
+        VMSTATE_UINT32(env.v7m.itcmcr, ARMCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int m_demcr_validate(void *opaque, int version_id)
+{
+    ARMCPU *cpu = opaque;
+    if (cpu->env.v7m.demcr & ~(1U << 24)) {
+        return -EINVAL;
+    }
+    armv7m_nvic_set_trace_enable(cpu->env.nvic,
+                                !!(cpu->env.v7m.demcr & (1U << 24)));
+    return 0;
+}
+
+static const VMStateDescription vmstate_m_demcr = {
+    .name = "cpu/m/demcr",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = m_needed,
+    .post_load = m_demcr_validate,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(env.v7m.demcr, ARMCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_m_faultmask_primask = {
     .name = "cpu/m/faultmask-primask",
     .version_id = 1,
@@ -582,6 +651,9 @@ static const VMStateDescription vmstate_m = {
         &vmstate_m_fp,
         &vmstate_m_mve,
         &vmstate_m_mpu_rnr_invalid,
+        &vmstate_m_actlr,
+        &vmstate_m_itcmcr,
+        &vmstate_m_demcr,
         NULL
     }
 };
@@ -1240,10 +1312,711 @@ static int cpu_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static const VMStateDescription vmstate_gnw_cycle_metadata = {
+    .name = "cpu/gnw-cycle-model/metadata",
+    .version_id = 2,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(pc, GnwCycleInsnMetadata),
+        VMSTATE_UINT32(encoding, GnwCycleInsnMetadata),
+        VMSTATE_UINT16(gpr_reads, GnwCycleInsnMetadata),
+        VMSTATE_UINT16(gpr_writes, GnwCycleInsnMetadata),
+        VMSTATE_UINT16(store_data_reads, GnwCycleInsnMetadata),
+        VMSTATE_UINT16(address_reads, GnwCycleInsnMetadata),
+        VMSTATE_UINT8(size, GnwCycleInsnMetadata),
+        VMSTATE_UINT8(insn_class, GnwCycleInsnMetadata),
+        VMSTATE_UINT8(flags, GnwCycleInsnMetadata),
+        VMSTATE_UINT8(fallback_reason, GnwCycleInsnMetadata),
+        VMSTATE_UINT8(apsr_reads, GnwCycleInsnMetadata),
+        VMSTATE_UINT8(apsr_writes, GnwCycleInsnMetadata),
+        VMSTATE_UINT8(memory_kind, GnwCycleInsnMetadata),
+        VMSTATE_UINT8(memory_size, GnwCycleInsnMetadata),
+        VMSTATE_UINT8_V(region_load_latency_class, GnwCycleInsnMetadata, 2),
+        VMSTATE_UINT64(branch_target, GnwCycleInsnMetadata),
+        VMSTATE_UINT64(memory_address, GnwCycleInsnMetadata),
+        VMSTATE_UINT32(memory_attributes, GnwCycleInsnMetadata),
+        VMSTATE_BOOL(branch_taken, GnwCycleInsnMetadata),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_gnw_cycle_store = {
+    .name = "cpu/gnw-cycle-model/store",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(address, GnwCycleStoreVisibility),
+        VMSTATE_UINT64(ready_fp, GnwCycleStoreVisibility),
+        VMSTATE_UINT32(attributes, GnwCycleStoreVisibility),
+        VMSTATE_UINT8(valid, GnwCycleStoreVisibility),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_gnw_dcache_line = {
+    .name = "cpu/gnw-cycle-model/dcache-line",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(line_base, GnwM7DCacheLine),
+        VMSTATE_BOOL(valid, GnwM7DCacheLine),
+        VMSTATE_BOOL(dirty, GnwM7DCacheLine),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_gnw_dcache_set = {
+    .name = "cpu/gnw-cycle-model/dcache-set",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(replacement_state, GnwM7DCacheSet),
+        VMSTATE_UINT8(invalidated_way_mask, GnwM7DCacheSet),
+        VMSTATE_UINT8(cleaned_way_mask, GnwM7DCacheSet),
+        VMSTATE_UINT8(unclean_invalidated_way_mask, GnwM7DCacheSet),
+        VMSTATE_BOOL(association_unknown, GnwM7DCacheSet),
+        VMSTATE_BOOL(membership_unknown, GnwM7DCacheSet),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool gnw_cycle_model_config_needed(void *opaque)
+{
+    return true;
+}
+
+/*
+ * This subsection is unconditional so a current source with the producer
+ * disabled cannot migrate into an enabled destination (or vice versa) merely
+ * because the state-bearing subsection is absent.
+ */
+static const VMStateDescription vmstate_gnw_cycle_model_config = {
+    .name = "cpu/gnw-cycle-model-config",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = gnw_cycle_model_config_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(gnw_m7_cycle_model_migration_config, ARMCPU,
+                             "experimental cycle-model mode differs"),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static bool gnw_cycle_model_needed(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    return cpu->gnw_m7_cycle_model;
+}
+
+static int gnw_cycle_model_pre_save(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    if (cpu->parent_obj.gnw_cycle_model.pending_valid ||
+        cpu->parent_obj.gnw_cycle_model.exception_scoreboard_flush_pending ||
+        cpu->parent_obj.gnw_cycle_model.xip_service_deferred_finish ||
+        cpu->parent_obj.gnw_cycle_model.xip_service_remaining_cycles ||
+        cpu->parent_obj.gnw_cycle_model.pending_bus_contention_cycles ||
+        cpu->parent_obj.gnw_cycle_model.pending_nc_axi_fetch_cycles ||
+        cpu->parent_obj.gnw_cycle_model.pending_icache_maintenance_cycles ||
+        cpu->parent_obj.gnw_cycle_model.pending_fetch_residual_cycles ||
+        cpu->parent_obj.gnw_cycle_model.pending_memory_residual_cycles ||
+        cpu->parent_obj.gnw_cycle_model.nc_axi_fetch_attempt_active ||
+        cpu->parent_obj.gnw_cycle_model.fetch_residual_attempt_active ||
+        cpu->parent_obj.gnw_cycle_model.dcache.pending_count ||
+        cpu->parent_obj.gnw_cycle_model.icache.pending_count ||
+        cpu->parent_obj.gnw_cycle_model.icache.pending_cycles ||
+        cpu->parent_obj.gnw_cycle_model.icache.attempt_active ||
+        cpu->parent_obj.gnw_cycle_model.icache.pending_overflow ||
+        cpu->parent_obj.gnw_cycle_model.flash_fetch.pending_count ||
+        cpu->parent_obj.gnw_cycle_model.flash_fetch.pending_bytes) {
+        error_report("cannot migrate a partial experimental cycle callback");
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static bool gnw_dcache_replacement_state_valid(uint8_t policy, uint8_t state)
+{
+    unsigned i, seen = 0;
+
+    switch (policy) {
+    case GNW_M7_DCACHE_OFF:
+    case GNW_M7_DCACHE_TAGS_NO_REPLACEMENT:
+        return state == 0;
+    case GNW_M7_DCACHE_ROUND_ROBIN_HYPOTHESIS:
+        return state <= 3;
+    case GNW_M7_DCACHE_TREE_PLRU_HYPOTHESIS:
+        return state <= 7;
+    case GNW_M7_DCACHE_TRUE_LRU_HYPOTHESIS:
+        for (i = 0; i < GNW_M7_DCACHE_WAYS; i++) {
+            unsigned way = (state >> (i * 2)) & 3;
+
+            if (seen & (1U << way)) {
+                return false;
+            }
+            seen |= 1U << way;
+        }
+        return seen == 0xf;
+    default:
+        return false;
+    }
+}
+
+static int gnw_cycle_model_post_load(void *opaque, int version_id)
+{
+    ARMCPU *cpu = opaque;
+    GnwCycleModelState *s = &cpu->parent_obj.gnw_cycle_model;
+    uint64_t valid = 0, dirty = 0, uncertain = 0;
+    unsigned set, way, op;
+    bool maintenance = false;
+
+    /* The whole-loop classifier is diagnostic and deliberately absent from
+     * VMState.  A destination may retain its locally configured immutable
+     * identities, but no source-side match progress or counters may cross the
+     * migration boundary. */
+    memset(&s->flash_schedule, 0, sizeof(s->flash_schedule));
+    memset(&s->flash_schedule_pending, 0,
+           sizeof(s->flash_schedule_pending));
+    s->flash_schedule_attempt_pending = false;
+    memset(s->icache.pending, 0, sizeof(s->icache.pending));
+    s->icache.pending_count = 0;
+    s->icache.pending_cycles = 0;
+    s->icache.attempt_active = false;
+    s->icache.pending_overflow = false;
+    if (version_id < 27) {
+        s->icache.disabled_fetch_line = 0;
+        s->icache.disabled_fetch_line_valid = false;
+    }
+    /* Streams predating VMState v25 did not carry I-cache shadow state.
+     * Start them with a cold cache on the destination instead of preserving
+     * any stale local tags or partial accounting. */
+    if (version_id < 25) {
+        s->icache.enabled = true;
+        memset(s->icache.tags, 0, sizeof(s->icache.tags));
+        memset(s->icache.valid, 0, sizeof(s->icache.valid));
+        memset(s->icache.lru_way, 0, sizeof(s->icache.lru_way));
+        s->icache.accesses = 0;
+        s->icache.hits = 0;
+        s->icache.misses = 0;
+        s->icache.invalidations_all = 0;
+        s->icache.invalidations_mva = 0;
+    }
+    if (version_id < 26) {
+        s->xip_unseen_next_address = 0;
+        s->xip_unseen_fraction = 0;
+        s->xip_unseen_qualified_bytes = 0;
+        s->xip_unseen_streams = 0;
+        s->xip_unseen_stream_active = false;
+    }
+    s->nc_axi_fetch_saved_line = 0;
+    s->nc_axi_fetch_saved_transitions = 0;
+    s->nc_axi_fetch_saved_cycles = 0;
+    s->nc_axi_fetch_saved_valid = false;
+    s->nc_axi_fetch_attempt_active = false;
+    s->fetch_residual_saved_fraction = 0;
+    s->fetch_residual_saved_charges = 0;
+    s->fetch_residual_saved_cycles = 0;
+    s->fetch_residual_saved_pending_cycles = 0;
+    s->fetch_residual_saved_set_conflict_active = false;
+    s->fetch_residual_attempt_active = false;
+    s->memory_residual_saved_base = 0;
+    s->memory_residual_saved_entry_pc = 0;
+    s->memory_residual_saved_bytes = 0;
+    s->memory_residual_saved_stride = 0;
+    s->memory_residual_saved_remaining = 0;
+    s->memory_residual_saved_pending_cycles = 0;
+    s->memory_residual_saved_charges = 0;
+    s->memory_residual_saved_cycles = 0;
+    s->memory_residual_saved_accepted = 0;
+    s->memory_residual_saved_rejected = 0;
+    s->memory_residual_saved_active = false;
+
+    if (!cpu->gnw_m7_cycle_model ||
+        !gnw_cycle_model_identity_valid(CPU(cpu))) {
+        error_report("experimental cycle-model migration identity mismatch");
+        return -EINVAL;
+    }
+    if (!gnw_cycle_model_cpu_ram_itcm_profile_valid(
+            CPU(cpu), cpu->gnw_m7_cpu_ram_itcm_profile)) {
+        error_report("experimental CPU RAM ITCM profile migration mismatch");
+        return -EINVAL;
+    }
+    if (!gnw_cycle_model_exception_transition_profile_valid(
+            CPU(cpu), cpu->gnw_m7_exception_transition_profile)) {
+        error_report("experimental exception-transition profile migration "
+                     "mismatch");
+        return -EINVAL;
+    }
+    if (!gnw_cycle_model_fetch_residual_profile_valid(
+            CPU(cpu), cpu->gnw_m7_fetch_residual_profile)) {
+        error_report("experimental fetch-residual profile migration "
+                     "mismatch");
+        return -EINVAL;
+    }
+    if (!gnw_cycle_model_memory_residual_profile_valid(
+            CPU(cpu), cpu->gnw_m7_memory_residual_profile)) {
+        error_report("experimental memory-residual profile migration "
+                     "mismatch");
+        return -EINVAL;
+    }
+    if (!gnw_cycle_model_schedule_history_profile_valid(
+            CPU(cpu), cpu->gnw_m7_schedule_history_profile)) {
+        error_report("experimental schedule-history profile migration "
+                     "mismatch");
+        return -EINVAL;
+    }
+    if (!gnw_cycle_model_migration_scalars_valid(s)) {
+        error_report("invalid experimental cycle-model scalar state");
+        return -EINVAL;
+    }
+    if (s->flash_fetch.pending_count || s->flash_fetch.pending_bytes ||
+        s->flash_fetch.valid_mask >> GNW_M7_FLASH_FETCH_LINES ||
+        s->flash_fetch.next_replace >= GNW_M7_FLASH_FETCH_LINES ||
+        s->flash_fetch.hits > s->flash_fetch.accesses ||
+        s->flash_fetch.misses >
+            s->flash_fetch.accesses - s->flash_fetch.hits) {
+        error_report("invalid experimental internal-flash fetch state");
+        return -EINVAL;
+    }
+    if ((s->nc_axi_fetch_valid &&
+         (s->nc_axi_fetch_line < 0x24000000 ||
+          s->nc_axi_fetch_line >= 0x24100000 ||
+          (s->nc_axi_fetch_line & 31))) ||
+        (!s->nc_axi_fetch_valid && s->nc_axi_fetch_line) ||
+        s->pending_nc_axi_fetch_cycles) {
+        error_report("invalid experimental noncacheable AXI fetch state");
+        return -EINVAL;
+    }
+    for (way = 0; way < GNW_M7_FLASH_FETCH_LINES; way++) {
+        uint64_t line = s->flash_fetch.lines[way];
+
+        if (!(s->flash_fetch.valid_mask & (1U << way))) {
+            if (line) {
+                error_report("invalid experimental flash fetch line");
+                return -EINVAL;
+            }
+        } else if (line < GNW_M7_INTERNAL_FLASH_BASE ||
+                   line >= GNW_M7_INTERNAL_FLASH_END ||
+                   (line & (GNW_M7_DCACHE_LINE_SIZE - 1))) {
+            error_report("invalid experimental flash fetch tag");
+            return -EINVAL;
+        }
+    }
+    if (s->load_path.profile_identity !=
+            (cpu->gnw_m7_load_path_candidate ?
+             GNW_M7_LOAD_PATH_PROFILE_V5 : 0)) {
+        error_report("experimental load-path profile migration mismatch");
+        return -EINVAL;
+    }
+    if (!gnw_cycle_model_xip_service_profile_valid(CPU(cpu)) ||
+        s->xip_service_profile_identity !=
+            (cpu->gnw_m7_xip_service_test_profile ?
+             GNW_M7_XIP_SERVICE_PROFILE_TEST_FIXED :
+             (cpu->gnw_m7_xip_service_unseen_v1_profile ?
+              GNW_M7_XIP_SERVICE_PROFILE_UNSEEN_V1 :
+              GNW_M7_XIP_SERVICE_PROFILE_OFF)) ||
+        s->xip_service_cursor_fp > s->cycle_fp ||
+        (s->xip_service_profile_identity == GNW_M7_XIP_SERVICE_PROFILE_OFF &&
+         (s->xip_service_cursor_fp || s->xip_service_requests ||
+          s->xip_service_cycles || s->xip_service_remaining_cycles)) ||
+        s->xip_service_remaining_cycles > s->xip_service_cycles ||
+        s->xip_service_deferred_finish ||
+        s->xip_service_remaining_cycles) {
+        error_report("experimental XIP service profile migration mismatch");
+        return -EINVAL;
+    }
+    if (s->dcache.policy != cpu->gnw_m7_dcache_policy ||
+        s->dcache.policy >= GNW_M7_DCACHE_POLICY_COUNT ||
+        s->dcache.pending_count) {
+        error_report("experimental D-cache shadow migration identity mismatch");
+        return -EINVAL;
+    }
+    uint32_t expected_bus_profile =
+        cpu->gnw_m7_bus_contention_test_profile ?
+        GNW_M7_BUS_CONTENTION_PROFILE_TEST_FIXED :
+        (cpu->gnw_m7_bus_contention_mdma_axi1_profile ?
+         GNW_M7_BUS_CONTENTION_PROFILE_MDMA_AXI1_V1 :
+         (cpu->gnw_m7_bus_contention_v37_bwm_comparison ?
+          GNW_M7_BUS_CONTENTION_PROFILE_V37_BWM_COMPARE :
+          (cpu->gnw_m7_bus_contention_v46_bwm_17_4 ?
+           GNW_M7_BUS_CONTENTION_PROFILE_V46_BWM_17_4 :
+           GNW_M7_BUS_CONTENTION_PROFILE_OFF)));
+    if (s->bus_contention_profile_identity != expected_bus_profile ||
+        (s->bus_contention_profile_identity ==
+             GNW_M7_BUS_CONTENTION_PROFILE_OFF &&
+         (s->bus_contention_observations || s->bus_contention_matches ||
+          s->bus_contention_cycles)) ||
+        s->bus_contention_matches > s->bus_contention_observations ||
+        s->pending_bus_contention_cycles) {
+        error_report("experimental bus contention profile migration mismatch");
+        return -EINVAL;
+    }
+    for (set = 0; set < GNW_M7_DCACHE_SETS; set++) {
+        GnwM7DCacheSet *set_state = &s->dcache.sets[set];
+
+        uncertain += set_state->association_unknown;
+        if (!gnw_dcache_replacement_state_valid(s->dcache.policy,
+                                                set_state->replacement_state) ||
+            set_state->invalidated_way_mask & ~0xf ||
+            set_state->cleaned_way_mask & ~0xf ||
+            set_state->unclean_invalidated_way_mask & ~0xf ||
+            (set_state->membership_unknown &&
+             !set_state->association_unknown) ||
+            (!set_state->association_unknown &&
+             (set_state->invalidated_way_mask ||
+              set_state->cleaned_way_mask ||
+              set_state->unclean_invalidated_way_mask))) {
+            error_report("invalid experimental D-cache shadow set state");
+            return -EINVAL;
+        }
+        for (way = 0; way < GNW_M7_DCACHE_WAYS; way++) {
+            GnwM7DCacheLine *line =
+                &s->dcache.lines[set * GNW_M7_DCACHE_WAYS + way];
+            unsigned earlier;
+
+            if (!line->valid && (line->dirty || line->line_base)) {
+                error_report("invalid experimental D-cache invalid line");
+                return -EINVAL;
+            }
+            if (line->valid) {
+                unsigned line_set;
+
+                if (!((line->line_base >= 0x24000000ULL &&
+                       line->line_base < 0x24100000ULL) ||
+                      (line->line_base >= 0x90000000ULL &&
+                       line->line_base < 0x94000000ULL)) ||
+                    (line->line_base & 31)) {
+                    error_report("invalid experimental D-cache line tag");
+                    return -EINVAL;
+                }
+                line_set = (line->line_base >> 5) &
+                           (GNW_M7_DCACHE_SETS - 1);
+                if (line_set != set) {
+                    error_report("misindexed experimental D-cache line");
+                    return -EINVAL;
+                }
+                for (earlier = 0; earlier < way; earlier++) {
+                    GnwM7DCacheLine *other =
+                        &s->dcache.lines[set * GNW_M7_DCACHE_WAYS +
+                                         earlier];
+
+                    if (other->valid &&
+                        other->line_base == line->line_base) {
+                        error_report("duplicate experimental D-cache tag");
+                        return -EINVAL;
+                    }
+                }
+                valid++;
+                dirty += line->dirty;
+            }
+        }
+    }
+    if (valid != s->dcache.valid_lines || dirty != s->dcache.dirty_lines ||
+        uncertain != s->dcache.uncertain_sets) {
+        error_report("experimental D-cache shadow counter mismatch");
+        return -EINVAL;
+    }
+    for (op = 0; op <= GNW_CYCLE_CACHE_BPIALL; op++) {
+        maintenance |= s->dcache.maintenance[op] != 0;
+    }
+    if (s->dcache.policy == GNW_M7_DCACHE_OFF &&
+        (valid || dirty || uncertain ||
+         s->dcache.instruction_cache_enabled ||
+         s->dcache.data_cache_enabled || s->dcache.accesses ||
+         s->dcache.hits || s->dcache.misses || s->dcache.allocations ||
+         s->dcache.dirty_evictions || s->dcache.ambiguous_accesses ||
+         s->dcache.rejected_disabled || s->dcache.rejected_path ||
+         s->dcache.rejected_attributes || s->dcache.dirty_discards ||
+         maintenance || s->dcache.external_events)) {
+        error_report("disabled experimental D-cache shadow has state");
+        return -EINVAL;
+    }
+    s->enabled = true;
+    return 0;
+}
+
+static const VMStateDescription vmstate_gnw_cycle_model = {
+    .name = "cpu/gnw-cycle-model",
+    .version_id = 27,
+    .minimum_version_id = 8,
+    .needed = gnw_cycle_model_needed,
+    .pre_save = gnw_cycle_model_pre_save,
+    .post_load = gnw_cycle_model_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT(parent_obj.gnw_cycle_model.previous, ARMCPU, 2,
+                       vmstate_gnw_cycle_metadata, GnwCycleInsnMetadata),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.epoch_cycles, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.cycle_fp, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.previous_issue_fp, ARMCPU),
+        VMSTATE_UINT64_ARRAY(parent_obj.gnw_cycle_model.gpr_ready_fp,
+                             ARMCPU, 16),
+        VMSTATE_UINT64_ARRAY(parent_obj.gnw_cycle_model.flags_ready_fp,
+                             ARMCPU, 4),
+        VMSTATE_UINT64_ARRAY(parent_obj.gnw_cycle_model.branch_flags_ready_fp,
+                             ARMCPU, 4),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.commit_fraction_fp, ARMCPU),
+        VMSTATE_STRUCT_ARRAY(parent_obj.gnw_cycle_model.store_visible, ARMCPU,
+                             GNW_CYCLE_STORE_SLOTS, 1,
+                             vmstate_gnw_cycle_store,
+                             GnwCycleStoreVisibility),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.completed_instructions,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.modeled_whole_cycles,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.issued_pairs, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.folded_nops, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.aborted_attempts, ARMCPU),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.instruction_fetch_attempts,
+            ARMCPU, 4),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.instruction_fetch_segments,
+            ARMCPU, 4),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.instruction_fetch_bytes, ARMCPU, 4),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.instruction_fetch_incomplete,
+            ARMCPU, 4),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.nc_axi_fetch_line,
+                         ARMCPU, 12),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.nc_axi_fetch_transitions,
+                         ARMCPU, 12),
+        VMSTATE_UINT32_V(parent_obj.gnw_cycle_model.pending_nc_axi_fetch_cycles,
+                         ARMCPU, 12),
+        VMSTATE_BOOL_V(parent_obj.gnw_cycle_model.nc_axi_fetch_valid,
+                       ARMCPU, 12),
+        VMSTATE_UINT64_ARRAY_V(parent_obj.gnw_cycle_model.flash_fetch.lines,
+                               ARMCPU, GNW_M7_FLASH_FETCH_LINES, 10),
+        VMSTATE_UINT64_ARRAY_V(
+            parent_obj.gnw_cycle_model.flash_fetch.phase_segments,
+            ARMCPU, 8, 10),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.flash_fetch.accesses,
+                         ARMCPU, 10),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.flash_fetch.hits,
+                         ARMCPU, 10),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.flash_fetch.misses,
+                         ARMCPU, 10),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.flash_fetch.bytes,
+                         ARMCPU, 10),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.flash_fetch.invalidations_all,
+            ARMCPU, 10),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.flash_fetch.invalidations_mva,
+            ARMCPU, 10),
+        VMSTATE_UINT8_V(parent_obj.gnw_cycle_model.flash_fetch.valid_mask,
+                        ARMCPU, 10),
+        VMSTATE_UINT8_V(parent_obj.gnw_cycle_model.flash_fetch.next_replace,
+                        ARMCPU, 10),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.xip_service_cursor_fp,
+                         ARMCPU, 5),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.xip_service_requests,
+                         ARMCPU, 5),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.xip_service_cycles,
+                         ARMCPU, 5),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.xip_service_remaining_cycles,
+            ARMCPU, 6),
+        VMSTATE_BOOL_V(parent_obj.gnw_cycle_model.xip_service_deferred_finish,
+                       ARMCPU, 6),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.xip_unseen_next_address, ARMCPU, 26),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.xip_unseen_fraction, ARMCPU, 26),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.xip_unseen_qualified_bytes, ARMCPU, 26),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.xip_unseen_streams, ARMCPU, 26),
+        VMSTATE_BOOL_V(
+            parent_obj.gnw_cycle_model.xip_unseen_stream_active, ARMCPU, 26),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.icache.disabled_fetch_line, ARMCPU, 27),
+        VMSTATE_BOOL_V(
+            parent_obj.gnw_cycle_model.icache.disabled_fetch_line_valid,
+            ARMCPU, 27),
+        VMSTATE_UINT64_ARRAY(parent_obj.gnw_cycle_model.fallback, ARMCPU,
+                             GNW_CYCLE_FALLBACK_COUNT),
+        VMSTATE_UINT32_ARRAY(parent_obj.gnw_cycle_model.config_identity,
+                             ARMCPU, 8),
+        VMSTATE_UINT32(parent_obj.gnw_cycle_model.implementation_version,
+                       ARMCPU),
+        VMSTATE_UINT32_V(
+            parent_obj.gnw_cycle_model.xip_service_profile_identity,
+            ARMCPU, 5),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.bus_contention_observations,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.bus_contention_matches,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.bus_contention_cycles,
+                       ARMCPU),
+        VMSTATE_UINT32_V(parent_obj.gnw_cycle_model.bus_contention_fraction,
+                         ARMCPU, 9),
+        VMSTATE_UINT32(
+            parent_obj.gnw_cycle_model.bus_contention_profile_identity,
+            ARMCPU),
+        VMSTATE_UINT32_V(
+            parent_obj.gnw_cycle_model.cpu_ram_itcm_profile_identity,
+            ARMCPU, 11),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.cpu_ram_itcm_profile_accepted,
+            ARMCPU, 11),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.cpu_ram_itcm_profile_rejected,
+            ARMCPU, 11),
+        VMSTATE_UINT32_V(
+            parent_obj.gnw_cycle_model.exception_transition_profile_identity,
+            ARMCPU, 13),
+        VMSTATE_UINT64_ARRAY_V(
+            parent_obj.gnw_cycle_model.exception_transition_count,
+            ARMCPU, GNW_CYCLE_EXCEPTION_TRANSITION_COUNT, 13),
+        VMSTATE_UINT32_V(
+            parent_obj.gnw_cycle_model.fetch_residual_profile_identity,
+            ARMCPU, 14),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.fetch_residual_fraction, ARMCPU, 14),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.fetch_residual_charges, ARMCPU, 14),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.fetch_residual_cycles, ARMCPU, 14),
+        VMSTATE_BOOL_V(
+            parent_obj.gnw_cycle_model.fetch_residual_set_conflict_active,
+            ARMCPU, 14),
+        VMSTATE_UINT32_V(
+            parent_obj.gnw_cycle_model.memory_residual_profile_identity,
+            ARMCPU, 15),
+        VMSTATE_UINT32_V(parent_obj.gnw_cycle_model.memory_residual_base,
+                         ARMCPU, 15),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.memory_residual_entry_pc,
+                         ARMCPU, 23),
+        VMSTATE_UINT32_V(parent_obj.gnw_cycle_model.memory_residual_bytes,
+                         ARMCPU, 15),
+        VMSTATE_UINT32_V(parent_obj.gnw_cycle_model.memory_residual_stride,
+                         ARMCPU, 15),
+        VMSTATE_UINT32_V(parent_obj.gnw_cycle_model.memory_residual_remaining,
+                         ARMCPU, 15),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.memory_residual_charges,
+                         ARMCPU, 15),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.memory_residual_cycles,
+                         ARMCPU, 15),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.memory_residual_accepted,
+                         ARMCPU, 15),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.memory_residual_rejected,
+                         ARMCPU, 15),
+        VMSTATE_BOOL_V(parent_obj.gnw_cycle_model.memory_residual_active,
+                       ARMCPU, 15),
+        VMSTATE_UINT32_V(
+            parent_obj.gnw_cycle_model.schedule_history_profile_identity,
+            ARMCPU, 24),
+        VMSTATE_UINT32_V(
+            parent_obj.gnw_cycle_model.schedule_history_outcomes, ARMCPU, 24),
+        VMSTATE_UINT32_V(
+            parent_obj.gnw_cycle_model.schedule_history_credit_cycles,
+            ARMCPU, 24),
+        VMSTATE_UINT32_V(
+            parent_obj.gnw_cycle_model.schedule_history_applied_credit_cycles,
+            ARMCPU, 24),
+        VMSTATE_UINT32_V(
+            parent_obj.gnw_cycle_model.schedule_history_compensation_cycles,
+            ARMCPU, 24),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.schedule_history_accepted, ARMCPU, 24),
+        VMSTATE_UINT64_V(
+            parent_obj.gnw_cycle_model.schedule_history_rejected, ARMCPU, 24),
+        VMSTATE_UINT8_V(
+            parent_obj.gnw_cycle_model.schedule_history_pattern, ARMCPU, 24),
+        VMSTATE_UINT8_V(
+            parent_obj.gnw_cycle_model.schedule_history_kind, ARMCPU, 24),
+        VMSTATE_BOOL_V(
+            parent_obj.gnw_cycle_model.schedule_history_active, ARMCPU, 24),
+        VMSTATE_BOOL(parent_obj.gnw_cycle_model.previous_valid, ARMCPU),
+        VMSTATE_BOOL(parent_obj.gnw_cycle_model.previous_was_store, ARMCPU),
+        VMSTATE_BOOL(parent_obj.gnw_cycle_model.disfold_set, ARMCPU),
+        VMSTATE_BOOL(parent_obj.gnw_cycle_model.test_near_rebase, ARMCPU),
+        VMSTATE_UINT64_ARRAY(
+            parent_obj.gnw_cycle_model.load_path.gpr_ready_fp, ARMCPU, 16),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.load_path.issue_next_fp,
+                       ARMCPU),
+        VMSTATE_UINT64(
+            parent_obj.gnw_cycle_model.load_path.miss_slot_ready_fp, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.load_path.critical_path_fp,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.load_path.epoch_cycles,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.load_path.last_issue_fp,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.load_path.last_ready_fp,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.load_path.accepted, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.load_path.cache_hits,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.load_path.cache_misses,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.load_path.rejected_shape,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.load_path.rejected_region,
+                       ARMCPU),
+        VMSTATE_UINT32(parent_obj.gnw_cycle_model.load_path.profile_identity,
+                       ARMCPU),
+        VMSTATE_UINT8(parent_obj.gnw_cycle_model.dcache.policy, ARMCPU),
+        VMSTATE_BOOL(
+            parent_obj.gnw_cycle_model.dcache.instruction_cache_enabled,
+            ARMCPU),
+        VMSTATE_BOOL(parent_obj.gnw_cycle_model.dcache.data_cache_enabled,
+                     ARMCPU),
+        VMSTATE_STRUCT_ARRAY(parent_obj.gnw_cycle_model.dcache.lines, ARMCPU,
+                             GNW_M7_DCACHE_LINES, 1,
+                             vmstate_gnw_dcache_line, GnwM7DCacheLine),
+        VMSTATE_STRUCT_ARRAY(parent_obj.gnw_cycle_model.dcache.sets, ARMCPU,
+                             GNW_M7_DCACHE_SETS, 1,
+                             vmstate_gnw_dcache_set, GnwM7DCacheSet),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.valid_lines, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.dirty_lines, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.uncertain_sets,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.accesses, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.hits, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.misses, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.allocations, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.dirty_evictions,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.ambiguous_accesses,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.rejected_disabled,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.rejected_path, ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.rejected_attributes,
+                       ARMCPU),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.dirty_discards,
+                       ARMCPU),
+        VMSTATE_UINT64_ARRAY(parent_obj.gnw_cycle_model.dcache.maintenance,
+                             ARMCPU, GNW_CYCLE_CACHE_BPIALL + 1),
+        VMSTATE_UINT64(parent_obj.gnw_cycle_model.dcache.external_events,
+                       ARMCPU),
+        VMSTATE_UINT64_ARRAY_V(parent_obj.gnw_cycle_model.icache.tags, ARMCPU,
+                               GNW_M7_ICACHE_SETS * GNW_M7_ICACHE_WAYS, 25),
+        VMSTATE_UINT8_ARRAY_V(parent_obj.gnw_cycle_model.icache.valid, ARMCPU,
+                              GNW_M7_ICACHE_SETS, 25),
+        VMSTATE_UINT8_ARRAY_V(parent_obj.gnw_cycle_model.icache.lru_way, ARMCPU,
+                              GNW_M7_ICACHE_SETS, 25),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.icache.accesses, ARMCPU,
+                         25),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.icache.hits, ARMCPU, 25),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.icache.misses, ARMCPU, 25),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.icache.invalidations_all,
+                         ARMCPU, 25),
+        VMSTATE_UINT64_V(parent_obj.gnw_cycle_model.icache.invalidations_mva,
+                         ARMCPU, 25),
+        VMSTATE_BOOL_V(parent_obj.gnw_cycle_model.icache.enabled, ARMCPU, 25),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 const VMStateDescription vmstate_arm_cpu = {
     .name = "cpu",
-    .version_id = 22,
-    .minimum_version_id = 22,
+    .version_id = 23,
+    .minimum_version_id = 23,
     .pre_save = cpu_pre_save,
     .post_save = cpu_post_save,
     .pre_load = cpu_pre_load,
@@ -1337,6 +2110,8 @@ const VMStateDescription vmstate_arm_cpu = {
         &vmstate_syndrome64,
         &vmstate_pstate64,
         &vmstate_event,
+        &vmstate_gnw_cycle_model_config,
+        &vmstate_gnw_cycle_model,
         NULL
     }
 };

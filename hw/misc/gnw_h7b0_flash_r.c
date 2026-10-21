@@ -2,8 +2,11 @@
  * real-erase-side-effect rationale. */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "qapi/error.h"
 #include "system/physmem.h"
 #include "migration/vmstate.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/gnw_h7b0_flash_r.h"
 #include "hw/misc/gnw_h7b0_regs_flash_r.h"
 
@@ -34,6 +37,21 @@
  * community-verified value over the reference manual. */
 #define SECTOR_SIZE (8 * 1024)
 
+/* Hidden-test profile only. These virtual-nanosecond values are arbitrary
+ * mechanism-test oracles, not STM32H7B0 measurements. */
+#define TEST_SECTOR_ERASE_NS 11000
+#define TEST_BANK_ERASE_NS   37000
+#define TEST_ERASE_PROFILE_ID 0x47574631U /* "GWF1" */
+/* DS13196 rev. 7, table 56 gives characterized maximum completion times,
+ * rather than typical or measured latencies.  The explicit conservative
+ * profile uses those upper bounds and must not be presented as calibrated
+ * physical timing. */
+#define CONSERVATIVE_SECTOR_ERASE_NS (2200 * 1000LL)
+#define CONSERVATIVE_BANK_ERASE_NS   (10 * 1000 * 1000LL)
+#define CONSERVATIVE_ERASE_PROFILE_ID 0x47574632U /* "GWF2" */
+#define ERASE_BANK1 1
+#define ERASE_BANK2 2
+
 static void erase_sector(MemoryRegion *bank_mr, uint32_t sector)
 {
     if (bank_mr == NULL) {
@@ -61,6 +79,75 @@ static void erase_bank(MemoryRegion *bank_mr)
         return;
     }
     memset(memory_region_get_ram_ptr(bank_mr), 0xff, memory_region_size(bank_mr));
+}
+
+static MemoryRegion *erase_target(GnwH7B0FlashRState *s)
+{
+    return s->erase_bank_index == ERASE_BANK1 ? s->bank1_mr : s->bank2_mr;
+}
+
+static uint32_t *erase_status(GnwH7B0FlashRState *s)
+{
+    uint32_t offset = s->erase_bank_index == ERASE_BANK1 ?
+        GNW_H7B0_FLASH_SR1_OFFSET : GNW_H7B0_FLASH_SR2_OFFSET;
+    return &s->regs[offset >> 2];
+}
+
+/* STM32H7 FLASH_SR QW is bit 2. In this narrow hidden profile it is the
+ * guest-visible busy indication for the pending command erase. */
+#define SR_QW (1U << 2)
+#define FLASH_SECTOR_COUNT 32U
+
+static void complete_pending_erase(void *opaque)
+{
+    GnwH7B0FlashRState *s = opaque;
+
+    if (!s->erase_pending) {
+        return;
+    }
+    if (s->erase_bank) {
+        erase_bank(erase_target(s));
+    } else {
+        erase_sector(erase_target(s), s->erase_sector);
+    }
+    *erase_status(s) &= ~SR_QW;
+    s->erase_pending = false;
+    s->erase_bank = false;
+    s->erase_bank_index = 0;
+    s->erase_sector = 0;
+    s->erase_profile_id = 0;
+}
+
+static uint32_t erase_profile_id(GnwH7B0FlashRState *s)
+{
+    if (!s->timing_mode ||
+        s->test_erase_timing == s->conservative_erase_timing) {
+        return 0;
+    }
+    return s->conservative_erase_timing ? CONSERVATIVE_ERASE_PROFILE_ID :
+                                          TEST_ERASE_PROFILE_ID;
+}
+
+static int64_t erase_delay_ns(GnwH7B0FlashRState *s, bool bank_erase)
+{
+    if (s->conservative_erase_timing) {
+        return bank_erase ? CONSERVATIVE_BANK_ERASE_NS :
+                            CONSERVATIVE_SECTOR_ERASE_NS;
+    }
+    return bank_erase ? TEST_BANK_ERASE_NS : TEST_SECTOR_ERASE_NS;
+}
+
+static void cancel_pending_erase(GnwH7B0FlashRState *s)
+{
+    timer_del(s->erase_timer);
+    if (s->erase_pending) {
+        *erase_status(s) &= ~SR_QW;
+    }
+    s->erase_pending = false;
+    s->erase_bank = false;
+    s->erase_bank_index = 0;
+    s->erase_sector = 0;
+    s->erase_profile_id = 0;
 }
 
 static bool rdp_is_level2(uint8_t rdp)
@@ -153,17 +240,45 @@ static bool flash_debug_access_allowed(void *opaque, hwaddr addr,
  * completes the erase synchronously within the write itself, that's
  * immediately. */
 static uint32_t apply_erase_side_effect(GnwH7B0FlashRState *s, uint32_t cr,
-                                         MemoryRegion *bank_mr)
+                                         MemoryRegion *bank_mr,
+                                         uint8_t bank_index)
 {
+    bool bank_erase = cr & CR_BER;
+    bool sector_erase = cr & CR_SER;
+    uint32_t sector = (cr & CR_SSN_MASK) >> CR_SSN_SHIFT;
+    uint32_t acknowledged = cr & ~(CR_START | CR_SER | CR_BER | CR_SSN_MASK);
+
     if (!(cr & CR_START)) {
         return cr;
     }
-    if (cr & CR_BER) {
-        erase_bank(bank_mr);
-    } else if (cr & CR_SER) {
-        erase_sector(bank_mr, (cr & CR_SSN_MASK) >> CR_SSN_SHIFT);
+    if (!erase_profile_id(s)) {
+        if (bank_erase) {
+            erase_bank(bank_mr);
+        } else if (sector_erase) {
+            erase_sector(bank_mr, sector);
+        }
+        return acknowledged;
     }
-    return cr & ~(CR_START | CR_SER | CR_BER | CR_SSN_MASK);
+    if (!bank_erase && !sector_erase) {
+        return acknowledged;
+    }
+    if (s->erase_pending) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "gnw-h7b0-flash_r: erase rejected while busy\n");
+        return acknowledged;
+    }
+
+    s->erase_pending = true;
+    s->erase_bank = bank_erase;
+    s->erase_bank_index = bank_index;
+    /* A bank erase has no sector selector. Keep migrated state canonical. */
+    s->erase_sector = bank_erase ? 0 : sector;
+    s->erase_profile_id = erase_profile_id(s);
+    *erase_status(s) |= SR_QW;
+    timer_mod(s->erase_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              erase_delay_ns(s, bank_erase));
+    return acknowledged;
 }
 
 static void gnw_h7b0_flash_r_reset(DeviceState *dev)
@@ -172,6 +287,7 @@ static void gnw_h7b0_flash_r_reset(DeviceState *dev)
     for (int i = 0; i < (GNW_H7B0_FLASH_R_SIZE / 4); i++) {
         s->regs[i] = get_flash_r_reset_value(i * 4);
     }
+    cancel_pending_erase(s);
 
     /* OPTSR_CUR/OPTSR_CUR_ (bank1/bank2 aliases, offsets 0x1c/0x11c):
      * RM0455 documents this register's reset value as "0xXXXX XXXX (see
@@ -278,9 +394,11 @@ static void gnw_h7b0_flash_r_write(void *opaque, hwaddr addr, uint64_t val64, un
     }
 
     if (reg_offset == FLASH_CR1_OFFSET) {
-        value = apply_erase_side_effect(s, value, s->bank1_mr);
+        value = apply_erase_side_effect(s, value, s->bank1_mr,
+                                        ERASE_BANK1);
     } else if (reg_offset == FLASH_CR2_OFFSET) {
-        value = apply_erase_side_effect(s, value, s->bank2_mr);
+        value = apply_erase_side_effect(s, value, s->bank2_mr,
+                                        ERASE_BANK2);
     }
 
     s->regs[reg_offset >> 2] = value;
@@ -297,6 +415,7 @@ static const MemoryRegionOps gnw_h7b0_flash_r_ops = {
 static int gnw_h7b0_flash_r_post_load(void *opaque, int version_id)
 {
     GnwH7B0FlashRState *s = GNW_H7B0_FLASH_R(opaque);
+    bool erase_state_valid;
 
     if (version_id < 2) {
         /* Version 1 migrated the raw option registers before RDP state was
@@ -306,6 +425,44 @@ static int gnw_h7b0_flash_r_post_load(void *opaque, int version_id)
                         RDP_MASK) >> RDP_SHIFT;
         s->rdp_initialized = true;
         s->optkey_stage = 0;
+    }
+    if (version_id < 3) {
+        cancel_pending_erase(s);
+    } else {
+        uint32_t sr1 = s->regs[GNW_H7B0_FLASH_SR1_OFFSET >> 2];
+        uint32_t sr2 = s->regs[GNW_H7B0_FLASH_SR2_OFFSET >> 2];
+        bool timer_is_pending = timer_pending(s->erase_timer);
+
+        if (s->erase_pending) {
+            bool bank_valid = s->erase_bank_index == ERASE_BANK1 ||
+                              s->erase_bank_index == ERASE_BANK2;
+            bool sector_valid = s->erase_bank ||
+                                s->erase_sector < FLASH_SECTOR_COUNT;
+            bool selector_valid = !s->erase_bank || s->erase_sector == 0;
+            bool status_valid = bank_valid &&
+                (s->erase_bank_index == ERASE_BANK1 ?
+                 (sr1 & SR_QW) && !(sr2 & SR_QW) :
+                 (sr2 & SR_QW) && !(sr1 & SR_QW));
+
+            erase_state_valid = s->erase_profile_id == erase_profile_id(s) &&
+                s->erase_profile_id != 0 && bank_valid &&
+                sector_valid && selector_valid && status_valid &&
+                timer_is_pending;
+        } else {
+            erase_state_valid = !timer_is_pending && !s->erase_bank &&
+                s->erase_bank_index == 0 && s->erase_sector == 0 &&
+                s->erase_profile_id == 0 && !(sr1 & SR_QW) && !(sr2 & SR_QW);
+        }
+
+        if (!erase_state_valid) {
+            /* VMSTATE_TIMER_PTR imports the timer before post_load. A failed
+             * validation must not leave that callback capable of erasing
+             * flash if the incoming VM is later resumed. */
+            cancel_pending_erase(s);
+            s->regs[GNW_H7B0_FLASH_SR1_OFFSET >> 2] &= ~SR_QW;
+            s->regs[GNW_H7B0_FLASH_SR2_OFFSET >> 2] &= ~SR_QW;
+            return -EINVAL;
+        }
     }
     update_rdp_registers(s, s->rdp_value);
     return 0;
@@ -342,11 +499,23 @@ static void gnw_h7b0_flash_r_init(Object *obj)
     GnwH7B0FlashRState *s = GNW_H7B0_FLASH_R(obj);
     memory_region_init_io(&s->mmio, obj, &gnw_h7b0_flash_r_ops, s, TYPE_GNW_H7B0_FLASH_R, GNW_H7B0_FLASH_R_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+    s->erase_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                  complete_pending_erase, s);
+}
+
+static void gnw_h7b0_flash_r_realize(DeviceState *dev, Error **errp)
+{
+    GnwH7B0FlashRState *s = GNW_H7B0_FLASH_R(dev);
+
+    if (s->test_erase_timing && s->conservative_erase_timing) {
+        error_setg(errp, "x-test-erase-timing and conservative-erase-timing "
+                   "are mutually exclusive");
+    }
 }
 
 static const VMStateDescription vmstate_gnw_h7b0_flash_r = {
     .name = TYPE_GNW_H7B0_FLASH_R,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = gnw_h7b0_flash_r_post_load,
     .fields = (const VMStateField[]) {
@@ -354,6 +523,12 @@ static const VMStateDescription vmstate_gnw_h7b0_flash_r = {
         VMSTATE_UINT8_V(rdp_value, GnwH7B0FlashRState, 2),
         VMSTATE_BOOL_V(rdp_initialized, GnwH7B0FlashRState, 2),
         VMSTATE_UINT8_V(optkey_stage, GnwH7B0FlashRState, 2),
+        VMSTATE_BOOL_V(erase_pending, GnwH7B0FlashRState, 3),
+        VMSTATE_BOOL_V(erase_bank, GnwH7B0FlashRState, 3),
+        VMSTATE_UINT8_V(erase_bank_index, GnwH7B0FlashRState, 3),
+        VMSTATE_UINT32_V(erase_sector, GnwH7B0FlashRState, 3),
+        VMSTATE_UINT32_V(erase_profile_id, GnwH7B0FlashRState, 3),
+        VMSTATE_TIMER_PTR_V(erase_timer, GnwH7B0FlashRState, 3),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -363,11 +538,29 @@ static void gnw_h7b0_flash_r_unrealize(DeviceState *dev)
     physical_memory_unregister_debug_access_filters(GNW_H7B0_FLASH_R(dev));
 }
 
+static void gnw_h7b0_flash_r_finalize(Object *obj)
+{
+    GnwH7B0FlashRState *s = GNW_H7B0_FLASH_R(obj);
+
+    timer_free(s->erase_timer);
+    g_free(s->rdp_image);
+}
+
+static const Property gnw_h7b0_flash_r_properties[] = {
+    DEFINE_PROP_BOOL("timing-mode", GnwH7B0FlashRState, timing_mode, false),
+    DEFINE_PROP_BOOL("x-test-erase-timing", GnwH7B0FlashRState,
+                     test_erase_timing, false),
+    DEFINE_PROP_BOOL("conservative-erase-timing", GnwH7B0FlashRState,
+                     conservative_erase_timing, false),
+};
+
 static void gnw_h7b0_flash_r_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     dc->vmsd = &vmstate_gnw_h7b0_flash_r;
+    dc->realize = gnw_h7b0_flash_r_realize;
     dc->unrealize = gnw_h7b0_flash_r_unrealize;
+    device_class_set_props(dc, gnw_h7b0_flash_r_properties);
     device_class_set_legacy_reset(dc, gnw_h7b0_flash_r_reset);
 }
 
@@ -376,6 +569,7 @@ static const TypeInfo gnw_h7b0_flash_r_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(GnwH7B0FlashRState),
     .instance_init = gnw_h7b0_flash_r_init,
+    .instance_finalize = gnw_h7b0_flash_r_finalize,
     .class_init    = gnw_h7b0_flash_r_class_init,
 };
 

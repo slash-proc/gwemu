@@ -11,10 +11,12 @@
  * sets it and spins on it clearing, which never happened before this
  * fix.
  *
- * Regular conversions (CR's ADSTART) are also instant: ISR's EOC is set
- * and DR is loaded with GNW_H7B0_ADC_FULL_BATTERY_RAW as soon as ADSTART
- * is written, and the matching NVIC line (ADC_IRQn, shared by ADC1/ADC2)
- * is pulsed if IER's EOCIE is set. This covers both firmware's battery
+ * By default regular conversions (CR's ADSTART) are instant: ISR's EOC is
+ * set and DR is loaded with GNW_H7B0_ADC_FULL_BATTERY_RAW as soon as ADSTART
+ * is written, and the matching NVIC line (ADC_IRQn, shared by ADC1/ADC2) is
+ * pulsed if IER's EOCIE is set. Opt-in timing mode instead sequences supported
+ * regular ranks against RCC-selected virtual clock rates and drives the IRQ
+ * as a level from sticky ISR/IER flags. This covers both firmware's battery
  * read paths: gnw-chainloader's board_get_battery_raw() busy-polls ISR's
  * EOC after setting ADSTART, while retro-go-sd's bq24072.c calls
  * HAL_ADC_Start_IT() and reads the result from HAL_ADC_ConvCpltCallback(),
@@ -52,8 +54,10 @@
 #define HW_MISC_GNW_H7B0_ADC_H
 
 #include "hw/core/sysbus.h"
+#include "hw/misc/gnw_h7b0_rcc.h"
 #include "qom/object.h"
 #include "hw/misc/gnw_h7b0_dma.h"
+#include "qemu/timer.h"
 
 #define TYPE_GNW_H7B0_ADC "gnw-h7b0-adc"
 OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0AdcState, GNW_H7B0_ADC)
@@ -63,6 +67,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0AdcState, GNW_H7B0_ADC)
  * device's DMA notifier the same way gnw_h7b0_sai1.c/gnw_h7b0_hash.c
  * register theirs (see gnw_h7b0_dma_set_request_notifier()). */
 #define GNW_H7B0_ADC_DMA_REQUEST_ADC2 10
+#define GNW_H7B0_ADC_DMA_PROVIDER_ID 0x41444332U /* "ADC2" */
 
 #define GNW_H7B0_ADC_SIZE   0x400
 
@@ -78,8 +83,29 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0AdcState, GNW_H7B0_ADC)
 #define ADC_CR_ADCAL        (1U << 31)
 #define GNW_H7B0_ADC_DR     0x40
 #define GNW_H7B0_ADC_SQR1   0x30
+#define GNW_H7B0_ADC_SQR2   0x34
+#define GNW_H7B0_ADC_SQR3   0x38
+#define GNW_H7B0_ADC_SQR4   0x3c
+#define GNW_H7B0_ADC_CFGR   0x0c
+#define GNW_H7B0_ADC_CFGR2  0x10
+#define GNW_H7B0_ADC_SMPR1  0x14
+#define GNW_H7B0_ADC_SMPR2  0x18
+#define GNW_H7B0_ADC_COMMON_CCR 0x308
 #define ADC_SQR1_SQ1_SHIFT  6
 #define ADC_SQR1_SQ1_MASK   (0x1FU << ADC_SQR1_SQ1_SHIFT)
+#define ADC_SQR1_L_SHIFT    0
+#define ADC_SQR1_L_MASK     (0xFU << ADC_SQR1_L_SHIFT)
+#define ADC_CFGR_RES_SHIFT  2
+#define ADC_CFGR_RES_MASK   (0x7U << ADC_CFGR_RES_SHIFT)
+#define ADC_CFGR_CONT       (1U << 13)
+#define ADC_CFGR_DISCEN     (1U << 16)
+#define ADC_CFGR_EXTEN_MASK (0x3U << 10)
+#define ADC_CFGR2_JOVSE    (1U << 1)
+#define ADC_CFGR2_ROVSE    (1U << 0)
+#define ADC_CR_ADSTP        (1U << 4)
+#define ADC_ISR_EOS         (1U << 3)
+#define ADC_IER_EOSIE       (1U << 3)
+#define ADC_CCR_DUAL_MASK   (0x1FU)
 
 /* Regular-sequence channel numbers this stub distinguishes (see DR-value
  * selection in gnw_h7b0_adc_write()). Everything else still gets
@@ -133,6 +159,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(GnwH7B0AdcState, GNW_H7B0_ADC)
 #define GNW_H7B0_ADC_INSTANCE_STRIDE 0x100
 #define GNW_H7B0_ADC_INSTANCE_COUNT  2
 
+typedef struct GnwH7B0AdcTimerContext {
+    GnwH7B0AdcState *adc;
+    unsigned int instance;
+} GnwH7B0AdcTimerContext;
+
 struct GnwH7B0AdcState {
     SysBusDevice parent_obj;
 
@@ -140,6 +171,22 @@ struct GnwH7B0AdcState {
     qemu_irq irq;
     uint32_t regs[GNW_H7B0_ADC_SIZE / 4];
     GnwH7B0DmaState *dma;
+    GnwH7B0RccState *rcc;
+    bool timing_mode;
+
+    /* Timer state is indexed ADC1=0, ADC2=1. Timers themselves are rebuilt
+     * from the migrated remaining conversion phase in post_load. */
+    QEMUTimer *conversion_timer[GNW_H7B0_ADC_INSTANCE_COUNT];
+    GnwH7B0AdcTimerContext conversion_timer_ctx[
+        GNW_H7B0_ADC_INSTANCE_COUNT];
+    bool conversion_active[GNW_H7B0_ADC_INSTANCE_COUNT];
+    uint8_t sequence_rank[GNW_H7B0_ADC_INSTANCE_COUNT];
+    uint8_t sequence_length[GNW_H7B0_ADC_INSTANCE_COUNT];
+    uint32_t remaining_half_cycles[GNW_H7B0_ADC_INSTANCE_COUNT];
+    uint64_t phase_remainder[GNW_H7B0_ADC_INSTANCE_COUNT];
+    int64_t last_update_ns[GNW_H7B0_ADC_INSTANCE_COUNT];
+    uint32_t active_kernel_hz[GNW_H7B0_ADC_INSTANCE_COUNT];
+    bool migrated_timing_mode;
 };
 
 /* Wires this ADC up to the shared DMA controller, registering a request
@@ -150,5 +197,7 @@ struct GnwH7B0AdcState {
  * simulates flag/IRQ timing -- real byte movement for non-M2M streams is
  * the source peripheral's job, same as gnw_h7b0_sai1.c/gnw_h7b0_hash.c). */
 void gnw_h7b0_adc_set_dma(GnwH7B0AdcState *s, GnwH7B0DmaState *dma);
+/* Connect the combined ADC1/ADC2 block to RCC after both devices exist. */
+void gnw_h7b0_adc_set_rcc(GnwH7B0AdcState *s, GnwH7B0RccState *rcc);
 
 #endif

@@ -6,6 +6,7 @@ contrib_plugins = [
 'execlog.c',
 'hotblocks.c',
 'hotpages.c',
+'gnw-timing-trace.c',
 'howvec.c',
 'hwprofile.c',
 'ips.c',

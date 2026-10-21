@@ -1,7 +1,8 @@
 /*
  * STM32H7B0 RTC minimal stub (Nintendo Game & Watch)
  *
- * Not cycle-accurate, no real calendar/clock counting. Purpose: real
+ * Calendar and Alarm A behavior needed by firmware; not cycle-accurate.
+ * Purpose: real
  * firmware's HAL_RTC_Init() -> RTC_EnterInitMode() writes ICSR.INIT
  * (bit 7) then polls ICSR.INITF (bit 6) for real hardware to confirm
  * entry into initialization mode, and RTC_ExitInitMode() ->
@@ -16,23 +17,21 @@
  * (same "instant approximation" pattern as RCC/PWR/OSPI/ADC's
  * ON->RDY bits) so the poll never blocks.
  *
- * CR's ALRAE/ALRBE/WUTE enable bits (Alarm A/B, periodic Wakeup Timer)
- * get the same instant treatment: on the 0->1 edge, the matching SR
- * flag (ALRAF/ALRBF/WUTF) is set immediately rather than after a real
- * ALRMAR/WUTR-derived delay, so firmware busy-polling SR (or ICSR's
- * ALRAWF/ALRBWF/WUTWF "write allowed" bits, already instant) for its
- * own alarm/wakeup to fire doesn't hang forever. Found via
- * patched-zelda-bank1.bin stalling completely (no more RTC/RCC writes
- * logged at all) right after a WPR-unlock + CR-write sequence. SCR
- * clears SR bits the same way real hardware does (write 1 to the
- * matching SCR bit); MISR mirrors SR gated by the CR *IE enable bits.
- * No real IRQ is raised to the NVIC -- this only unblocks *polling*
- * loops, not interrupt-driven waits.
+ * Alarms A and B run from QEMU_CLOCK_VIRTUAL. Their calendar fields and masks
+ * select the next matching second. SCR clears their SR flags, MISR gates them
+ * with CR.ALRAIE/ALRBIE, and the shared alarm output drives RTC_Alarm_IRQn.
+ * The wakeup counter also runs from virtual time and updates WUTF/MISR. The
+ * second device output carries WUTF gated by CR.WUTIE into EXTI line 19;
+ * EXTI owns its mask, pending flag, and dedicated RTC_WKUP_IRQn output.
  *
- * TR/DR (time/date) are a real ticking calendar, seeded from the
- * host's wall-clock time at reset and advanced via QEMU_CLOCK_VIRTUAL
+ * TR/DR (time/date) are a ticking calendar, seeded from the host's
+ * local time at reset by default and advanced via QEMU_CLOCK_VIRTUAL
  * (see gnw_h7b0_rtc_sync_calendar()/_reanchor_calendar() in the .c
- * file) -- added because gnw-chainloader has a real clock display
+ * file). The SoC overrides that default with Unix epoch 0 in timing mode.
+ * The `initial-epoch` property can instead select a deterministic nonnegative
+ * Unix epoch, displayed as UTC. The standard QEMU `-rtc base`
+ * option is not consumed by this device. This was added because the
+ * gnw-chainloader has a real clock display
  * that reads TR/DR and a static/stub value looked obviously wrong. A
  * write to either re-anchors the running calendar to the new value
  * (in case firmware ever sets the clock), but no tested firmware image
@@ -47,9 +46,8 @@
  * too, which silently freezes tv_usec for every
  * GW_GetCurrentMillis()/_gettimeofday() caller.
  *
- * Every other register (PRER, WUTR, WPR, CALR, SHIFTR,
- * timestamp/alarm value registers, CFGR) is a plain read/write shadow
- * with no side effects.
+ * Every other register (WPR, CALR, SHIFTR, timestamp and CFGR) is a plain
+ * read/write shadow with no side effects.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -116,27 +114,38 @@ struct GnwH7B0RtcState {
     SysBusDevice parent_obj;
 
     MemoryRegion mmio;
-    qemu_irq irq;              /* RTC_Alarm_IRQn (Alarm A/B only -- the
-                                 * wakeup-timer's real IRQ line,
-                                 * RTC_WKUP_IRQn, isn't wired anywhere
-                                 * else in this SoC model and no tested
-                                 * firmware needs it). */
+    qemu_irq irq;
+    qemu_irq wakeup_irq;
+    QEMUTimer *alarm_a_timer;
+    QEMUTimer *alarm_b_timer;
+    QEMUTimer *wakeup_timer;
+    int64_t alarm_a_deadline_ns;
+    int64_t alarm_a_remaining_ns;
+    int64_t alarm_b_deadline_ns;
+    int64_t alarm_b_remaining_ns;
+    int64_t wakeup_deadline_ns;
+    int64_t wakeup_remaining_ns;
     uint32_t regs[GNW_H7B0_RTC_SIZE / 4];
 
     /*
-     * Real ticking calendar: rtc_base_epoch is the Unix time the
+     * Ticking calendar: rtc_base_epoch is the Unix time the
      * calendar read TR/DR as, at host virtual-clock time
      * rtc_base_vclock_ns -- current calendar time is always
      * rtc_base_epoch + (now - rtc_base_vclock_ns). Seeded from the
-     * host's wall-clock time at reset (like a battery-backed RTC that
+     * host's wall-clock time at reset by default (like a battery-backed RTC that
      * was already running) rather than 2000-01-01, since real
      * firmware (gnw-chainloader's clock display) only ever *reads*
      * this calendar -- it has no in-firmware time-set UI in the
      * images tested so far, so there's nothing to seed it from except
-     * the host clock.
+     * the host clock. A nonnegative `initial_epoch` property selects a
+     * deterministic UTC epoch; the -1 default preserves host-local fields.
      */
     int64_t rtc_base_epoch;
     int64_t rtc_base_vclock_ns;
+    /* Optional deterministic epoch; -1 keeps the historical host-local seed. */
+    int64_t initial_epoch;
+    /* Calendar interpretation captured at reset and included in migration. */
+    bool rtc_calendar_utc;
 
     /*
      * Calendar shadow-register lock: virtual-clock instant that a

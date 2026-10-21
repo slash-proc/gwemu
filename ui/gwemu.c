@@ -240,20 +240,19 @@ static struct gwemu_console *get_scon_from_window(uint32_t window_id)
  * resamples the whole surface -- visibly blurry. Snapping to the
  * nearest point size whose product with the scale is integral (with
  * 1.75 = 7/4, any multiple of 4pt) restores exact 1:1 presentation.
- * On density-1 hosts (x11/Windows) scale is 1.0 and this reduces to a
- * pass-through of px_w/px_h.
+ * SDL's display scale is the stable logical-to-display conversion. Pixel
+ * density is a fallback for backends that do not expose an elevated display
+ * scale, but is not used when a stable scale is available because fractional
+ * buffer rounding can make it fluctuate by a pixel during interactive resize.
  */
 float gwemu_get_window_pixel_scale(SDL_Window *win)
 {
     float density = fmaxf(SDL_GetWindowPixelDensity(win), 1.0f);
-    if (density > 1.01f) {
-        return density;
-    }
-    /* X11/XWayland reports a pixel density of 1 even when the desktop
-     * applies a scaled coordinate space; SDL still reports that scale via
-     * GetWindowDisplayScale (for example density=1, display_scale=2). Use
-     * the display scale as the fallback on every backend. */
-    return fmaxf(SDL_GetWindowDisplayScale(win), density);
+    float display_scale = fmaxf(SDL_GetWindowDisplayScale(win), 1.0f);
+    /* Prefer the backend's stable scale when available. Pixel density is
+     * derived from rounded buffer dimensions and can wobble slightly as a
+     * fractional-scale Wayland window is interactively resized. */
+    return display_scale > 1.01f ? display_scale : density;
 }
 
 void gwemu_snap_window_points(SDL_Window *win, int px_w, int px_h,
@@ -299,7 +298,7 @@ void gwemu_snap_window_points(SDL_Window *win, int px_w, int px_h,
  * reapply them once SDL has learned the compositor scale. */
 void gwemu_set_window_size_pixels(SDL_Window *win, int px_w, int px_h)
 {
-    int pt_w, pt_h;
+    int pt_w, pt_h, current_w, current_h;
 
     if (!win || px_w <= 0 || px_h <= 0) {
         return;
@@ -307,10 +306,23 @@ void gwemu_set_window_size_pixels(SDL_Window *win, int px_w, int px_h)
     if (win == m_window) {
         m_window_desired_width_px = px_w;
         m_window_desired_height_px = px_h;
-        m_window_dpi_size_corrected = false;
         m_window_programmatic_resize_pending = true;
     }
     gwemu_snap_window_points(win, px_w, px_h, &pt_w, &pt_h);
+    SDL_GetWindowSize(win, &current_w, &current_h);
+    if (current_w == pt_w && current_h == pt_h) {
+        if (win == m_window) {
+            m_window_dpi_size_corrected = true;
+            m_window_programmatic_resize_pending = false;
+        }
+        return;
+    }
+    if (win == m_window) {
+        /* This request is already expressed in the current display's point
+         * size. Wait for its configure acknowledgement without correcting
+         * every pixel-size event. A later display-scale change will recalc. */
+        m_window_dpi_size_corrected = true;
+    }
     if (getenv("GNW_SCALE_DEBUG")) {
         fprintf(stderr, "SCALE_DEBUG request pixels=%dx%d points=%dx%d "
                 "density=%.3f display_scale=%.3f\n", px_w, px_h, pt_w,
@@ -328,14 +340,10 @@ static void gwemu_correct_window_dpi_size(SDL_Window *window, bool force)
         return;
     }
 
-    float density = gwemu_get_window_pixel_scale(window);
-    float display_scale = fmaxf(SDL_GetWindowDisplayScale(window), 1.0f);
-    if (density <= 1.01f) {
-        /* Wayland may deliver the initial configure before its fractional
-         * scale is known. Keep waiting for its scale/pixel-size event. */
-        if (display_scale <= 1.01f) {
-            m_window_dpi_size_corrected = true;
-        }
+    float pixel_scale = gwemu_get_window_pixel_scale(window);
+    if (pixel_scale <= 1.01f) {
+        /* At unity scale, requested pixel dimensions equal SDL points. */
+        m_window_dpi_size_corrected = true;
         return;
     }
 
@@ -346,6 +354,13 @@ static void gwemu_correct_window_dpi_size(SDL_Window *window, bool force)
     gwemu_snap_window_points(window, m_window_min_width_px,
                              m_window_min_height_px, &min_width_pt,
                              &min_height_pt);
+    int current_width_pt, current_height_pt;
+    SDL_GetWindowSize(window, &current_width_pt, &current_height_pt);
+    if (abs(current_width_pt - width_pt) <= 1 &&
+        abs(current_height_pt - height_pt) <= 1) {
+        m_window_dpi_size_corrected = true;
+        return;
+    }
     m_window_dpi_size_corrected = true;
     SDL_SetWindowMinimumSize(window, min_width_pt, min_height_pt);
     SDL_SetWindowSize(window, width_pt, height_pt);
@@ -359,9 +374,8 @@ static void window_resize(struct gwemu_console *scon)
 
     /*
      * surface dims are PIXELS; SDL_SetWindowSize takes POINTS. Equal on
-     * x11/Windows, but on Wayland with display scaling points*density =
-     * pixels, so dividing keeps the physical size right (previously the
-     * window ballooned by the scale factor).
+     * x11/Windows. On high-DPI backends, divide by the stable display scale
+     * so the drawable retains the requested physical pixel dimensions.
      */
     int rw_pt, rh_pt;
     gwemu_snap_window_points(scon->real_window,
@@ -716,37 +730,34 @@ static void handle_windowevent(SDL_Event *ev)
 
     switch (ev->type) {
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-        /* A user drag already gives us the new size on X11. Reapplying the
-         * stored pixel target here converts that interactive size through
-         * the desktop scale and fights the window manager, producing jumps.
-         * Only settle a pending size we requested ourselves. */
-        if (scon->real_window == m_window &&
-            m_window_programmatic_resize_pending) {
-            gwemu_correct_window_dpi_size(scon->real_window, true);
-        }
-        if (scon->real_window == m_window &&
-            m_window_dpi_size_corrected) {
-            int pixel_width, pixel_height;
+        /* A pixel-size event is the compositor acknowledging a size, not a
+         * request to resize again. Reissuing SDL_SetWindowSize here creates
+         * a configure loop on Wayland when the pixel density and display
+         * scale differ slightly: each configure generates another pixel
+         * size event, while the request is snapped using the display scale.
+         * Initial sizing and display-scale changes are corrected at their
+         * respective call sites instead. */
+        if (scon->real_window == m_window && m_window_dpi_size_corrected) {
+            int current_width_pt, current_height_pt;
             int expected_width_pt, expected_height_pt;
-            SDL_GetWindowSizeInPixels(m_window, &pixel_width, &pixel_height);
-            /* On X11 the renderer/window pixel dimensions stay equal to
-             * the SDL window size even when display_scale is > 1. Only
-             * high-density backends multiply point size by pixel density. */
-            float density = fmaxf(SDL_GetWindowPixelDensity(m_window), 1.0f);
+            SDL_GetWindowSize(m_window, &current_width_pt, &current_height_pt);
             gwemu_snap_window_points(m_window, m_window_desired_width_px,
                                      m_window_desired_height_px,
                                      &expected_width_pt,
                                      &expected_height_pt);
-            int expected_width = (int)lroundf(expected_width_pt * density);
-            int expected_height = (int)lroundf(expected_height_pt * density);
-            if (abs(pixel_width - expected_width) <= 2 &&
-                abs(pixel_height - expected_height) <= 2) {
+            if (abs(current_width_pt - expected_width_pt) <= 1 &&
+                abs(current_height_pt - expected_height_pt) <= 1) {
                 m_window_programmatic_resize_pending = false;
             }
         }
         break;
     case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
-        gwemu_correct_window_dpi_size(scon->real_window, true);
+        if (scon->real_window == m_window) {
+            /* SDL reports this event when the stable display scale changes.
+             * Do not infer scale changes from pixel-size events: fractional
+             * Wayland buffers can round by a pixel as the window is resized. */
+            gwemu_correct_window_dpi_size(m_window, true);
+        }
         break;
     case SDL_EVENT_WINDOW_RESIZED:
         {
@@ -1587,6 +1598,17 @@ static void poll_events(struct gwemu_console *scon)
 
         if (m_settings_window && get_window_id_from_event(ev) == SDL_GetWindowID(m_settings_window)) {
             gwemu_settings_hud_process_sdl_events(ev);
+            /* GNW buttons are global device inputs. SDL routes keyboard
+             * events to whichever window owns focus, including the separate
+             * Settings window, so remap them before dropping its events. */
+            if (ev->type == SDL_EVENT_KEY_DOWN ||
+                ev->type == SDL_EVENT_KEY_UP ||
+                ev->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+                ev->type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+                gwemu_main_loop_lock();
+                gnw_input_process_sdl_event(ev);
+                gwemu_main_loop_unlock();
+            }
             if (ev->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
                 SDL_HideWindow(m_settings_window);
             }
