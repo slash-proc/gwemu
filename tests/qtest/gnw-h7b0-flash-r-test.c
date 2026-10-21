@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "libqtest-single.h"
 #include "migration/migration-qmp.h"
 
