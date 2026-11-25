@@ -124,8 +124,22 @@ static void sdl3_to_audfmt(SDL_AudioFormat sdlfmt, struct audsettings *as)
     }
 }
 
+/*
+ * SDL_Quit() destroys every remaining audio stream (SDL_QuitAudio()
+ * always drops `simplified` streams, i.e. all SDL_OpenAudioDeviceStream()
+ * ones) before QEMU's exit notifiers get to close this voice -- leaving
+ * sdl->stream dangling and turning the close into a use-after-free
+ * (SIGSEGV in SDL_LockAudioStream / SIGBUS in SDL_DestroyAudioQueue).
+ * When the audio subsystem is already gone there is nothing left to
+ * pause or destroy: just forget the stream.
+ */
 static void sdl3_close_out(SDL3VoiceOut *sdl)
 {
+    if (!SDL_WasInit(SDL_INIT_AUDIO)) {
+        sdl->stream = NULL;
+        sdl->initialized = 0;
+        return;
+    }
     if (sdl->initialized && sdl->stream) {
         SDL_LockAudioStream(sdl->stream);
         sdl->exit = 1;
@@ -230,8 +244,14 @@ static void sdl3_callback_out(void *opaque, SDL_AudioStream *stream,
     }
 }
 
+/* See sdl3_close_out(): same teardown-order hazard for record streams. */
 static void sdl3_close_in(SDL3VoiceIn *sdl)
 {
+    if (!SDL_WasInit(SDL_INIT_AUDIO)) {
+        sdl->stream = NULL;
+        sdl->initialized = 0;
+        return;
+    }
     if (sdl->initialized && sdl->stream) {
         SDL_LockAudioStream(sdl->stream);
         sdl->exit = 1;

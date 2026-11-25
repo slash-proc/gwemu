@@ -2297,7 +2297,12 @@ static void display_finalize(void)
     }
     SDL_DestroyRenderer(m_renderer);
     SDL_DestroyWindow(m_window);
-    SDL_Quit();
+    /* No SDL_Quit() here: main() registers it via atexit() instead, so it
+     * runs AFTER QEMU's exit notifiers (atexit is LIFO and qemu_init()
+     * registers qemu_run_exit_notifiers later). Quitting SDL here tore the
+     * audio subsystem down while gnw_h7b0_sai1 still owned an open
+     * SDL_AudioStream, and the notifier then destroyed the freed stream
+     * -- SIGBUS/SIGSEGV on every clean exit. */
 }
 
 static QemuDisplay qemu_display_gwemu = {
@@ -2705,6 +2710,16 @@ int main(int argc, char **argv)
     atexit(gwemu_settings_save);
     gnw_input_load();
     atexit(gnw_input_save);
+    /*
+     * Registered before the qemu_main thread starts, i.e. before
+     * qemu_init_subsystems() registers atexit(qemu_run_exit_notifiers).
+     * atexit runs LIFO, so the exit notifiers (which close the SDL3 audio
+     * streams owned by gnw_h7b0_sai1) run first and SDL_Quit() runs last.
+     * Quitting SDL before them double-destroyed those streams
+     * (SDL_QuitAudio() frees every remaining simplified stream) --
+     * SIGBUS/SIGSEGV on every clean exit on macOS.
+     */
+    atexit(SDL_Quit);
 
     bool has_flash_images = false;
     for (int i = 1; i < g_orig_argc; i++) {
