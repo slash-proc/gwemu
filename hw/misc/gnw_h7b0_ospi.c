@@ -1372,9 +1372,14 @@ static void gnw_h7b0_ospi_write(void *opaque, hwaddr addr,
          * pending_addr+dr_pos (mirrors ospi_gen_read_byte()'s
          * addressing for indirect reads); any other write-class
          * command (e.g. WRSR) still has its byte dropped, since only
-         * PP is modeled with a real data-phase effect.
+         * PP is modeled with a real data-phase effect. Nintendo's stock
+         * firmwares program with their own driver, always quad page
+         * program 0x38 (their MX25U chips), whatever chip is selected
+         * here; the default chip's own opcode is 0x3E, so their saves
+         * (NVRAM, Zelda's save slots) were dropped.
          */
-        if (s->pending_instr == ospi_chip_program_opcode(s) && s->backing) {
+        if ((s->pending_instr == ospi_chip_program_opcode(s) ||
+             s->pending_instr == 0x38) && s->backing) {
             uint64_t length = (uint64_t)s->regs[GNW_H7B0_OSPI_DLR >> 2] + 1;
 
             for (unsigned i = 0; i < size && s->dr_pos < length; i++) {
